@@ -12,13 +12,18 @@
  * WHAT THIS FILE IS
  * -----------------
  * A throwaway, dependency-free, dual-era MCP server exposing ONE tool
- * (`probe_briefing`). Every invocation appends a tamper-evident record to an
- * append-only JSONL log: server-clock timestamp, a server-minted nonce the caller
- * cannot forge, and every scrap of caller identity the transport actually reveals.
+ * (`probe_briefing`). Every invocation appends a record to an append-only JSONL
+ * log: server-clock timestamp, a server-minted nonce the caller cannot forge, and
+ * every scrap of caller identity the transport actually reveals.
+ *
+ * The log is append-only and carries a monotonic `seq`, so truncation, a wiped
+ * volume, or a torn write are DETECTABLE. It is not tamper-PROOF: the operator
+ * holds the file and could rewrite it. The integrity checks exist to catch
+ * accidents (ephemeral filesystem, redeploy, volume swap), not an adversary.
  *
  * It also carries the analysis, because a raw log does not settle an assumption —
  * a verdict does. `report` classifies the log against pre-registered firing
- * windows and prints one of five named outcomes. See README.md.
+ * windows and prints one of six named outcomes. See README.md.
  *
  * THE TRAP THIS IS BUILT AROUND
  * -----------------------------
@@ -28,7 +33,30 @@
  * So: nothing is proof unless it was ARMED FIRST (`arm` writes the expected fire
  * time and a secret label into the log BEFORE the window opens), and the verdict
  * demands at least one discriminator that a manual test could not have produced.
- * README.md states plainly what is proof and what is merely consistent with it.
+ *
+ * THE SECOND TRAP, WHICH IS WORSE
+ * -------------------------------
+ * ABSENCE OF EVIDENCE MUST NEVER SCORE AS EVIDENCE OF SUCCESS. v1 of this probe
+ * failed that: `independent = beacon === "machine_absent" || transportUnseen`,
+ * where BOTH disjuncts were satisfied by a missing signal. A dead beacon loop, a
+ * closed terminal, a rotated admin token, a server restart that cleared in-memory
+ * state, or an empty manual-identity set each read as positive evidence. A hand
+ * test run at 07:00 with the operator sitting at the keyboard could score CLEAN.
+ *
+ * Every discriminator here is therefore a POSITIVE test with an explicit
+ * "unavailable" state:
+ *
+ *   - the beacon discriminator requires an ABSENCE BRACKET — a beacon stream that
+ *     was demonstrably running, went quiet BEFORE the call, and stayed quiet for a
+ *     margin AFTER it. "Stale" alone proves nothing: a machine that woke at 07:05
+ *     and fired a catch-up task at 07:06 with the operator at the keyboard has a
+ *     stale beacon too, and its beacon resumes seconds later. That is the shape we
+ *     now detect and refuse.
+ *   - the transport discriminator requires a NON-EMPTY, TRUSTWORTHY manual
+ *     baseline and compares on both an exact and a coarsened identity, so an
+ *     empty log or a DHCP renewal cannot manufacture novelty.
+ *   - `NO_INVOCATION_OBSERVED` requires POSITIVE evidence the server was up across
+ *     the whole window (heartbeat records). A dead server is not a silent client.
  *
  * FALSE FAILS ARE AS EXPENSIVE AS FALSE PASSES. A false fail triggers an
  * architectural no-branch (server-side push, promoted to a Phase 4 commitment)
@@ -36,12 +64,17 @@
  * a request for spec non-compliance, it speaks both the modern (2026-07-28) and
  * legacy (initialize-handshake) protocol eras, and it logs every request it
  * refuses so "the client tried and failed" can never be misread as "the client
- * never tried".
+ * never tried". Ambient noise the server tolerates by design (scanner 404s, a
+ * legacy GET on the MCP endpoint, an unknown JSON-RPC method) is recorded and
+ * reported but does NOT invalidate a window — flags are classified by DIRECTION,
+ * so noise that could hide a real fire blocks the negative verdict, and only
+ * noise that could make an attended call look unattended blocks the positive one.
  *
  * SUBCOMMANDS (entrypoint is fixed by package.json's `probe:scheduled-task`)
  *   bun run probe:scheduled-task                       # serve (default)
+ *   bun run probe:scheduled-task doctor                # is the wiring right?
  *   bun run probe:scheduled-task arm --client desktop --fire-at <ISO8601+offset>
- *   bun run probe:scheduled-task report [--json] [--file <path>]
+ *   bun run probe:scheduled-task report [--json] [--file <path>] [--now <ISO>]
  *   bun run probe:scheduled-task verify-nonce <nonce>
  *
  * NON-GOALS (deliberate, do not add): OAuth, SSE, subscriptions/listen, MRTR,
@@ -51,7 +84,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 
-const PROBE_VERSION = "1.0.0";
+const PROBE_VERSION = "2.0.0";
 const SERVER_NAME = "brainz-scheduled-task-probe";
 const TOOL_NAME = "probe_briefing";
 
@@ -61,18 +94,75 @@ const LEGACY_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
 const LEGACY_FALLBACK_VERSION = "2025-06-18";
 
 // ---------------------------------------------------------------------------
+// Thresholds. Every one of these is a place where "I did not see anything" is
+// deliberately NOT allowed to mean "nothing happened".
+// ---------------------------------------------------------------------------
+
+/** Log at most one beacon per minute. The documented loop pings every 2 minutes. */
+const BEACON_LOG_THROTTLE_MS = 60_000;
+
+/**
+ * Consecutive beacons further apart than this mean the loop was not actually
+ * running, so the quiet period that follows proves nothing about the machine.
+ */
+const BEACON_STREAM_MAX_GAP_MS = 15 * 60_000;
+
+/** How many consecutive on-cadence beacons prove the loop was alive before it went quiet. */
+const BEACON_STREAM_MIN_SAMPLES = 3;
+
+/** The machine must already have been unreachable this long when the call landed. */
+const BEACON_PRE_CALL_QUIET_MS = 10 * 60_000;
+
+/**
+ * ...and must STAY unreachable this long afterwards. This is the disjunct that
+ * kills the wake-triggered catch-up fire: a machine that woke to run the task
+ * resumes beaconing within a minute or two of waking, i.e. right around the call.
+ */
+const BEACON_POST_CALL_QUIET_MS = 10 * 60_000;
+
+/** Arming a few seconds before the window opens is not pre-registration. */
+const MIN_ARM_LEAD_MS = 30 * 60_000;
+
+/**
+ * Two "distinct days" must be genuinely distinct. UTC-date keying let 16:30 and
+ * 17:30 local on one afternoon count as two days; wide windows let ONE call
+ * satisfy two of them.
+ */
+const MIN_WINDOW_SEPARATION_MS = 20 * 60 * 60_000;
+
+/** `window_minutes` is a HALF-WIDTH: the window is fire_at ± window_minutes. */
+const MIN_WINDOW_MINUTES = 1;
+const MAX_WINDOW_MINUTES = 120;
+
+const HEARTBEAT_DEFAULT_SECONDS = 300;
+
+// ---------------------------------------------------------------------------
 // Record shapes. Everything on disk is one of these, one JSON object per line.
 // Optional-ness is expressed as `| null`, never `?`, because the repo compiles
-// with exactOptionalPropertyTypes.
+// with exactOptionalPropertyTypes. Fields added after v1 are read through
+// tolerant accessors so a v1 log still parses.
 // ---------------------------------------------------------------------------
 
 type Era = "modern" | "legacy" | "unknown";
 
+/** Where the operator's by-hand tests came from. Decides whether 5b is usable at all. */
+type HandTestOrigin = "desktop" | "web" | "both" | "none" | "unspecified";
+
+const HAND_TEST_ORIGINS: readonly HandTestOrigin[] = ["desktop", "web", "both", "none", "unspecified"];
+
 interface TransportIdentity {
   /** Socket peer as the runtime sees it. Behind a platform proxy this is the proxy. */
   remote_ip: string | null;
-  /** Whatever the edge said the real client was, if anything. */
+  /** Whatever the edge said the real client was, if anything. CALLER-SUPPLIABLE. */
   edge_client_ip: string | null;
+  /**
+   * True when the socket peer is a private/loopback/CGNAT address, i.e. we really
+   * are behind a platform proxy and the edge header is worth believing. A public
+   * peer can set `cf-connecting-ip` to anything, so we do not believe it.
+   */
+  edge_trusted: boolean;
+  /** The address identity comparisons actually use. See `trustedIp`. */
+  identity_ip: string | null;
   user_agent: string | null;
   /** SHA-256 prefix of the Authorization header. Never the value itself. */
   authorization_fingerprint: string | null;
@@ -99,6 +189,18 @@ interface BootRecord extends BaseRecord {
   boots_in_log: number;
   runtime: string;
   server_utc_offset_minutes: number;
+  heartbeat_seconds: number;
+}
+
+/**
+ * Proof the server was up. Without these, "nothing arrived" is indistinguishable
+ * from "the process was dead", and the probe would score a platform outage as
+ * evidence against Assumption 3.
+ */
+interface HeartbeatRecord extends BaseRecord {
+  kind: "heartbeat";
+  interval_seconds: number;
+  uptime_seconds: number;
 }
 
 interface ArmRecord extends BaseRecord {
@@ -108,17 +210,27 @@ interface ArmRecord extends BaseRecord {
   /** ISO 8601 WITH an explicit offset or Z. Enforced — a naive string is a timezone false-fail. */
   fire_at: string;
   fire_at_epoch_ms: number;
+  /** HALF-WIDTH in minutes. The window is fire_at ± this. */
   window_minutes: number;
   /** Server-minted. The user pastes this into the scheduled prompt BEFORE the window. */
   expected_label: string;
   /** The user's assertion that they will not touch the client during the window. */
   attest_away: boolean;
+  /** Pre-registered, so it cannot be re-told after the fact to rescue a window. */
+  hand_tests_from: HandTestOrigin;
   note: string | null;
 }
 
 interface BeaconRecord extends BaseRecord {
   kind: "beacon";
   host_label: string | null;
+  /**
+   * Optional, operator-supplied corroboration (e.g. macOS HID idle seconds).
+   * NEVER qualifies a window — it is measured by the machine under test and its
+   * cross-sleep semantics are unverified. Printed, never counted.
+   */
+  user_idle_seconds: number | null;
+  screen_locked: boolean | null;
   transport: TransportIdentity;
 }
 
@@ -156,7 +268,12 @@ interface ToolCallRecord extends BaseRecord {
   protocol_version: string | null;
   client_info: unknown;
   spec_deviations: string[];
-  /** Seconds since the presence beacon last pinged, or null if it never has. */
+  /**
+   * Seconds since the last beacon, as the process saw it. Seeded from the log at
+   * boot so a restart no longer nulls it — but the VERDICT does not use this
+   * field. The absence bracket is computed from beacon records, because staleness
+   * at one instant cannot distinguish an absent machine from a dead beacon.
+   */
   beacon_age_seconds: number | null;
   path: string;
   transport: TransportIdentity;
@@ -164,6 +281,7 @@ interface ToolCallRecord extends BaseRecord {
 
 type ProbeRecord =
   | BootRecord
+  | HeartbeatRecord
   | ArmRecord
   | BeaconRecord
   | HttpRecord
@@ -229,17 +347,30 @@ function env(name: string): string | null {
   return value === undefined || value.trim() === "" ? null : value.trim();
 }
 
-function requireEnv(name: string, why: string): string {
+/**
+ * `secret` controls the lecture. The token-rotation paragraph is true of the two
+ * secrets and nonsense attached to a URL, which is where a user most often meets
+ * this error.
+ */
+function requireEnv(name: string, why: string, secret = false): string {
   const value = env(name);
   if (value === null) {
-    fatal(
-      2,
-      `[probe] FATAL: ${name} is not set.`,
-      `[probe] ${why}`,
-      "[probe] This probe never auto-generates secrets: a restart that silently",
-      "[probe] rotated the token would break the connector URL and read as",
-      "[probe] 'the scheduled task did not fire' — a false FAIL. Set it explicitly.",
-    );
+    const lines = [`[probe] FATAL: ${name} is not set.`, `[probe] ${why}`];
+    if (secret) {
+      lines.push(
+        "[probe] This probe never auto-generates secrets: a restart that silently",
+        "[probe] rotated the token would break the connector URL and read as",
+        "[probe] 'the scheduled task did not fire' — a false FAIL. Set it explicitly.",
+      );
+    } else {
+      lines.push(
+        "[probe] Set it in the platform's variable UI, or in a local .env, or export it:",
+        `[probe]   export ${name}=...`,
+        "[probe] (The beacon loop in README step 4 needs EXPORTED variables — `.env` is",
+        "[probe]  auto-loaded by `bun run` but not by a bare `curl` in your shell.)",
+      );
+    }
+    fatal(2, ...lines);
   }
   return value;
 }
@@ -278,6 +409,7 @@ class ProbeLog {
       } catch {
         // A torn final line means the process died mid-write. Skip it rather
         // than crash: losing one record must not make the whole log unreadable.
+        // The `seq` continuity check in assess() is what notices the loss.
       }
     }
     return out;
@@ -313,6 +445,26 @@ const EDGE_IP_HEADERS = [
   "x-forwarded-for",
 ];
 
+/**
+ * Is the socket peer a proxy we are plausibly sitting behind? Only then are the
+ * edge headers worth believing. Without this, `identity_ip` — and therefore the
+ * whole transport discriminator — is a value the caller chooses.
+ */
+function isProxyPeer(ip: string | null): boolean {
+  if (ip === null || ip === "") return false;
+  const v = ip.toLowerCase().replace(/^::ffff:/, "");
+  if (v === "::1" || v.startsWith("127.")) return true;
+  if (v.startsWith("10.") || v.startsWith("192.168.")) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(v)) return true;
+  // Carrier-grade NAT (100.64.0.0/10) — Fly and several PaaS proxies live here.
+  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(v)) return true;
+  // IPv6 unique-local (fc00::/7) and link-local (fe80::/10).
+  if (/^f[cd]/.test(v) || v.startsWith("fe8") || v.startsWith("fe9") || v.startsWith("fea") || v.startsWith("feb")) {
+    return true;
+  }
+  return false;
+}
+
 function captureTransport(req: Request, peerIp: string | null): TransportIdentity {
   const headers: { [name: string]: string } = {};
   let authFingerprint: string | null = null;
@@ -330,29 +482,72 @@ function captureTransport(req: Request, peerIp: string | null): TransportIdentit
   for (const name of EDGE_IP_HEADERS) {
     const value = headers[name];
     if (value !== undefined && value !== "") {
-      // x-forwarded-for is a chain; the client is the leftmost entry.
-      edgeIp = (value.split(",")[0] ?? value).trim();
+      if (name === "x-forwarded-for") {
+        // RIGHTMOST, not leftmost. The leftmost entry is whatever the caller put
+        // there; the rightmost is what the proxy we trust appended.
+        const parts = value.split(",").map((p) => p.trim()).filter((p) => p !== "");
+        edgeIp = parts[parts.length - 1] ?? null;
+      } else {
+        edgeIp = value.trim();
+      }
       break;
     }
   }
 
+  // A peer we cannot see at all (peerIp null) is treated as untrusted: we fall
+  // back to the edge header but the `edge_trusted` flag records that we are
+  // believing something the caller could have written.
+  const edgeTrusted = isProxyPeer(peerIp);
+  const identityIp = edgeTrusted ? (edgeIp ?? peerIp) : (peerIp ?? edgeIp);
+
   return {
     remote_ip: peerIp,
     edge_client_ip: edgeIp,
+    edge_trusted: edgeTrusted,
+    identity_ip: identityIp,
     user_agent: headers["user-agent"] ?? null,
     authorization_fingerprint: authFingerprint,
     headers,
   };
 }
 
-/** The most client-like address available. Used only to compare invocations to each other. */
-function bestIp(t: TransportIdentity): string {
+/**
+ * The address identity comparisons use. Tolerates v1 records, which have no
+ * `identity_ip` field.
+ */
+function trustedIp(t: TransportIdentity): string {
+  if (t.identity_ip !== undefined && t.identity_ip !== null && t.identity_ip !== "") return t.identity_ip;
   return t.edge_client_ip ?? t.remote_ip ?? "unknown";
 }
 
 /** Identity tuple used to ask "did this call come from the same place as that one?". */
 function identityKey(t: TransportIdentity): string {
-  return `${bestIp(t)} | ${t.user_agent ?? "no-ua"}`;
+  return `${trustedIp(t)} | ${t.user_agent ?? "no-ua"}`;
+}
+
+/** IPv4 /24 or IPv6 /48. A DHCP renewal or privacy-address rotation stays inside these. */
+function ipNetwork(ip: string): string {
+  if (ip.includes(":")) return `${ip.split(":").slice(0, 3).join(":")}::/48`;
+  const octets = ip.split(".");
+  if (octets.length === 4) return `${octets.slice(0, 3).join(".")}.0/24`;
+  return ip;
+}
+
+/** "Claude/1.2.3 (macOS)" -> "claude". A client auto-update must not manufacture novelty. */
+function uaFamily(ua: string | null): string {
+  if (ua === null || ua.trim() === "") return "no-ua";
+  const head = ua.trim().split(/[/\s]/)[0] ?? ua;
+  return head.toLowerCase().replace(/[\d.]+$/, "");
+}
+
+/**
+ * Deliberately blunt. `identityKey` alone is an exact tuple over two values that
+ * drift innocently — a Desktop auto-update or a DHCP renewal between the hand
+ * test and the window would convert "same machine" into "unseen identity" and
+ * MANUFACTURE the discriminator. A call must be unseen under both keys to count.
+ */
+function coarseIdentityKey(t: TransportIdentity): string {
+  return `${ipNetwork(trustedIp(t))} | ${uaFamily(t.user_agent)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +582,7 @@ interface MessageContext {
  * from the 2026-07-28 spec — WITHOUT rejecting anything. The deviations list is
  * the interesting output: it tells U6 exactly what the real client sends.
  */
-function analyseMessage(message: JsonRpcMessage, req: Request): MessageContext {
+function analyseMessage(message: JsonRpcMessage, req: Request, transport: TransportIdentity): MessageContext {
   const deviations: string[] = [];
   const params = asObject(message.params);
   const meta = params === null ? null : asObject(params["_meta"]);
@@ -428,6 +623,11 @@ function analyseMessage(message: JsonRpcMessage, req: Request): MessageContext {
   const accept = req.headers.get("accept") ?? "";
   if (!accept.includes("text/event-stream")) deviations.push("accept_missing_text_event_stream");
   if (!accept.includes("application/json")) deviations.push("accept_missing_application_json");
+  // A public peer that supplies an edge-IP header is describing itself. Recorded
+  // because it is the only way a caller could try to steer the identity tuple.
+  if (!transport.edge_trusted && transport.edge_client_ip !== null) {
+    deviations.push("edge_ip_header_from_untrusted_peer");
+  }
 
   return {
     era,
@@ -453,7 +653,8 @@ const TOOL_DEFINITION = {
         type: "string",
         description:
           "The label supplied by the prompt that asked for this call, copied exactly. " +
-          "Omit it if the prompt did not give you one.",
+          "If the prompt gave you a label you MUST pass it — the call is not counted as " +
+          "evidence without it. Omit it only if the prompt genuinely gave you none.",
       },
       caller_note: {
         type: "string",
@@ -487,10 +688,12 @@ function runServer(): void {
   const mcpToken = requireEnv(
     "PROBE_MCP_TOKEN",
     "It is the unguessable path segment in the connector URL: https://<host>/mcp/<PROBE_MCP_TOKEN>",
+    true,
   );
   const adminToken = requireEnv(
     "PROBE_ADMIN_TOKEN",
     "It is the bearer token protecting /probe/arm, /probe/records and /probe/beacon.",
+    true,
   );
   if (secretEquals(mcpToken, adminToken)) {
     fatal(
@@ -507,6 +710,10 @@ function runServer(): void {
   const bootId = `boot_${randomHex(6)}`;
   const existing = log.read();
 
+  const rawHeartbeat = Number(env("PROBE_HEARTBEAT_SECONDS") ?? String(HEARTBEAT_DEFAULT_SECONDS));
+  const heartbeatSeconds =
+    Number.isFinite(rawHeartbeat) && rawHeartbeat >= 0 ? Math.floor(rawHeartbeat) : HEARTBEAT_DEFAULT_SECONDS;
+
   log.append<BootRecord>({
     kind: "server_boot",
     boot_id: bootId,
@@ -517,11 +724,35 @@ function runServer(): void {
     boots_in_log: existing.filter((r) => r.kind === "server_boot").length,
     runtime: `bun ${Bun.version}`,
     server_utc_offset_minutes: -new Date().getTimezoneOffset(),
+    heartbeat_seconds: heartbeatSeconds,
   });
 
-  /** Last presence-beacon ping, in memory. Also trailed into the log, sparsely. */
-  let lastBeaconMs: number | null = null;
-  let lastBeaconLoggedMs = 0;
+  // Liveness proof. Without it, a platform outage across the window is
+  // indistinguishable from "the scheduled task never fired" — and the probe would
+  // print the expensive no-branch for a dead process.
+  if (heartbeatSeconds > 0) {
+    const startedMs = Date.now();
+    const beat = (): void => {
+      log.append<HeartbeatRecord>({
+        kind: "heartbeat",
+        boot_id: bootId,
+        interval_seconds: heartbeatSeconds,
+        uptime_seconds: Math.round((Date.now() - startedMs) / 1000),
+      });
+    };
+    beat();
+    setInterval(beat, heartbeatSeconds * 1000);
+  }
+
+  /**
+   * Last presence-beacon ping. SEEDED FROM THE LOG so a restart no longer resets
+   * it to null — a null read as "beacon never pinged", which the v1 analyser
+   * turned into "machine absent". The verdict no longer depends on this value,
+   * but the recorded field should still be honest.
+   */
+  const seededBeacon = [...existing].reverse().find((r): r is BeaconRecord => r.kind === "beacon");
+  let lastBeaconMs: number | null = seededBeacon === undefined ? null : seededBeacon.ts_epoch_ms;
+  let lastBeaconLoggedMs = lastBeaconMs ?? 0;
 
   const port = Number(env("PORT") ?? "8787");
 
@@ -558,6 +789,7 @@ function runServer(): void {
           `${SERVER_NAME} v${PROBE_VERSION}\n` +
             `server_time_utc: ${new Date().toISOString()}\n` +
             `records: ${records.length}\ntool_calls: ${calls}\n` +
+            `heartbeat_seconds: ${heartbeatSeconds}\n` +
             "No secrets are served from this page. The MCP endpoint is at an unguessable path.\n",
           { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } },
         );
@@ -568,7 +800,8 @@ function runServer(): void {
         const bearer = req.headers.get("authorization") ?? "";
         const presented = bearer.toLowerCase().startsWith("bearer ") ? bearer.slice(7) : "";
         if (!secretEquals(presented, adminToken)) {
-          // 404, never 401: an admin surface should not announce itself.
+          // 404, never 401: an admin surface should not announce itself. The CLI
+          // compensates by naming all three causes of a 404 in its error text.
           logHttp(404, "admin_auth_failed");
           return new Response("not found\n", { status: 404 });
         }
@@ -581,6 +814,7 @@ function runServer(): void {
             boot_id: bootId,
             log_durable_declared: logDurable,
             log_path_basename: logPath.split("/").pop() ?? logPath,
+            heartbeat_seconds: heartbeatSeconds,
             records,
           });
         }
@@ -588,19 +822,30 @@ function runServer(): void {
         if (path === "/probe/beacon" && req.method === "POST") {
           lastBeaconMs = Date.now();
           let hostLabel: string | null = null;
+          let idleSeconds: number | null = null;
+          let screenLocked: boolean | null = null;
           try {
-            hostLabel = safeString(asObject(await req.json())?.["host_label"], 64);
+            const body = asObject(await req.json());
+            hostLabel = safeString(body?.["host_label"], 64);
+            const idle = body?.["user_idle_seconds"];
+            idleSeconds = typeof idle === "number" && Number.isFinite(idle) ? Math.round(idle) : null;
+            const locked = body?.["screen_locked"];
+            screenLocked = typeof locked === "boolean" ? locked : null;
           } catch {
             hostLabel = null;
           }
-          // Trail the beacon into the log at most every 10 minutes, so presence
-          // history survives a server restart without flooding the file.
-          if (lastBeaconMs - lastBeaconLoggedMs > 10 * 60_000) {
+          // Trail the beacon into the log at most once a minute. The documented
+          // loop pings every 2 minutes, so in practice every ping is recorded:
+          // the presence TIMELINE is the evidence, and a 10-minute throttle
+          // against a 10-minute quiet threshold would have made it unusable.
+          if (lastBeaconMs - lastBeaconLoggedMs > BEACON_LOG_THROTTLE_MS) {
             lastBeaconLoggedMs = lastBeaconMs;
             log.append<BeaconRecord>({
               kind: "beacon",
               boot_id: bootId,
               host_label: hostLabel,
+              user_idle_seconds: idleSeconds,
+              screen_locked: screenLocked,
               transport,
             });
           }
@@ -627,17 +872,54 @@ function runServer(): void {
               { status: 400 },
             );
           }
-          const windowMinutes = typeof body["window_minutes"] === "number" ? body["window_minutes"] : 20;
+          const rawWindow = body["window_minutes"];
+          const windowMinutes = typeof rawWindow === "number" && Number.isFinite(rawWindow) ? rawWindow : 20;
+          if (windowMinutes < MIN_WINDOW_MINUTES || windowMinutes > MAX_WINDOW_MINUTES) {
+            return Response.json(
+              {
+                error:
+                  `window_minutes is a HALF-WIDTH (the window is fire_at ± window_minutes, so ` +
+                  `${windowMinutes} means a ${windowMinutes * 2}-minute window). It must be between ` +
+                  `${MIN_WINDOW_MINUTES} and ${MAX_WINDOW_MINUTES}. Wide windows let consecutive days ` +
+                  `overlap, and one call can then satisfy two windows.`,
+              },
+              { status: 400 },
+            );
+          }
+          const fireAtMs = Date.parse(fireAt);
+          const windowStartMs = fireAtMs - windowMinutes * 60_000;
+          const nowMs = Date.now();
+          if (windowStartMs - nowMs < MIN_ARM_LEAD_MS) {
+            return Response.json(
+              {
+                error:
+                  `the window opens at ${new Date(windowStartMs).toISOString()}, which is less than ` +
+                  `${MIN_ARM_LEAD_MS / 60_000} minutes from now (or already past). Arming is ` +
+                  "PRE-REGISTRATION: a label minted seconds before the window is not evidence that " +
+                  "the label could not have been in circulation beforehand. Pick a later fire_at.",
+                window_opens_at: new Date(windowStartMs).toISOString(),
+                server_time_utc: new Date(nowMs).toISOString(),
+                minimum_lead_minutes: MIN_ARM_LEAD_MS / 60_000,
+              },
+              { status: 400 },
+            );
+          }
+          const rawOrigin = safeString(body["hand_tests_from"], 16) ?? "unspecified";
+          const handTestsFrom: HandTestOrigin = (HAND_TEST_ORIGINS as readonly string[]).includes(rawOrigin)
+            ? (rawOrigin as HandTestOrigin)
+            : "unspecified";
+
           const armed = log.append<ArmRecord>({
             kind: "arm",
             boot_id: bootId,
             arm_id: `arm_${randomHex(5)}`,
             client: safeString(body["client"], 32) ?? "unspecified",
             fire_at: fireAt,
-            fire_at_epoch_ms: Date.parse(fireAt),
+            fire_at_epoch_ms: fireAtMs,
             window_minutes: windowMinutes,
             expected_label: `run-${randomHex(6)}`,
             attest_away: body["attest_away"] === true,
+            hand_tests_from: handTestsFrom,
             note: safeString(body["note"], 300),
           });
           return Response.json({
@@ -645,6 +927,9 @@ function runServer(): void {
             expected_label: armed.expected_label,
             fire_at: armed.fire_at,
             window_minutes: armed.window_minutes,
+            window_start: new Date(windowStartMs).toISOString(),
+            window_end: new Date(fireAtMs + windowMinutes * 60_000).toISOString(),
+            hand_tests_from: armed.hand_tests_from,
             armed_at: armed.ts,
           });
         }
@@ -672,7 +957,10 @@ function runServer(): void {
       }
 
       if (req.method === "GET" || req.method === "DELETE") {
-        // 2026-07-28 removed the GET stream and DELETE session teardown.
+        // 2026-07-28 removed the GET stream and DELETE session teardown. A
+        // dual-era client opening the optional server->client stream lands here
+        // on EVERY legitimate connection, so this is reported and never counted
+        // as window-invalidating noise.
         logHttp(405, `legacy_${req.method.toLowerCase()}_on_mcp_endpoint`);
         return new Response("method not allowed\n", { status: 405, headers: { allow: "POST" } });
       }
@@ -718,11 +1006,18 @@ function runServer(): void {
   console.log(`[probe] log: ${logPath} (durable declared: ${logDurable})`);
   console.log(`[probe] MCP endpoint path: /mcp/<PROBE_MCP_TOKEN>  (alternate: POST /mcp + bearer)`);
   console.log(`[probe] records at boot: ${existing.length}`);
+  console.log(
+    heartbeatSeconds > 0
+      ? `[probe] heartbeat: every ${heartbeatSeconds}s (proves the server was up across a window)`
+      : "[probe] heartbeat: DISABLED — 'nothing arrived' can no longer be told from 'server was down'",
+  );
   if (!logDurable) {
     console.warn(
       "[probe] WARNING: PROBE_LOG_DURABLE is not set. If this host has an ephemeral " +
-        "filesystem, a restart silently erases the evidence and an unattended call that " +
-        "DID happen will read as 'never fired'. Mount a volume and set PROBE_LOG_DURABLE=1.",
+        "filesystem, a restart silently erases the evidence. That is not merely a lost " +
+        "negative: a wiped log also empties the manual-identity baseline, which is what " +
+        "the transport discriminator compares against. Unproven durability now blocks " +
+        "BOTH verdicts. Mount a volume and set PROBE_LOG_DURABLE=1.",
     );
   }
 }
@@ -740,7 +1035,7 @@ function handleMessage(
   const method = typeof message.method === "string" ? message.method : null;
   const id = message.id === undefined ? null : message.id;
   const isNotification = message.id === undefined || message.id === null;
-  const ctx = analyseMessage(message, req);
+  const ctx = analyseMessage(message, req, transport);
   const params = asObject(message.params);
 
   const logRpc = (errorCode: number | null): void => {
@@ -893,14 +1188,15 @@ function handleMessage(
       // Spec says a modern server returns HTTP 404 for an unknown method. We return
       // 200 with the JSON-RPC error instead: a 404 can send a dual-era client down
       // the deprecated HTTP+SSE fallback path, which would fail the probe for a
-      // reason unrelated to scheduled tasks. Deliberate, documented deviation.
+      // reason unrelated to scheduled tasks. Deliberate, documented deviation —
+      // and the analyser therefore must not treat it as window-invalidating noise.
       return fail(-32601, `Method not found: ${method}`);
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// CLI: arm / report / verify-nonce
+// CLI: doctor / arm / report / verify-nonce
 // ---------------------------------------------------------------------------
 
 function parseFlags(argv: string[]): Map<string, string> {
@@ -924,7 +1220,7 @@ function parseFlags(argv: string[]): Map<string, string> {
 }
 
 function adminHeaders(): { [k: string]: string } {
-  const token = requireEnv("PROBE_ADMIN_TOKEN", "Needed to reach the deployed probe's admin API.");
+  const token = requireEnv("PROBE_ADMIN_TOKEN", "Needed to reach the deployed probe's admin API.", true);
   return { authorization: `Bearer ${token}`, "content-type": "application/json" };
 }
 
@@ -935,37 +1231,77 @@ function baseUrl(): string {
   ).replace(/\/+$/, "");
 }
 
+/**
+ * The admin surface answers 404 for a bad token on purpose (it should not
+ * announce itself), which makes wrong-token, wrong-URL and stale-deployment
+ * indistinguishable on the wire. Compensate here, where there is no attacker to
+ * worry about — this was measured as the single most likely place to stall.
+ */
+function admin404Help(url: string): string[] {
+  return [
+    `[probe] HTTP 404 from ${url}`,
+    "[probe] The admin surface answers 404 (not 401) for a bad token by design, so this",
+    "[probe] one status covers three causes. In order of likelihood:",
+    "[probe]   1. PROBE_ADMIN_TOKEN does not match the deployed server's value.",
+    "[probe]   2. PROBE_BASE_URL points somewhere else (wrong service, wrong domain).",
+    "[probe]   3. The deployment is stale / not running this probe version.",
+    "[probe] To tell them apart:",
+    `[probe]   curl -s ${url.replace(/\/probe\/.*$/, "/")}`,
+    "[probe]   -> a 'brainz-scheduled-task-probe vX' status line means the URL is right",
+    "[probe]      and the token is wrong; anything else means the URL is wrong.",
+    "[probe] Then: `bun run probe:scheduled-task doctor`.",
+  ];
+}
+
 async function cmdArm(argv: string[]): Promise<void> {
   const flags = parseFlags(argv);
   const fireAt = flags.get("fire-at");
   const client = flags.get("client") ?? "unspecified";
+  const handTestsFrom = flags.get("hand-tests-from") ?? "unspecified";
   if (fireAt === undefined) {
     fatal(
       2,
       "usage: arm --client <desktop|code|web|other> --fire-at <ISO8601 with offset>",
-      "            [--window-minutes 20] [--attest-away] [--note '...']",
+      "            [--window-minutes 20] [--attest-away]",
+      "            [--hand-tests-from <desktop|web|both|none>] [--note '...']",
       "",
-      "  --fire-at MUST carry an explicit offset or Z, e.g. 2026-08-13T07:00:00-07:00.",
+      "  --fire-at MUST carry an explicit offset or Z, e.g. 2026-08-13T07:00:00-07:00,",
+      `  and must open at least ${MIN_ARM_LEAD_MS / 60_000} minutes from now.`,
+      "  --window-minutes is a HALF-WIDTH: 20 means fire_at ± 20 min, a 40-minute window.",
       "  --attest-away asserts you will not touch the client during the window. Without",
       "  it the run can never reach UNATTENDED_CONFIRMED.",
+      "  --hand-tests-from records where your by-hand tests came from. If it is not",
+      "  `desktop`, the transport discriminator (5b) is void — a cloud-scheduled run and",
+      "  your own claude.ai session egress from the same infrastructure. Unspecified is",
+      "  treated as void, because an unrecorded answer is not an answer.",
     );
+  }
+  if (!(HAND_TEST_ORIGINS as readonly string[]).includes(handTestsFrom)) {
+    fatal(2, `--hand-tests-from must be one of: ${HAND_TEST_ORIGINS.join(", ")}`);
   }
   const body = {
     client,
     fire_at: fireAt,
     window_minutes: Number(flags.get("window-minutes") ?? "20"),
     attest_away: flags.get("attest-away") === "true",
+    hand_tests_from: handTestsFrom,
     note: flags.get("note") ?? null,
   };
-  const res = await fetch(`${baseUrl()}/probe/arm`, {
-    method: "POST",
-    headers: adminHeaders(),
-    body: JSON.stringify(body),
-  });
+  const url = `${baseUrl()}/probe/arm`;
+  const res = await fetch(url, { method: "POST", headers: adminHeaders(), body: JSON.stringify(body) });
   const text = await res.text();
+  if (res.status === 404) fatal(1, ...admin404Help(url));
   if (!res.ok) fatal(1, `[probe] arm failed (HTTP ${res.status}): ${text}`);
-  const armed = JSON.parse(text) as { arm_id: string; expected_label: string; fire_at: string };
-  console.log(`\nARMED. arm_id=${armed.arm_id}  fire_at=${armed.fire_at}\n`);
+  const armed = JSON.parse(text) as {
+    arm_id: string;
+    expected_label: string;
+    fire_at: string;
+    window_minutes: number;
+    window_start: string;
+    window_end: string;
+  };
+  console.log(`\nARMED. arm_id=${armed.arm_id}  fire_at=${armed.fire_at}`);
+  console.log(`window: ${armed.window_start} .. ${armed.window_end}  (fire_at ± ${armed.window_minutes} min)\n`);
   console.log("Paste this, verbatim, as the scheduled task's prompt:\n");
   console.log("  ----------------------------------------------------------------");
   console.log(`  Call the ${TOOL_NAME} tool on the brainz probe connector with`);
@@ -978,175 +1314,725 @@ async function cmdArm(argv: string[]): Promise<void> {
   if (body.attest_away !== true) {
     console.log("NOTE: --attest-away was not passed, so this run cannot reach UNATTENDED_CONFIRMED.");
   }
+  if (handTestsFrom !== "desktop") {
+    console.log(
+      `NOTE: --hand-tests-from=${handTestsFrom}, so the transport discriminator is void for this\n` +
+        "      window. Unless the presence beacon can bracket an absence, this window cannot\n" +
+        "      reach UNATTENDED_CONFIRMED. See README, 'What counts as proof'.",
+    );
+  }
+  console.log(
+    "\nBefore the window opens, run `bun run probe:scheduled-task doctor` — it is much\n" +
+      "cheaper to find a broken beacon token now than to read INCONCLUSIVE tomorrow.",
+  );
 }
 
 async function fetchRecords(flags: Map<string, string>): Promise<{
   records: ProbeRecord[];
-  logDurableDeclared: boolean;
   source: string;
 }> {
   const file = flags.get("file");
   if (file !== undefined && file !== "true") {
-    return { records: new ProbeLog(file).read(), logDurableDeclared: false, source: `file:${file}` };
+    return { records: new ProbeLog(file).read(), source: `file:${file}` };
   }
   const url = `${baseUrl()}/probe/records`;
   const res = await fetch(url, { headers: adminHeaders() });
+  if (res.status === 404) {
+    fatal(1, ...admin404Help(url), "[probe] This is INCONCLUSIVE, not an answer about scheduled tasks.");
+  }
   if (!res.ok) {
     fatal(
       1,
       `[probe] could not read records (HTTP ${res.status}) from ${url}`,
-      "[probe] This is an INFRA_FAILURE, not an answer about scheduled tasks.",
+      "[probe] This is INCONCLUSIVE, not an answer about scheduled tasks.",
     );
   }
-  const body = (await res.json()) as { records: ProbeRecord[]; log_durable_declared: boolean };
-  return { records: body.records, logDurableDeclared: body.log_durable_declared, source: url };
+  const body = (await res.json()) as { records: ProbeRecord[] };
+  return { records: body.records, source: url };
 }
+
+// ---------------------------------------------------------------------------
+// Assessment
+// ---------------------------------------------------------------------------
 
 type Verdict =
   | "UNATTENDED_CONFIRMED"
   | "CONSISTENT_BUT_UNPROVEN"
   | "NO_INVOCATION_OBSERVED"
-  | "INFRA_FAILURE"
+  | "WINDOWS_STILL_OPEN"
+  | "INCONCLUSIVE"
   | "NOT_RUN_YET";
+
+/**
+ * Flags carry a DIRECTION. v1 computed flags, printed them, and then could not
+ * use them to block anything except (in prose) a negative result — so a degraded
+ * instrument could still produce UNATTENDED_CONFIRMED. Every flag now declares
+ * which verdicts it makes unsafe, and the verdict function honours both.
+ */
+interface Flag {
+  code: string;
+  detail: string;
+  /** This flag makes UNATTENDED_CONFIRMED unsafe. */
+  blocks_confirmation: boolean;
+  /** This flag makes NO_INVOCATION_OBSERVED unsafe. */
+  blocks_negative: boolean;
+  /**
+   * True when the INSTRUMENT is degraded (log unreadable, uptime unprovable,
+   * connector never attached) rather than the EVIDENCE being weak. Instrument
+   * failures force INCONCLUSIVE — "I could not measure" — instead of a verdict
+   * about the client's behaviour.
+   */
+  instrument: boolean;
+}
+
+function flag(
+  code: string,
+  detail: string,
+  blocksConfirmation: boolean,
+  blocksNegative: boolean,
+  instrument = false,
+): Flag {
+  return {
+    code,
+    detail,
+    blocks_confirmation: blocksConfirmation,
+    blocks_negative: blocksNegative,
+    instrument,
+  };
+}
+
+type BeaconVerdict =
+  | "absence_bracketed"
+  | "machine_present_at_call"
+  | "resumed_before_post_call_quiet_elapsed"
+  | "unavailable__no_beacon_records"
+  | "unavailable__stream_was_not_running_before_the_quiet_period"
+  | "unavailable__never_resumed_after_the_call"
+  | "unavailable__beacon_was_being_rejected_during_the_quiet_period"
+  | "unavailable__server_was_not_up_across_the_quiet_period"
+  | "unavailable__call_came_from_the_beacon_machine_itself"
+  | "unavailable__no_call_to_bracket";
+
+type TransportVerdict =
+  | "unseen_in_operator_traffic"
+  | "seen_in_operator_traffic"
+  | "unavailable__no_manual_baseline"
+  | "unavailable__hand_tests_not_confined_to_desktop"
+  | "unavailable__no_call_to_compare";
+
+type Liveness = "covered" | "gap" | "unknown";
 
 interface WindowAssessment {
   arm_id: string;
   client: string;
+  hand_tests_from: HandTestOrigin;
   fire_at: string;
   window_start: string;
   window_end: string;
+  window_half_width_minutes: number;
+  closed: boolean;
   attest_away: boolean;
   expected_label: string;
   calls: ToolCallRecord[];
+  /** In-window calls carrying the arm-time label. These are the ones under test. */
+  evidence_call_ids: string[];
   label_match: boolean;
-  transport_unseen_outside_windows: boolean;
-  beacon: "machine_absent" | "machine_present" | "unknown";
+  transport_discriminator: TransportVerdict;
+  beacon_discriminator: BeaconVerdict;
   independent_discriminator: boolean;
-  infra_flags: string[];
+  independent_via: string | null;
+  /** Which discriminators this client/hand-test combination could ever produce. */
+  structurally_available: string[];
+  server_liveness_across_window: Liveness;
+  flags: Flag[];
   unmet: string[];
+  clean: boolean;
 }
 
-function assess(records: ProbeRecord[], logDurableDeclared: boolean): {
+interface AssessResult {
   verdict: Verdict;
   windows: WindowAssessment[];
-  global_flags: string[];
+  global_flags: Flag[];
+  qualifying_window_ids: string[];
   summary: { [k: string]: unknown };
-} {
-  const arms = records.filter((r): r is ArmRecord => r.kind === "arm");
-  const calls = records.filter((r): r is ToolCallRecord => r.kind === "tool_call");
-  const boots = records.filter((r): r is BootRecord => r.kind === "server_boot");
-  const beacons = records.filter((r): r is BeaconRecord => r.kind === "beacon");
-  const rpcs = records.filter((r): r is RpcRecord => r.kind === "mcp_rpc");
-  const https = records.filter((r): r is HttpRecord => r.kind === "http");
+}
 
+function sortedByTime<T extends BaseRecord>(records: T[]): T[] {
+  return [...records].sort((a, b) => a.ts_epoch_ms - b.ts_epoch_ms);
+}
+
+/**
+ * Was the server demonstrably up for the whole of [start, end]? "I have no
+ * heartbeats" is `unknown`, never `covered` — a dead process must not be scored
+ * as a silent client.
+ */
+function livenessAcross(startMs: number, endMs: number, heartbeats: HeartbeatRecord[]): Liveness {
+  if (heartbeats.length === 0) return "unknown";
+  const intervals = heartbeats
+    .map((h) => h.interval_seconds)
+    .filter((s) => typeof s === "number" && Number.isFinite(s) && s > 0);
+  const interval = intervals.length > 0 ? Math.max(...intervals) : HEARTBEAT_DEFAULT_SECONDS;
+  const tolerance = interval * 2.5 * 1000 + 60_000;
+
+  const before = heartbeats.filter((h) => h.ts_epoch_ms <= startMs);
+  const after = heartbeats.filter((h) => h.ts_epoch_ms >= endMs);
+  const last = before[before.length - 1];
+  const first = after[0];
+  if (last === undefined || startMs - last.ts_epoch_ms > tolerance) return "gap";
+  if (first === undefined || first.ts_epoch_ms - endMs > tolerance) return "gap";
+
+  const spanning = [last, ...heartbeats.filter((h) => h.ts_epoch_ms > startMs && h.ts_epoch_ms < endMs), first];
+  for (let i = 1; i < spanning.length; i++) {
+    const prev = spanning[i - 1];
+    const cur = spanning[i];
+    if (prev === undefined || cur === undefined) continue;
+    if (cur.ts_epoch_ms - prev.ts_epoch_ms > tolerance) return "gap";
+  }
+  return "covered";
+}
+
+/**
+ * The absence bracket. This is the fix for the headline hole: v1 asked only "is
+ * the beacon stale?", and a stale beacon is produced by a dead loop, a closed
+ * terminal, a rotated token, a restarted server, or a machine that woke up
+ * ninety seconds ago — none of which are an absent machine.
+ *
+ * A bracket requires all of:
+ *   - a beacon stream that was demonstrably RUNNING (>= 3 samples on cadence)
+ *     before it went quiet;
+ *   - quiet for at least BEACON_PRE_CALL_QUIET_MS when the call landed;
+ *   - a beacon that RESUMED afterwards — proving the loop was alive all along
+ *     and the quiet was the machine, not the instrument;
+ *   - that resume being at least BEACON_POST_CALL_QUIET_MS after the call, so a
+ *     wake-then-catch-up-fire (resume seconds later) does not qualify;
+ *   - no admin auth failures during the quiet period (a rejected beacon looks
+ *     exactly like an absent machine);
+ *   - the server itself up across the quiet period;
+ *   - and the CALL DID NOT COME FROM THE BEACON MACHINE. A machine that just
+ *     made an HTTPS request was manifestly reachable, so the beacon cannot
+ *     testify to its absence at that instant no matter how the timings line up.
+ *     This is what makes a Desktop-LOCAL schedule unconfirmable by 5a — and it
+ *     is the root-level fix for the wake-then-catch-up-fire scenario, which
+ *     otherwise only fails on a timing margin. Compared on IP, not the full
+ *     identity tuple: the beacon is `curl` and the client is not, so their
+ *     user-agents differ while the machine is the same.
+ */
+function beaconBracket(
+  callMs: number,
+  callTransport: TransportIdentity,
+  beacons: BeaconRecord[],
+  adminAuthFailures: HttpRecord[],
+  heartbeats: HeartbeatRecord[],
+): BeaconVerdict {
+  if (beacons.length === 0) return "unavailable__no_beacon_records";
+  const callIp = trustedIp(callTransport);
+  const callNet = ipNetwork(callIp);
+  if (beacons.some((b) => trustedIp(b.transport) === callIp || ipNetwork(trustedIp(b.transport)) === callNet)) {
+    return "unavailable__call_came_from_the_beacon_machine_itself";
+  }
+  const before = beacons.filter((b) => b.ts_epoch_ms <= callMs);
+  const lastBefore = before[before.length - 1];
+  if (lastBefore === undefined || before.length < BEACON_STREAM_MIN_SAMPLES) {
+    return "unavailable__stream_was_not_running_before_the_quiet_period";
+  }
+  const cadence = before.slice(-BEACON_STREAM_MIN_SAMPLES);
+  for (let i = 1; i < cadence.length; i++) {
+    const prev = cadence[i - 1];
+    const cur = cadence[i];
+    if (prev === undefined || cur === undefined) continue;
+    if (cur.ts_epoch_ms - prev.ts_epoch_ms > BEACON_STREAM_MAX_GAP_MS) {
+      return "unavailable__stream_was_not_running_before_the_quiet_period";
+    }
+  }
+
+  if (callMs - lastBefore.ts_epoch_ms < BEACON_PRE_CALL_QUIET_MS) return "machine_present_at_call";
+
+  const after = beacons.find((b) => b.ts_epoch_ms > callMs);
+  if (after === undefined) return "unavailable__never_resumed_after_the_call";
+  if (after.ts_epoch_ms - callMs < BEACON_POST_CALL_QUIET_MS) {
+    return "resumed_before_post_call_quiet_elapsed";
+  }
+
+  const quietStart = lastBefore.ts_epoch_ms;
+  const quietEnd = after.ts_epoch_ms;
+  if (adminAuthFailures.some((h) => h.ts_epoch_ms >= quietStart && h.ts_epoch_ms <= quietEnd)) {
+    return "unavailable__beacon_was_being_rejected_during_the_quiet_period";
+  }
+  if (livenessAcross(quietStart, quietEnd, heartbeats) !== "covered") {
+    return "unavailable__server_was_not_up_across_the_quiet_period";
+  }
+  return "absence_bracketed";
+}
+
+/** Which discriminators this client + hand-test combination could ever produce. */
+function structurallyAvailable(client: string, handTestsFrom: HandTestOrigin): string[] {
+  const c = client.toLowerCase();
+  const out: string[] = [];
+  const local = c.includes("desktop") || c.includes("local");
+  if (local) {
+    out.push(
+      "5b transport: UNAVAILABLE BY CONSTRUCTION — a Desktop-local schedule fires from " +
+        "your own machine, so its identity is your identity. If a call DOES arrive from a " +
+        "datacenter identity, that is the finding that Desktop schedules execute server-side.",
+      "5a beacon: available only if the machine stays unreachable across AND after the call. " +
+        "A machine that wakes to run a catch-up task resumes beaconing within a minute, which " +
+        "this probe refuses — see README limit 8.",
+    );
+  } else {
+    out.push(
+      handTestsFrom === "desktop"
+        ? "5b transport: available (hand tests confined to Desktop, so the cloud identity is clean)."
+        : `5b transport: VOID — hand_tests_from=${handTestsFrom}. A cloud-scheduled run and your ` +
+            "own claude.ai session egress from the same infrastructure.",
+      "5a beacon: available if your machine was unreachable across and after the call.",
+    );
+  }
+  return out;
+}
+
+function assess(records: ProbeRecord[], nowMs: number): AssessResult {
+  const arms = sortedByTime(records.filter((r): r is ArmRecord => r.kind === "arm"));
+  const calls = sortedByTime(records.filter((r): r is ToolCallRecord => r.kind === "tool_call"));
+  const boots = sortedByTime(records.filter((r): r is BootRecord => r.kind === "server_boot"));
+  const beacons = sortedByTime(records.filter((r): r is BeaconRecord => r.kind === "beacon"));
+  const heartbeats = sortedByTime(records.filter((r): r is HeartbeatRecord => r.kind === "heartbeat"));
+  const rpcs = sortedByTime(records.filter((r): r is RpcRecord => r.kind === "mcp_rpc"));
+  const https = sortedByTime(records.filter((r): r is HttpRecord => r.kind === "http"));
+
+  const halfWidthMs = (a: ArmRecord): number => a.window_minutes * 60_000;
   const inAnyWindow = (ms: number): boolean =>
-    arms.some((a) => {
-      const half = a.window_minutes * 60_000;
-      return ms >= a.fire_at_epoch_ms - half && ms <= a.fire_at_epoch_ms + half;
-    });
+    arms.some((a) => ms >= a.fire_at_epoch_ms - halfWidthMs(a) && ms <= a.fire_at_epoch_ms + halfWidthMs(a));
 
-  // Calls outside every armed window are the presumed-manual population.
-  const manualIdentities = new Set(
-    calls.filter((c) => !inAnyWindow(c.ts_epoch_ms)).map((c) => identityKey(c.transport)),
+  const adminAuthFailures = https.filter((h) => h.reason === "admin_auth_failed");
+
+  // ---------------------------------------------------------------------
+  // The operator-identity population. v1 built this from out-of-window TOOL
+  // CALLS only, so an empty set made "this identity was never seen before"
+  // VACUOUSLY TRUE for every window — including calls from the operator's own
+  // desktop. Beacons are posted by the operator's machine BY CONSTRUCTION, and
+  // every out-of-window RPC is the operator wiring the connector up; that data
+  // was captured and then ignored.
+  // ---------------------------------------------------------------------
+  const operatorExact = new Set<string>();
+  const operatorCoarse = new Set<string>();
+  // IP sets too, because the beacon runs under `curl` while the MCP client does
+  // not: on one machine the full identity tuples differ but the address does not.
+  const operatorIps = new Set<string>();
+  const operatorIpNets = new Set<string>();
+  const addOperator = (t: TransportIdentity): void => {
+    operatorExact.add(identityKey(t));
+    operatorCoarse.add(coarseIdentityKey(t));
+    operatorIps.add(trustedIp(t));
+    operatorIpNets.add(ipNetwork(trustedIp(t)));
+  };
+  for (const b of beacons) addOperator(b.transport);
+  for (const c of calls) if (!inAnyWindow(c.ts_epoch_ms)) addOperator(c.transport);
+  for (const r of rpcs) if (!inAnyWindow(r.ts_epoch_ms)) addOperator(r.transport);
+
+  const manualCalls = calls.filter((c) => !inAnyWindow(c.ts_epoch_ms));
+
+  // ------------------------------ global flags -------------------------------
+  const globalFlags: Flag[] = [];
+
+  // Durability is DEMONSTRATED if the log survived a restart carrying records;
+  // otherwise only ASSERTED. Derived from the boot records themselves so
+  // `report --file` on a durable log is not falsely downgraded.
+  const durabilityDeclared = boots.length > 0 && (boots[boots.length - 1]?.log_durable_declared ?? false);
+  const durabilityDemonstrated = boots.some((b, i) => i > 0 && b.records_at_boot > 0);
+  if (!durabilityDeclared && !durabilityDemonstrated) {
+    globalFlags.push(
+      flag(
+        "log_durability_unproven",
+        "Nothing shows this log survives a restart. That does not merely risk losing a " +
+          "negative: a wiped log also empties the manual-identity baseline the transport " +
+          "discriminator compares against, which is exactly how an attended call scores as " +
+          "unattended. Blocks both verdicts.",
+        true,
+        true,
+        true,
+      ),
+    );
+  }
+
+  // seq is assigned as (records read at construction) and increments per append,
+  // so an intact log has seq === index. A gap means a torn write; a restart to 0
+  // means the file was replaced.
+  const seqBreak = records.findIndex((r, i) => r.seq !== i);
+  if (seqBreak !== -1) {
+    globalFlags.push(
+      flag(
+        "log_sequence_discontinuity",
+        `record at index ${seqBreak} carries seq=${records[seqBreak]?.seq ?? "?"}. Records are ` +
+          "missing or the file was replaced; the log cannot be read as complete.",
+        true,
+        true,
+        true,
+      ),
+    );
+  }
+  const bootRegression = boots.findIndex(
+    (b, i) => i > 0 && b.records_at_boot < (boots[i - 1]?.records_at_boot ?? 0),
   );
+  if (bootRegression !== -1) {
+    globalFlags.push(
+      flag(
+        "log_shrank_across_a_restart",
+        "a later boot saw FEWER records than an earlier one — the log was wiped or replaced " +
+          "(ephemeral filesystem, redeploy without a volume, volume swap).",
+        true,
+        true,
+        true,
+      ),
+    );
+  }
 
-  const globalFlags: string[] = [];
-  // Durability is DEMONSTRATED if the log survived a restart; otherwise only asserted.
-  if (boots.length < 2 && !logDurableDeclared) globalFlags.push("log_durability_unproven");
   if (!rpcs.some((r) => r.method === "tools/list")) {
-    globalFlags.push("no_tools_list_ever_seen__connector_may_never_have_attached");
+    globalFlags.push(
+      flag(
+        "no_tools_list_ever_seen__connector_may_never_have_attached",
+        "No client ever listed the tools. Nothing here is known to have come from an MCP " +
+          "client at all, so a record in a window proves only that SOMETHING posted JSON-RPC.",
+        true,
+        true,
+        true,
+      ),
+    );
   }
   if (https.some((h) => h.reason === "mcp_token_mismatch")) {
-    globalFlags.push("requests_rejected_on_mcp_path__wrong_token_in_connector_url");
+    globalFlags.push(
+      flag(
+        "requests_rejected_on_mcp_path__wrong_token_in_connector_url",
+        "Something reached the MCP path with the wrong token. A real scheduled fire may have " +
+          "been rejected, so 'nothing arrived' is not trustworthy.",
+        false,
+        true,
+      ),
+    );
+  }
+  if (heartbeats.length === 0) {
+    globalFlags.push(
+      flag(
+        "no_server_heartbeats__uptime_unproven",
+        "There are no heartbeat records, so there is no positive evidence the server was up " +
+          "during any window. An outage and a silent client look identical without them. " +
+          "(Upgrade the deployed probe, or set PROBE_HEARTBEAT_SECONDS.)",
+        false,
+        true,
+        true,
+      ),
+    );
+  }
+  if (adminAuthFailures.length > 0) {
+    globalFlags.push(
+      flag(
+        "admin_requests_rejected__beacon_may_have_been_silently_dead",
+        `${adminAuthFailures.length} admin request(s) were rejected. If that was the presence ` +
+          "beacon (wrong or unexported PROBE_ADMIN_TOKEN), its silence is the instrument, not " +
+          "the machine. Beacon evidence is refused for any window whose quiet period overlaps one.",
+        false,
+        false,
+      ),
+    );
   }
 
+  // ------------------------------ per window ---------------------------------
   const windows: WindowAssessment[] = arms.map((arm) => {
-    const half = arm.window_minutes * 60_000;
+    const half = halfWidthMs(arm);
     const start = arm.fire_at_epoch_ms - half;
     const end = arm.fire_at_epoch_ms + half;
-    const armedBeforeWindow = arm.ts_epoch_ms < start;
+    const closed = nowMs > end;
+    const handTestsFrom: HandTestOrigin = (HAND_TEST_ORIGINS as readonly string[]).includes(
+      arm.hand_tests_from as string,
+    )
+      ? arm.hand_tests_from
+      : "unspecified";
     const inWindow = calls.filter((c) => c.ts_epoch_ms >= start && c.ts_epoch_ms <= end);
+    const expected = arm.expected_label.trim();
+    const evidence = inWindow.filter((c) => (c.run_label ?? "").trim() === expected);
+    const others = inWindow.filter((c) => (c.run_label ?? "").trim() !== expected);
 
-    const infra: string[] = [];
-    if (!armedBeforeWindow) infra.push("armed_after_window_opened__evidence_is_retrofitted");
-    if (boots.some((b) => b.ts_epoch_ms >= start && b.ts_epoch_ms <= end)) {
-      infra.push("server_restarted_inside_window");
-    }
-    if (https.some((h) => h.ts_epoch_ms >= start && h.ts_epoch_ms <= end && h.status >= 400)) {
-      infra.push("http_error_inside_window");
-    }
-    if (rpcs.some((r) => r.ts_epoch_ms >= start && r.ts_epoch_ms <= end && r.error_code !== null)) {
-      infra.push("jsonrpc_error_inside_window");
-    }
+    const flags: Flag[] = [];
 
-    const labelMatch = inWindow.length > 0 && inWindow.every((c) => c.run_label === arm.expected_label);
-    const transportUnseen =
-      inWindow.length > 0 && inWindow.every((c) => !manualIdentities.has(identityKey(c.transport)));
-
-    // Beacon: was the user's own machine reachable around the fire time?
-    let beacon: WindowAssessment["beacon"] = "unknown";
-    const ages = inWindow.map((c) => c.beacon_age_seconds).filter((a): a is number => a !== null);
-    if (ages.length > 0) {
-      beacon = Math.min(...ages) > 15 * 60 ? "machine_absent" : "machine_present";
-    } else if (beacons.length > 0) {
-      const nearest = beacons.reduce((best, b) =>
-        Math.abs(b.ts_epoch_ms - arm.fire_at_epoch_ms) < Math.abs(best.ts_epoch_ms - arm.fire_at_epoch_ms)
-          ? b
-          : best,
+    // ---- pre-registration -------------------------------------------------
+    if (arm.ts_epoch_ms >= start) {
+      flags.push(
+        flag(
+          "armed_after_window_opened__evidence_is_retrofitted",
+          "the window was armed at or after it opened; this is fitting a story to a call you " +
+            "already saw.",
+          true,
+          false,
+        ),
       );
-      beacon =
-        Math.abs(nearest.ts_epoch_ms - arm.fire_at_epoch_ms) > 15 * 60_000
-          ? "machine_absent"
-          : "machine_present";
+    } else if (start - arm.ts_epoch_ms < MIN_ARM_LEAD_MS) {
+      flags.push(
+        flag(
+          "armed_less_than_30_min_before_the_window_opened",
+          `armed ${Math.round((start - arm.ts_epoch_ms) / 60_000)} min before the window. ` +
+            "Pre-registration is supposed to mean the label could not have been in circulation " +
+            "beforehand; minting one and pasting it into a chat moments later does not show that.",
+          true,
+          false,
+        ),
+      );
     }
 
-    const independent = beacon === "machine_absent" || transportUnseen;
+    // ---- ambient noise, classified by direction ---------------------------
+    // v1 disqualified a window for ANY >=400 or any JSON-RPC error inside it,
+    // which contradicted the server's own leniency posture: an internet scanner
+    // hitting /wp-login.php, a dual-era client opening the optional GET stream,
+    // or an unknown method the server deliberately answers 200 + -32601 each
+    // killed a perfectly good day, and re-arming reproduced it.
+    const httpIn = https.filter((h) => h.ts_epoch_ms >= start && h.ts_epoch_ms <= end);
+    const rpcIn = rpcs.filter((r) => r.ts_epoch_ms >= start && r.ts_epoch_ms <= end);
+    const ambient = httpIn.filter((h) => h.reason === "unknown_path").length;
+    const legacyStream = httpIn.filter((h) => h.reason.startsWith("legacy_")).length;
+    const methodNotFound = rpcIn.filter((r) => r.error_code === -32601).length;
+    if (ambient > 0 || legacyStream > 0 || methodNotFound > 0) {
+      flags.push(
+        flag(
+          "ambient_traffic_in_window__ignored_by_design",
+          `${ambient} scanner 404(s), ${legacyStream} legacy GET/DELETE on the MCP endpoint, ` +
+            `${methodNotFound} unknown JSON-RPC method(s). The server tolerates all of these on ` +
+            "purpose, so they do not invalidate the window.",
+          false,
+          false,
+        ),
+      );
+    }
+    if (httpIn.some((h) => h.reason === "mcp_token_mismatch")) {
+      flags.push(
+        flag(
+          "mcp_token_mismatch_inside_window",
+          "a request reached the MCP path with the wrong token inside this window — a real fire " +
+            "may have been rejected here.",
+          false,
+          true,
+        ),
+      );
+    }
+    if (rpcIn.some((r) => r.error_code === -32602)) {
+      flags.push(
+        flag(
+          "unknown_tool_called_inside_window",
+          "a client called a tool by a name this server does not have. Something tried and failed; " +
+            "'nothing arrived' is not trustworthy for this window.",
+          false,
+          true,
+        ),
+      );
+    }
+    const restarted = boots.some((b) => b.ts_epoch_ms >= start && b.ts_epoch_ms <= end);
+    if (restarted) {
+      flags.push(
+        flag(
+          "server_restarted_inside_window",
+          "the server booted inside this window (a redeploy, an OOM kill, or a scale-to-zero cold " +
+            "start on Render/Fly/Cloud Run). A request arriving during the restart would be lost, " +
+            "so a silent window proves nothing. A call that DID land is still a call.",
+          false,
+          true,
+        ),
+      );
+    }
 
+    // ---- label ------------------------------------------------------------
+    // `.some`, not `.every`: a retry, or a second call where the model dropped
+    // the optional argument, must not permanently sink a window — the README
+    // disclaims measuring prompt adherence. But an unlabelled in-window call
+    // from ANY other source than the evidence call is exactly the hand test this
+    // probe exists to catch, so that fails closed.
+    const labelMatch = evidence.length > 0;
+    const evidenceIdentities = new Set(evidence.map((c) => identityKey(c.transport)));
+    const strayIdentities = others.filter((c) => !evidenceIdentities.has(identityKey(c.transport)));
+    if (strayIdentities.length > 0) {
+      flags.push(
+        flag(
+          "unlabelled_in_window_call_from_a_different_source",
+          `${strayIdentities.length} in-window call(s) did not carry the label AND did not come ` +
+            "from the same identity as the labelled call. That is the shape of a hand test landing " +
+            "in the window.",
+          true,
+          false,
+        ),
+      );
+    }
+
+    // ---- is this even an MCP client? --------------------------------------
+    // Nothing in v1 bound an in-window record to an MCP client: a curl one-liner
+    // from a VPS uptime check produced a record that was in-window, label-carrying
+    // and from an unseen identity.
+    if (evidence.some((c) => c.era === "unknown" && (c.client_info ?? null) === null)) {
+      flags.push(
+        flag(
+          "in_window_call_not_identifiable_as_an_mcp_client",
+          "the labelled call declared no protocol era and no clientInfo. A bare HTTP POST looks " +
+            "exactly like this.",
+          true,
+          false,
+        ),
+      );
+    }
+
+    // ---- discriminator 5b: transport --------------------------------------
+    let transportVerdict: TransportVerdict;
+    if (evidence.length === 0) {
+      transportVerdict = "unavailable__no_call_to_compare";
+    } else if (handTestsFrom !== "desktop") {
+      // README limit 2 as a check rather than an honour-system checkbox.
+      transportVerdict = "unavailable__hand_tests_not_confined_to_desktop";
+    } else if (manualCalls.length === 0) {
+      transportVerdict = "unavailable__no_manual_baseline";
+    } else {
+      const unseen = evidence.every(
+        (c) =>
+          !operatorExact.has(identityKey(c.transport)) &&
+          !operatorCoarse.has(coarseIdentityKey(c.transport)) &&
+          !operatorIps.has(trustedIp(c.transport)) &&
+          !operatorIpNets.has(ipNetwork(trustedIp(c.transport))),
+      );
+      transportVerdict = unseen ? "unseen_in_operator_traffic" : "seen_in_operator_traffic";
+    }
+
+    // ---- discriminator 5a: beacon absence bracket -------------------------
+    let beaconVerdict: BeaconVerdict = "unavailable__no_call_to_bracket";
+    for (const c of evidence) {
+      const v = beaconBracket(c.ts_epoch_ms, c.transport, beacons, adminAuthFailures, heartbeats);
+      // Every evidence call must be bracketed; report the first that is not.
+      if (v !== "absence_bracketed") {
+        beaconVerdict = v;
+        break;
+      }
+      beaconVerdict = v;
+    }
+
+    const independentVia =
+      beaconVerdict === "absence_bracketed"
+        ? "5a beacon absence bracket"
+        : transportVerdict === "unseen_in_operator_traffic"
+          ? "5b transport identity unseen in operator traffic"
+          : null;
+    const independent = independentVia !== null;
+
+    const liveness = livenessAcross(start, end, heartbeats);
+    if (closed && liveness !== "covered") {
+      flags.push(
+        flag(
+          liveness === "gap"
+            ? "server_liveness_gap_across_window"
+            : "server_liveness_unknown_across_window",
+          liveness === "gap"
+            ? "heartbeats do not cover this window end to end — the server was down for part of it, " +
+              "so a silent window is not evidence the client stayed silent."
+            : "no heartbeat records cover this window, so there is no positive evidence the server " +
+              "was up. Absence of a call is therefore not evidence of absence of a fire.",
+          false,
+          true,
+        ),
+      );
+    }
+
+    // ---- what is unmet ----------------------------------------------------
     const unmet: string[] = [];
+    if (!closed) unmet.push(`window has not closed yet (closes ${new Date(end).toISOString()})`);
     if (inWindow.length === 0) unmet.push("no tool call landed inside the window");
-    if (!labelMatch) unmet.push("in-window call did not carry the arm-time label");
+    else if (!labelMatch) unmet.push("no in-window call carried the arm-time label");
     if (!arm.attest_away) unmet.push("no away attestation for this window");
     if (!independent) {
       unmet.push(
-        "no discriminator independent of your attestation (beacon did not show the machine " +
-          "absent, and the caller's transport identity also appears on out-of-window calls)",
+        "no discriminator independent of your attestation " +
+          `(beacon: ${beaconVerdict}; transport: ${transportVerdict})`,
       );
     }
-    if (infra.length > 0) unmet.push(`infrastructure noise in the window: ${infra.join(", ")}`);
+    for (const f of flags) if (f.blocks_confirmation) unmet.push(`${f.code}: ${f.detail}`);
 
     return {
       arm_id: arm.arm_id,
       client: arm.client,
+      hand_tests_from: handTestsFrom,
       fire_at: arm.fire_at,
       window_start: new Date(start).toISOString(),
       window_end: new Date(end).toISOString(),
+      window_half_width_minutes: arm.window_minutes,
+      closed,
       attest_away: arm.attest_away,
       expected_label: arm.expected_label,
       calls: inWindow,
+      evidence_call_ids: evidence.map((c) => c.id),
       label_match: labelMatch,
-      transport_unseen_outside_windows: transportUnseen,
-      beacon,
+      transport_discriminator: transportVerdict,
+      beacon_discriminator: beaconVerdict,
       independent_discriminator: independent,
-      infra_flags: infra,
+      independent_via: independentVia,
+      structurally_available: structurallyAvailable(arm.client, handTestsFrom),
+      server_liveness_across_window: liveness,
+      flags,
       unmet,
+      clean: closed && unmet.length === 0,
     };
   });
 
-  const clean = windows.filter((w) => w.unmet.length === 0);
-  const cleanDays = new Set(clean.map((w) => w.window_start.slice(0, 10)));
+  // ---------------------------------------------------------------------
+  // Counting "distinct days". v1 keyed on the UTC date of window_start, so a
+  // US-Pacific operator arming 16:30 and 17:30 local got two "days" an hour
+  // apart; and because `window_minutes` is an unvalidated half-width, wide
+  // windows overlapped and ONE call could satisfy two of them. Both are closed
+  // by requiring the counted windows to be non-overlapping, >= 20 h apart, and
+  // to rest on disjoint sets of calls.
+  // ---------------------------------------------------------------------
+  const cleanWindows = windows.filter((w) => w.clean);
+  const qualifying: WindowAssessment[] = [];
+  for (const w of cleanWindows) {
+    const prev = qualifying[qualifying.length - 1];
+    if (prev === undefined) {
+      qualifying.push(w);
+      continue;
+    }
+    const separated =
+      Date.parse(w.fire_at) - Date.parse(prev.fire_at) >= MIN_WINDOW_SEPARATION_MS &&
+      Date.parse(w.window_start) > Date.parse(prev.window_end);
+    const disjoint = w.evidence_call_ids.every((id) => !prev.evidence_call_ids.includes(id));
+    if (separated && disjoint) qualifying.push(w);
+  }
+  if (cleanWindows.length >= 2 && qualifying.length < 2) {
+    globalFlags.push(
+      flag(
+        "clean_windows_are_not_independent",
+        `${cleanWindows.length} clean windows, but only ${qualifying.length} are ` +
+          `>= ${MIN_WINDOW_SEPARATION_MS / 3_600_000} h apart, non-overlapping, and resting on ` +
+          "different calls. Two windows an hour apart — or one call satisfying two overlapping " +
+          "windows — is one observation, not two.",
+        true,
+        false,
+      ),
+    );
+  }
+
+  const blocksConfirmation = globalFlags.some((f) => f.blocks_confirmation);
+  const instrumentDegraded = globalFlags.some((f) => f.instrument && f.blocks_confirmation);
+  const blocksNegative =
+    globalFlags.some((f) => f.blocks_negative) ||
+    windows.some((w) => w.closed && w.flags.some((f) => f.blocks_negative));
+  const openWindows = windows.filter((w) => !w.closed);
+  const closedWithCalls = windows.some((w) => w.closed && w.calls.length > 0);
 
   let verdict: Verdict;
   if (arms.length === 0) {
     verdict = "NOT_RUN_YET";
-  } else if (cleanDays.size >= 2) {
+  } else if (qualifying.length >= 2 && !blocksConfirmation) {
     verdict = "UNATTENDED_CONFIRMED";
-  } else if (windows.some((w) => w.calls.length > 0)) {
+  } else if (openWindows.length > 0) {
+    // The run is not finished. v1 had no such state and printed the expensive
+    // no-branch for a window two days in the future.
+    verdict = "WINDOWS_STILL_OPEN";
+  } else if (instrumentDegraded) {
+    // "I could not measure" outranks "the evidence was weak": if the log itself
+    // cannot be trusted, neither a call nor its absence means anything.
+    verdict = "INCONCLUSIVE";
+  } else if (closedWithCalls) {
     verdict = "CONSISTENT_BUT_UNPROVEN";
-  } else if (
-    globalFlags.length > 0 ||
-    windows.some((w) => w.infra_flags.length > 0)
-  ) {
-    verdict = "INFRA_FAILURE";
+  } else if (blocksNegative || blocksConfirmation) {
+    verdict = "INCONCLUSIVE";
   } else {
     verdict = "NO_INVOCATION_OBSERVED";
   }
@@ -1155,51 +2041,124 @@ function assess(records: ProbeRecord[], logDurableDeclared: boolean): {
     verdict,
     windows,
     global_flags: globalFlags,
+    qualifying_window_ids: qualifying.map((w) => w.arm_id),
     summary: {
       records: records.length,
       armings: arms.length,
+      windows_still_open: openWindows.length,
       tool_calls_total: calls.length,
-      tool_calls_in_a_window: calls.filter((c) => inAnyWindow(c.ts_epoch_ms)).length,
-      presumed_manual_calls: calls.length - calls.filter((c) => inAnyWindow(c.ts_epoch_ms)).length,
+      tool_calls_in_a_window: calls.length - manualCalls.length,
+      presumed_manual_calls: manualCalls.length,
+      operator_identities_known: operatorExact.size,
       server_boots: boots.length,
+      heartbeats: heartbeats.length,
+      beacon_records: beacons.length,
       distinct_client_identities: new Set(calls.map((c) => identityKey(c.transport))).size,
       protocol_eras_seen: [...new Set(rpcs.map((r) => r.era))],
       protocol_versions_seen: [...new Set(rpcs.map((r) => r.protocol_version).filter((v) => v !== null))],
       spec_deviations_seen: [...new Set(rpcs.flatMap((r) => r.spec_deviations))],
-      clean_windows: clean.length,
-      clean_window_days: [...cleanDays],
+      clean_windows: cleanWindows.length,
+      qualifying_windows: qualifying.length,
     },
   };
 }
 
 const VERDICT_MEANING: { [K in Verdict]: string } = {
   UNATTENDED_CONFIRMED:
-    "Assumption 3 HOLDS. KTD12/R21 stand: ship recipes, keep push out of v1.",
+    "Assumption 3 HOLDS, to the strongest standard this instrument can reach: on at least " +
+    "two independent days, >=20 h apart and resting on different calls, a labelled call " +
+    "landed inside a window armed at least 30 minutes beforehand, with an away attestation, " +
+    "and with a discriminator independent of that attestation. KTD12/R21 stand: ship recipes, " +
+    "keep push out of v1. Read 'what this still does not prove' in the README before citing it.",
   CONSISTENT_BUT_UNPROVEN:
-    "A call landed in the window but at least one guard is unmet. This is NOT a pass. " +
-    "Read `unmet` below, fix that one thing, and re-arm. Do not cite this as evidence.",
+    "A call landed in a closed window but at least one guard is unmet. This is NOT a pass. " +
+    "Read `unmet` below, fix that one thing, and re-arm. Do not cite this as evidence either way.",
   NO_INVOCATION_OBSERVED:
-    "The window opened and closed with nothing arriving, and the server was healthy. " +
-    "This is evidence AGAINST Assumption 3 — re-run once more to rule out a one-off, " +
-    "then take the Phase 0 decision: manual morning-pull recipe + push promoted to Phase 4.",
-  INFRA_FAILURE:
-    "The probe could not observe cleanly (restart, rejected requests, connector never " +
-    "attached, unproven log durability). This says NOTHING about Assumption 3. Fix the " +
-    "probe and re-run. Never record this as a failure of the assumption.",
+    "Every window closed with nothing arriving, AND the server is demonstrably up across them " +
+    "(heartbeats), AND nothing in the log could have hidden a real fire. This is evidence " +
+    "AGAINST Assumption 3 — re-run once more to rule out a one-off, then take the Phase 0 " +
+    "decision: manual morning-pull recipe + push promoted to Phase 4.",
+  WINDOWS_STILL_OPEN:
+    "At least one armed window has not closed yet, so the run is not finished and no verdict " +
+    "is due. Nothing below is a result. If flags are printed, fix them NOW — before the window " +
+    "opens — or tomorrow's report will be INCONCLUSIVE.",
+  INCONCLUSIVE:
+    "The instrument was degraded, so the log cannot be read either way: something is missing " +
+    "that would have to be present for silence to mean anything (durable log, heartbeats, a " +
+    "connector that ever attached, an intact record sequence). This says NOTHING about " +
+    "Assumption 3. Fix what is named and re-run. Recording this as a failure of the assumption " +
+    "is the expensive mistake.",
   NOT_RUN_YET: "No arming records. Run `arm` before the scheduled task fires.",
 };
 
+const PROOF_STANDARD = [
+  "WHAT WOULD BE PROOF, AND WHAT IS MERELY CONSISTENT WITH IT",
+  "",
+  "  Proof, to the limit of this instrument: on >=2 independent days, a call carrying a",
+  "  label minted AFTER the window was registered landed inside that window, and at least",
+  "  one discriminator held that your attestation did not produce —",
+  "    5a  the presence beacon was demonstrably RUNNING, went quiet before the call, and",
+  "        stayed quiet for >=10 min after it (so the quiet was the machine, not a dead",
+  "        loop, and not a machine that had just woken up); or",
+  "    5b  the call's transport identity appears nowhere in traffic known to be yours,",
+  "        compared on both an exact and a coarsened key, against a NON-EMPTY baseline,",
+  "        with your hand tests confined to Desktop.",
+  "",
+  "  Merely consistent with it: a call in the window with an honest attestation and no",
+  "  independent discriminator. That is a true statement about a call you did not make —",
+  "  and it is indistinguishable from a call you made and forgot. It is not a pass.",
+  "",
+  "  Not reachable at all: proof that no human was in the room. No HTTP server can see",
+  "  that. A Desktop-LOCAL schedule additionally cannot be confirmed by this instrument,",
+  "  because the machine must be awake to fire and a scheduled wake is indistinguishable",
+  "  from you opening the lid. See README limit 8.",
+].join("\n");
+
+function printFlags(title: string, flags: Flag[], indent: string): void {
+  if (flags.length === 0) return;
+  console.log(`\n${indent}${title}`);
+  for (const f of flags) {
+    const dir =
+      f.blocks_confirmation && f.blocks_negative
+        ? "blocks BOTH verdicts"
+        : f.blocks_confirmation
+          ? "blocks UNATTENDED_CONFIRMED"
+          : f.blocks_negative
+            ? "blocks NO_INVOCATION_OBSERVED"
+            : "informational";
+    console.log(`${indent}  ! ${f.code}  [${dir}]`);
+    console.log(`${indent}      ${f.detail}`);
+  }
+}
+
 async function cmdReport(argv: string[]): Promise<void> {
   const flags = parseFlags(argv);
-  const { records, logDurableDeclared, source } = await fetchRecords(flags);
-  const result = assess(records, logDurableDeclared);
+  const { records, source } = await fetchRecords(flags);
+  const nowFlag = flags.get("now");
+  const nowMs =
+    nowFlag !== undefined && nowFlag !== "true" && !Number.isNaN(Date.parse(nowFlag))
+      ? Date.parse(nowFlag)
+      : Date.now();
+  const result = assess(records, nowMs);
 
   if (flags.get("json") === "true") {
-    console.log(JSON.stringify({ source, ...result, verdict_meaning: VERDICT_MEANING[result.verdict] }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          source,
+          evaluated_at_utc: new Date(nowMs).toISOString(),
+          ...result,
+          verdict_meaning: VERDICT_MEANING[result.verdict],
+        },
+        null,
+        2,
+      ),
+    );
     return;
   }
 
   console.log(`\nsource: ${source}`);
+  console.log(`evaluated at: ${new Date(nowMs).toISOString()}`);
   console.log(`\n=== VERDICT: ${result.verdict} ===`);
   console.log(VERDICT_MEANING[result.verdict]);
 
@@ -1207,32 +2166,143 @@ async function cmdReport(argv: string[]): Promise<void> {
   for (const [k, v] of Object.entries(result.summary)) {
     console.log(`  ${k}: ${Array.isArray(v) ? JSON.stringify(v) : String(v)}`);
   }
-  if (result.global_flags.length > 0) {
-    console.log("\n--- global flags (these can invalidate a negative result) ---");
-    for (const f of result.global_flags) console.log(`  ! ${f}`);
-  }
+
+  printFlags(
+    result.verdict === "WINDOWS_STILL_OPEN"
+      ? "--- global flags (fix these BEFORE the window, or tomorrow reads INCONCLUSIVE) ---"
+      : "--- global flags ---",
+    result.global_flags,
+    "",
+  );
 
   console.log("\n--- windows ---");
   if (result.windows.length === 0) console.log("  (none armed)");
   for (const w of result.windows) {
-    console.log(`\n  ${w.arm_id}  client=${w.client}  fire_at=${w.fire_at}`);
-    console.log(`    window:  ${w.window_start} .. ${w.window_end}`);
-    console.log(`    calls in window: ${w.calls.length}`);
+    console.log(
+      `\n  ${w.arm_id}  client=${w.client}  hand_tests_from=${w.hand_tests_from}  fire_at=${w.fire_at}`,
+    );
+    console.log(
+      `    window:  ${w.window_start} .. ${w.window_end}  (fire_at ± ${w.window_half_width_minutes} min)` +
+        `  ${w.closed ? "[closed]" : "[STILL OPEN]"}`,
+    );
+    for (const note of w.structurally_available) console.log(`    structurally: ${note}`);
+    console.log(`    calls in window: ${w.calls.length}  (labelled: ${w.evidence_call_ids.length})`);
     for (const c of w.calls) {
       console.log(
         `      - ${c.ts}  id=${c.id}  label=${c.run_label ?? "(none)"}  ` +
           `era=${c.era}  from=${identityKey(c.transport)}  beacon_age_s=${c.beacon_age_seconds ?? "n/a"}`,
       );
     }
-    console.log(`    label match:            ${w.label_match}`);
-    console.log(`    away attestation:       ${w.attest_away}`);
-    console.log(`    transport unseen in manual traffic: ${w.transport_unseen_outside_windows}`);
-    console.log(`    beacon at fire time:    ${w.beacon}`);
-    console.log(`    independent discriminator: ${w.independent_discriminator}`);
-    if (w.unmet.length === 0) console.log("    => CLEAN (counts toward confirmation)");
+    console.log(`    away attestation:          ${w.attest_away}`);
+    console.log(`    5b transport:              ${w.transport_discriminator}`);
+    console.log(`    5a beacon:                 ${w.beacon_discriminator}`);
+    console.log(
+      `    server up across window:   ${w.closed ? w.server_liveness_across_window : "(not evaluated — window still open)"}`,
+    );
+    console.log(
+      `    independent discriminator: ${w.independent_discriminator}` +
+        (w.independent_via === null ? "" : ` (via ${w.independent_via})`),
+    );
+    printFlags("flags:", w.flags, "    ");
+    if (w.clean) console.log("    => CLEAN (counts toward confirmation)");
     else for (const u of w.unmet) console.log(`    => unmet: ${u}`);
   }
+
+  if (result.qualifying_window_ids.length > 0) {
+    console.log(`\nqualifying (independent) windows: ${result.qualifying_window_ids.join(", ")}`);
+  }
+
+  console.log(`\n${PROOF_STANDARD}`);
   console.log("\nRecord the outcome in RESULT.local.md (copy RESULT-TEMPLATE.md).\n");
+}
+
+/**
+ * The wiring check. Every failure below is one a user would otherwise meet as an
+ * undifferentiated 404 the morning after, when it is too late to fix.
+ */
+async function cmdDoctor(): Promise<void> {
+  const base = baseUrl();
+  const problems: string[] = [];
+  const say = (okFlag: boolean, text: string): void => console.log(`  ${okFlag ? "ok  " : "FAIL"}  ${text}`);
+
+  console.log(`\nchecking ${base}\n`);
+
+  let root: Response | null = null;
+  try {
+    root = await fetch(`${base}/`);
+  } catch (err) {
+    say(false, `cannot reach ${base}/ — ${String(err)}`);
+    problems.push("PROBE_BASE_URL is unreachable");
+  }
+  if (root !== null) {
+    const text = await root.text();
+    const isProbe = text.includes(SERVER_NAME);
+    say(isProbe, isProbe ? `origin is a ${SERVER_NAME}` : `origin answered, but it is not this probe`);
+    if (!isProbe) problems.push("PROBE_BASE_URL points at something that is not this probe");
+    else console.log(text.split("\n").filter((l) => l !== "").map((l) => `        ${l}`).join("\n"));
+  }
+
+  const res = await fetch(`${base}/probe/records`, { headers: adminHeaders() });
+  const adminOk = res.ok;
+  say(adminOk, adminOk ? "PROBE_ADMIN_TOKEN accepted" : `admin API refused (HTTP ${res.status})`);
+  if (!adminOk) {
+    problems.push("PROBE_ADMIN_TOKEN does not match the deployed server");
+    for (const line of admin404Help(`${base}/probe/records`)) console.log(`        ${line}`);
+    console.log(`\n${problems.length} problem(s).\n`);
+    process.exit(1);
+  }
+
+  const body = (await res.json()) as { records: ProbeRecord[]; log_durable_declared: boolean };
+  const records = body.records;
+  const result = assess(records, Date.now());
+
+  const durable = body.log_durable_declared;
+  say(durable, durable ? "log durability declared" : "PROBE_LOG_DURABLE is not set on the server");
+  if (!durable) problems.push("mount a volume and set PROBE_LOG_DURABLE=1 — this blocks BOTH verdicts");
+
+  const heartbeats = records.filter((r) => r.kind === "heartbeat").length;
+  say(heartbeats > 0, heartbeats > 0 ? `${heartbeats} heartbeat record(s)` : "no heartbeats — uptime unprovable");
+  if (heartbeats === 0) problems.push("no heartbeat records; 'nothing arrived' will be INCONCLUSIVE");
+
+  const beacons = records.filter((r): r is BeaconRecord => r.kind === "beacon");
+  const lastBeacon = beacons[beacons.length - 1];
+  const beaconAgeS = lastBeacon === undefined ? null : Math.round((Date.now() - lastBeacon.ts_epoch_ms) / 1000);
+  const beaconLive = beaconAgeS !== null && beaconAgeS < BEACON_STREAM_MAX_GAP_MS / 1000;
+  say(
+    beaconLive,
+    lastBeacon === undefined
+      ? "no beacon records — discriminator 5a will be unavailable"
+      : `last beacon ${beaconAgeS}s ago (${beacons.length} record(s))`,
+  );
+  if (!beaconLive) {
+    problems.push(
+      "the presence beacon is not running (or its token is wrong). Without it 5a is unavailable; " +
+        "if the loop dies mid-run the window reads INCONCLUSIVE, not CLEAN",
+    );
+  }
+
+  const toolsList = records.some((r) => r.kind === "mcp_rpc" && r.method === "tools/list");
+  say(toolsList, toolsList ? "a client has listed the tools (connector attached)" : "no tools/list ever seen");
+  if (!toolsList) problems.push("the connector has never attached; add it and hand-test once");
+
+  const manual = records.filter((r) => r.kind === "tool_call").length;
+  say(manual > 0, manual > 0 ? `${manual} tool call(s) recorded` : "no tool call has ever been recorded");
+  if (manual === 0) problems.push("hand-test the tool once from Desktop to establish the 5b baseline");
+
+  for (const f of result.global_flags) {
+    const blocking = f.blocks_confirmation || f.blocks_negative;
+    say(!blocking, blocking ? `${f.code} — ${f.detail}` : `note: ${f.code}`);
+    if (blocking && !problems.includes(f.code)) problems.push(f.code);
+  }
+
+  console.log(
+    problems.length === 0
+      ? "\nAll checks pass. Arm a window and go away.\n"
+      : `\n${problems.length} problem(s) to fix BEFORE the window opens:\n` +
+          problems.map((p) => `  - ${p}`).join("\n") +
+          "\n",
+  );
+  if (problems.length > 0) process.exit(1);
 }
 
 async function cmdVerifyNonce(argv: string[]): Promise<void> {
@@ -1265,6 +2335,9 @@ switch (subcommand) {
   case "serve":
     runServer();
     break;
+  case "doctor":
+    await cmdDoctor();
+    break;
   case "arm":
     await cmdArm(rest);
     break;
@@ -1276,6 +2349,6 @@ switch (subcommand) {
     break;
   default:
     console.error(`unknown subcommand: ${subcommand}`);
-    console.error("usage: serve | arm | report | verify-nonce <nonce>");
+    console.error("usage: serve | doctor | arm | report | verify-nonce <nonce>");
     process.exit(2);
 }
