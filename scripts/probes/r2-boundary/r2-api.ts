@@ -59,6 +59,29 @@ const AUTH_PATTERN =
 const QUOTA_PATTERN =
   /quota|maximum number|max number|bucket limit|limit (has been )?(reached|exceeded)|exceeded .*limit|too many buckets/i;
 const CONFLICT_PATTERN = /already (exists|owned)|bucket.*exists/i;
+const EXPIRED_PATTERN = /expired|not ?yet ?valid|token.*(expire|refresh)|invalid.*(session|security) ?token/i;
+
+/**
+ * Error codes this client generates ITSELF, without a request ever leaving the
+ * process. They exist so a probe-side impossibility can never be scored as a
+ * vendor answer: `probe_path_normalised_by_client` in particular is the
+ * difference between "R2 denied a traversal-shaped key" (a finding) and "our own
+ * URL parser rewrote the path before sending" (no finding at all).
+ */
+export const CLIENT_CODES = {
+  pathNormalised: "probe_path_normalised_by_client",
+} as const;
+
+/**
+ * Did this failure come from the credential having aged out rather than from
+ * access control? The scope matrix mints once and issues ~10 requests against
+ * that credential; an `ExpiredToken` mid-matrix is indistinguishable from a
+ * scope denial by status alone (both are 403), and scoring it as a denial is
+ * the same false-pass family as scoring a transport error as one.
+ */
+export function isExpiredCredentialFailure(call: CallFailure): boolean {
+  return EXPIRED_PATTERN.test(`${call.code ?? ""} ${call.message}`);
+}
 
 export function classifyFailure(status: number, code: string | null, message: string): FailureKind {
   const haystack = `${code ?? ""} ${message}`;
@@ -113,6 +136,23 @@ export function loadEnv(source: Record<string, string | undefined> = process.env
   }
   if (!/^[a-z0-9-]+$/.test(bucketPrefix)) {
     errors.push("R2_PROBE_BUCKET_PREFIX must be lowercase letters, digits and hyphens only.");
+  }
+
+  // The dashboard hands you `https://<account>.r2.cloudflarestorage.com`, but
+  // this is a HOST: it is concatenated as `https://${host}`. Pasting the URL
+  // yields `https://https://…`, every S3 call throws at fetch, and the probe
+  // reports "the S3 credentials are wrong" — an assertion that is false and
+  // sends the user off to regenerate a perfectly good token.
+  const endpoint = source["R2_S3_ENDPOINT"];
+  if (endpoint !== undefined && endpoint !== "") {
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(endpoint)) {
+      errors.push(
+        `R2_S3_ENDPOINT must be a bare HOST, not a URL — strip the scheme. ` +
+          `Use "<account-id>.r2.cloudflarestorage.com", not "https://…".`,
+      );
+    } else if (endpoint.includes("/")) {
+      errors.push(`R2_S3_ENDPOINT must be a bare host with no path (got a "/").`);
+    }
   }
 
   if (missing.length > 0 || errors.length > 0) return { env: null, missing, errors };
@@ -346,7 +386,6 @@ export class R2Client {
     segments: string[],
     options: { query?: Record<string, string> | undefined; body?: Uint8Array | undefined } = {},
   ): Promise<Call<string>> {
-    this.counters.s3 += 1;
     const started = performance.now();
 
     const signed = await signS3Request({
@@ -358,6 +397,28 @@ export class R2Client {
       credentials,
     });
 
+    // Refuse to send a request the URL layer has already rewritten. Sending it
+    // would produce a signature mismatch (403) that reads exactly like a scope
+    // denial, which is the false-pass this probe exists to avoid.
+    if (signed.deliveredPath !== signed.canonicalUri) {
+      const ms = performance.now() - started;
+      return {
+        ok: false,
+        status: 0,
+        kind: "other",
+        code: CLIENT_CODES.pathNormalised,
+        message:
+          `not sent: the URL layer rewrote the path before it left the process ` +
+          `(signed "${signed.canonicalUri}", would have sent "${signed.deliveredPath}"). ` +
+          `Any HTTP client resolves "." / ".." / "%2e%2e" segments, so a key of this shape ` +
+          `cannot be put on the wire as written and this cell proves nothing either way.`,
+        retryAfterSeconds: null,
+        ms,
+        raw: "",
+      };
+    }
+
+    this.counters.s3 += 1;
     const init: RequestInit = { method, headers: signed.headers };
     if (signed.body !== undefined) init.body = signed.body;
 

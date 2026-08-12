@@ -103,6 +103,20 @@ export interface SignedS3Request {
   body: Uint8Array | undefined;
   /** Kept for diagnostics: if a signature is rejected, this is what to read. */
   canonicalRequest: string;
+  /** The path that was signed. */
+  canonicalUri: string;
+  /**
+   * The path an HTTP client will actually PUT ON THE WIRE for `url`.
+   *
+   * WHATWG URL parsing resolves `.` and `..` segments — and decodes `%2e` first,
+   * so `%2e%2e` collapses too. A key shaped like `tenant-a/../tenant-b/x` is
+   * therefore rewritten to `tenant-b/x` *before* it leaves the process, which
+   * would (a) break the signature and (b) look like a denial. The caller
+   * compares this against `canonicalUri` and refuses to send a request it cannot
+   * deliver as intended, rather than scoring the resulting 403 as a scope
+   * denial. See `docs` note in README: "traversal-shaped keys".
+   */
+  deliveredPath: string;
 }
 
 export async function signS3Request(options: SignS3RequestOptions): Promise<SignedS3Request> {
@@ -166,10 +180,14 @@ export async function signS3Request(options: SignS3RequestOptions): Promise<Sign
     `AWS4-HMAC-SHA256 Credential=${options.credentials.accessKeyId}/${credentialScope}, ` +
     `SignedHeaders=${signedHeaders}, Signature=${signature}`;
 
+  const url = `https://${options.host}${canonicalUri}${canonicalQuery ? `?${canonicalQuery}` : ""}`;
+
   return {
-    url: `https://${options.host}${canonicalUri}${canonicalQuery ? `?${canonicalQuery}` : ""}`,
+    url,
     headers: outHeaders,
     body: options.body,
     canonicalRequest,
+    canonicalUri,
+    deliveredPath: new URL(url).pathname,
   };
 }
