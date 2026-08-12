@@ -44,8 +44,10 @@ observed, or refuses to answer.
 - Whether a raw outbound TCP socket to port 5432 opens from inside a deployed container, and
   whether a *real Postgres* is on the other end (the SSL negotiation is answered with `S`).
 - Whether a full Postgres session authenticates over each transport, with mutual SCRAM —
-  including verifying the **server's** signature, which is what rules out a transparent proxy
-  that merely accepted the socket.
+  including verifying the **server's** signature. That rules out a terminator which merely
+  accepted the socket: the far end has to hold this role's stored key. Both facts
+  (`scram_completed`, `server_signature_verified`) are recorded in the report, and a session
+  that comes up without them is reported `INCONCLUSIVE_PEER_UNVERIFIED` rather than passed.
 - Whether **session semantics** survive: `SET LOCAL` read back inside an explicit transaction,
   the same backend pid across statements in that transaction, the GUC scoped out after
   `COMMIT`, and a named prepared statement usable between round trips. This — not the
@@ -59,6 +61,12 @@ observed, or refuses to answer.
   Cloudflare Containers carry no documented commitment about raw egress, so a pass is a
   *current-state* fact, not a guarantee. Record the date and colo in `RESULT.md` and re-check
   before U6 ships.
+- That there is no **relaying** proxy in the path. SCRAM without channel binding cannot detect
+  one: a byte forwarder passes the exchange upstream and the returned signature verifies
+  legitimately. Channel binding is the only mechanism that would catch it, and it is
+  deliberately not used (the WebSocket transport has no Postgres-layer TLS to bind to, and both
+  transports must be byte-identical above the transport to be comparable). What is ruled out is
+  a peer that *terminates* the connection without holding the role's key.
 - That `postgres.js` specifically will work. It proves the wire protocol and session semantics
   work; `postgres.js` uses protocol-level named statements where this probe uses SQL-level
   `PREPARE`/`EXECUTE`. Those are the same underlying property — a named statement persisting
@@ -66,7 +74,39 @@ observed, or refuses to answer.
   probe carries no driver on purpose (see "Design constraints" below).
 - Anything about throughput, connection limits, LRU behaviour under load, or wake latency.
   It opens one connection per transport.
-- Anything at all, if you run it with `--local`. That mode measures **your laptop**.
+- Anything at all, if you run it with `--local`. That mode measures **your laptop**, always
+  reports the verdict `CALIBRATION_ONLY`, and always exits 50.
+
+---
+
+## The one shortcut that would invalidate everything: `wrangler dev`
+
+Containers need a Workers Paid plan, and the first `wrangler deploy` on Apple Silicon builds
+the image under amd64 emulation. Both make it tempting to "just see it work first" with
+`bunx wrangler dev`, which runs the identical image in **local Docker on your machine** and
+answers on `http://localhost:8787`. That container opens raw TCP to 5432 from your laptop's
+Docker bridge, passes every stage, and — before this was fixed — stamped `origin: 'container'`
+and a verdict of `A_RAW_TCP_OK` on the result.
+
+A probe that certifies Assumption 4 from a laptop is worse than no probe, because the whole
+KTD2 rationale rests on the answer. So a container run must now **show** where it ran:
+
+| Evidence | Who observes it | Why a local run cannot produce it |
+|---|---|---|
+| a Cloudflare `cf` object on the incoming request | the Worker | absent under a plain `wrangler dev` |
+| a colo | the Worker (`request.cf.colo`) | there is no colo on a laptop |
+| a `cf-ray` header on the **request** | the Worker | added by Cloudflare's edge |
+| a `cf-ray` header on the **response** | **the driver on your machine** | a local dev server does not emit one |
+| `https` scheme and a public, non-loopback host | **the driver** | `wrangler dev` serves `http://localhost` |
+
+The last two matter most: they are the only checks that do not depend on believing the report.
+The driver may only ever **downgrade** a verdict on this evidence, never upgrade one, and it
+records what the container claimed in `driver.containerVerdict` so the artifact shows both the
+claim and the refusal. Missing any of them gives `INCONCLUSIVE_ORIGIN_UNVERIFIED` (exit 30).
+
+Running under `wrangler dev --remote` does execute on Cloudflare and will satisfy these checks;
+it is a preview deployment rather than the deployed Worker, so note it in `RESULT.md` if you
+take that route.
 
 ---
 
@@ -91,18 +131,33 @@ observed, or refuses to answer.
 | Variable | Where | What |
 |---|---|---|
 | `PROBE_DATABASE_URL` | `wrangler secret put` | The **DIRECT** (non-`-pooler`) Neon connection string. |
-| `PROBE_AUTH_TOKEN` | `wrangler secret put` | Any random string. Without it the Worker refuses **every** request — its `*.workers.dev` URL is public and this endpoint runs SQL. |
-| `PROBE_ALLOW_POOLER` | `wrangler secret put` (optional) | `"1"` to run against a `-pooler` endpoint anyway. See the warning below. |
+| `PROBE_AUTH_TOKEN` | `wrangler secret put` | Any random string. Without it the Worker refuses **every** request — its `*.workers.dev` URL is public and this endpoint runs SQL. Set it with `printf %s '<token>' \| wrangler secret put ...` or at the interactive prompt: `echo` appends a newline, and the mismatch that causes is the most common 401. |
+| `PROBE_ALLOW_POOLER` | `wrangler secret put` (optional) | `"1"` to allow a `-pooler` endpoint. Either this or the per-call flag enables it. |
+| `PROBE_ALLOW_NONSTANDARD_PORT` | `wrangler secret put` (optional) | `"1"` to allow a DSN whose port is not 5432. Either this or the per-call flag enables it. |
 
 **Set in your shell** for the driver (`bun run probe:container-tcp`):
 
 | Variable | Mode | What |
 |---|---|---|
-| `PROBE_URL` | verdict | `https://brainz-probe-container-tcp.<your-subdomain>.workers.dev` |
+| `PROBE_URL` | verdict | `https://brainz-probe-container-tcp.<your-subdomain>.workers.dev` — must be `https` and a public host, see the `wrangler dev` section above. |
 | `PROBE_AUTH_TOKEN` | verdict | The same random string you gave `wrangler secret put`. |
 | `PROBE_DATABASE_URL` | `--local` | The direct Neon connection string, for calibration. |
-| `PROBE_TLS_INSECURE` | `--local` (optional) | `1` to skip TLS certificate verification — only if a corporate MITM proxy sits between your laptop and the internet. Never set this for the container run. |
-| `PROBE_ALLOW_POOLER` | either (optional) | `1`. See below. |
+| `PROBE_TLS_INSECURE` | `--local` only | `1` to skip TLS certificate verification — only if a corporate MITM proxy sits between your laptop and the internet. It is **not** accepted over the wire: the container reads it from its own environment only, so nobody can disable the certificate check on the run that settles the question. |
+| `PROBE_ALLOW_POOLER` | either | `1`. Forwarded to the container per call, so the shell value works in verdict mode too — as does the Worker secret above; either one enables it. See below. |
+| `PROBE_ALLOW_NONSTANDARD_PORT` | either | `1`. Same forwarding. See "the port is part of the question" below. |
+
+Per-call knobs (`--timeout`, `--allow-pooler`, `--allow-nonstandard-port`) are sent in the
+request body and forwarded by the Worker, so they take effect in **both** modes.
+
+### The port is part of the question
+
+Assumption 4 is a claim about raw outbound TCP to **5432**. Every port in this probe is
+DSN-derived, so a DSN naming some other port would produce a true measurement of the wrong
+thing — and would also collapse the `control.tcp_443` arm if it happened to name 443. The probe
+refuses a non-5432 DSN (`INCONCLUSIVE_PRECONDITION`) unless you set
+`PROBE_ALLOW_NONSTANDARD_PORT=1`, which is the right thing to do when you are deliberately
+testing port filtering. Every verdict string then names the port that was actually dialled, and
+the run says out loud that Assumption 4 as written is not settled by it.
 
 ### Do not use a `-pooler` connection string
 
@@ -127,25 +182,37 @@ bun run probe:container-tcp -- --local
 ```
 
 This runs the **identical** probe code against the **same** Neon project from your machine.
-It settles nothing about Cloudflare. What it does is remove the single most expensive failure
-mode: if the container run later fails, calibration having passed is what makes that failure
-attributable to the platform rather than to this probe's wire implementation. Skip it and a
-red container result is ambiguous — and the ambiguous branch is the one that costs a runtime
-rewrite.
+It settles nothing about Cloudflare, always reports `CALIBRATION_ONLY`, and always **exits
+50** — a calibration can never be mistaken for the answer by a script or by a reader. The
+report still carries `wouldBeVerdict`: what the same evidence would have meant from a
+container.
+
+What calibration buys you is twofold:
+
+1. It removes the most expensive failure mode. If the container run later fails, calibration
+   having passed is what makes that failure attributable to the platform rather than to this
+   probe's wire implementation.
+2. It writes `result-calibration-receipt.json` (gitignored) recording whether this probe's
+   hand-rolled **WebSocket** client was ever seen carrying a session. The driver requires that
+   receipt before it will let a container run claim `(c)` — see rule 5 below.
 
 Expect every `tcp.*` stage to pass. The `ws.*` and `http.*` stages should also pass against a
-real Neon host.
+real Neon host; if `ws.*` does not pass here, fix that before reading anything into a `(c)`.
 
 ### 2. Deploy
 
+Deploy first, then set the secrets. `wrangler secret put` against a Worker that does not exist
+yet prompts to create one — fine interactively, a failure in CI.
+
 ```bash
 cd /path/to/brainz
+bunx wrangler deploy                        -c scripts/probes/container-tcp/wrangler.toml
 bunx wrangler secret put PROBE_DATABASE_URL -c scripts/probes/container-tcp/wrangler.toml
 bunx wrangler secret put PROBE_AUTH_TOKEN   -c scripts/probes/container-tcp/wrangler.toml
-bunx wrangler deploy                        -c scripts/probes/container-tcp/wrangler.toml
 ```
 
-Wrangler prints the deployed URL. That is your `PROBE_URL`.
+Wrangler prints the deployed URL. That is your `PROBE_URL`. Until `PROBE_AUTH_TOKEN` is set the
+Worker answers 503 to everything, on purpose.
 
 ### 3. Get the verdict
 
@@ -155,9 +222,16 @@ export PROBE_AUTH_TOKEN='<the same random string>'
 bun run probe:container-tcp
 ```
 
-The first call after a deploy wakes a cold container and can take a while. **If it times out,
-retry once** before reading anything into it. `bunx wrangler tail -c
-scripts/probes/container-tcp/wrangler.toml` shows the container's stdout if it never starts.
+The first call after a deploy wakes a cold container **and** a cold Neon compute. Stage
+deadlines default to 15 s and the whole-run ceiling is derived from them, but if you see
+`INCONCLUSIVE_TCP_REACHABLE` on the first call, retry — and raise the deadline if it repeats:
+
+```bash
+bun run probe:container-tcp -- --timeout=30000
+```
+
+`bunx wrangler tail -c scripts/probes/container-tcp/wrangler.toml` shows the container's stdout
+if it never starts.
 
 ### 4. Record it
 
@@ -168,8 +242,11 @@ gitignored — copy the redacted summary into `RESULT.md`, not the raw file.
 ### 5. Tear down
 
 ```bash
-bunx wrangler delete --name brainz-probe-container-tcp
+bunx wrangler delete -c scripts/probes/container-tcp/wrangler.toml --name brainz-probe-container-tcp
 ```
+
+`-c` is not optional: without it, wrangler resolves against the repo-root `wrangler.toml`, which
+is the real fleet.
 
 Then delete the throwaway Neon project. Leaving the Worker deployed leaves a public endpoint
 that holds a database credential.
@@ -185,31 +262,59 @@ that holds a database credential.
 | `A_RAW_TCP_OK` | 0 | (a). Assumption 4 holds. KTD2 unchanged. |
 | `B_WEBSOCKET_ONLY` | 10 | (b). Containers kept; transport changes to `@neondatabase/serverless` `Pool`/`Client` over WebSocket. |
 | `C_BOTH_BLOCKED` | 20 | (c). The priced no-branch applies. Re-open the 128 MB question. |
+| `INCONCLUSIVE_ORIGIN_UNVERIFIED` | 30 | This run could not be shown to have happened on Cloudflare. The likeliest cause is `wrangler dev`. |
 | `INCONCLUSIVE_NO_BASELINE_EGRESS` | 30 | Nothing got out, including plain HTTPS. A statement about this run, not about Cloudflare. |
-| `INCONCLUSIVE_TCP_REACHABLE` | 30 | 5432 was reachable and a real Postgres answered, but the session did not complete. Leaning (a). |
+| `INCONCLUSIVE_TCP_REACHABLE` | 30 | A raw socket to the Postgres port opened, but no session came out of it. Leaning (a); (b) and (c) are both forbidden here. |
 | `INCONCLUSIVE_WS_OPEN` | 30 | The WebSocket upgraded but the session did not complete. Leaning (b). |
-| `INCONCLUSIVE_PRECONDITION` | 30 | The probe refused to run — bad DSN, or a `-pooler` endpoint. |
+| `INCONCLUSIVE_PEER_UNVERIFIED` | 30 | A transport carried a full session, but no completed SCRAM exchange with a verified server signature was recorded on it. |
+| `INCONCLUSIVE_CONTROL_ABSENT` | 30 | A transport passed, but the negative control never ran — the battery was never shown able to fail. |
+| `INCONCLUSIVE_CONTROL_SUSPECT` | 30 | The negative control *passed* the session battery. The instrument is in doubt; no verdict is usable in either direction. |
+| `INCONCLUSIVE_WS_CLIENT_UNPROVEN` | 30 | (c) was indicated, but this probe's own WebSocket client has never been observed working anywhere. |
+| `INCONCLUSIVE_PRECONDITION` | 30 | The probe refused to run — bad DSN, a `-pooler` endpoint, or a port that is not 5432. |
+| `CALIBRATION_ONLY` | 50 | A `--local` run. Never a verdict, whatever the evidence. Read `wouldBeVerdict`. |
+| *(no report)* | 40 | The driver could not run at all: missing env var, unreachable endpoint, or a response that was not a report from this probe. |
 
 **Do not branch the plan on any `INCONCLUSIVE_*`.** That is the point of them existing.
 
-### The four rules that make this trustworthy in both directions
+### The rules that make this trustworthy in both directions
+
+The governing rule, from which the rest follow: **absence of evidence is never evidence of
+success.** A missing signal, a swallowed error, an unreachable control or a degraded instrument
+produces a named `INCONCLUSIVE_*` with a non-zero exit code — never a pass, and never a
+decisive fail either.
 
 1. **A handshake is never the answer.** The verdict reads `sessionSemantics`, which requires
    `SET LOCAL` readback, same-backend continuity, transaction scoping and a surviving prepared
    statement. A half-open socket, a transparent proxy or a silently re-established connection
    would all pass a handshake check and fail this.
-2. **(c) requires a working control.** Both transports failing is only reported as (c) when
-   ordinary HTTPS egress from the same container *did* work. Otherwise it is
+2. **The run must prove where it happened.** `origin: 'container'` is a claim the container
+   writes about itself. A conclusive verdict additionally requires the Worker to have seen a
+   Cloudflare `cf` object, a colo and an inbound `cf-ray`, *and* the driver to have seen a
+   `cf-ray` on the response it received over `https` from a public host. See the `wrangler dev`
+   section above.
+3. **Reachability gates nothing.** The throwaway reachability probe is diagnostic only; the
+   real transport always opens its own socket. And because (b) and (c) both assert that raw TCP
+   did *not* work, neither may be issued once a handshake to the Postgres port has completed —
+   even if the WebSocket arm sailed through. That case is `INCONCLUSIVE_TCP_REACHABLE`, and one
+   lost packet is enough to cause it, so re-run before reading anything into it.
+4. **The peer must authenticate itself to us.** `scram_completed` and
+   `server_signature_verified` are recorded as facts on the authenticate stage, and the wire
+   client refuses an `AuthenticationOk` that arrives mid-SASL without a verifiable SASLFinal —
+   the one message a peer that cannot complete SCRAM is unable to forge. A session without
+   those facts is `INCONCLUSIVE_PEER_UNVERIFIED`, not a pass. (A *relaying* proxy is still not
+   ruled out; see "It cannot prove" above.)
+5. **The instrument must be shown able to fail, and (c) needs its own control.** The one-shot
+   HTTP driver runs the identical battery as a negative control: it must authenticate and then
+   fail every session assertion. If it never authenticated, the null check did not happen and a
+   passing transport reports `INCONCLUSIVE_CONTROL_ABSENT`. If it *passes* the battery, the run
+   is `INCONCLUSIVE_CONTROL_SUSPECT`. And because a rejected WebSocket upgrade
+   (`EWSUPGRADE`) is byte-identical to a bug in this probe's own handshake, `(c)` also requires
+   a calibration receipt showing the WebSocket arm working somewhere —
+   `INCONCLUSIVE_WS_CLIENT_UNPROVEN` otherwise.
+6. **(c) requires a working egress control.** Both transports failing is only reported as (c)
+   when ordinary HTTPS egress from the same container *did* work. Otherwise it is
    `INCONCLUSIVE_NO_BASELINE_EGRESS` — a config or credential problem, not an architecture
    finding.
-3. **Reachability is measured separately from the session.** If the TCP handshake to 5432
-   completes and a real Postgres answers the SSL negotiation, egress is not the blocker, and
-   any later failure reports `INCONCLUSIVE_TCP_REACHABLE` rather than forfeiting pooled TCP
-   over a bug in this code. The same holds for a WebSocket that upgraded.
-4. **The one-shot HTTP driver runs the identical battery as a negative control.** It should
-   authenticate and then fail every session assertion. Seeing it fail that way is what proves
-   the WebSocket transport is a real session and not the HTTP function wearing a different
-   name. If HTTP ever *passes* the session battery, the run is flagged as suspect.
 
 ---
 
@@ -229,8 +334,17 @@ does **not** reopen.
 **(c) `C_BOTH_BLOCKED`** — Take the priced no-branch: Workers plus Neon's HTTP driver. Pooled
 TCP, prepared statements and the 128 MB headroom are forfeited. Re-open the 128 MB question
 before U6 is built, and expect a split runtime because consolidation cycles still belong on
-Containers. Before accepting this, check the `control.tcp_443` stage: if raw TCP to 443
-succeeded while 5432 did not, this is port filtering and worth raising with Cloudflare first.
+Containers. This is the expensive branch, so it is also the one with the most preconditions —
+the probe will only issue it once all of these hold. Check them yourself before acting:
+
+- `control.https_443` passed (otherwise it is `INCONCLUSIVE_NO_BASELINE_EGRESS`).
+- No raw TCP handshake to the Postgres port completed at any point in the run (otherwise
+  `INCONCLUSIVE_TCP_REACHABLE`).
+- A calibration receipt exists showing the `ws.*` arm working against this same Neon project,
+  so the WebSocket failure is Cloudflare's and not ours (otherwise
+  `INCONCLUSIVE_WS_CLIENT_UNPROVEN`).
+- `control.tcp_443`: if raw TCP to 443 succeeded while the Postgres port did not, this is port
+  filtering, not a ban on raw sockets, and it is worth raising with Cloudflare first.
 
 ---
 
@@ -260,14 +374,18 @@ reasons that have nothing to do with the question.
 
 - **Cloudflare:** one Worker, one Durable Object class, one container instance
   (`standard-1`, `max_instances = 1`, `sleepAfter = "2m"`). Nothing touches the `brainz-fleet`
-  Worker or the repo-root `wrangler.toml`. Delete with `wrangler delete --name
-  brainz-probe-container-tcp`.
+  Worker or the repo-root `wrangler.toml`. Delete with `wrangler delete -c
+  scripts/probes/container-tcp/wrangler.toml --name brainz-probe-container-tcp` — always with
+  `-c`, or wrangler resolves against the fleet's root config.
 - **Neon:** no DDL, no writes, no rows. `SET LOCAL` and `PREPARE` are session-scoped and gone
   when the connection closes. The optional `hnsw.ef_search` check only runs if the `vector`
   extension is already installed; it never creates it.
-- **This repo:** `result-*.json` is gitignored. `RESULT.md` is committed and must stay
-  redacted — the probe's own output already replaces the hostname with a fingerprint, in error
-  strings too.
+- **This repo:** `result-*.json` (including `result-calibration-receipt.json`) is gitignored.
+  `RESULT.md` is committed and must stay redacted — the probe's own output already replaces the
+  Neon hostname with a fingerprint, in error strings too, and the probe endpoint's own host is
+  fingerprinted the same way because a `*.workers.dev` subdomain identifies the account. A
+  credential shorter than three characters cannot be pattern-redacted without shredding the
+  report; the run says so out loud in its notes rather than emitting it silently.
 
 ---
 
@@ -282,10 +400,19 @@ reasons that have nothing to do with the question.
 - **Nothing credential-shaped is ever emitted.** The connection string, role, password and
   hostname are replaced before any string enters the report — including inside error messages,
   which is where an endpoint id would otherwise leak into a public repo via `RESULT.md`.
-- **Every wait is bounded.** Filtered egress usually presents as a silent SYN drop, not a
-  refusal, so an unbounded probe would hang and report nothing — which reads, to whoever ran
-  it, exactly like a failure.
-- **Fail closed.** No `PROBE_AUTH_TOKEN`, no service.
+- **Every wait is bounded**, including the DNS lookup. Filtered egress usually presents as a
+  silent SYN drop, not a refusal, so an unbounded probe would hang and report nothing — which
+  reads, to whoever ran it, exactly like a failure. The whole-run ceiling inside the container
+  is derived from the stage deadline rather than fixed, so raising `--timeout` cannot turn a
+  fully-blocked run into a 504 with no report at all.
+- **Fail closed, in both directions.** No `PROBE_AUTH_TOKEN`, no service. No corroborated
+  origin, no verdict. No demonstrated null result, no pass.
+- **Cloudflare's egress CA is trusted, not merely noticed.** When
+  `/etc/cloudflare/certs/cloudflare-containers-ca.crt` exists, the image's entrypoint exports
+  `NODE_EXTRA_CA_CERTS` for it. Detecting interception and then failing every HTTPS candidate on
+  certificate validation would report a misconfiguration as a platform denial. The report
+  records both `cloudflare_egress_ca_present` and whether it took effect
+  (`extra_ca_configured`).
 
 ---
 
@@ -294,6 +421,7 @@ reasons that have nothing to do with the question.
 | File | What |
 |---|---|
 | `probe.ts` | The driver. `bun run probe:container-tcp` (verdict) or `-- --local` (calibration). |
+| `driver-gate.ts` | What the driver establishes for itself: endpoint shape, Cloudflare's `cf-ray`, report validation, the calibration receipt. May downgrade a verdict, never upgrade one. |
 | `worker.ts` | The Worker + container Durable Object. Authenticates, injects the DSN, forwards to the container. Opens no connection itself. |
 | `wrangler.toml` | Throwaway deployment config. Separate Worker from the fleet. |
 | `Dockerfile` / `.dockerignore` | The throwaway image. No dependency install step. |
@@ -303,7 +431,7 @@ reasons that have nothing to do with the question.
 | `container/pg-wire.ts` | The Postgres v3 protocol, transport-agnostic. |
 | `container/scram.ts` | SCRAM-SHA-256 with server-signature verification. |
 | `container/battery.ts` | The session-semantics battery, run identically on all three channels. |
-| `container/report.ts` | Report types, the redactor, and the verdict rule. |
+| `container/report.ts` | Report types, the redactor, the attestation shape, and the verdict rule. |
 | `RESULT.md` | The durable answer. Fill it in; it is committed. |
 
 ## Sources

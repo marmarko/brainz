@@ -179,6 +179,24 @@ export interface PgConnectParams {
 }
 
 /**
+ * What actually happened during authentication, recorded as facts rather than
+ * asserted in a stage's prose.
+ *
+ * The report used to claim "SCRAM-SHA-256 completed AND the server signature
+ * verified" on a stage whose only recorded detail was the server version. A
+ * sentence a human copies into a public result file must be checkable from the
+ * report, so these three fields exist and the verdict reads them.
+ */
+export interface AuthFacts {
+  /** `scram-sha-256`, or `none` when the server asked for no authentication. */
+  method: 'scram-sha-256' | 'none' | null;
+  /** A SASL exchange was started by the server. */
+  saslStarted: boolean;
+  /** SASLFinal arrived and its `v=` signature matched what we computed. */
+  serverSignatureVerified: boolean;
+}
+
+/**
  * One Postgres session over one byte channel.
  *
  * Messages are pulled, not pushed: `next()` awaits the next backend message
@@ -197,6 +215,16 @@ export class PgSession implements SqlChannel {
   /** Server-sent settings (server_version, ...) — useful evidence in the report. */
   readonly parameters = new Map<string, string>();
   private backendPid: number | null = null;
+  /**
+   * Deadline for every backend message during `query`. Set from the run's
+   * stage timeout so a cold Neon compute does not read as a protocol failure.
+   */
+  queryTimeoutMs = 15_000;
+  private readonly authFacts: AuthFacts = {
+    method: null,
+    saslStarted: false,
+    serverSignatureVerified: false,
+  };
 
   constructor(private readonly transport: WireTransport) {
     this.name = transport.name;
@@ -206,6 +234,11 @@ export class PgSession implements SqlChannel {
 
   get pid(): number | null {
     return this.backendPid;
+  }
+
+  /** Read-only view of what authentication actually did. */
+  get auth(): Readonly<AuthFacts> {
+    return this.authFacts;
   }
 
   private fail(error: Error): void {
@@ -273,6 +306,12 @@ export class PgSession implements SqlChannel {
    * Only SCRAM-SHA-256 and "no authentication" are accepted. Cleartext and MD5
    * are refused loudly rather than implemented: Neon uses SCRAM, so being asked
    * for either is itself a finding worth reading in the report.
+   *
+   * AuthenticationOk is NOT accepted once a SASL exchange has begun without a
+   * verified SASLFinal. SASLFinal carries the one message an intermediary that
+   * cannot complete SCRAM is unable to forge; skipping straight to `R(0)` is
+   * exactly how such a peer would look, and accepting it would let the probe
+   * certify a session whose far end was never authenticated to us.
    */
   async authenticate(params: PgConnectParams, timeoutMs: number): Promise<void> {
     this.transport.write(
@@ -294,7 +333,17 @@ export class PgSession implements SqlChannel {
         case 'R': {
           const view = new DataView(message.body.buffer, message.body.byteOffset, message.body.byteLength);
           const subtype = view.getInt32(0, false);
-          if (subtype === 0) break; // AuthenticationOk
+          if (subtype === 0) {
+            // AuthenticationOk.
+            if (this.authFacts.saslStarted && !this.authFacts.serverSignatureVerified) {
+              throw new ScramError(
+                'the server answered AuthenticationOk in the middle of a SASL exchange, without ' +
+                  'a SASLFinal this client could verify — refusing to treat the peer as authenticated',
+              );
+            }
+            this.authFacts.method ??= 'none';
+            break;
+          }
           if (subtype === 10) {
             const mechanisms: string[] = [];
             let offset = 4;
@@ -306,6 +355,8 @@ export class PgSession implements SqlChannel {
             if (!mechanisms.includes('SCRAM-SHA-256')) {
               throw new ScramError(`server offered only: ${mechanisms.join(', ')}`);
             }
+            this.authFacts.saslStarted = true;
+            this.authFacts.method = 'scram-sha-256';
             const payload = encoder.encode(scram.clientFirst);
             this.transport.write(
               frame('p', concat([cstring('SCRAM-SHA-256'), int32(payload.length), payload])),
@@ -329,6 +380,7 @@ export class PgSession implements SqlChannel {
               // not hold this role's stored key.
               throw new ScramError('server signature did not verify — the peer is not this Postgres');
             }
+            this.authFacts.serverSignatureVerified = true;
             break;
           }
           throw new PgProtocolError(
@@ -360,7 +412,7 @@ export class PgSession implements SqlChannel {
     }
   }
 
-  async query(sql: string, timeoutMs = 15_000): Promise<QueryResult> {
+  async query(sql: string, timeoutMs = this.queryTimeoutMs): Promise<QueryResult> {
     this.transport.write(frame('Q', cstring(sql)));
     const result: QueryResult = { fields: [], rows: [], commandTags: [], notices: [] };
     let failure: PgProtocolError | null = null;

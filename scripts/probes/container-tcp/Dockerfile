@@ -41,4 +41,14 @@ USER bun
 
 EXPOSE 8080
 
-CMD ["bun", "run", "container/server.ts"]
+# Cloudflare mounts its egress-interception CA at container start when outbound
+# HTTPS interception is active. The probe used to merely RECORD that the file
+# existed, which meant an intercepted container failed every HTTPS candidate
+# (the generic control, the WebSocket, the one-shot HTTP control) on
+# certificate validation and reported it as platform denial with no way out.
+# Trusting it here is the remedy; the report still records both the CA's
+# presence and whether this took effect (`extra_ca_configured`).
+#
+# It has to happen in the entrypoint rather than as an `ENV`: the file is
+# mounted at start, and a value pointing at a missing file is worse than none.
+CMD ["sh", "-c", "CA=/etc/cloudflare/certs/cloudflare-containers-ca.crt; if [ -r \"$CA\" ]; then export NODE_EXTRA_CA_CERTS=\"$CA\"; fi; exec bun run container/server.ts"]

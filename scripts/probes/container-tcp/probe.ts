@@ -10,29 +10,42 @@
  *             project. Run it FIRST. Without it, a container failure is
  *             ambiguous between "Cloudflare blocks this" and "the probe is
  *             broken", and that ambiguity is exactly what would push the plan
- *             onto an expensive no-branch it did not need.
+ *             onto an expensive no-branch it did not need. A calibration run
+ *             always exits 50 and its verdict is always CALIBRATION_ONLY — it
+ *             can never be mistaken for the answer by a script or by a reader.
  *
  *   (default) VERDICT. Calls the deployed Worker, which runs the probe inside a
  *             deployed Cloudflare Container. This is the only run that settles
- *             Assumption 4.
+ *             Assumption 4 — and only if this driver can independently see that
+ *             Cloudflare served the response.  See `gateReport` in driver-gate.ts: the
+ *             container's own `origin: 'container'` is a claim, not evidence.
  *
  * Exit codes are meaningful, so this can be scripted:
  *   0  (a) raw TCP works                     10 (b) WebSocket only
  *   20 (c) both blocked                      30 inconclusive — do not branch
- *   40 the probe could not run at all
+ *   40 the probe could not run at all        50 calibration only — never a verdict
  */
 
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { runProbe } from './container/run.ts';
 import type { ProbeReport, StageResult } from './container/report.ts';
+import {
+  classifyEndpoint,
+  gateReport,
+  parseReport,
+  writeReceipt,
+  type EndpointEvidence,
+} from './driver-gate.ts';
 
 const HERE = fileURLToPath(new URL('.', import.meta.url).href);
+const RECEIPT_PATH = `${HERE}result-calibration-receipt.json`;
 
 interface Cli {
   local: boolean;
   jsonOnly: boolean;
   allowPooler: boolean;
+  allowNonStandardPort: boolean;
   tlsInsecure: boolean;
   stageTimeoutMs: number;
   outPath: string | null;
@@ -43,14 +56,16 @@ function parseCli(argv: readonly string[]): Cli {
     local: false,
     jsonOnly: false,
     allowPooler: process.env['PROBE_ALLOW_POOLER'] === '1',
+    allowNonStandardPort: process.env['PROBE_ALLOW_NONSTANDARD_PORT'] === '1',
     tlsInsecure: process.env['PROBE_TLS_INSECURE'] === '1',
-    stageTimeoutMs: 8_000,
+    stageTimeoutMs: 15_000,
     outPath: null,
   };
   for (const arg of argv) {
     if (arg === '--local') cli.local = true;
     else if (arg === '--json') cli.jsonOnly = true;
     else if (arg === '--allow-pooler') cli.allowPooler = true;
+    else if (arg === '--allow-nonstandard-port') cli.allowNonStandardPort = true;
     else if (arg === '--tls-insecure') cli.tlsInsecure = true;
     else if (arg.startsWith('--timeout=')) {
       const value = Number.parseInt(arg.slice('--timeout='.length), 10);
@@ -79,13 +94,18 @@ Environment
     PROBE_AUTH_TOKEN     the same random string given to \`wrangler secret put\`
 
 Optional
-  PROBE_ALLOW_POOLER=1   run against a -pooler endpoint anyway (the result will be wrong)
-  PROBE_TLS_INSECURE=1   skip TLS certificate verification (corporate MITM proxies)
+  PROBE_ALLOW_POOLER=1            run against a -pooler endpoint anyway (the result will be wrong)
+  PROBE_ALLOW_NONSTANDARD_PORT=1  run against a DSN whose port is not 5432
+  PROBE_TLS_INSECURE=1            skip TLS certificate verification, --local only (MITM proxies)
 
 Flags
   --json                 print the report JSON only
-  --timeout=<ms>         per-stage deadline (default 8000)
+  --timeout=<ms>         per-stage deadline (default 15000, clamped to 1000..60000)
   --out=<path>           where to write the result JSON
+
+Exit codes
+  0  (a) raw TCP works       10 (b) WebSocket only        20 (c) both blocked
+  30 inconclusive            40 could not run at all      50 calibration (--local)
 `;
 
 function fail(message: string): never {
@@ -96,24 +116,36 @@ function fail(message: string): never {
   throw new Error(message);
 }
 
-async function fetchRemoteReport(cli: Cli): Promise<ProbeReport> {
+/* ------------------------------------------------------------------------- */
+/* The remote call                                                            */
+/* ------------------------------------------------------------------------- */
+
+async function fetchRemoteReport(cli: Cli): Promise<{ report: ProbeReport; evidence: EndpointEvidence }> {
   const base = process.env['PROBE_URL'];
   const token = process.env['PROBE_AUTH_TOKEN'];
   if (!base) fail('PROBE_URL is not set. Deploy the Worker first — see the README.');
   if (!token) fail('PROBE_AUTH_TOKEN is not set. Use the same value you gave `wrangler secret put`.');
 
   const url = new URL('/probe', base).toString();
+  // The container's own ceiling is derived from the stage timeout; this one has
+  // to sit above it, or a legitimately slow run is reported to the operator as
+  // an unreachable endpoint.
+  const clientTimeoutMs = Math.max(180_000, cli.stageTimeoutMs * 12 + 60_000);
   let response: Response;
   try {
     response = await fetch(url, {
       method: 'POST',
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ allowPooler: cli.allowPooler, stageTimeoutMs: cli.stageTimeoutMs }),
-      signal: AbortSignal.timeout(180_000),
+      body: JSON.stringify({
+        allowPooler: cli.allowPooler,
+        allowNonStandardPort: cli.allowNonStandardPort,
+        stageTimeoutMs: cli.stageTimeoutMs,
+      }),
+      signal: AbortSignal.timeout(clientTimeoutMs),
     });
   } catch (error) {
     fail(
-      `could not reach ${new URL(base).origin} — ${error instanceof Error ? error.message : String(error)}\n` +
+      `could not reach the probe endpoint — ${error instanceof Error ? error.message : String(error)}\n` +
         '  A cold container can take a while on the first call after a deploy. Retry once.',
     );
   }
@@ -122,11 +154,16 @@ async function fetchRemoteReport(cli: Cli): Promise<ProbeReport> {
   if (!response.ok) {
     fail(`the Worker answered HTTP ${response.status}:\n${text.slice(0, 1200)}`);
   }
-  try {
-    return JSON.parse(text) as ProbeReport;
-  } catch {
-    return fail(`the Worker did not return a report:\n${text.slice(0, 1200)}`);
+  const parsed = parseReport(text);
+  if (!parsed.ok) {
+    fail(
+      'the response was not a container-tcp report:\n  - ' +
+        parsed.problems.join('\n  - ') +
+        '\n  If an older image is deployed, redeploy it: ' +
+        '`bunx wrangler deploy -c scripts/probes/container-tcp/wrangler.toml`.',
+    );
   }
+  return { report: parsed.report, evidence: classifyEndpoint(base, response.headers) };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -138,6 +175,12 @@ const MARK: Record<StageResult['status'], string> = {
   failed: '  FAIL',
   skipped: '  skip',
   expected_failure: '  FAIL(expected)',
+};
+
+const CONTROL_MEANING: Record<ProbeReport['negativeControl'], string> = {
+  discriminated: 'PASS — it authenticated and then failed every session assertion, as it must',
+  absent: 'DID NOT RUN — the battery was never shown to be capable of failing',
+  suspect: 'SUSPECT — a channel with no session kept session semantics; the battery is in doubt',
 };
 
 function wrap(text: string, indent: string, width = 96): string {
@@ -158,16 +201,35 @@ function wrap(text: string, indent: string, width = 96): string {
 
 function render(report: ProbeReport): string {
   const out: string[] = [];
+  const attestation = report.attestation;
   out.push('');
   out.push('='.repeat(100));
   out.push('  ASSUMPTION 4 PROBE — raw outbound TCP from a Cloudflare Container to Neon');
   out.push('='.repeat(100));
   out.push('');
-  out.push(`  origin              ${report.origin}${report.origin === 'local' ? '  (calibration — NOT a verdict)' : ''}`);
-  out.push(`  cloudflare colo     ${report.environment['cloudflare_colo'] ?? '(none)'}`);
+  out.push(`  origin (claimed)    ${report.origin}${report.origin === 'local' ? '  (calibration — NOT a verdict)' : ''}`);
+  out.push(
+    `  origin corroborated ${String(attestation.originCorroborated)}${attestation.originCorroborated ? '' : '   <-- nothing below is a statement about Cloudflare'}`,
+  );
+  if (attestation.missing.length > 0) {
+    for (const item of attestation.missing) out.push(wrap(`missing: ${item}`, ' '.repeat(22)));
+  }
+  out.push(`  cloudflare colo     ${attestation.cloudflareColo ?? '(none)'}`);
+  out.push(`  worker saw cf/ray   cf=${String(attestation.workerSawCfObject)} ray_colo=${attestation.workerRayColo ?? '(none)'}`);
+  out.push(`  cf container env    ${attestation.containerEnvMarkers.length > 0 ? attestation.containerEnvMarkers.join(' ') : '(none)'}`);
+  if (report.driver !== null) {
+    const d = report.driver;
+    out.push(
+      `  driver saw          scheme=${d.endpointScheme} host=${d.endpointHostShape} cf-ray=${String(d.cfRayPresent)}${d.cfRayColo === null ? '' : ` (${d.cfRayColo})`}`,
+    );
+    out.push(`  container verdict   ${d.containerVerdict ?? '(none)'}`);
+  }
   out.push(`  runtime             bun ${String(report.environment['bun_version'])} on ${String(report.environment['platform'])}/${String(report.environment['arch'])}`);
-  out.push(`  egress CA present   ${String(report.environment['cloudflare_egress_ca_present'])}`);
+  out.push(
+    `  egress CA           present=${String(attestation.cloudflareEgressCaPresent)} trusted=${String(attestation.extraCaConfigured)}`,
+  );
   out.push(`  target              ${report.target.hostFingerprint} (*.${report.target.hostSuffix}) port ${report.target.port}`);
+  out.push(`  stage timeout       ${String(report.environment['stage_timeout_ms'])} ms`);
   out.push(`  elapsed             ${report.totalMs} ms`);
   out.push('');
   out.push('-'.repeat(100));
@@ -186,21 +248,26 @@ function render(report: ProbeReport): string {
   out.push('-'.repeat(100));
   out.push('  TRANSPORTS');
   out.push('-'.repeat(100));
-  const rows: [string, string][] = [
-    ['(a) raw TCP :5432       ', 'rawTcp5432'],
+  const rows: [string, keyof ProbeReport['transports']][] = [
+    [`(a) raw TCP :${report.target.port}`.padEnd(24), 'rawTcpPostgresPort'],
     ['(b) postgres over wss   ', 'webSocket443'],
     ['    one-shot HTTP (ctrl)', 'httpOneShot443'],
   ];
-  out.push(`${' '.repeat(28)}channel   authenticated   session semantics`);
+  out.push(`${' '.repeat(28)}channel   authenticated   peer verified   session semantics`);
   for (const [label, key] of rows) {
-    const t = report.transports[key as keyof ProbeReport['transports']];
+    const t = report.transports[key];
     out.push(
-      `  ${label}    ${String(t.channelOpen).padEnd(10)}${String(t.authenticated).padEnd(16)}${String(t.sessionSemantics)}`,
+      `  ${label}    ${String(t.channelOpen).padEnd(10)}${String(t.authenticated).padEnd(16)}${String(t.peerVerified).padEnd(16)}${String(t.sessionSemantics)}`,
     );
   }
   out.push('');
+  out.push(`  negative control    ${CONTROL_MEANING[report.negativeControl]}`);
+  out.push('');
   out.push('='.repeat(100));
-  out.push(`  VERDICT: ${report.verdictMeaning.label}`);
+  out.push(`  VERDICT: ${report.verdict} — ${report.verdictMeaning.label}`);
+  if (report.wouldBeVerdict !== null) {
+    out.push(`  (on the same evidence, a container run would have reported ${report.wouldBeVerdict})`);
+  }
   out.push('='.repeat(100));
   out.push('');
   out.push('  Assumption 4');
@@ -231,12 +298,19 @@ if (cli.local) {
     dsn,
     origin: 'local',
     colo: null,
+    workerSawCfObject: false,
+    workerRayColo: null,
     allowPooler: cli.allowPooler,
+    allowNonStandardPort: cli.allowNonStandardPort,
     tlsInsecure: cli.tlsInsecure,
     stageTimeoutMs: cli.stageTimeoutMs,
   });
+  // The receipt records what this probe's own WebSocket client did, so a later
+  // container run that wants to claim (c) has something to check itself against.
+  writeReceipt(report, RECEIPT_PATH);
 } else {
-  report = await fetchRemoteReport(cli);
+  const remote = await fetchRemoteReport(cli);
+  report = gateReport(remote.report, remote.evidence, RECEIPT_PATH);
 }
 
 if (cli.jsonOnly) {
@@ -250,6 +324,10 @@ if (cli.jsonOnly) {
 const stamp = report.startedAt.replace(/[:.]/g, '-');
 const outPath = cli.outPath ?? `${HERE}result-${report.origin}-${stamp}.json`;
 writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
-if (!cli.jsonOnly) process.stdout.write(`  raw report written to ${outPath}\n\n`);
+if (!cli.jsonOnly) {
+  process.stdout.write(`  raw report written to ${outPath}\n`);
+  if (cli.local) process.stdout.write(`  calibration receipt written to ${RECEIPT_PATH}\n`);
+  process.stdout.write('\n');
+}
 
 process.exit(report.verdictMeaning.exitCode);

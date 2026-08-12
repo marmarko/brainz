@@ -17,19 +17,40 @@ import { runProbe, type RunOptions } from './run.ts';
 const PORT = Number.parseInt(process.env['PORT'] ?? '8080', 10);
 
 /**
+ * 15s, not 8s. The README's own sequence guarantees a COLD Neon compute on the
+ * verdict run — calibrate (which wakes it), then `wrangler deploy` (minutes
+ * under amd64 emulation on Apple Silicon), then run — and a wake that pushes
+ * one backend-message wait past the deadline used to fail `tcp.authenticate`
+ * and report a spurious inconclusive on a working platform.
+ */
+const DEFAULT_STAGE_TIMEOUT_MS = 15_000;
+const MIN_STAGE_TIMEOUT_MS = 1_000;
+const MAX_STAGE_TIMEOUT_MS = 60_000;
+
+/**
  * Backstop only. Every network stage carries its own deadline, so this should
  * never fire; it is here because a hang would otherwise surface as a Cloudflare
  * 5xx with no report at all, which reads like a failed probe rather than a
  * failed request.
+ *
+ * DERIVED from the stage timeout rather than fixed: a fully-blocked egress path
+ * spends its whole run in sequential timeouts (DNS, HTTPS, reachability, the
+ * TCP transport, the 443 control, the WebSocket, the HTTP control), so a fixed
+ * ceiling with a raised stage timeout would cut off the run and return a 504
+ * with NO report — losing INCONCLUSIVE_NO_BASELINE_EGRESS exactly when it is
+ * the answer.
  */
-const OVERALL_DEADLINE_MS = 90_000;
-const DEFAULT_STAGE_TIMEOUT_MS = 8_000;
+function overallDeadlineMs(stageTimeoutMs: number): number {
+  return Math.min(300_000, Math.max(90_000, stageTimeoutMs * 10));
+}
 
 interface ProbeRequestBody {
   dsn?: unknown;
   colo?: unknown;
+  workerSawCfObject?: unknown;
+  workerRayColo?: unknown;
   allowPooler?: unknown;
-  tlsInsecure?: unknown;
+  allowNonStandardPort?: unknown;
   stageTimeoutMs?: unknown;
 }
 
@@ -37,6 +58,11 @@ function bool(value: unknown, fallback: boolean): boolean {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'string') return value === '1' || value.toLowerCase() === 'true';
   return fallback;
+}
+
+function clampTimeout(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return DEFAULT_STAGE_TIMEOUT_MS;
+  return Math.min(MAX_STAGE_TIMEOUT_MS, Math.max(MIN_STAGE_TIMEOUT_MS, Math.round(value)));
 }
 
 function json(body: unknown, status: number): Response {
@@ -68,26 +94,36 @@ async function handleProbe(request: Request): Promise<Response> {
     );
   }
 
+  const stageTimeoutMs = clampTimeout(body.stageTimeoutMs);
   const options: RunOptions = {
     dsn,
+    // A CLAIM, not evidence — `container/run.ts:attest` is what decides whether
+    // it is corroborated, from the three fields below plus the driver's own
+    // observation of a `cf-ray` on the response.
     origin: 'container',
-    colo: typeof body.colo === 'string' ? body.colo : null,
+    colo: typeof body.colo === 'string' && body.colo !== '' ? body.colo : null,
+    workerSawCfObject: bool(body.workerSawCfObject, false),
+    workerRayColo: typeof body.workerRayColo === 'string' && body.workerRayColo !== '' ? body.workerRayColo : null,
     allowPooler: bool(body.allowPooler, process.env['PROBE_ALLOW_POOLER'] === '1'),
-    tlsInsecure: bool(body.tlsInsecure, process.env['PROBE_TLS_INSECURE'] === '1'),
-    stageTimeoutMs:
-      typeof body.stageTimeoutMs === 'number' && body.stageTimeoutMs > 0
-        ? body.stageTimeoutMs
-        : DEFAULT_STAGE_TIMEOUT_MS,
+    allowNonStandardPort: bool(body.allowNonStandardPort, process.env['PROBE_ALLOW_NONSTANDARD_PORT'] === '1'),
+    // Deliberately NOT accepted from the request body. The driver documents
+    // `--tls-insecure` as a laptop-only escape hatch for a corporate MITM
+    // proxy; honouring it over the wire would let a caller disable the
+    // certificate check on the one run that settles the question.
+    tlsInsecure: process.env['PROBE_TLS_INSECURE'] === '1',
+    stageTimeoutMs,
   };
 
-  const deadline = new Promise<null>((resolve) => setTimeout(() => resolve(null), OVERALL_DEADLINE_MS));
+  const ceiling = overallDeadlineMs(stageTimeoutMs);
+  const deadline = new Promise<null>((resolve) => setTimeout(() => resolve(null), ceiling));
   const report = await Promise.race([runProbe(options), deadline]);
   if (report === null) {
     return json(
       {
         error: 'deadline_exceeded',
-        detail: `the probe did not finish within ${OVERALL_DEADLINE_MS}ms; every stage is ` +
-          'individually bounded, so this indicates a bug in the probe rather than a network result',
+        detail: `the probe did not finish within ${ceiling}ms (stage timeout ${stageTimeoutMs}ms); ` +
+          'every stage is individually bounded, so this indicates a bug in the probe rather than ' +
+          'a network result. Nothing here is a statement about Cloudflare egress.',
       },
       504,
     );
@@ -105,7 +141,10 @@ Bun.serve({
     return new Response(
       'brainz Assumption 4 probe container.\n' +
         '  GET  /health\n' +
-        '  POST /probe   {"dsn": "postgresql://...", "colo": "..."}\n',
+        '  POST /probe   {"dsn", "colo", "workerSawCfObject", "workerRayColo",\n' +
+        '                 "allowPooler", "allowNonStandardPort", "stageTimeoutMs"}\n' +
+        '                 — normally posted by the Worker, which is the only thing\n' +
+        '                   that can observe the Cloudflare attestation fields.\n',
       { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } },
     );
   },

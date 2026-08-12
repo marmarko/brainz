@@ -100,7 +100,7 @@ export async function probeReachability(
   };
 
   try {
-    const resolved = await lookup(host);
+    const resolved = await boundedLookup(host, timeoutMs);
     result.dnsOk = true;
     result.addressFamily = resolved.family;
   } catch (error) {
@@ -134,6 +134,28 @@ export async function probeReachability(
     socket.destroy();
   }
   return result;
+}
+
+/**
+ * `dns.lookup` carries no deadline of its own — it is bounded only by the
+ * resolver's own retry policy, which on a container with filtered egress can be
+ * tens of seconds. Every other wait in this probe is bounded; an unbounded one
+ * here would burn the whole-run deadline and return no report at all, which
+ * reads to whoever ran it exactly like a failure.
+ */
+async function boundedLookup(host: string, timeoutMs: number): Promise<{ family: number }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => reject(new TransportError(`DNS lookup timed out after ${timeoutMs}ms`, 'ETIMEDOUT', 'dns')),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([lookup(host), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function connectTcp(host: string, port: number, timeoutMs: number): Promise<Socket> {

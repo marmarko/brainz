@@ -10,6 +10,16 @@
  * Nothing here throws to the caller. A probe that dies on an unexpected error
  * reports nothing, and reporting nothing is indistinguishable — to whoever runs
  * it — from reporting failure. Every stage captures its own outcome.
+ *
+ * NO STAGE GATES ANOTHER STAGE THAT COULD MEASURE THE SAME FACT
+ * ------------------------------------------------------------
+ * `probeReachability` used to gate the whole raw-TCP arm on a single-shot
+ * throwaway connection. One lost packet on that connection suppressed the real
+ * transport — which opens its own socket and redoes the same check — and the
+ * run then reported a decisive "raw TCP is blocked" over a port that had just
+ * completed a handshake. Reachability is now diagnostic only: the real
+ * transport is ALWAYS attempted, and any completed handshake to the Postgres
+ * port forbids the verdicts that claim raw TCP did not work.
  */
 
 import { existsSync } from 'node:fs';
@@ -21,13 +31,18 @@ import {
   hostFingerprint,
   hostSuffix,
   makeRedactor,
+  materializeMeaning,
   summarizeNotes,
+  unmaskableSecretCount,
   VERDICTS,
   type DetailValue,
+  type NegativeControlState,
+  type OriginAttestation,
   type ProbeReport,
   type Redactor,
   type StageResult,
   type TransportSummary,
+  type Verdict,
   type VerdictInputs,
 } from './report.ts';
 import {
@@ -36,16 +51,23 @@ import {
   openWebSocketTransport,
   probeGenericHttps,
   probeReachability,
+  TransportError,
 } from './transports.ts';
 
 export interface RunOptions {
   dsn: string;
-  /** `container` is the only origin that settles anything. See ProbeReport. */
+  /** `container` is a CLAIM, not evidence. See `attestation` on the report. */
   origin: 'container' | 'local';
-  /** Cloudflare colo, stamped by the Worker. Null on a laptop run. */
+  /** Cloudflare colo, stamped by the Worker from `request.cf`. Null on a laptop. */
   colo: string | null;
+  /** Did the Worker see a Cloudflare `cf` object at all? Absent under `wrangler dev`. */
+  workerSawCfObject: boolean;
+  /** Colo suffix of the incoming `cf-ray`, as the Worker saw it. Names only, never the id. */
+  workerRayColo: string | null;
   /** Escape hatch for a `-pooler` DSN. Off by default — see battery.ts. */
   allowPooler: boolean;
+  /** Escape hatch for a DSN whose port is not 5432. Off by default — see below. */
+  allowNonStandardPort: boolean;
   /** Escape hatch for a corporate TLS-intercepting proxy on the laptop run. */
   tlsInsecure: boolean;
   stageTimeoutMs: number;
@@ -53,9 +75,15 @@ export interface RunOptions {
 
 const APPLICATION_NAME = 'brainz-assumption4-probe';
 
+/** The port Assumption 4 is literally about. */
+const POSTGRES_PORT = 5432;
+
+const CLOUDFLARE_EGRESS_CA = '/etc/cloudflare/certs/cloudflare-containers-ca.crt';
+
 const EMPTY_TRANSPORT: TransportSummary = {
   channelOpen: false,
   authenticated: false,
+  peerVerified: false,
   sessionSemantics: false,
 };
 
@@ -91,7 +119,7 @@ function parseDsn(dsn: string): ParsedDsn {
 
   return {
     host,
-    port: url.port ? Number.parseInt(url.port, 10) : 5432,
+    port: url.port ? Number.parseInt(url.port, 10) : POSTGRES_PORT,
     user,
     password,
     database,
@@ -100,24 +128,86 @@ function parseDsn(dsn: string): ParsedDsn {
   };
 }
 
+/**
+ * Evidence about where this run happened, gathered inside the container.
+ *
+ * The gate is deliberately positive: a container run must SHOW that Cloudflare
+ * handled the request, rather than being believed because it said so. The
+ * driver adds its own independent half (`cf-ray` on the response it received);
+ * this half alone is necessary, not sufficient.
+ */
+function attest(options: RunOptions): OriginAttestation {
+  const containerEnvMarkers = Object.keys(process.env)
+    .filter((key) => key.startsWith('CLOUDFLARE_'))
+    .sort();
+  const missing: string[] = [];
+  if (options.origin === 'container') {
+    if (!options.workerSawCfObject) {
+      missing.push(
+        'worker_cf_object — the Worker saw no Cloudflare `cf` object on the incoming request, ' +
+          'which is what a plain `wrangler dev` looks like',
+      );
+    }
+    if (options.colo === null || options.colo === '') {
+      missing.push('cloudflare_colo — no colo was stamped on this run');
+    }
+    if (options.workerRayColo === null) {
+      missing.push(
+        'worker_cf_ray — the request that reached the Worker carried no `cf-ray` header, so it ' +
+          "did not arrive through Cloudflare's edge",
+      );
+    }
+  }
+  return {
+    claimedOrigin: options.origin,
+    workerSawCfObject: options.workerSawCfObject,
+    cloudflareColo: options.colo,
+    workerRayColo: options.workerRayColo,
+    containerEnvMarkers,
+    cloudflareEgressCaPresent: existsSync(CLOUDFLARE_EGRESS_CA),
+    extraCaConfigured: (process.env['NODE_EXTRA_CA_CERTS'] ?? '') !== '',
+    originCorroborated: options.origin === 'local' ? true : missing.length === 0,
+    missing,
+  };
+}
+
 export async function runProbe(options: RunOptions): Promise<ProbeReport> {
   const startedAt = new Date().toISOString();
   const runStarted = Date.now();
   const stages: StageResult[] = [];
   const notes: string[] = [];
+  const attestation = attest(options);
 
   const environment: Record<string, DetailValue> = {
-    origin: options.origin,
+    origin_claimed: options.origin,
+    origin_corroborated: attestation.originCorroborated,
     cloudflare_colo: options.colo,
+    cloudflare_env_markers: attestation.containerEnvMarkers.length,
     bun_version: typeof Bun === 'undefined' ? null : Bun.version,
     platform: platform(),
     arch: arch(),
     // Present only when Cloudflare's outbound HTTPS interception is active for
     // this container. Its presence changes how an HTTPS result should be read,
-    // so it is recorded whether or not it is set.
-    cloudflare_egress_ca_present: existsSync('/etc/cloudflare/certs/cloudflare-containers-ca.crt'),
+    // so it is recorded whether or not it is set — and the image's entrypoint
+    // trusts it, so a detected CA is remediated rather than merely observed.
+    cloudflare_egress_ca_present: attestation.cloudflareEgressCaPresent,
+    extra_ca_configured: attestation.extraCaConfigured,
     tls_verification: options.tlsInsecure ? 'DISABLED (--tls-insecure)' : 'enforced',
+    stage_timeout_ms: options.stageTimeoutMs,
   };
+
+  if (attestation.cloudflareEgressCaPresent && !attestation.extraCaConfigured) {
+    notes.push(
+      "Cloudflare's egress interception CA is mounted in this container but this process was " +
+        'not started with NODE_EXTRA_CA_CERTS pointing at it. Every HTTPS candidate (the ' +
+        'generic control, the WebSocket, the one-shot HTTP control) can then fail certificate ' +
+        'validation and read as a platform denial when it is a trust-store misconfiguration. ' +
+        'Rebuild the image: the entrypoint exports it when the file exists.',
+    );
+  }
+  if (!attestation.originCorroborated) {
+    notes.push(`Missing origin evidence: ${attestation.missing.join('; ')}.`);
+  }
 
   /* --- precondition: the connection string ------------------------------- */
 
@@ -136,22 +226,33 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
       detail: {},
       error: error instanceof Error ? error.message : 'unparseable connection string',
     });
-    return finish(startedAt, runStarted, options, stages, notes, environment, {
+    return finish(startedAt, runStarted, options, attestation, stages, notes, environment, {
       hostFingerprint: 'unknown',
       hostSuffix: 'unknown',
       port: 0,
       isPoolerEndpoint: false,
     }, {
       precondition: { ok: false },
-      rawTcp5432: EMPTY_TRANSPORT,
+      originCorroborated: attestation.originCorroborated,
+      rawTcpPostgresPort: EMPTY_TRANSPORT,
+      rawTcpPortConnectOk: false,
       webSocket443: EMPTY_TRANSPORT,
       httpOneShot443: EMPTY_TRANSPORT,
+      negativeControl: 'absent',
       genericHttpsEgress: false,
       rawTcp443Reachable: false,
     });
   }
 
   const redact = makeRedactor([options.dsn, dsn.password, dsn.user], dsn.host);
+  const unmaskable = unmaskableSecretCount([dsn.password, dsn.user]);
+  if (unmaskable > 0) {
+    notes.push(
+      `${unmaskable} credential value(s) in this DSN are shorter than 3 characters and were NOT ` +
+        'pattern-redacted — substituting a one- or two-character needle would shred every error ' +
+        'string in the report. Read the output before pasting any of it into RESULT.md.',
+    );
+  }
   const isPooler = dsn.host.includes('-pooler.');
   const target = {
     hostFingerprint: hostFingerprint(dsn.host),
@@ -159,6 +260,17 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
     port: dsn.port,
     isPoolerEndpoint: isPooler,
   };
+  const emptyInputs = (): VerdictInputs => ({
+    precondition: { ok: false },
+    originCorroborated: attestation.originCorroborated,
+    rawTcpPostgresPort: EMPTY_TRANSPORT,
+    rawTcpPortConnectOk: false,
+    webSocket443: EMPTY_TRANSPORT,
+    httpOneShot443: EMPTY_TRANSPORT,
+    negativeControl: 'absent',
+    genericHttpsEgress: false,
+    rawTcp443Reachable: false,
+  });
 
   stages.push({
     id: 'precondition.dsn',
@@ -175,6 +287,39 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
         'preference; this probe negotiates plain SCRAM-SHA-256 on both transports on purpose, ' +
         'because the WebSocket transport has no Postgres-layer TLS channel to bind to and the ' +
         'two runs must be byte-identical above the transport to be comparable.',
+    );
+  }
+
+  /* --- precondition: the port Assumption 4 is about ----------------------- */
+
+  // Every port in this probe is DSN-derived, but the question is not: Assumption
+  // 4 asks about 5432 specifically, and a verdict computed over some other port
+  // would be a true statement about the wrong measurement. It also collapses the
+  // `control.tcp_443` arm if the DSN happens to name 443.
+  const portOk = dsn.port === POSTGRES_PORT || options.allowNonStandardPort;
+  stages.push({
+    id: 'precondition.postgres_port',
+    proves: `the DSN names port ${POSTGRES_PORT}, which is the port Assumption 4 is written about.`,
+    status: portOk ? 'ok' : 'failed',
+    ms: 0,
+    detail: { port: dsn.port, override_set: options.allowNonStandardPort },
+    error: portOk
+      ? null
+      : `This DSN names port ${dsn.port}, not ${POSTGRES_PORT}. Assumption 4 is a claim about raw ` +
+        `outbound TCP to ${POSTGRES_PORT}; certifying it from a run against another port would ` +
+        'be a true measurement of the wrong thing. Use the direct Neon endpoint on ' +
+        `${POSTGRES_PORT}, or set PROBE_ALLOW_NONSTANDARD_PORT=1 (or pass --allow-nonstandard-port) ` +
+        'if you are deliberately testing port filtering — every verdict string then names the ' +
+        'port actually dialled.',
+  });
+  if (!portOk) {
+    return finish(startedAt, runStarted, options, attestation, stages, notes, environment, target, emptyInputs());
+  }
+  if (dsn.port !== POSTGRES_PORT) {
+    notes.push(
+      `This run dialled port ${dsn.port}, NOT ${POSTGRES_PORT}. Every verdict below is a statement ` +
+        `about ${dsn.port}. Assumption 4 as written is about ${POSTGRES_PORT} and is not settled ` +
+        'by this run.',
     );
   }
 
@@ -198,14 +343,15 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
   });
 
   if (!poolerOk) {
-    return finish(startedAt, runStarted, options, stages, notes, environment, target, {
-      precondition: { ok: false },
-      rawTcp5432: EMPTY_TRANSPORT,
-      webSocket443: EMPTY_TRANSPORT,
-      httpOneShot443: EMPTY_TRANSPORT,
-      genericHttpsEgress: false,
-      rawTcp443Reachable: false,
-    });
+    return finish(startedAt, runStarted, options, attestation, stages, notes, environment, target, emptyInputs());
+  }
+  if (isPooler && options.allowPooler) {
+    notes.push(
+      'PROBE_ALLOW_POOLER is set and this IS a pooler endpoint. PgBouncer can route PREPARE and ' +
+        'EXECUTE to the same backend when it holds a single idle server connection, so a PASSING ' +
+        'session battery here is not evidence of session semantics — only of egress. Do not read ' +
+        'the (a)/(b) distinction off this run.',
+    );
   }
 
   /* --- control: generic HTTPS egress ------------------------------------- */
@@ -221,14 +367,14 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
     error: https.failure ? redact(`${https.failure.code}: ${https.failure.message}`) : null,
   });
 
-  /* --- candidate (a): raw TCP on 5432 ------------------------------------ */
+  /* --- candidate (a): raw TCP on the Postgres port ------------------------ */
 
   const reachStarted = Date.now();
   const reach = await probeReachability(dsn.host, dsn.port, options.stageTimeoutMs, true);
   const postgresAnswered = reach.tcpConnectOk && reach.sslNegotiationReply === 'S';
   stages.push({
     id: 'tcp.reachability',
-    proves: `a raw outbound TCP socket to port ${dsn.port} opens AND a real Postgres answers the SSL negotiation. This is the pure egress question Assumption 4 asks.`,
+    proves: `DIAGNOSTIC ONLY (it gates nothing): a raw outbound TCP socket to port ${dsn.port} opens AND a real Postgres answers the SSL negotiation. The transport below opens its own socket regardless of what this stage found.`,
     status: postgresAnswered ? 'ok' : 'failed',
     ms: Date.now() - reachStarted,
     detail: {
@@ -250,54 +396,75 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
   if (reach.tcpConnectOk && reach.sslNegotiationReply !== 'S') {
     notes.push(
       'A TCP connection to the Postgres port was ACCEPTED but nothing answered the Postgres SSL ' +
-        'negotiation. That reads as interception or black-holing rather than a clean block, and ' +
-        'is worth raising with Cloudflare before accepting any no-branch.',
+        'negotiation on that connection. That reads as interception or black-holing rather than ' +
+        'a clean block, and is worth raising with Cloudflare before accepting any no-branch.',
     );
   }
 
-  let tcpSummary: TransportSummary = { ...EMPTY_TRANSPORT, channelOpen: postgresAnswered };
-  if (postgresAnswered) {
-    tcpSummary = await runOverTransport(
-      'tcp',
-      `raw TCP + STARTTLS on ${dsn.port}`,
-      stages,
-      redact,
-      async () => {
-        const opened = await openTcpTlsTransport(
-          dsn.host,
-          dsn.port,
-          options.stageTimeoutMs,
-          !options.tlsInsecure,
-        );
-        return {
-          transport: opened.transport,
-          detail: {
-            tcp_connect_ms: opened.tcpConnectMs,
-            tls_handshake_ms: opened.tlsHandshakeMs,
-            tls_protocol: opened.tlsProtocol,
-            tls_certificate_authorized: opened.tlsAuthorized,
-          },
-        };
-      },
-      dsn,
-      options.stageTimeoutMs,
-      true,
-    );
-    tcpSummary.channelOpen = true;
-  }
+  // Always attempted. `openTcpTlsTransport` redoes the connect and the
+  // SSLRequest check on its own socket, so gating it on the throwaway probe
+  // above would let one transient suppress the measurement that matters.
+  let tcpPortConnectOk = reach.tcpConnectOk;
+  const tcpSummary = await runOverTransport(
+    'tcp',
+    `raw TCP + STARTTLS on ${dsn.port}`,
+    stages,
+    redact,
+    async () => {
+      const opened = await openTcpTlsTransport(
+        dsn.host,
+        dsn.port,
+        options.stageTimeoutMs,
+        !options.tlsInsecure,
+      );
+      tcpPortConnectOk = true;
+      return {
+        transport: opened.transport,
+        detail: {
+          tcp_connect_ms: opened.tcpConnectMs,
+          tls_handshake_ms: opened.tlsHandshakeMs,
+          tls_protocol: opened.tlsProtocol,
+          tls_certificate_authorized: opened.tlsAuthorized,
+        },
+      };
+    },
+    (error) => {
+      // A failure AFTER the TCP handshake still proves the handshake happened.
+      // Recording that is what stops a TLS or SSLRequest problem being reported
+      // as "the platform blocks raw TCP".
+      if (error instanceof TransportError && error.phase !== 'dns' && error.phase !== 'tcp') {
+        tcpPortConnectOk = true;
+      }
+    },
+    dsn,
+    options.stageTimeoutMs,
+  );
 
   /* --- control: raw TCP on 443 ------------------------------------------- */
 
   const tcp443Started = Date.now();
-  const tcp443 = await probeReachability(dsn.host, 443, options.stageTimeoutMs, false);
+  const tcp443Independent = dsn.port !== 443;
+  const tcp443 = tcp443Independent
+    ? await probeReachability(dsn.host, 443, options.stageTimeoutMs, false)
+    : null;
   stages.push({
     id: 'control.tcp_443',
-    proves: 'whether ANY raw outbound TCP socket opens from this runtime. Separates "port 5432 is filtered" from "no raw sockets at all", which are different problems with different fallbacks.',
-    status: tcp443.tcpConnectOk ? 'ok' : 'failed',
+    proves: 'whether ANY raw outbound TCP socket opens from this runtime. Separates "the Postgres port is filtered" from "no raw sockets at all", which are different problems with different fallbacks.',
+    status: tcp443 === null ? 'skipped' : tcp443.tcpConnectOk ? 'ok' : 'failed',
     ms: Date.now() - tcp443Started,
-    detail: { tcp_connect: tcp443.tcpConnectOk, tcp_connect_ms: tcp443.tcpConnectMs },
-    error: tcp443.failure ? redact(`${tcp443.failure.code}: ${tcp443.failure.message}`) : null,
+    detail:
+      tcp443 === null
+        ? { reason: 'the DSN already names port 443, so this control would measure the candidate' }
+        : { tcp_connect: tcp443.tcpConnectOk, tcp_connect_ms: tcp443.tcpConnectMs },
+    error: tcp443?.failure ? redact(`${tcp443.failure.code}: ${tcp443.failure.message}`) : null,
   });
+  if (tcp443 === null) {
+    notes.push(
+      'The `control.tcp_443` arm was skipped: the DSN names port 443, so the control and the ' +
+        'candidate would be the same measurement. Port filtering cannot be distinguished from a ' +
+        'blanket socket ban on this run.',
+    );
+  }
 
   /* --- candidate (b): Postgres over a WebSocket on 443 -------------------- */
 
@@ -310,9 +477,9 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
       const opened = await openWebSocketTransport(dsn.host, options.stageTimeoutMs);
       return { transport: opened.transport, detail: { upgrade_ms: opened.upgradeMs, path: '/v2' } };
     },
+    null,
     dsn,
     options.stageTimeoutMs,
-    false,
   );
 
   /* --- negative control: the one-shot HTTP driver ------------------------- */
@@ -327,23 +494,40 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
   const httpSummary: TransportSummary = {
     channelOpen: httpBattery.authenticated,
     authenticated: httpBattery.authenticated,
+    // The one-shot endpoint authenticates inside Neon rather than over the wire
+    // from here, so it never carries evidence about the peer.
+    peerVerified: false,
     sessionSemantics: httpBattery.sessionSemantics,
   };
-  if (httpBattery.authenticated && !httpBattery.sessionSemantics) {
+  const negativeControl: NegativeControlState = httpBattery.sessionSemantics
+    ? 'suspect'
+    : httpBattery.authenticated
+      ? 'discriminated'
+      : 'absent';
+  if (negativeControl === 'discriminated') {
     notes.push(
       "The one-shot HTTP endpoint answered SELECT 1 and then failed the session battery, exactly " +
         'as it should. That is the control that proves the WebSocket transport above is a real ' +
         'session and not the HTTP function wearing a different name.',
     );
   }
+  if (negativeControl === 'absent') {
+    const why = httpBattery.stages.find((stage) => stage.id === 'http.select_1')?.error;
+    notes.push(
+      `The negative control could not run. Reason recorded by \`http.select_1\`: ${why ?? 'no error was captured'}.`,
+    );
+  }
 
-  return finish(startedAt, runStarted, options, stages, notes, environment, target, {
+  return finish(startedAt, runStarted, options, attestation, stages, notes, environment, target, {
     precondition: { ok: true },
-    rawTcp5432: tcpSummary,
+    originCorroborated: attestation.originCorroborated,
+    rawTcpPostgresPort: tcpSummary,
+    rawTcpPortConnectOk: tcpPortConnectOk,
     webSocket443: wsSummary,
     httpOneShot443: httpSummary,
+    negativeControl,
     genericHttpsEgress: https.ok,
-    rawTcp443Reachable: tcp443.tcpConnectOk,
+    rawTcp443Reachable: tcp443?.tcpConnectOk ?? false,
   });
 }
 
@@ -354,11 +538,12 @@ async function runOverTransport(
   stages: StageResult[],
   redact: Redactor,
   open: () => Promise<{ transport: import('./pg-wire.ts').WireTransport; detail: Record<string, DetailValue> }>,
+  /** Lets the caller record socket-level facts carried by a failed open. */
+  onOpenError: ((error: unknown) => void) | null,
   dsn: ParsedDsn,
   timeoutMs: number,
-  channelAlreadyProven: boolean,
 ): Promise<TransportSummary> {
-  const summary: TransportSummary = { ...EMPTY_TRANSPORT, channelOpen: channelAlreadyProven };
+  const summary: TransportSummary = { ...EMPTY_TRANSPORT };
 
   const openStarted = Date.now();
   let session: PgSession;
@@ -374,18 +559,27 @@ async function runOverTransport(
       error: null,
     });
     session = new PgSession(opened.transport);
+    session.queryTimeoutMs = timeoutMs;
   } catch (error) {
+    onOpenError?.(error);
     stages.push({
       id: `${prefix}.channel_open`,
       proves: `${description} — the byte channel itself opens.`,
       status: 'failed',
       ms: Date.now() - openStarted,
-      detail: {},
+      detail: {
+        failed_phase: error instanceof TransportError ? error.phase : null,
+        failed_code: error instanceof TransportError ? error.code : null,
+      },
       error: redact(error instanceof Error ? error.message : String(error)),
     });
     return summary;
   }
 
+  const authProves =
+    'the far end completed SCRAM-SHA-256 and returned a server signature this client verified, ' +
+    'so it holds this role\'s stored key — not a terminator that merely accepted the socket. ' +
+    '(A byte-RELAYING proxy is not ruled out: plain SCRAM without channel binding cannot detect one.)';
   const authStarted = Date.now();
   try {
     await session.authenticate(
@@ -398,24 +592,39 @@ async function runOverTransport(
       },
       timeoutMs,
     );
+    summary.peerVerified = session.auth.serverSignatureVerified;
     stages.push({
       id: `${prefix}.authenticate`,
-      proves: 'SCRAM-SHA-256 completed AND the server signature verified — the far end really is this Neon Postgres, not a proxy that accepted the socket.',
-      status: 'ok',
+      proves: authProves,
+      // The claim above is only true when the facts below say so. A session
+      // that came up without a verified SCRAM exchange is recorded as a FAILED
+      // authenticate stage even though the connection is usable, and the
+      // verdict refuses to be conclusive over it.
+      status: summary.peerVerified ? 'ok' : 'failed',
       ms: Date.now() - authStarted,
       detail: {
+        auth_method: session.auth.method,
+        scram_started: session.auth.saslStarted,
+        server_signature_verified: session.auth.serverSignatureVerified,
         server_version: session.parameters.get('server_version') ?? null,
         backend_pid_received: session.pid !== null,
       },
-      error: null,
+      error: summary.peerVerified
+        ? null
+        : 'the session came up without a verified SCRAM-SHA-256 server signature, so nothing here ' +
+          'establishes that the peer is this Neon Postgres rather than something that accepted the bytes',
     });
   } catch (error) {
     stages.push({
       id: `${prefix}.authenticate`,
-      proves: 'SCRAM-SHA-256 completed AND the server signature verified.',
+      proves: authProves,
       status: 'failed',
       ms: Date.now() - authStarted,
-      detail: {},
+      detail: {
+        auth_method: session.auth.method,
+        scram_started: session.auth.saslStarted,
+        server_signature_verified: session.auth.serverSignatureVerified,
+      },
       error: redact(error instanceof Error ? error.message : String(error)),
     });
     await session.terminate();
@@ -437,61 +646,56 @@ function finish(
   startedAt: string,
   runStarted: number,
   options: RunOptions,
+  attestation: OriginAttestation,
   stages: StageResult[],
   notes: string[],
   environment: Record<string, DetailValue>,
   target: ProbeReport['target'],
   inputs: VerdictInputs,
 ): ProbeReport {
-  const verdict = decideVerdict(inputs);
-  const allNotes = [...notes, ...summarizeNotes(inputs, verdict)];
-  const base = VERDICTS[verdict];
+  const observed = decideVerdict(inputs);
+  const allNotes = [...notes, ...summarizeNotes(inputs, observed, target.port)];
+
   // A calibration run computes the same verdict from the same evidence, but the
-  // evidence came from the wrong machine. Rewriting the wording — rather than
-  // relying on a note further down the page — is what stops a green laptop run
-  // from being pasted into RESULT.md as the answer.
-  const meaning =
-    options.origin === 'local'
-      ? {
-          label: `CALIBRATION ONLY (not a verdict) — would be ${base.label}`,
-          assumption4:
-            'NOT SETTLED. This ran on the machine that invoked it, so it measures that machine\'s ' +
-            'egress, not a deployed Cloudflare Container\'s. What it does establish is that the ' +
-            'probe itself works against this Neon project — which is what makes a later container ' +
-            'failure attributable to the platform.',
-          planAction:
-            'Deploy the Worker and container and re-run without --local. Only that run may be ' +
-            'recorded in RESULT.md as the answer to Assumption 4.',
-          exitCode: base.exitCode,
-        }
-      : base;
-  if (options.origin === 'local') {
+  // evidence came from the wrong machine. The VERDICT ITSELF becomes
+  // CALIBRATION_ONLY — not a rewritten label over an `A_RAW_TCP_OK` field and a
+  // zero exit code — because `verdict` and the exit code are the two surfaces a
+  // script and a transcriber read, and both used to lie on a laptop run.
+  const isLocal = options.origin === 'local';
+  const verdict: Verdict = isLocal ? 'CALIBRATION_ONLY' : observed;
+  const wouldBeVerdict: Verdict | null = isLocal ? observed : null;
+  const meaning = materializeMeaning(VERDICTS[verdict], target.port);
+  if (isLocal) {
     allNotes.unshift(
       'THIS IS A CALIBRATION RUN, NOT A VERDICT. It ran on the machine that invoked it, not ' +
         'inside a deployed Cloudflare Container, so it says nothing about Cloudflare egress. Its ' +
-        'job is to prove this probe\'s own wire implementation works against this Neon project, ' +
+        "job is to prove this probe's own wire implementation works against this Neon project, " +
         'so that a failure in the container run is attributable to the platform rather than to ' +
-        'this code.',
+        `this code. On the same evidence, a container run would have reported ${observed}.`,
     );
   }
   return {
     probe: 'container-tcp',
     settles:
       'Assumption 4 — a deployed Cloudflare Container can open unrestricted raw outbound TCP to Neon',
-    schemaVersion: 1,
+    schemaVersion: 2,
     startedAt,
     totalMs: Date.now() - runStarted,
     origin: options.origin,
+    attestation,
     environment,
     target,
     stages,
     transports: {
-      rawTcp5432: inputs.rawTcp5432,
+      rawTcpPostgresPort: inputs.rawTcpPostgresPort,
       webSocket443: inputs.webSocket443,
       httpOneShot443: inputs.httpOneShot443,
     },
+    negativeControl: inputs.negativeControl,
     verdict,
+    wouldBeVerdict,
     verdictMeaning: meaning,
     notes: allNotes,
+    driver: null,
   };
 }
