@@ -19,15 +19,23 @@
  * accepted the socket. A probe that only proves "bytes went somewhere" is
  * exactly the false pass this file exists to prevent.
  *
+ * WHERE THIS RUNS — AND WHERE IT DOES NOT
+ * ---------------------------------------
+ * This file is the raw TCP arm only. Neon's Postgres offers SCRAM-SHA-256 on
+ * 5432, so that transport requires it and refuses anything weaker. Neon's
+ * WebSocket wire proxy on 443 offers no SASL at all — it terminates TLS itself
+ * and then asks for `AuthenticationCleartextPassword` — so nothing here executes
+ * on that leg, and the probe's peer-verification claim is scoped per transport
+ * rather than asserted across both. See `PeerVerificationReason` in report.ts.
+ *
  * CHANNEL BINDING IS DELIBERATELY NOT USED
  * ----------------------------------------
  * Neon offers SCRAM-SHA-256-PLUS, and some Neon connection strings carry
  * `channel_binding=require` — a *client-side* preference, not a server
- * requirement, so plain SCRAM-SHA-256 is accepted. It has to be plain here:
- * the WebSocket transport carries the Postgres protocol in the clear inside an
- * already-encrypted `wss` tunnel, so there is no TLS channel at the Postgres
- * layer to bind to. Using plain SCRAM on both transports keeps the two runs
- * byte-identical above the transport, which is the comparison this probe makes.
+ * requirement, so plain SCRAM-SHA-256 is accepted. Binding would tie the
+ * exchange to the raw TCP arm's own TLS channel, which the WebSocket arm does
+ * not have at the Postgres layer; keeping it plain leaves the two arms
+ * comparable above the transport, which is the comparison this probe makes.
  *
  * SASLprep is not applied. Passwords Neon generates are ASCII, for which
  * SASLprep is the identity function. A non-ASCII password would need it.

@@ -322,6 +322,9 @@ export async function openTcpTlsTransport(
   return {
     transport: {
       name: `tcp+tls:${port}`,
+      // STARTTLS completed above, and `rejectUnauthorized` is on unless the
+      // operator explicitly passed --tls-insecure.
+      encrypted: true,
       write: (bytes) => void tls.write(Buffer.from(bytes)),
       close: () => void tls.destroy(),
       onData: (cb) => sink.attach(cb),
@@ -348,6 +351,23 @@ export async function openTcpTlsTransport(
  * NOT the `neon()` HTTP function — that one is `httpOneShotChannel` below, and
  * conflating the two is the confusion the plan already had to correct once.
  * Here, a `Client` holds a session; there, every statement is its own request.
+ *
+ * AUTHENTICATION ON THIS LEG IS NOT SCRAM
+ * ---------------------------------------
+ * The proxy answers the startup message with `AuthenticationCleartextPassword`
+ * (request 3) and offers no SASL mechanism at all. That is Neon's documented
+ * design for the serverless endpoint: SCRAM-SHA-256's PBKDF2 is specified to
+ * cost on the order of 100ms of CPU, which does not fit a serverless CPU budget,
+ * so they lean on the tunnel's own TLS and on long random generated passwords
+ * instead. `@neondatabase/serverless` reflects the same fact from the other
+ * side — its default `pipelineConnect: "password"` pipelines the startup message
+ * with a cleartext PasswordMessage, which is only possible because that is what
+ * the endpoint asks for, and its default `forceDisablePgSSL: true` skips
+ * Postgres-level TLS because the WebSocket already carries it.
+ *
+ * The consequence for this probe: there is no server signature to verify on this
+ * transport, so `peerVerified` is false here BY DESIGN and the verdict rule gates
+ * (b) on session semantics instead. See `PeerVerificationReason` in report.ts.
  */
 export interface WebSocketResult {
   transport: WireTransport;
@@ -399,6 +419,11 @@ export async function openWebSocketTransport(
   return {
     transport: {
       name: 'wss:443',
+      // `wss` — the URL is built as such a few lines up, and the runtime
+      // validates the endpoint's certificate. This is what makes it legitimate
+      // to answer Neon's cleartext-password request on this leg; a `ws://`
+      // transport would report false here and `authenticate` would refuse.
+      encrypted: true,
       write: (bytes) => socket.send(bytes),
       close: () => socket.close(),
       onData: (cb) => sink.attach(cb),

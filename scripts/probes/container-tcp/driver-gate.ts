@@ -99,8 +99,8 @@ export function parseReport(text: string): ParseOutcome {
   const candidate = parsed as Partial<ProbeReport>;
   const problems: string[] = [];
   if (candidate.probe !== 'container-tcp') problems.push('`probe` is not "container-tcp"');
-  if (candidate.schemaVersion !== 2) {
-    problems.push(`schemaVersion is ${String(candidate.schemaVersion)}, expected 2`);
+  if (candidate.schemaVersion !== 3) {
+    problems.push(`schemaVersion is ${String(candidate.schemaVersion)}, expected 3`);
   }
   if (candidate.origin !== 'container' && candidate.origin !== 'local') problems.push('`origin` is missing');
   if (typeof candidate.verdict !== 'string' || !(candidate.verdict in VERDICTS)) {

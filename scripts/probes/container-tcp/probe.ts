@@ -29,7 +29,7 @@
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { runProbe } from './container/run.ts';
-import type { ProbeReport, StageResult } from './container/report.ts';
+import type { ProbeReport, StageResult, TransportSummary } from './container/report.ts';
 import {
   classifyEndpoint,
   gateReport,
@@ -178,9 +178,27 @@ const MARK: Record<StageResult['status'], string> = {
 };
 
 const CONTROL_MEANING: Record<ProbeReport['negativeControl'], string> = {
-  discriminated: 'PASS — it authenticated and then failed every session assertion, as it must',
+  discriminated:
+    'PASS — it authenticated, then failed to read back the SET LOCAL nonce and failed to run a ' +
+    'prepared statement from an earlier round trip, as a channel with no session must',
   absent: 'DID NOT RUN — the battery was never shown to be capable of failing',
-  suspect: 'SUSPECT — a channel with no session kept session semantics; the battery is in doubt',
+  suspect: 'SUSPECT — a channel with no session kept per-session state; the battery is in doubt',
+};
+
+/** One line per row of the transports table, so `peer verified` is never read bare. */
+const PEER_REASON_TEXT: Record<TransportSummary['peerVerificationReason'], string> = {
+  scram_server_signature_verified:
+    'SCRAM-SHA-256 completed and the server signature verified — the peer holds this role’s stored key',
+  cleartext_auth_no_server_signature:
+    'NOT VERIFIABLE ON THIS TRANSPORT BY DESIGN: the endpoint asked for a cleartext password ' +
+    'inside its own TLS and offers no SASL, so there is no server signature to check. Session ' +
+    'semantics below, contrasted with the one-shot HTTP control, is what rules out a terminator here',
+  no_authentication_requested:
+    'THE FAR END CHALLENGED FOR NOTHING — straight to AuthenticationOk. Refused on every transport',
+  auth_incomplete: 'authentication was attempted and did not complete',
+  auth_not_attempted: 'the channel never opened, so authentication was never attempted',
+  one_shot_http_no_wire_auth:
+    'not applicable — it authenticates inside Neon from a header, not over the wire from here',
 };
 
 function wrap(text: string, indent: string, width = 96): string {
@@ -259,9 +277,32 @@ function render(report: ProbeReport): string {
     out.push(
       `  ${label}    ${String(t.channelOpen).padEnd(10)}${String(t.authenticated).padEnd(16)}${String(t.peerVerified).padEnd(16)}${String(t.sessionSemantics)}`,
     );
+    // `peer verified: false` means several completely different things. Printing
+    // the bare boolean without the reason is how (b) gets misread as carrying
+    // (a)'s assurance, or as a failure when the endpoint simply has no mechanism
+    // that could produce one.
+    out.push(
+      wrap(`peer_verification_reason=${t.peerVerificationReason} — ${PEER_REASON_TEXT[t.peerVerificationReason]}`, ' '.repeat(30)),
+    );
   }
   out.push('');
   out.push(`  negative control    ${CONTROL_MEANING[report.negativeControl]}`);
+  if (report.negativeControlAssertions !== null) {
+    const a = report.negativeControlAssertions;
+    out.push(
+      `${' '.repeat(22)}control assertions: select_1=${String(a.selectOne)} ` +
+        `set_local_readback=${String(a.setLocalReadback)} same_backend=${String(a.sameBackendInTxn)} ` +
+        `local_scoped_out=${String(a.localScopedOut)} prepared_statement=${String(a.preparedStatement)}`,
+    );
+    out.push(
+      wrap(
+        'The two that must be false are set_local_readback and prepared_statement. same_backend ' +
+          'may legitimately be true — Neon keeps warm backends, so two one-shot requests can land ' +
+          'on the same pid without any session existing.',
+        ' '.repeat(22),
+      ),
+    );
+  }
   out.push('');
   out.push('='.repeat(100));
   out.push(`  VERDICT: ${report.verdict} — ${report.verdictMeaning.label}`);

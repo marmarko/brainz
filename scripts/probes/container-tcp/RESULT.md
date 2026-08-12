@@ -50,6 +50,23 @@
 `A_RAW_TCP_OK` (0) · `B_WEBSOCKET_ONLY` (10) · `C_BOTH_BLOCKED` (20) — the three that settle
 anything.
 
+> **(a) and (b) do not carry the same assurance, and the write-up must not imply they do.**
+> `A_RAW_TCP_OK` includes a verified SCRAM-SHA-256 server signature: the far end demonstrably
+> holds this role's stored key. `B_WEBSOCKET_ONLY` does **not** and cannot — Neon's WebSocket
+> wire proxy terminates TLS itself and then asks for a cleartext password, offering no SASL
+> mechanism at all, so there is no server signature to check on that leg. A (b) run therefore
+> reports `peer verified = false` with
+> `peer_verification_reason = cleartext_auth_no_server_signature`, and that is the *expected*
+> value there, not a failure.
+>
+> What (b) still establishes: the far end held a real Postgres **session** — `SET LOCAL` nonce
+> readback, one backend pid across an explicit transaction, the GUC scoped out after `COMMIT`,
+> and a prepared statement surviving a round trip — while Neon's one-shot HTTP endpoint, using
+> the same credential against the same project on the same run, failed those same assertions.
+> That rules out something that merely accepted a channel. Beyond it, the peer is only as
+> trusted as the runtime's TLS certificate validation of the `wss` endpoint. Say this in the
+> write-up; do not let (b) be read as (a).
+
 `INCONCLUSIVE_ORIGIN_UNVERIFIED` · `INCONCLUSIVE_NO_BASELINE_EGRESS` ·
 `INCONCLUSIVE_TCP_REACHABLE` · `INCONCLUSIVE_WS_OPEN` · `INCONCLUSIVE_PEER_UNVERIFIED` ·
 `INCONCLUSIVE_CONTROL_ABSENT` · `INCONCLUSIVE_CONTROL_SUSPECT` ·
@@ -79,7 +96,7 @@ here is precisely what we did not observe".*
 | | Outcome | Observed? | Consequence |
 |---|---|---|---|
 | **(a)** | raw TCP on 5432 carried a full Postgres session, with a verified peer and a control that showed the battery can fail | | KTD2 stands as written |
-| **(b)** | no raw TCP handshake to 5432 completed at all, and `wss` on 443 carried a full Postgres session | | Containers KEPT, transport changes only |
+| **(b)** | no raw TCP handshake to 5432 completed at all, and `wss` on 443 carried a full Postgres session — peer NOT cryptographically verified there (cleartext auth, no server signature), so the session battery plus the discriminating control is what carries it | | Containers KEPT, transport changes only |
 | **(c)** | both failed while HTTPS from the same container worked, and calibration had proven the `ws.*` arm elsewhere | | Workers + one-shot HTTP driver; pooled TCP, prepared statements and 128 MB headroom forfeited |
 | | none of the above | | inconclusive — name it below, do not branch |
 
@@ -89,24 +106,42 @@ here is precisely what we did not observe".*
 
 *Copy from the report's TRANSPORTS block.*
 
-| Transport | channel open | authenticated | peer verified | session semantics |
-|---|---|---|---|---|
-| (a) raw TCP `:<port dialled>` | | | | |
-| (b) Postgres over `wss:443` | | | | |
-| one-shot HTTP `:443` (control) | | | *(always false — it authenticates inside Neon, not over the wire from here)* | |
+*The report prints a `peer_verification_reason=` line under each row. Copy it — the bare
+boolean is not readable on its own.*
 
-**Negative control** — copy the report's `negative control` line, which is one of three and
-never a yes/no:
+| Transport | channel open | authenticated | peer verified | `peer_verification_reason` | session semantics |
+|---|---|---|---|---|---|
+| (a) raw TCP `:<port dialled>` | | | | *(must be `scram_server_signature_verified` for an (a) verdict)* | |
+| (b) Postgres over `wss:443` | | | *(expected **false** — see below)* | *(expected `cleartext_auth_no_server_signature`)* | |
+| one-shot HTTP `:443` (control) | | | *(always false — it authenticates inside Neon, not over the wire from here)* | `one_shot_http_no_wire_auth` | |
+
+**Negative control** — copy the report's `negative control` line and the `control assertions:`
+line beneath it. It is one of three and never a yes/no:
 
 | | What it means for this run |
 |---|---|
-| `PASS — authenticated, then failed every session assertion` | The battery was shown able to register a negative. A conclusive verdict is allowed. |
+| `PASS — authenticated, then failed to read back the SET LOCAL nonce and failed to run a prepared statement from an earlier round trip` | The battery was shown able to register a negative. A conclusive verdict is allowed. |
 | `DID NOT RUN` | The null check never happened. The probe reports `INCONCLUSIVE_CONTROL_ABSENT`; read `http.select_1` for why (a 4xx, an unreachable host, intercepted TLS) and re-run. **This is not the same as the control behaving.** |
-| `SUSPECT` | A channel with no session kept session semantics. The instrument is in doubt and no verdict is usable in either direction. |
+| `SUSPECT` | A channel with no session kept per-session state. The instrument is in doubt and no verdict is usable in either direction. |
 
-**`peer verified`** is the recorded fact behind "SCRAM completed and the server signature
-verified". If it is false on the transport that carried the session, the verdict is
-`INCONCLUSIVE_PEER_UNVERIFIED` — do not write it up as a pass.
+> `same_backend=true` on the control is **normal and not suspicious** — Neon keeps warm
+> backends, so two one-shot requests can reach the same pid without any session existing. The
+> two that must be false are `set_local_readback` and `prepared_statement`.
+
+**Reading `peer verified`.** It is the recorded fact behind "SCRAM completed and the server
+signature verified", and its meaning is **per transport**:
+
+- **On raw TCP (a).** Neon's Postgres offers SCRAM-SHA-256 on 5432. `false` there is a real
+  absence, the verdict is `INCONCLUSIVE_PEER_UNVERIFIED`, and it must not be written up as a
+  pass. Unchanged.
+- **On the WebSocket leg (b).** `false` with reason `cleartext_auth_no_server_signature` is the
+  *expected* value: that endpoint offers no mechanism that could produce a signature. It does
+  **not** block (b), which is gated on session semantics plus the negative control instead.
+  Record the caveat from THE DECISION above alongside the verdict.
+- **On any transport,** reason `no_authentication_requested` — the far end challenged for
+  nothing and went straight to `AuthenticationOk` — is fatal and yields
+  `INCONCLUSIVE_PEER_UNVERIFIED`. That one is the serious case: it is how something that merely
+  accepted the channel looks.
 
 ---
 
@@ -128,7 +163,8 @@ verified". If it is false on the transport that carried the session, the verdict
 
 | Stage | Result | Proves |
 |---|---|---|
-| `*.authenticate` — `scram_completed` + `server_signature_verified` | | The far end holds this role's stored key, so it is not a terminator that merely accepted the socket. (A byte-relaying proxy is NOT ruled out — plain SCRAM has no channel binding.) |
+| `tcp.authenticate` — `auth_method` + `server_signature_verified` + `peer_verification_reason` | | The far end holds this role's stored key, so it is not a terminator that merely accepted the socket. (A byte-relaying proxy is NOT ruled out — plain SCRAM has no channel binding.) |
+| `ws.authenticate` — `auth_method` + `peer_verification_reason` | | Only that the far end **challenged for a credential and accepted it**, over TLS. Expect `auth_method=cleartext-password` and `peer_verification_reason=cleartext_auth_no_server_signature`: Neon's wire proxy offers no SASL, so this stage proves nothing about the peer's identity. On this transport the four rows below, contrasted with the `http.*` control, are what rule out a terminator. |
 | `*.set_local_readback` | | `SET LOCAL` is visible to the next statement — the two share a session |
 | `*.same_backend_in_txn` | | The same backend process, not just a connection that answered |
 | `*.local_scoped_out` | | The GUC was transaction-scoped — what per-request `hnsw.ef_search` tuning depends on |
@@ -148,7 +184,7 @@ an input to how much the per-tenant connection LRU is worth under outcome (b).*
 | TLS handshake | |
 | WebSocket upgrade to `/v2` | |
 | SCRAM authenticate (raw TCP) | |
-| SCRAM authenticate (WebSocket) | |
+| cleartext-password authenticate (WebSocket) | |
 | Total run | |
 
 ---
@@ -181,9 +217,15 @@ suggested interception.*
   one connection per transport was opened.
 - That `postgres.js` in particular works. The probe proves the wire protocol and the session
   properties `postgres.js` depends on; it carries no driver.
-- That no **relaying** proxy sits in the path. SCRAM without channel binding cannot detect a
-  byte forwarder — its relayed server signature verifies legitimately. What is ruled out is a
-  peer that terminates the connection without holding the role's key.
+- That no **relaying** proxy sits in the path on the raw TCP arm. SCRAM without channel binding
+  cannot detect a byte forwarder — its relayed server signature verifies legitimately. What is
+  ruled out there is a peer that terminates the connection without holding the role's key.
+- **Peer identity at all on the WebSocket arm.** Neon's wire proxy asks for a cleartext password
+  inside its own TLS and offers no SASL, so there is no server signature to verify and none is
+  claimed. What a `(b)` verdict rules out is a thing that merely accepted a channel — via the
+  session battery, contrasted against the one-shot HTTP control on the same run. It does not
+  identify the thing on the other end. The remaining assurance there is the runtime's TLS
+  certificate validation of the `wss` endpoint, so whatever ships under (b) must not disable it.
 - Anything about a colo other than the one recorded above, or about any port other than the one
   dialled.
 

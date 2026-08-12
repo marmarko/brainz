@@ -24,9 +24,10 @@
 
 import { existsSync } from 'node:fs';
 import { arch, platform } from 'node:os';
-import { PgSession, type SqlChannel } from './pg-wire.ts';
+import { PgSession, SCRAM_ONLY, type AuthFacts, type AuthPolicy, type SqlChannel } from './pg-wire.ts';
 import { runSessionBattery } from './battery.ts';
 import {
+  classifyNegativeControl,
   decideVerdict,
   hostFingerprint,
   hostSuffix,
@@ -36,10 +37,11 @@ import {
   unmaskableSecretCount,
   VERDICTS,
   type DetailValue,
-  type NegativeControlState,
   type OriginAttestation,
+  type PeerVerificationReason,
   type ProbeReport,
   type Redactor,
+  type SessionAssertions,
   type StageResult,
   type TransportSummary,
   type Verdict,
@@ -84,8 +86,35 @@ const EMPTY_TRANSPORT: TransportSummary = {
   channelOpen: false,
   authenticated: false,
   peerVerified: false,
+  peerVerificationReason: 'auth_not_attempted',
   sessionSemantics: false,
 };
+
+/**
+ * Neon's WebSocket wire proxy asks for `AuthenticationCleartextPassword` and
+ * offers no SASL, so refusing cleartext here does not harden the probe — it
+ * makes the (b) branch unmeasurable, which is the expensive failure. The
+ * credential still never leaves this process unencrypted: `authenticate` refuses
+ * cleartext unless the transport reports `encrypted`, and `wss` is the only
+ * thing that opens this leg.
+ */
+const WEBSOCKET_AUTH: AuthPolicy = { cleartextPassword: 'allow-over-encrypted-transport' };
+
+/**
+ * What authentication actually established about the far end.
+ *
+ * Derived from recorded facts rather than from "did authenticate throw", so the
+ * report can distinguish "this endpoint has no mechanism that could prove it"
+ * from "this endpoint refused to prove it" from "we never asked".
+ */
+function peerVerificationReason(facts: Readonly<AuthFacts>): PeerVerificationReason {
+  if (facts.serverSignatureVerified) return 'scram_server_signature_verified';
+  if (facts.method === 'cleartext-password' && facts.cleartextPasswordSent) {
+    return 'cleartext_auth_no_server_signature';
+  }
+  if (facts.method === 'none') return 'no_authentication_requested';
+  return 'auth_incomplete';
+}
 
 interface ParsedDsn {
   host: string;
@@ -241,7 +270,7 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
       negativeControl: 'absent',
       genericHttpsEgress: false,
       rawTcp443Reachable: false,
-    });
+    }, null);
   }
 
   const redact = makeRedactor([options.dsn, dsn.password, dsn.user], dsn.host);
@@ -283,10 +312,11 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
 
   if (dsn.hadChannelBindingRequire) {
     notes.push(
-      'The connection string carries `channel_binding=require`. That is a client-side ' +
-        'preference; this probe negotiates plain SCRAM-SHA-256 on both transports on purpose, ' +
-        'because the WebSocket transport has no Postgres-layer TLS channel to bind to and the ' +
-        'two runs must be byte-identical above the transport to be comparable.',
+      'The connection string carries `channel_binding=require`. That is a client-side preference, ' +
+        'not a server requirement, and neither transport honours it. On the Postgres port this ' +
+        'probe negotiates plain SCRAM-SHA-256 rather than SCRAM-SHA-256-PLUS. On the WebSocket ' +
+        "leg the question does not arise at all: Neon's wire proxy asks for a cleartext password " +
+        'and offers no SASL, so there is no binding to require. Neither is a finding.',
     );
   }
 
@@ -313,7 +343,7 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
         'port actually dialled.',
   });
   if (!portOk) {
-    return finish(startedAt, runStarted, options, attestation, stages, notes, environment, target, emptyInputs());
+    return finish(startedAt, runStarted, options, attestation, stages, notes, environment, target, emptyInputs(), null);
   }
   if (dsn.port !== POSTGRES_PORT) {
     notes.push(
@@ -343,7 +373,7 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
   });
 
   if (!poolerOk) {
-    return finish(startedAt, runStarted, options, attestation, stages, notes, environment, target, emptyInputs());
+    return finish(startedAt, runStarted, options, attestation, stages, notes, environment, target, emptyInputs(), null);
   }
   if (isPooler && options.allowPooler) {
     notes.push(
@@ -438,6 +468,10 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
     },
     dsn,
     options.stageTimeoutMs,
+    // Neon's Postgres DOES offer SCRAM on this port. Accepting a cleartext
+    // password here would be a real downgrade, and being ASKED for one is itself
+    // a finding worth reading in the report.
+    SCRAM_ONLY,
   );
 
   /* --- control: raw TCP on 443 ------------------------------------------- */
@@ -480,6 +514,7 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
     null,
     dsn,
     options.stageTimeoutMs,
+    WEBSOCKET_AUTH,
   );
 
   /* --- negative control: the one-shot HTTP driver ------------------------- */
@@ -497,18 +532,20 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
     // The one-shot endpoint authenticates inside Neon rather than over the wire
     // from here, so it never carries evidence about the peer.
     peerVerified: false,
+    peerVerificationReason: 'one_shot_http_no_wire_auth',
     sessionSemantics: httpBattery.sessionSemantics,
   };
-  const negativeControl: NegativeControlState = httpBattery.sessionSemantics
-    ? 'suspect'
-    : httpBattery.authenticated
-      ? 'discriminated'
-      : 'absent';
+  const controlAssertions: SessionAssertions = httpBattery.assertions;
+  const negativeControl = classifyNegativeControl(httpBattery.authenticated, controlAssertions);
   if (negativeControl === 'discriminated') {
     notes.push(
-      "The one-shot HTTP endpoint answered SELECT 1 and then failed the session battery, exactly " +
-        'as it should. That is the control that proves the WebSocket transport above is a real ' +
-        'session and not the HTTP function wearing a different name.',
+      'The one-shot HTTP endpoint answered SELECT 1 over the same credential and then failed both ' +
+        'assertions that require a session — it did not read back the `SET LOCAL` nonce, and a ' +
+        'prepared statement created by one request did not exist in the next. That is the control ' +
+        'that proves the WebSocket transport above is a real session and not the HTTP function ' +
+        'wearing a different name. It matters more than it used to: the WebSocket leg cannot ' +
+        "verify a peer signature (Neon's proxy offers none), so this contrast is the whole " +
+        'argument there against a channel that was merely accepted.',
     );
   }
   if (negativeControl === 'absent') {
@@ -528,7 +565,7 @@ export async function runProbe(options: RunOptions): Promise<ProbeReport> {
     negativeControl,
     genericHttpsEgress: https.ok,
     rawTcp443Reachable: tcp443?.tcpConnectOk ?? false,
-  });
+  }, controlAssertions);
 }
 
 /** Open a byte channel, authenticate over it, then run the identical battery. */
@@ -542,6 +579,7 @@ async function runOverTransport(
   onOpenError: ((error: unknown) => void) | null,
   dsn: ParsedDsn,
   timeoutMs: number,
+  authPolicy: AuthPolicy,
 ): Promise<TransportSummary> {
   const summary: TransportSummary = { ...EMPTY_TRANSPORT };
 
@@ -576,10 +614,22 @@ async function runOverTransport(
     return summary;
   }
 
-  const authProves =
-    'the far end completed SCRAM-SHA-256 and returned a server signature this client verified, ' +
-    'so it holds this role\'s stored key — not a terminator that merely accepted the socket. ' +
-    '(A byte-RELAYING proxy is not ruled out: plain SCRAM without channel binding cannot detect one.)';
+  // The `proves` sentence has to match what the transport can actually prove.
+  // On the Postgres port Neon offers SCRAM, so a verified server signature is
+  // both available and required. On Neon's WebSocket wire proxy it is not
+  // available at ANY setting — the endpoint asks for a cleartext password and
+  // offers no SASL — so a stage that claimed SCRAM proof there would be a false
+  // sentence sitting under a green (b).
+  const scramRequired = authPolicy.cleartextPassword === 'refuse';
+  const authProves = scramRequired
+    ? 'the far end completed SCRAM-SHA-256 and returned a server signature this client verified, ' +
+      "so it holds this role's stored key — not a terminator that merely accepted the socket. " +
+      '(A byte-RELAYING proxy is not ruled out: plain SCRAM without channel binding cannot detect one.)'
+    : 'the far end CHALLENGED for a credential and accepted it, over a transport that encrypts ' +
+      "what it sends. It does NOT prove the peer's identity: this endpoint asks for a cleartext " +
+      'password and offers no SASL, so there is no server signature to verify — see ' +
+      '`peer_verification_reason`. On this transport, what rules out a terminator that merely ' +
+      'accepted the channel is the session battery below plus the one-shot HTTP control failing it.';
   const authStarted = Date.now();
   try {
     await session.authenticate(
@@ -591,30 +641,42 @@ async function runOverTransport(
         applicationName: APPLICATION_NAME,
       },
       timeoutMs,
+      authPolicy,
     );
     summary.peerVerified = session.auth.serverSignatureVerified;
+    summary.peerVerificationReason = peerVerificationReason(session.auth);
+    // A cleartext exchange is an acceptable OUTCOME only where the caller asked
+    // for it. `no_authentication_requested` is never acceptable anywhere: a far
+    // end that challenges for nothing is the terminator shape both gates exist
+    // to catch, and it lands here as a FAILED stage on every transport.
+    const authAcceptable =
+      summary.peerVerificationReason === 'scram_server_signature_verified' ||
+      (!scramRequired && summary.peerVerificationReason === 'cleartext_auth_no_server_signature');
     stages.push({
       id: `${prefix}.authenticate`,
       proves: authProves,
-      // The claim above is only true when the facts below say so. A session
-      // that came up without a verified SCRAM exchange is recorded as a FAILED
-      // authenticate stage even though the connection is usable, and the
-      // verdict refuses to be conclusive over it.
-      status: summary.peerVerified ? 'ok' : 'failed',
+      status: authAcceptable ? 'ok' : 'failed',
       ms: Date.now() - authStarted,
       detail: {
         auth_method: session.auth.method,
         scram_started: session.auth.saslStarted,
         server_signature_verified: session.auth.serverSignatureVerified,
+        peer_verification_reason: summary.peerVerificationReason,
         server_version: session.parameters.get('server_version') ?? null,
         backend_pid_received: session.pid !== null,
       },
-      error: summary.peerVerified
+      error: authAcceptable
         ? null
-        : 'the session came up without a verified SCRAM-SHA-256 server signature, so nothing here ' +
-          'establishes that the peer is this Neon Postgres rather than something that accepted the bytes',
+        : summary.peerVerificationReason === 'no_authentication_requested'
+          ? 'the far end asked for NO authentication and went straight to AuthenticationOk. That ' +
+            'is how something that merely accepted the channel looks, and it is refused on every ' +
+            'transport'
+          : 'the session came up without a verified SCRAM-SHA-256 server signature on a transport ' +
+            'where Neon does offer SCRAM, so nothing here establishes that the peer is this Neon ' +
+            'Postgres rather than something that accepted the bytes',
     });
   } catch (error) {
+    summary.peerVerificationReason = peerVerificationReason(session.auth);
     stages.push({
       id: `${prefix}.authenticate`,
       proves: authProves,
@@ -624,7 +686,10 @@ async function runOverTransport(
         auth_method: session.auth.method,
         scram_started: session.auth.saslStarted,
         server_signature_verified: session.auth.serverSignatureVerified,
+        peer_verification_reason: summary.peerVerificationReason,
       },
+      // The password is the payload of the one frame this path can fail on, so
+      // `authenticate` scrubs it before throwing; this is the second pass.
       error: redact(error instanceof Error ? error.message : String(error)),
     });
     await session.terminate();
@@ -652,6 +717,13 @@ function finish(
   environment: Record<string, DetailValue>,
   target: ProbeReport['target'],
   inputs: VerdictInputs,
+  /**
+   * The negative control's own per-assertion results, or null when the run
+   * stopped before the control could execute. Carried into the report so
+   * "the battery can register a negative" is checkable rather than asserted —
+   * which is what the WebSocket leg now leans on, having no peer signature.
+   */
+  controlAssertions: SessionAssertions | null,
 ): ProbeReport {
   const observed = decideVerdict(inputs);
   const allNotes = [...notes, ...summarizeNotes(inputs, observed, target.port)];
@@ -678,7 +750,7 @@ function finish(
     probe: 'container-tcp',
     settles:
       'Assumption 4 — a deployed Cloudflare Container can open unrestricted raw outbound TCP to Neon',
-    schemaVersion: 2,
+    schemaVersion: 3,
     startedAt,
     totalMs: Date.now() - runStarted,
     origin: options.origin,
@@ -692,6 +764,7 @@ function finish(
       httpOneShot443: inputs.httpOneShot443,
     },
     negativeControl: inputs.negativeControl,
+    negativeControlAssertions: controlAssertions,
     verdict,
     wouldBeVerdict,
     verdictMeaning: meaning,

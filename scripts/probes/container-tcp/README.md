@@ -43,11 +43,29 @@ observed, or refuses to answer.
 
 - Whether a raw outbound TCP socket to port 5432 opens from inside a deployed container, and
   whether a *real Postgres* is on the other end (the SSL negotiation is answered with `S`).
-- Whether a full Postgres session authenticates over each transport, with mutual SCRAM —
-  including verifying the **server's** signature. That rules out a terminator which merely
-  accepted the socket: the far end has to hold this role's stored key. Both facts
-  (`scram_completed`, `server_signature_verified`) are recorded in the report, and a session
-  that comes up without them is reported `INCONCLUSIVE_PEER_UNVERIFIED` rather than passed.
+- Whether a full Postgres session authenticates over each transport — and, **on the raw TCP
+  arm**, with mutual SCRAM including verification of the **server's** signature. That rules out
+  a terminator which merely accepted the socket: the far end has to hold this role's stored
+  key. The facts (`auth_method`, `scram_started`, `server_signature_verified`,
+  `peer_verification_reason`) are recorded on the authenticate stage.
+
+  **On the WebSocket arm there is no such proof, and the report says so rather than implying
+  otherwise.** Neon's wire proxy (`wss://<host>/v2`) terminates TLS itself and then asks for
+  `AuthenticationCleartextPassword`; it offers no SASL mechanism at all. Neon documents this as
+  deliberate — SCRAM's PBKDF2 is specified to cost ~100ms of CPU, which does not fit a
+  serverless budget — and `@neondatabase/serverless` reflects it from the other side with its
+  default `pipelineConnect: "password"`. So that transport records
+  `peer_verification_reason: cleartext_auth_no_server_signature`, `peerVerified: false`, and the
+  peer-verification gate is scoped per transport: **(a) still requires a verified SCRAM server
+  signature; (b) turns on session semantics instead.** Requiring a signature the endpoint cannot
+  produce would not raise the bar — it would make (b) unreachable against real Neon, turning a
+  KEEP-Containers answer into an inconclusive.
+
+  What does *not* change: a far end that challenges for **no** credential at all
+  (`no_authentication_requested`) is refused on every transport, because that is precisely the
+  terminator shape. And a cleartext password is only ever sent when the caller's transport
+  policy asks for it **and** the transport reports itself encrypted; the raw TCP arm asks for
+  SCRAM only, so being offered cleartext on 5432 is still a failure and still a finding.
 - Whether **session semantics** survive: `SET LOCAL` read back inside an explicit transaction,
   the same backend pid across statements in that transaction, the GUC scoped out after
   `COMMIT`, and a named prepared statement usable between round trips. This — not the
@@ -61,12 +79,18 @@ observed, or refuses to answer.
   Cloudflare Containers carry no documented commitment about raw egress, so a pass is a
   *current-state* fact, not a guarantee. Record the date and colo in `RESULT.md` and re-check
   before U6 ships.
-- That there is no **relaying** proxy in the path. SCRAM without channel binding cannot detect
-  one: a byte forwarder passes the exchange upstream and the returned signature verifies
-  legitimately. Channel binding is the only mechanism that would catch it, and it is
-  deliberately not used (the WebSocket transport has no Postgres-layer TLS to bind to, and both
-  transports must be byte-identical above the transport to be comparable). What is ruled out is
-  a peer that *terminates* the connection without holding the role's key.
+- That there is no **relaying** proxy in the path, on the raw TCP arm. SCRAM without channel
+  binding cannot detect one: a byte forwarder passes the exchange upstream and the returned
+  signature verifies legitimately. Channel binding is the only mechanism that would catch it,
+  and it is deliberately not used. What *is* ruled out there is a peer that *terminates* the
+  connection without holding the role's key.
+- **Peer identity at all, on the WebSocket arm.** That endpoint offers no mechanism with mutual
+  proof (see above), so a `(b)` verdict cannot claim what `(a)` claims. What stands behind the
+  peer on that leg is the runtime's TLS certificate validation of the `wss` endpoint, plus the
+  session battery — `SET LOCAL` nonce readback, one backend pid across an explicit transaction,
+  the GUC scoped out after `COMMIT`, and a prepared statement surviving a round trip — every one
+  of which Neon's one-shot HTTP endpoint fails on the same run. That contrast rules out a thing
+  that merely accepted a channel. It does not identify the thing on the other end.
 - That `postgres.js` specifically will work. It proves the wire protocol and session semantics
   work; `postgres.js` uses protocol-level named statements where this probe uses SQL-level
   `PREPARE`/`EXECUTE`. Those are the same underlying property — a named statement persisting
@@ -260,15 +284,15 @@ that holds a database credential.
 | Verdict | Exit code | Meaning |
 |---|---|---|
 | `A_RAW_TCP_OK` | 0 | (a). Assumption 4 holds. KTD2 unchanged. |
-| `B_WEBSOCKET_ONLY` | 10 | (b). Containers kept; transport changes to `@neondatabase/serverless` `Pool`/`Client` over WebSocket. |
+| `B_WEBSOCKET_ONLY` | 10 | (b). Containers kept; transport changes to `@neondatabase/serverless` `Pool`/`Client` over WebSocket. **Peer identity is NOT cryptographically verified at the Postgres layer on this transport** — Neon's wire proxy asks for a cleartext password inside its own TLS and offers no SASL. (b) is carried by session semantics plus the negative control, not by a server signature. Do not quote it as equivalent to (a). |
 | `C_BOTH_BLOCKED` | 20 | (c). The priced no-branch applies. Re-open the 128 MB question. |
 | `INCONCLUSIVE_ORIGIN_UNVERIFIED` | 30 | This run could not be shown to have happened on Cloudflare. The likeliest cause is `wrangler dev`. |
 | `INCONCLUSIVE_NO_BASELINE_EGRESS` | 30 | Nothing got out, including plain HTTPS. A statement about this run, not about Cloudflare. |
 | `INCONCLUSIVE_TCP_REACHABLE` | 30 | A raw socket to the Postgres port opened, but no session came out of it. Leaning (a); (b) and (c) are both forbidden here. |
 | `INCONCLUSIVE_WS_OPEN` | 30 | The WebSocket upgraded but the session did not complete. Leaning (b). |
-| `INCONCLUSIVE_PEER_UNVERIFIED` | 30 | A transport carried a full session, but no completed SCRAM exchange with a verified server signature was recorded on it. |
+| `INCONCLUSIVE_PEER_UNVERIFIED` | 30 | A transport carried a full session, but the authentication on it was not one this probe accepts *for that transport*. On raw TCP that means no verified SCRAM server signature (Neon does offer SCRAM there, so its absence is the finding). On the WebSocket leg a cleartext password is accepted, so landing here means something else — most likely `no_authentication_requested`: the far end challenged for nothing. Read `peer_verification_reason` on the authenticate stage. |
 | `INCONCLUSIVE_CONTROL_ABSENT` | 30 | A transport passed, but the negative control never ran — the battery was never shown able to fail. |
-| `INCONCLUSIVE_CONTROL_SUSPECT` | 30 | The negative control *passed* the session battery. The instrument is in doubt; no verdict is usable in either direction. |
+| `INCONCLUSIVE_CONTROL_SUSPECT` | 30 | The negative control kept per-session state (read back the `SET LOCAL` nonce, or ran a prepared statement from an earlier round trip). The instrument is in doubt; no verdict is usable in either direction. |
 | `INCONCLUSIVE_WS_CLIENT_UNPROVEN` | 30 | (c) was indicated, but this probe's own WebSocket client has never been observed working anywhere. |
 | `INCONCLUSIVE_PRECONDITION` | 30 | The probe refused to run — bad DSN, a `-pooler` endpoint, or a port that is not 5432. |
 | `CALIBRATION_ONLY` | 50 | A `--local` run. Never a verdict, whatever the evidence. Read `wouldBeVerdict`. |
@@ -297,20 +321,49 @@ decisive fail either.
    did *not* work, neither may be issued once a handshake to the Postgres port has completed —
    even if the WebSocket arm sailed through. That case is `INCONCLUSIVE_TCP_REACHABLE`, and one
    lost packet is enough to cause it, so re-run before reading anything into it.
-4. **The peer must authenticate itself to us.** `scram_completed` and
-   `server_signature_verified` are recorded as facts on the authenticate stage, and the wire
-   client refuses an `AuthenticationOk` that arrives mid-SASL without a verifiable SASLFinal —
-   the one message a peer that cannot complete SCRAM is unable to forge. A session without
-   those facts is `INCONCLUSIVE_PEER_UNVERIFIED`, not a pass. (A *relaying* proxy is still not
-   ruled out; see "It cannot prove" above.)
+4. **The peer must authenticate itself to us as far as the transport allows — and the report
+   must say how far that is.** `auth_method`, `scram_started`, `server_signature_verified` and
+   `peer_verification_reason` are recorded as facts on the authenticate stage. The wire client
+   refuses an `AuthenticationOk` that arrives mid-SASL without a verifiable SASLFinal (the one
+   message a peer that cannot complete SCRAM is unable to forge), refuses a mid-exchange
+   downgrade from SASL to cleartext, and refuses a cleartext request on any transport that did
+   not ask for it or that does not encrypt what it sends.
+
+   The gate is then **per transport**, because `peerVerified` comes from SCRAM and Neon's
+   WebSocket proxy has no SCRAM to give:
+
+   | | (a) raw TCP `:5432` | (b) `wss:443` |
+   |---|---|---|
+   | What Neon offers | SCRAM-SHA-256 | cleartext password inside the `wss` TLS; no SASL |
+   | Accepted by the probe | SCRAM only — cleartext is a refused downgrade | cleartext, over an encrypted transport |
+   | `peerVerified` | must be `true` | `false`, reason `cleartext_auth_no_server_signature` |
+   | What the verdict rests on | verified server signature **+** session semantics | session semantics **+** the negative control |
+   | Always fatal | `no_authentication_requested` | `no_authentication_requested` |
+
+   This is a real weakening of what (b) asserts, and it is stated in the verdict text, in the
+   run notes and in the transports table rather than left for a reader to infer. The
+   alternative was worse: requiring a signature that endpoint cannot produce made (b)
+   unreachable against real Neon, so a container with raw TCP blocked would have reported
+   `INCONCLUSIVE_PEER_UNVERIFIED` instead of the branch on which Containers are **kept**.
 5. **The instrument must be shown able to fail, and (c) needs its own control.** The one-shot
-   HTTP driver runs the identical battery as a negative control: it must authenticate and then
-   fail every session assertion. If it never authenticated, the null check did not happen and a
-   passing transport reports `INCONCLUSIVE_CONTROL_ABSENT`. If it *passes* the battery, the run
-   is `INCONCLUSIVE_CONTROL_SUSPECT`. And because a rejected WebSocket upgrade
-   (`EWSUPGRADE`) is byte-identical to a bug in this probe's own handshake, `(c)` also requires
-   a calibration receipt showing the WebSocket arm working somewhere —
-   `INCONCLUSIVE_WS_CLIENT_UNPROVEN` otherwise.
+   HTTP driver runs the identical battery as a negative control. It must authenticate and then
+   fail the two assertions that can only hold on a real session: the `SET LOCAL` nonce readback
+   and the prepared statement. (It is *not* required to land on a different backend pid — Neon
+   keeps warm backends, so two one-shot requests genuinely can reach the same one; requiring
+   that would make the control flap on a true negative.) If it never authenticated, the null
+   check did not happen and a passing transport reports `INCONCLUSIVE_CONTROL_ABSENT`. If
+   either of those two assertions *passes*, the run is `INCONCLUSIVE_CONTROL_SUSPECT`. Its
+   per-assertion results are carried in the report (`negativeControlAssertions`) so the claim is
+   checkable rather than asserted.
+
+   This control matters more on the WebSocket leg than anywhere else: with no server signature
+   available there, the contrast between "the same battery passed on `wss` and failed on the
+   one-shot HTTP endpoint, using the same credential against the same project" is the *whole*
+   argument that the far end held a real session rather than merely accepting a channel.
+
+   And because a rejected WebSocket upgrade (`EWSUPGRADE`) is byte-identical to a bug in this
+   probe's own handshake, `(c)` also requires a calibration receipt showing the WebSocket arm
+   working somewhere — `INCONCLUSIVE_WS_CLIENT_UNPROVEN` otherwise.
 6. **(c) requires a working egress control.** Both transports failing is only reported as (c)
    when ordinary HTTPS egress from the same container *did* work. Otherwise it is
    `INCONCLUSIVE_NO_BASELINE_EGRESS` — a config or credential problem, not an architecture
@@ -428,10 +481,11 @@ reasons that have nothing to do with the question.
 | `container/server.ts` | The container entrypoint. `GET /health`, `POST /probe`. |
 | `container/run.ts` | Stage orchestration, redaction, report assembly. |
 | `container/transports.ts` | The three byte channels plus the two reachability probes. |
-| `container/pg-wire.ts` | The Postgres v3 protocol, transport-agnostic. |
-| `container/scram.ts` | SCRAM-SHA-256 with server-signature verification. |
+| `container/pg-wire.ts` | The Postgres v3 protocol, transport-agnostic. Owns the per-transport `AuthPolicy` — SCRAM-only by default, cleartext password only where a caller asks for it on an encrypted transport. |
+| `container/scram.ts` | SCRAM-SHA-256 with server-signature verification. Raw TCP arm only; Neon's WebSocket proxy offers no SASL. |
 | `container/battery.ts` | The session-semantics battery, run identically on all three channels. |
-| `container/report.ts` | Report types, the redactor, the attestation shape, and the verdict rule. |
+| `container/report.ts` | Report types, the redactor, the attestation shape, `PeerVerificationReason`, the negative-control classifier, and the verdict rule. |
+| `auth-transport.test.ts` | `bun test` — the per-transport auth rules against a scripted in-memory backend (cleartext accepted on `wss`, refused on raw TCP *before the credential is transmitted*, downgrade and unencrypted-transport refusals), credential containment, the negative-control discrimination coupling, and the verdict gate. Lives outside `container/` so it stays out of the image. |
 | `RESULT.md` | The durable answer. Fill it in; it is committed. |
 
 ## Sources
@@ -441,3 +495,19 @@ reasons that have nothing to do with the question.
 - Container egress, `enableInternet`, HTTPS interception and the CA at `/etc/cloudflare/certs/` — <https://github.com/cloudflare/containers/blob/main/docs/egress.md>
 - Cloudflare Containers beta limitations — <https://developers.cloudflare.com/containers/beta-info/>
 - Workers TCP sockets, and the note that outbound TCP is blocked on port 25 and to Cloudflare IP ranges — <https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/>
+
+Why the WebSocket leg authenticates with a cleartext password rather than SCRAM:
+
+- Neon, *Quicker serverless Postgres connections* — states they moved to "simple password auth
+  (which is still protected by TLS encryption)" because SCRAM-SHA-256 "is [specifically
+  intended] to take about 100ms of CPU time", which does not fit a serverless CPU budget, and
+  that they "generate and support only random passwords" as the compensating control —
+  <https://neon.com/blog/quicker-serverless-postgres>
+- `@neondatabase/serverless` `CONFIG.md` — `pipelineConnect` defaults to `"password"` and
+  pipelines "the first three messages to the database (startup, authentication and first
+  query)", which "will only work if you've configured cleartext password authentication";
+  `forceDisablePgSSL` defaults to `true` because the WebSocket already carries TLS —
+  <https://github.com/neondatabase/serverless/blob/main/CONFIG.md>
+- Postgres protocol message formats — `AuthenticationCleartextPassword` is `Byte1('R')` +
+  `Int32(8)` + `Int32(3)`; the response is `PasswordMessage` (`Byte1('p')`, length, the password
+  as a C string) — <https://www.postgresql.org/docs/current/protocol-message-formats.html>

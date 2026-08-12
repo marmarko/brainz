@@ -17,6 +17,15 @@ import { ScramError, startScram, verifyServerSignature } from './scram.ts';
 export interface WireTransport {
   /** For the report: `tcp+tls:5432` or `wss:443`. */
   readonly name: string;
+  /**
+   * Are the bytes handed to `write` encrypted before they leave this process?
+   *
+   * True for the STARTTLS'd raw socket and for `wss`. It is a REQUIRED
+   * precondition for sending a cleartext password (see `authenticate`), so that
+   * adding a plaintext transport later cannot silently turn the credential path
+   * into a plaintext one — the check is structural rather than a comment.
+   */
+  readonly encrypted: boolean;
   write(bytes: Uint8Array): void;
   close(): void;
   onData(cb: (chunk: Uint8Array) => void): void;
@@ -185,15 +194,59 @@ export interface PgConnectParams {
  * The report used to claim "SCRAM-SHA-256 completed AND the server signature
  * verified" on a stage whose only recorded detail was the server version. A
  * sentence a human copies into a public result file must be checkable from the
- * report, so these three fields exist and the verdict reads them.
+ * report, so these fields exist and the verdict reads them.
  */
 export interface AuthFacts {
-  /** `scram-sha-256`, or `none` when the server asked for no authentication. */
-  method: 'scram-sha-256' | 'none' | null;
+  /**
+   * `scram-sha-256` (mutual, a server signature to verify), `cleartext-password`
+   * (one-way — the server proves nothing to us), or `none` when the server asked
+   * for no authentication at all.
+   */
+  method: 'scram-sha-256' | 'cleartext-password' | 'none' | null;
   /** A SASL exchange was started by the server. */
   saslStarted: boolean;
   /** SASLFinal arrived and its `v=` signature matched what we computed. */
   serverSignatureVerified: boolean;
+  /** A PasswordMessage carrying the role's password in the clear was sent. */
+  cleartextPasswordSent: boolean;
+}
+
+/**
+ * Which authentication requests this transport is willing to answer.
+ *
+ * `'refuse'` is the default everywhere it is not spelled out, and it is what the
+ * raw TCP arm uses: Neon's Postgres offers SCRAM-SHA-256 on 5432, so being asked
+ * for a cleartext password there is a downgrade and a finding, never something
+ * to satisfy.
+ *
+ * `'allow-over-encrypted-transport'` exists for exactly one endpoint. Neon's
+ * WebSocket wire proxy (`wss://<host>/v2`) terminates TLS itself and then asks
+ * for `AuthenticationCleartextPassword`; it does not offer SASL/SCRAM. Neon
+ * documents this as a deliberate design choice — SCRAM's PBKDF2 is specified to
+ * cost roughly 100ms of CPU, which does not fit a serverless CPU budget — and
+ * relies on the WebSocket's own TLS plus long random generated passwords
+ * instead. Refusing it does not make the probe stricter; it makes the (b) branch
+ * unmeasurable.
+ */
+export interface AuthPolicy {
+  readonly cleartextPassword: 'refuse' | 'allow-over-encrypted-transport';
+}
+
+/** The raw TCP arm. SCRAM or nothing. */
+export const SCRAM_ONLY: AuthPolicy = { cleartextPassword: 'refuse' };
+
+/**
+ * Remove a secret from a message that is about to become an Error.
+ *
+ * The PasswordMessage is the one frame in this protocol whose payload IS the
+ * credential, so a write failure on it is the one place a transport error could
+ * plausibly quote it back. `run.ts` redacts every stage error again on the way
+ * into the report; this is the first of the two, applied at the point the secret
+ * is actually in scope.
+ */
+function withoutSecret(value: string, secret: string): string {
+  if (secret.length === 0) return value;
+  return value.split(secret).join('[redacted]');
 }
 
 /**
@@ -224,6 +277,7 @@ export class PgSession implements SqlChannel {
     method: null,
     saslStarted: false,
     serverSignatureVerified: false,
+    cleartextPasswordSent: false,
   };
 
   constructor(private readonly transport: WireTransport) {
@@ -303,9 +357,22 @@ export class PgSession implements SqlChannel {
   /**
    * Startup + authentication, ending at the first ReadyForQuery.
    *
-   * Only SCRAM-SHA-256 and "no authentication" are accepted. Cleartext and MD5
-   * are refused loudly rather than implemented: Neon uses SCRAM, so being asked
-   * for either is itself a finding worth reading in the report.
+   * SCRAM-SHA-256 is always acceptable. `AuthenticationCleartextPassword`
+   * (request 3) is acceptable ONLY when the caller opts in via `policy` AND the
+   * transport reports itself encrypted — that is the WebSocket arm, where Neon's
+   * wire proxy offers nothing else. MD5 and every other method are refused
+   * loudly rather than implemented.
+   *
+   * Three separate refusals guard the cleartext path, because a downgrade is
+   * precisely what an interception layer would attempt:
+   *
+   *   - the caller has to have asked for it (the raw TCP arm never does, so a
+   *     cleartext request on 5432 is still a failure and still a finding);
+   *   - the transport has to be encrypted, so the credential cannot be put on
+   *     the wire in the clear by a future plaintext transport;
+   *   - a SASL exchange must not already be in flight. A peer that starts SCRAM
+   *     and then asks for the password instead is trying to skip the half of the
+   *     exchange that would have proved who it is.
    *
    * AuthenticationOk is NOT accepted once a SASL exchange has begun without a
    * verified SASLFinal. SASLFinal carries the one message an intermediary that
@@ -313,7 +380,11 @@ export class PgSession implements SqlChannel {
    * exactly how such a peer would look, and accepting it would let the probe
    * certify a session whose far end was never authenticated to us.
    */
-  async authenticate(params: PgConnectParams, timeoutMs: number): Promise<void> {
+  async authenticate(
+    params: PgConnectParams,
+    timeoutMs: number,
+    policy: AuthPolicy = SCRAM_ONLY,
+  ): Promise<void> {
     this.transport.write(
       buildStartup({
         user: params.user,
@@ -342,6 +413,43 @@ export class PgSession implements SqlChannel {
               );
             }
             this.authFacts.method ??= 'none';
+            break;
+          }
+          if (subtype === 3) {
+            // AuthenticationCleartextPassword. The response is a PasswordMessage
+            // ('p') whose entire body is the password as a C string.
+            if (policy.cleartextPassword !== 'allow-over-encrypted-transport') {
+              throw new ScramError(
+                'the server asked for a cleartext password (authentication request 3), but this ' +
+                  'transport accepts SCRAM-SHA-256 only. Neon offers SCRAM on the Postgres port, ' +
+                  'so a cleartext request here is a downgrade and is refused rather than answered',
+              );
+            }
+            if (!this.transport.encrypted) {
+              throw new ScramError(
+                'the server asked for a cleartext password on a transport that does not encrypt ' +
+                  'what it sends — refusing to put the credential on the wire',
+              );
+            }
+            if (this.authFacts.saslStarted) {
+              throw new ScramError(
+                'the server began a SASL exchange and then asked for a cleartext password ' +
+                  'instead — that abandons the half of SCRAM that proves who the peer is, and is ' +
+                  'refused as a downgrade',
+              );
+            }
+            this.authFacts.method = 'cleartext-password';
+            try {
+              this.transport.write(frame('p', cstring(params.password)));
+            } catch (error) {
+              // This is the only frame whose payload is the credential, so its
+              // failure is the only one that could quote it back.
+              throw new PgProtocolError(
+                'failed to send the password response: ' +
+                  withoutSecret(error instanceof Error ? error.message : String(error), params.password),
+              );
+            }
+            this.authFacts.cleartextPasswordSent = true;
             break;
           }
           if (subtype === 10) {
@@ -384,7 +492,8 @@ export class PgSession implements SqlChannel {
             break;
           }
           throw new PgProtocolError(
-            `unsupported authentication request ${subtype} (this probe implements SCRAM-SHA-256 only)`,
+            `unsupported authentication request ${subtype} (this probe implements SCRAM-SHA-256, ` +
+              "and cleartext password on transports that ask for it and encrypt what they send)",
           );
         }
         case 'S': {

@@ -34,9 +34,25 @@
  * evidence for each of its claims:
  *
  *   - that the run happened where it says it happened (origin corroboration),
- *   - that the far end is really this Postgres (SCRAM server signature),
+ *   - that authentication established what it can establish on that transport —
+ *     a verified SCRAM server signature on the Postgres port, where Neon offers
+ *     SCRAM; and on the WebSocket leg, where Neon's proxy offers only a
+ *     cleartext password inside its own TLS, that the peer at least CHALLENGED
+ *     for a credential (see `PeerVerificationReason`),
  *   - that the instrument can register a negative (the HTTP one-shot control),
  *   - and, for (b)/(c), that raw TCP to the Postgres port genuinely did not open.
+ *
+ * WHY THE PEER GATE IS PER-TRANSPORT
+ * ----------------------------------
+ * It was not, and that was a bug with a price. `peerVerified` came from SCRAM's
+ * server-signature check and gated (a) AND (b). Neon's WebSocket wire proxy
+ * cannot produce a server signature — it terminates TLS itself and then asks for
+ * a cleartext password, offering no SASL at all — so (b) was unreachable against
+ * real Neon. A deployed container with raw TCP blocked would have reported
+ * INCONCLUSIVE_PEER_UNVERIFIED instead of (b), and (b) is the answer that KEEPS
+ * Containers. The gate is now scoped per transport, and the job it was doing on
+ * the WebSocket leg is carried by `classifyNegativeControl` plus the session
+ * battery instead.
  */
 
 import { createHash } from 'node:crypto';
@@ -71,6 +87,48 @@ export interface StageResult {
   error: string | null;
 }
 
+/**
+ * WHY `peerVerified: false` IS NOT ONE FACT BUT SEVERAL
+ * ----------------------------------------------------
+ * A bare false collapses three situations that mean completely different things:
+ * a peer that refused to prove itself, a peer that was never asked, and a peer
+ * that CANNOT be asked because the endpoint does not offer a mechanism with
+ * mutual proof. Neon's WebSocket wire proxy is the third: it asks for a
+ * cleartext password inside the `wss` tunnel and does not offer SASL/SCRAM at
+ * all, so there is no server signature to verify on that leg by design.
+ *
+ * The distinction is load-bearing rather than cosmetic. `peerVerified` used to
+ * gate BOTH (a) and (b); against real Neon that made (b) unreachable, so a
+ * container with raw TCP blocked would have reported an inconclusive instead of
+ * the branch that KEEPS Containers. The reason is what lets the gate be
+ * per-transport without becoming a hole.
+ */
+export type PeerVerificationReason =
+  /** SCRAM-SHA-256 completed and the server's `v=` signature verified. */
+  | 'scram_server_signature_verified'
+  /**
+   * The endpoint asked for `AuthenticationCleartextPassword` and offered no
+   * SASL. Authentication succeeded; the peer proved nothing to us at the
+   * Postgres layer, because this mechanism carries nothing for it to prove with.
+   */
+  | 'cleartext_auth_no_server_signature'
+  /**
+   * The far end asked for NO authentication and went straight to
+   * AuthenticationOk. This is the terminator signature, and it never unlocks a
+   * conclusive verdict on any transport.
+   */
+  | 'no_authentication_requested'
+  /** Authentication was attempted and did not complete. */
+  | 'auth_incomplete'
+  /** The channel never opened, so authentication was never attempted. */
+  | 'auth_not_attempted'
+  /**
+   * The one-shot HTTP endpoint authenticates inside Neon from a connection
+   * string in a header, not over the wire from here. It carries no evidence
+   * about the peer in either direction, by construction.
+   */
+  | 'one_shot_http_no_wire_auth';
+
 export interface TransportSummary {
   /** Did the byte channel open at all (TCP handshake / WebSocket upgrade / HTTP response)? */
   channelOpen: boolean;
@@ -79,24 +137,40 @@ export interface TransportSummary {
   /**
    * Did a SCRAM-SHA-256 exchange run to completion AND the server's final
    * signature verify? This is recorded as a fact rather than asserted in prose,
-   * because it is the only thing standing between "a Postgres answered" and
-   * "something accepted the socket". Always false for the one-shot HTTP
-   * control, which authenticates inside Neon's endpoint rather than over the
-   * wire and therefore proves nothing about the peer from here.
+   * because on a transport that OFFERS SCRAM it is the only thing standing
+   * between "a Postgres answered" and "something accepted the socket".
    *
-   * NOTE ON WHAT THIS DOES NOT RULE OUT: plain SCRAM (no channel binding — see
-   * `scram.ts`) cannot detect a *relaying* proxy, which forwards the exchange
-   * upstream and returns a signature that verifies legitimately. It rules out a
-   * terminator that merely accepted the socket, not a byte forwarder.
+   * False does not mean "suspicious" on its own — read `peerVerificationReason`,
+   * which says WHICH of the several very different situations produced it.
+   *
+   * NOTE ON WHAT THIS DOES NOT RULE OUT, WHEN TRUE: plain SCRAM (no channel
+   * binding — see `scram.ts`) cannot detect a *relaying* proxy, which forwards
+   * the exchange upstream and returns a signature that verifies legitimately. It
+   * rules out a terminator that merely accepted the socket, not a byte forwarder.
    */
   peerVerified: boolean;
+  /** Why `peerVerified` holds the value it does. See PeerVerificationReason. */
+  peerVerificationReason: PeerVerificationReason;
   /**
    * Did `SET LOCAL` inside an explicit transaction read back, stay scoped to
    * that transaction, land on one backend, and did a named prepared statement
    * survive between round trips? This — not the TCP handshake — is what KTD2
    * actually needs.
+   *
+   * On the WebSocket leg this is now the WHOLE of the anti-terminator argument,
+   * since that endpoint offers no mechanism with mutual proof. See
+   * `classifyNegativeControl` for the check that keeps it honest.
    */
   sessionSemantics: boolean;
+}
+
+/** The five session assertions, as observed on one channel. */
+export interface SessionAssertions {
+  selectOne: boolean;
+  setLocalReadback: boolean;
+  sameBackendInTxn: boolean;
+  localScopedOut: boolean;
+  preparedStatement: boolean;
 }
 
 /**
@@ -107,12 +181,49 @@ export interface TransportSummary {
  * same as it having behaved, and must never be read as if it had.
  */
 export type NegativeControlState =
-  /** It authenticated and then failed every session assertion, as it must. */
+  /**
+   * It authenticated and then failed the assertions that can only hold on a real
+   * session — the `SET LOCAL` nonce readback and the prepared statement.
+   */
   | 'discriminated'
   /** It never authenticated, so the battery's null check did not happen. */
   | 'absent'
-  /** It appeared to KEEP session semantics, which should be impossible. */
+  /** It appeared to KEEP per-session state, which should be impossible. */
   | 'suspect';
+
+/**
+ * WHY THIS IS STRICTER THAN "the control did not pass the battery"
+ * ---------------------------------------------------------------
+ * `peerVerified` no longer gates (b), because Neon's WebSocket proxy offers no
+ * mechanism that could produce it. The job that gate was doing — refusing to let
+ * a thing that merely accepted a channel be read as a real Postgres session —
+ * falls entirely to the session battery on that leg. So the battery has to be
+ * shown to DISCRIMINATE, not merely to have returned a non-pass.
+ *
+ * Two of the four session assertions are the ones a channel with no session
+ * behind it cannot pass, and they are the two checked here:
+ *
+ *   setLocalReadback   a nonce written by one statement is read back by the next
+ *   preparedStatement  a named statement created by one round trip runs in a later one
+ *
+ * Either of those passing on Neon's one-shot HTTP endpoint would mean the
+ * channel held state it cannot hold, so the instrument is measuring something
+ * other than what it claims and NO verdict from it is usable — `suspect`.
+ *
+ * `sameBackendInTxn` is deliberately NOT required to fail. Neon's HTTP endpoint
+ * keeps warm backends and consecutive requests can genuinely land on the same
+ * pid; requiring it to differ would make the control flap on a true negative.
+ * `localScopedOut` is derived from `setLocalReadback` (see battery.ts) and so
+ * cannot pass without it.
+ */
+export function classifyNegativeControl(
+  authenticated: boolean,
+  assertions: SessionAssertions,
+): NegativeControlState {
+  if (!authenticated) return 'absent';
+  if (assertions.setLocalReadback || assertions.preparedStatement) return 'suspect';
+  return 'discriminated';
+}
 
 export type Verdict =
   | 'A_RAW_TCP_OK'
@@ -155,11 +266,11 @@ export const VERDICTS: Record<Verdict, VerdictMeaning> = {
     exitCode: 0,
   },
   B_WEBSOCKET_ONLY: {
-    label: '(b) RAW TCP BLOCKED — WEBSOCKET ON 443 WORKS',
+    label: '(b) RAW TCP BLOCKED — WEBSOCKET ON 443 WORKS (peer NOT cryptographically verified)',
     assumption4:
-      'FAILS as literally worded, but the consequence is small. Raw TCP to {port} did not work; the Postgres wire protocol over a WebSocket on 443 did, with full session semantics.',
+      'FAILS as literally worded, but the consequence is small. Raw TCP to {port} did not work; the Postgres wire protocol over a WebSocket on 443 did, with full session semantics. READ THIS BEFORE QUOTING IT AS EQUIVALENT TO (a): peer identity was NOT cryptographically verified at the Postgres layer on that transport. Neon\'s WebSocket wire proxy asks for a cleartext password inside the already-TLS tunnel and offers no SASL/SCRAM, so there is no server signature to check — by design, not by failure. What stands behind the peer\'s identity here is the runtime\'s TLS certificate validation of the `wss` endpoint, plus the session battery: SET LOCAL nonce readback, one backend pid across an explicit transaction, the GUC scoped out after COMMIT, and a prepared statement surviving a round trip — every one of which Neon\'s one-shot HTTP endpoint failed on the same run. That rules out a thing that merely accepted a channel. It is a strictly weaker claim than (a)\'s verified SCRAM server signature.',
     planAction:
-      "KTD2's first no-branch applies and Containers are KEPT. Swap the transport to @neondatabase/serverless Pool/Client over WebSocket. `SET LOCAL hnsw.ef_search`, prepared statements, the per-tenant LRU and the 128 MB headroom all survive. Do NOT move to Workers. Update Assumption 4's line to record the transport change, and note that a connection now costs a WebSocket upgrade.",
+      "KTD2's first no-branch applies and Containers are KEPT. Swap the transport to @neondatabase/serverless Pool/Client over WebSocket. `SET LOCAL hnsw.ef_search`, prepared statements, the per-tenant LRU and the 128 MB headroom all survive. Do NOT move to Workers. Update Assumption 4's line to record the transport change, note that a connection now costs a WebSocket upgrade, and record that the WebSocket leg authenticates with a cleartext password over TLS rather than SCRAM — so certificate validation of the wss endpoint is the thing that must not be disabled.",
     exitCode: 10,
   },
   C_BOTH_BLOCKED: {
@@ -211,11 +322,11 @@ export const VERDICTS: Record<Verdict, VerdictMeaning> = {
     exitCode: 30,
   },
   INCONCLUSIVE_PEER_UNVERIFIED: {
-    label: 'INCONCLUSIVE — the session worked but the peer was never authenticated to us',
+    label: 'INCONCLUSIVE — the session worked but authentication established nothing about the peer',
     assumption4:
-      'UNSETTLED. A transport carried a full Postgres session, but no completed SCRAM-SHA-256 exchange with a verified server signature was recorded on it. Without that, "we reached Neon" rests on the far end having accepted our bytes, which an interception layer can also do. A pass here would advertise a guarantee the run did not enforce.',
+      'UNSETTLED. A transport carried a full Postgres session, but the authentication that happened on it was not one this probe accepts for that transport. On the raw TCP port that means no completed SCRAM-SHA-256 exchange with a verified server signature — Neon\'s Postgres DOES offer SCRAM on {port}, so its absence is the finding. On the WebSocket leg, a cleartext password inside the TLS tunnel IS accepted (that is all Neon\'s wire proxy offers), so reaching this verdict there means something else happened: most likely the far end asked for NO authentication at all and went straight to AuthenticationOk, which is exactly how a terminator that merely accepted the channel would look.',
     planAction:
-      'Do not branch on this. Check the authenticate stage: `scram_completed` and `server_signature_verified` are recorded there. A server that answered AuthenticationOk without a SASL exchange is itself the finding — Neon requires SCRAM.',
+      'Do not branch on this. Read the authenticate stage: `auth_method`, `scram_started`, `server_signature_verified` and `peer_verification_reason` are recorded there. `no_authentication_requested` means the peer was never challenged for anything and is the serious case; `auth_incomplete` means the exchange broke midway and a re-run is the first move.',
     exitCode: 30,
   },
   INCONCLUSIVE_CONTROL_ABSENT: {
@@ -227,9 +338,9 @@ export const VERDICTS: Record<Verdict, VerdictMeaning> = {
     exitCode: 30,
   },
   INCONCLUSIVE_CONTROL_SUSPECT: {
-    label: 'INCONCLUSIVE — the negative control PASSED the session battery',
+    label: 'INCONCLUSIVE — the negative control kept state it cannot hold',
     assumption4:
-      "UNSETTLED, and the instrument is in doubt. Neon's one-shot HTTP endpoint, which has no session behind it at all, appeared to keep session semantics. That should be impossible, so the battery is measuring something other than what it claims, and no verdict computed from it can be trusted in either direction.",
+      "UNSETTLED, and the instrument is in doubt. Neon's one-shot HTTP endpoint, which has no session behind it at all, read back the `SET LOCAL` nonce or ran a prepared statement created by an earlier round trip. That should be impossible, so the battery is measuring something other than what it claims, and no verdict computed from it can be trusted in either direction. It matters more than it used to: on the WebSocket leg the battery is now the WHOLE of the argument that the far end is a real Postgres session rather than something that accepted a channel.",
     planAction:
       'Do not branch on this, in either direction. Re-run the laptop calibration and read the `http.*` stages: the battery itself needs fixing before this probe can settle anything.',
     exitCode: 30,
@@ -345,8 +456,11 @@ export interface CalibrationReceiptCheck {
 export interface ProbeReport {
   probe: 'container-tcp';
   settles: 'Assumption 4 — a deployed Cloudflare Container can open unrestricted raw outbound TCP to Neon';
-  /** 2: attestation, peerVerified, negativeControl, wouldBeVerdict, renamed TCP transport key. */
-  schemaVersion: 2;
+  /**
+   * 3: per-transport `peerVerificationReason`, and the negative control's own
+   * per-assertion results. Both exist because `peerVerified` stopped gating (b).
+   */
+  schemaVersion: 3;
   startedAt: string;
   totalMs: number;
   /**
@@ -374,6 +488,12 @@ export interface ProbeReport {
   };
   /** What the negative control established. See NegativeControlState. */
   negativeControl: NegativeControlState;
+  /**
+   * The negative control's own per-assertion results, so the claim "the battery
+   * can register a negative" is checkable from the report rather than asserted.
+   * Null only when the probe stopped before the control ran.
+   */
+  negativeControlAssertions: SessionAssertions | null;
   verdict: Verdict;
   /**
    * On a `--local` run, what the same evidence would have meant had it come
@@ -486,6 +606,24 @@ export interface VerdictInputs {
   rawTcp443Reachable: boolean;
 }
 
+/**
+ * The peer-verification outcomes that do NOT block a (b) verdict.
+ *
+ * (b) turns on session semantics — that is the property KTD2 needs and the
+ * property Containers are kept for. Neon's WebSocket wire proxy cannot produce a
+ * server signature at all, so requiring one there does not raise the bar; it
+ * makes (b) unreachable against real Neon and converts a KEEP-Containers answer
+ * into an inconclusive, which is nearly as expensive as converting it into (c).
+ *
+ * What is emphatically NOT on this list is `no_authentication_requested`. A far
+ * end that challenges for nothing is the terminator shape the gate was built
+ * for, and it stays fatal on every transport.
+ */
+const PEER_REASONS_COMPATIBLE_WITH_B: readonly PeerVerificationReason[] = [
+  'scram_server_signature_verified',
+  'cleartext_auth_no_server_signature',
+];
+
 export function decideVerdict(i: VerdictInputs): Verdict {
   if (!i.precondition.ok) return 'INCONCLUSIVE_PRECONDITION';
 
@@ -500,7 +638,11 @@ export function decideVerdict(i: VerdictInputs): Verdict {
 
   // (a) is the only verdict that certifies raw pooled TCP, so it demands the
   // full session battery — plus a verified peer and a control that showed it
-  // can fail.
+  // can fail. This gate is UNCHANGED and deliberately strictest: Neon's Postgres
+  // does offer SCRAM-SHA-256 on the Postgres port, so a missing server signature
+  // there is a real absence rather than an endpoint that cannot supply one.
+  // Accepting a cleartext password on this transport would be a downgrade, and
+  // `SCRAM_ONLY` in run.ts means the exchange never even gets that far.
   if (i.rawTcpPostgresPort.sessionSemantics) {
     if (!i.rawTcpPostgresPort.peerVerified) return 'INCONCLUSIVE_PEER_UNVERIFIED';
     if (i.negativeControl === 'absent') return 'INCONCLUSIVE_CONTROL_ABSENT';
@@ -513,9 +655,15 @@ export function decideVerdict(i: VerdictInputs): Verdict {
   // false negative that one lost packet would otherwise produce.
   if (i.rawTcpPortConnectOk) return 'INCONCLUSIVE_TCP_REACHABLE';
 
-  // (b) likewise: KTD2's no-branch survives *because* session semantics do.
+  // (b) rests on session semantics, which is exactly the property KTD2's
+  // no-branch survives on. Peer identity is gated by REASON here rather than by
+  // the bare `peerVerified` flag: the endpoint offers no mechanism that could
+  // set it, so requiring it would forbid (b) against real Neon rather than
+  // making the claim stronger. `no_authentication_requested` is still fatal.
   if (i.webSocket443.sessionSemantics) {
-    if (!i.webSocket443.peerVerified) return 'INCONCLUSIVE_PEER_UNVERIFIED';
+    if (!PEER_REASONS_COMPATIBLE_WITH_B.includes(i.webSocket443.peerVerificationReason)) {
+      return 'INCONCLUSIVE_PEER_UNVERIFIED';
+    }
     if (i.negativeControl === 'absent') return 'INCONCLUSIVE_CONTROL_ABSENT';
     return 'B_WEBSOCKET_ONLY';
   }
@@ -565,6 +713,31 @@ export function summarizeNotes(i: VerdictInputs, verdict: Verdict, port: number)
         'withdrawn.',
     );
   }
+  if (
+    verdict === 'B_WEBSOCKET_ONLY' &&
+    i.webSocket443.peerVerificationReason === 'cleartext_auth_no_server_signature'
+  ) {
+    notes.push(
+      'WHAT (b) DOES NOT CLAIM: peer identity was not cryptographically verified at the Postgres ' +
+        "layer on the WebSocket transport. Neon's wire proxy asked for a cleartext password " +
+        '(authentication request 3) inside the already-TLS `wss` tunnel and offered no ' +
+        'SASL/SCRAM, so there was no server signature to check — `peer_verification_reason` on ' +
+        'that transport reads `cleartext_auth_no_server_signature`. This is Neon\'s documented ' +
+        'design for the serverless endpoint, not a failure of this run, and it is why (b) is ' +
+        'gated on session semantics rather than on a verified peer. Do not write (b) up as ' +
+        'carrying the same assurance as (a).',
+    );
+    notes.push(
+      'WHAT (b) DOES claim, and what carries it: the far end held a real Postgres session. The ' +
+        'same battery that passed here — `SET LOCAL` nonce readback, one backend pid across an ' +
+        'explicit transaction, the GUC scoped out after COMMIT, and a prepared statement ' +
+        "surviving a round trip — was failed on the same run by Neon's one-shot HTTP endpoint, " +
+        'which authenticates identically and holds no session. That contrast is the whole ' +
+        'anti-terminator argument on this leg; if the control had not discriminated, this would ' +
+        'have been an inconclusive instead. Beyond that, the peer is only as trusted as the ' +
+        "runtime's TLS certificate validation of the `wss` endpoint — so never disable it.",
+    );
+  }
   if (i.negativeControl === 'absent') {
     notes.push(
       "The negative control did not run: Neon's one-shot HTTP endpoint never authenticated, so " +
@@ -576,9 +749,12 @@ export function summarizeNotes(i: VerdictInputs, verdict: Verdict, port: number)
   }
   if (i.negativeControl === 'suspect') {
     notes.push(
-      "Neon's one-shot HTTP endpoint appeared to preserve session semantics. That should be " +
-        'impossible and casts doubt on the session battery itself — treat the whole run as ' +
-        'suspect and re-run the laptop calibration.',
+      "Neon's one-shot HTTP endpoint read back the `SET LOCAL` nonce or ran a prepared statement " +
+        'created by an earlier round trip. It holds no session, so that should be impossible, and ' +
+        'it casts doubt on the session battery itself — treat the whole run as suspect and re-run ' +
+        'the laptop calibration. (Note that the control landing on the SAME BACKEND PID is not ' +
+        'suspicious and is not what triggered this: Neon keeps warm backends, so consecutive ' +
+        'one-shot requests can genuinely reach the same one.)',
     );
   }
   if (!i.originCorroborated) {

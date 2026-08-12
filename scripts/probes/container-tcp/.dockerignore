@@ -19,4 +19,8 @@ Dockerfile
 worker.ts
 probe.ts
 
+# Tests run on the host. `container/` is the image payload; keeping the test
+# outside it is also why it lives at this level rather than beside the code.
+*.test.ts
+
 .DS_Store

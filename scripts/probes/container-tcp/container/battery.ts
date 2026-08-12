@@ -44,15 +44,15 @@
  */
 
 import { firstCell, type QueryResult, type SqlChannel } from './pg-wire.ts';
-import type { Redactor, StageResult, StageStatus } from './report.ts';
+import type { Redactor, SessionAssertions, StageResult, StageStatus } from './report.ts';
 
-export interface BatteryAssertions {
-  selectOne: boolean;
-  setLocalReadback: boolean;
-  sameBackendInTxn: boolean;
-  localScopedOut: boolean;
-  preparedStatement: boolean;
-}
+/**
+ * The per-assertion record. It lives in `report.ts` because the report now
+ * carries the NEGATIVE CONTROL's copy of it: with `peerVerified` no longer
+ * gating (b), "the battery can register a negative" has to be checkable from the
+ * artifact rather than asserted in prose. See `classifyNegativeControl`.
+ */
+export type BatteryAssertions = SessionAssertions;
 
 export interface BatteryResult {
   stages: StageResult[];
