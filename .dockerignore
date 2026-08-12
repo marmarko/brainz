@@ -1,0 +1,53 @@
+# Build context exclusions for the fleet image (U1 step 6).
+#
+# Two jobs. The first is a smaller, faster build. The second matters more: the
+# repo is public from commit one and the working tree will reference credentials
+# that unlock a real mailbox, so anything credential-shaped is kept out of the
+# image as well as out of git. An image layer is as durable as a commit and
+# harder to notice.
+
+# Version control and CI
+.git
+.gitignore
+.gitattributes
+.github
+.gitleaks.toml
+
+# Installed locally; the image installs its own from the lockfile
+node_modules
+
+# Build and test output
+dist
+coverage
+*.tsbuildinfo
+
+# Not needed at runtime. `*.md` matches one path segment, so this is the
+# top-level prose only — src/README.md rides along with the source and is
+# small enough not to be worth a second rule.
+docs
+test
+scripts
+*.md
+
+# Credentials and local configuration. The controls are GitHub push protection
+# and the gitleaks CI job (U1 step 5); this list is defence in depth, not the
+# control.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.dev.vars
+.wrangler
+
+# Deployment configuration is read by wrangler on the host, not by the container
+wrangler.toml
+Dockerfile
+.dockerignore
+
+# OS and editor
+.DS_Store
+*.swp
+.idea
+.vscode
+.claude

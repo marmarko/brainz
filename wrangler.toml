@@ -1,0 +1,159 @@
+# Cloudflare Containers configuration for both fleets (U1 step 6, KTD2).
+#
+# NOT YET SERVING REAL TRAFFIC. This file is complete in shape and deliberately
+# unbound: no route and no custom domain, and the Worker entrypoint plus both
+# Container classes land in later units (U6, U10). It exists now because three
+# later units verify against a continuously running, publicly reachable fleet,
+# and because a deployment shape is much cheaper to get wrong before there is
+# application code to blame.
+#
+# Shape, per KTD2: Worker -> Durable Object -> Container. Containers are not an
+# alternative to Workers, they are reached through one. The Worker named in
+# `main` is a router; the containers do the work.
+#
+# Why Containers and not Workers or Hyperdrive (KTD2, settled):
+#   - Hyperdrive caps at 25 configs per account, so a per-tenant connection
+#     string design walls at tenant #26.
+#   - Workers' 128 MB ceiling rules out in-process rerank and embedding batches.
+#   - Containers run arbitrary images with per-10ms billing and scale-to-zero,
+#     so the fleet keeps pooled TCP, prepared statements, a per-tenant
+#     postgres.js connection LRU and `SET LOCAL` discipline, connecting straight
+#     to Neon with no Hyperdrive slot consumed.
+#
+# Assumption 4 (raw outbound TCP from a deployed Container to Neon) is verified
+# in Phase 0, not assumed here. The no-branch keeps this file: if raw TCP is
+# blocked, the fallback is these same Containers with
+# `@neondatabase/serverless` over WebSocket on 443 — a port Containers
+# explicitly permit — whose Pool/Client preserve session and transaction
+# semantics, so `SET LOCAL hnsw.ef_search`, prepared statements and the
+# per-tenant LRU all survive. Only if WebSocket egress also fails does the
+# branch fall to Workers plus the one-shot HTTP driver, and only then does this
+# configuration change.
+
+name = "brainz-fleet"
+
+# The router Worker. Lands with U6; it resolves the tenant from the
+# authenticated bearer and hands the request to that tenant's container.
+main = "src/mcp/router.ts"
+
+compatibility_date = "2026-08-12"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+# ---------------------------------------------------------------------------
+# DECISION 1 — Tenant-affinity routing.
+#
+# Container instances are addressed by a Durable Object id derived from the
+# tenant id:
+#
+#   getContainer(env.MCP_FLEET, tenantId).fetch(request)   // idFromName(tenantId)
+#
+# This is a decision, not an implementation detail, which is why it is written
+# down next to the configuration rather than left to whoever writes the router.
+#
+# The per-tenant connection LRU (~500 warm) is the entire reason the Container
+# runtime was chosen over Workers, and it only pays off under affinity. Route by
+# load instead and two things break at once: every instance opens its own
+# connections to the same Neon compute — connection amplification across the
+# fleet against a database sized for one tenant's traffic — while most calls
+# land on an instance that has never seen this tenant and take a cold LRU miss.
+# That lands directly on the warm-p99 promise this decision exists to defend.
+#
+# The cost of affinity is honest and accepted: a tenant's throughput is bounded
+# by one instance, and an instance is a single point of failure for its tenant
+# until it is replaced. Both are the right trade for a per-user brain, where
+# per-tenant concurrency is small and cross-tenant blast radius is the property
+# being bought.
+#
+# DECISION 2 — sleepAfter (scale-to-zero vs. wake cost).
+#
+# Scale-to-zero is the cost model: per-10ms billing means an idle brain should
+# cost nothing, and R13's idle anchor assumes exactly that. But the wake cost is
+# not absorbed by the platform — it lands on the first call an agent makes,
+# which is a user waiting on `recall` in their client, and on a cold connection
+# LRU behind it.
+#
+# Chosen values, set on the Container classes (`sleepAfter` is a property of the
+# Container class from @cloudflare/containers, not a key in this file — U6 and
+# U10 set it mechanically; it is recorded here because it is a cost/latency
+# decision, not a code detail):
+#
+#   MCP fleet    sleepAfter = "15m"   (platform default is "10m")
+#   worker fleet sleepAfter = "5m"
+#
+# The MCP fleet is interactive and its wake cost is paid by a user, so it buys a
+# longer idle window than the default: an agent session is bursty, and a second
+# question five minutes after the first should not pay a cold start plus a cold
+# LRU. The worker fleet is batch, wakes on a schedule and has no one waiting, so
+# it gives the idle time back. Revisit both against measured wake latency and
+# real idle distribution during U13's bake — the numbers below are reasoned, not
+# measured, and this comment is the record of which is which.
+# ---------------------------------------------------------------------------
+
+# --- MCP fleet -------------------------------------------------------------
+[[containers]]
+class_name = "McpFleet"
+image = "./Dockerfile"
+
+# `lite` (1/16 vCPU, 256 MiB) reinstates the ceiling KTD2 rejected Workers over.
+# `standard-1` is the smallest predefined type with headroom for in-process
+# rerank and embedding batches; `standard-4` (4 vCPU, 12 GiB) is the top of the
+# predefined range if that proves tight at U11.
+instance_type = "standard-1"
+
+# Ceiling, not a target. Under tenant affinity this bounds concurrently *active*
+# tenants, since idle instances sleep rather than occupy a slot. Raise it with
+# beta signups; it exists so a runaway does not scale into a surprise invoice.
+max_instances = 50
+
+# --- Worker fleet ----------------------------------------------------------
+# Same image, different entrypoint. Consolidation cycles run for minutes with
+# embedding batches and belong on Containers regardless of how the MCP surface
+# is served, so this fleet stays here even under the Assumption-4 no-branch.
+[[containers]]
+class_name = "WorkerFleet"
+image = "./Dockerfile"
+instance_type = "standard-1"
+max_instances = 20
+
+# ---------------------------------------------------------------------------
+# Durable Object bindings. The DO is the addressing mechanism for Decision 1 —
+# the id derived from the tenant id is a DO id, and the container instance
+# follows the DO.
+# ---------------------------------------------------------------------------
+[[durable_objects.bindings]]
+name = "MCP_FLEET"
+class_name = "McpFleet"
+
+[[durable_objects.bindings]]
+name = "WORKER_FLEET"
+class_name = "WorkerFleet"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["McpFleet", "WorkerFleet"]
+
+# ---------------------------------------------------------------------------
+# Deliberately absent until the surrounding units land.
+#
+# Routes. U6's OAuth discovery metadata binds absolute issuer URLs to a stable
+# public origin, so the origin is provisioned before U6 rather than discovered
+# during it. Binding a route now would publish an endpoint that 500s.
+#
+#   [[routes]]
+#   pattern = "mcp.<origin>"
+#   custom_domain = true
+#
+# Scheduled triggers for the worker fleet (U10 owns the schedule itself).
+#
+#   [triggers]
+#   crons = ["*/5 * * * *"]
+#
+# Secrets. Nothing credential-shaped belongs in this file — it is committed to a
+# public repo. The per-tenant connection strings and bearer grants live in the
+# named secret store behind src/control/secrets.ts, which exists precisely
+# because platform environment variables cannot hold per-tenant secrets at
+# scale. The store's own access credential is set with `wrangler secret put`.
+# ---------------------------------------------------------------------------
