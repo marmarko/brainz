@@ -81,6 +81,21 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # worker-configuration.d.ts is generated from wrangler.toml and declares
+      # the bindings every handler sees. Committed so a fresh clone typechecks
+      # offline — but a committed generated file drifts silently: rename a
+      # binding in the config, forget to regenerate, and the types keep
+      # compiling while the runtime hands the handler an undefined namespace on
+      # the request path. Regenerating and diffing is the only way to notice.
+      - name: Worker types are in sync with wrangler.toml
+        run: |
+          bunx wrangler types
+          if ! git diff --quiet -- worker-configuration.d.ts; then
+            echo "::error::worker-configuration.d.ts is stale. Run 'bunx wrangler types' and commit the result."
+            git diff --stat -- worker-configuration.d.ts
+            exit 1
+          fi
+
       - name: Typecheck
         run: bun run typecheck
 

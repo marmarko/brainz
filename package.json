@@ -22,7 +22,9 @@
     "probe:r2": "bun run scripts/probes/r2-boundary/probe.ts"
   },
   "devDependencies": {
+    "@cloudflare/containers": "^0.3.7",
     "@types/bun": "latest",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "wrangler": "^4.122.0"
   }
 }
