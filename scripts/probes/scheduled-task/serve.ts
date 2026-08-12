@@ -1411,6 +1411,7 @@ type BeaconVerdict =
   | "unavailable__beacon_was_being_rejected_during_the_quiet_period"
   | "unavailable__server_was_not_up_across_the_quiet_period"
   | "unavailable__call_came_from_the_beacon_machine_itself"
+  | "unavailable__machine_was_active_during_the_claimed_absence"
   | "unavailable__no_call_to_bracket";
 
 type TransportVerdict =
@@ -1516,6 +1517,11 @@ function livenessAcross(startMs: number, endMs: number, heartbeats: HeartbeatRec
  *     otherwise only fails on a timing margin. Compared on IP, not the full
  *     identity tuple: the beacon is `curl` and the client is not, so their
  *     user-agents differ while the machine is the same.
+ *   - and NOTHING ELSE from that machine touched the server during the quiet
+ *     period either. The same argument applies across the whole gap, not just at
+ *     the call instant: a hand test at 06:00 from the laptop, with the beacon
+ *     loop dead since 05:00, is presence evidence sitting in the log — the
+ *     "absence" is contradicted by a record we already hold.
  */
 function beaconBracket(
   callMs: number,
@@ -1523,6 +1529,8 @@ function beaconBracket(
   beacons: BeaconRecord[],
   adminAuthFailures: HttpRecord[],
   heartbeats: HeartbeatRecord[],
+  /** Timestamps of non-beacon traffic from an address the beacon also posts from. */
+  beaconMachineActivityMs: number[],
 ): BeaconVerdict {
   if (beacons.length === 0) return "unavailable__no_beacon_records";
   const callIp = trustedIp(callTransport);
@@ -1557,6 +1565,9 @@ function beaconBracket(
   const quietEnd = after.ts_epoch_ms;
   if (adminAuthFailures.some((h) => h.ts_epoch_ms >= quietStart && h.ts_epoch_ms <= quietEnd)) {
     return "unavailable__beacon_was_being_rejected_during_the_quiet_period";
+  }
+  if (beaconMachineActivityMs.some((ms) => ms > quietStart && ms < quietEnd)) {
+    return "unavailable__machine_was_active_during_the_claimed_absence";
   }
   if (livenessAcross(quietStart, quietEnd, heartbeats) !== "covered") {
     return "unavailable__server_was_not_up_across_the_quiet_period";
@@ -1604,6 +1615,19 @@ function assess(records: ProbeRecord[], nowMs: number): AssessResult {
     arms.some((a) => ms >= a.fire_at_epoch_ms - halfWidthMs(a) && ms <= a.fire_at_epoch_ms + halfWidthMs(a));
 
   const adminAuthFailures = https.filter((h) => h.reason === "admin_auth_failed");
+
+  // Any non-beacon traffic from an address the beacon also posts from is direct
+  // proof that machine was reachable at that moment. Used to contradict a claimed
+  // absence anywhere inside the quiet period, not merely at the call instant.
+  const beaconIps = new Set(beacons.map((b) => trustedIp(b.transport)));
+  const beaconIpNets = new Set([...beaconIps].map(ipNetwork));
+  const fromBeaconMachine = (t: TransportIdentity): boolean =>
+    beaconIps.has(trustedIp(t)) || beaconIpNets.has(ipNetwork(trustedIp(t)));
+  const beaconMachineActivityMs = [
+    ...calls.filter((c) => fromBeaconMachine(c.transport)),
+    ...rpcs.filter((r) => fromBeaconMachine(r.transport)),
+    ...https.filter((h) => fromBeaconMachine(h.transport)),
+  ].map((r) => r.ts_epoch_ms);
 
   // ---------------------------------------------------------------------
   // The operator-identity population. v1 built this from out-of-window TOOL
@@ -1897,7 +1921,14 @@ function assess(records: ProbeRecord[], nowMs: number): AssessResult {
     // ---- discriminator 5a: beacon absence bracket -------------------------
     let beaconVerdict: BeaconVerdict = "unavailable__no_call_to_bracket";
     for (const c of evidence) {
-      const v = beaconBracket(c.ts_epoch_ms, c.transport, beacons, adminAuthFailures, heartbeats);
+      const v = beaconBracket(
+        c.ts_epoch_ms,
+        c.transport,
+        beacons,
+        adminAuthFailures,
+        heartbeats,
+        beaconMachineActivityMs,
+      );
       // Every evidence call must be bracketed; report the first that is not.
       if (v !== "absence_bracketed") {
         beaconVerdict = v;
@@ -1980,7 +2011,12 @@ function assess(records: ProbeRecord[], nowMs: number): AssessResult {
   // by requiring the counted windows to be non-overlapping, >= 20 h apart, and
   // to rest on disjoint sets of calls.
   // ---------------------------------------------------------------------
-  const cleanWindows = windows.filter((w) => w.clean);
+  // Sorted by FIRE time, not arm time: re-arming day 1 after arming day 2 would
+  // otherwise make the separation check compute a negative delta and discard a
+  // genuinely independent window — a manufactured false fail.
+  const cleanWindows = windows
+    .filter((w) => w.clean)
+    .sort((a, b) => Date.parse(a.fire_at) - Date.parse(b.fire_at));
   const qualifying: WindowAssessment[] = [];
   for (const w of cleanWindows) {
     const prev = qualifying[qualifying.length - 1];

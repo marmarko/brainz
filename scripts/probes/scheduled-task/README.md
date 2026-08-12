@@ -86,9 +86,10 @@ with an absent machine. A bracket requires **all** of:
 - no admin requests were being rejected during the quiet period (a beacon 404ing on a
   rotated token looks exactly like an absent machine);
 - the server itself was up across the quiet period;
-- and **the call did not come from the beacon machine's own IP.** A machine that just
-  made an HTTPS request was manifestly reachable, so the beacon cannot testify to its
-  absence at that instant however the timings line up.
+- **nothing from the beacon machine's own address touched the server at any point in
+  the quiet period** — not the call, and not a hand test an hour earlier. A machine that
+  just made an HTTPS request was manifestly reachable, so the beacon cannot testify to
+  its absence however the timings line up.
 
 #### 5b — the transport identity
 
@@ -186,11 +187,11 @@ re-arm, and do not cite it in the plan either way.
    The report surfaces the identity of every call; read it rather than assuming.
 9. **The probe tool returns instantly.** A real `briefing` that takes 30s could time out
    inside a scheduled task. Not covered.
-10. **Optional beacon idle fields are corroboration, never proof.** If your beacon posts
-    `user_idle_seconds` / `screen_locked`, they are recorded and printed. They never
-    qualify a window: they are measured by the machine under test, their behaviour across
-    sleep/wake is unverified, and an untouched laptop with the lid open produces the same
-    reading as an absent operator.
+10. **Optional beacon idle fields are recorded, never counted.** If your beacon posts
+    `user_idle_seconds` / `screen_locked`, they are stored on the beacon record and
+    visible in `report --json`. They never qualify a window: they are measured by the
+    machine under test, their behaviour across sleep/wake is unverified, and an untouched
+    laptop with the lid open produces the same reading as an absent operator.
 
 ---
 
