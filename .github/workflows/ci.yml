@@ -1,0 +1,122 @@
+# The PR-blocking tier (U1 approach steps 5 and 7).
+#
+# Everything in this job runs with **no secrets**, on purpose. A pull request
+# from a fork gets exactly the same green as one from a branch, which is the
+# only way an outside contributor can tell whether their change is good. That
+# constraint is what keeps the deterministic half of the suite deterministic:
+# zero model calls, no network egress, no live substrate.
+#
+# Deliberately NOT wired in here:
+#   * `scripts/probes/**` — throwaway probes that need real credentials and are
+#     run by hand while an assumption is being settled.
+#   * `eval:blocking`, `eval:canary`, `eval:live-parity`, `conformance`,
+#     `test:roundtrip` — declared now so the Verification Contract's command
+#     names stay stable, implemented by U7/U17. They exit non-zero on purpose;
+#     wiring them today would make CI red from day one and train everyone to
+#     ignore it.
+#   * anything needing a live Neon project — see `real-substrate.yml`.
+
+name: CI
+
+on:
+  # `push` is limited to the default branch so a branch with an open PR does not
+  # run the whole job twice for one commit.
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  blocking:
+    name: typecheck · tests · ledger · secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      # Wired at U1 rather than discovered at U3. Nothing in the suite talks to
+      # it yet; it is here so the unit that needs a real Postgres with pgvector
+      # inherits a working, secret-free substrate instead of re-plumbing CI
+      # under deadline. pg17 + pgvector matches the tenant substrate.
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_DB: brainz_test
+          POSTGRES_USER: postgres
+          # Trust auth, not a password. The container is reachable only from
+          # this job, and a password here would put a credential-shaped string
+          # in a public repo for no security gain at all.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # The name U3's schema and migration tests read. Not a secret: it points
+      # at the throwaway service container above.
+      DATABASE_URL: postgres://postgres@localhost:5432/brainz_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Full history: gitleaks scans commits, not just the tip tree, so a
+          # secret added and then removed on the same branch is still caught.
+          fetch-depth: 0
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # Prints the count of known-but-unguarded hazards alongside the unit
+      # tests. That number should go down and should never be zero by accident.
+      - name: Tests
+        run: bun test
+
+      # R7 / R20: no unclassified capability, no passed revisit date. A
+      # capability may be declined; it may not be forgotten.
+      - name: Concepts ledger
+        run: bun run ledger:check
+
+      - name: Verify the pgvector service
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS vector'
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tAc \
+            "SELECT 'pgvector ' || extversion FROM pg_extension WHERE extname = 'vector'"
+
+      # Secret scanning before any credential exists. The repo is public from
+      # commit one and the working tree references credentials that unlock a
+      # real mailbox — a committed `.env` is instantly public and effectively
+      # unrevocable. This is a control; `.gitignore` and discipline are not.
+      #
+      # The CLI is used rather than the vendor action because the action needs a
+      # licence secret for organisation-owned repos, and a job that depends on a
+      # secret cannot run on a fork PR. `--redact` keeps any finding's value out
+      # of a public build log.
+      - name: Scan for committed secrets (gitleaks)
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/gitleaks" gitleaks
+          "$RUNNER_TEMP/gitleaks/gitleaks" version
+          "$RUNNER_TEMP/gitleaks/gitleaks" git . --redact --exit-code 1

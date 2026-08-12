@@ -1,0 +1,157 @@
+# The scheduled, secret-gated tier. NEVER runs on `pull_request`.
+#
+# ---------------------------------------------------------------------------
+# Why this workflow exists at all
+# ---------------------------------------------------------------------------
+# The hazard ledger's "dev engine masks remote engine" card. In the reference
+# implementation, a local stand-in engine accepted a query shape the real remote
+# engine rejected, so the bug was invisible in development and in CI and only
+# appeared against the real substrate — where it aborted every sync. A test
+# suite that only ever runs against a convenient local engine does not merely
+# miss that class of bug; it actively produces confidence that the class does
+# not exist.
+#
+# So a second tier is structural, not optional. `ci.yml` proves the code is
+# correct against a dockerized Postgres with no secrets, which is what lets fork
+# PRs run it. This workflow proves the same code is correct against a real Neon
+# project — where connection pooling, per-connection GUCs, extension
+# availability and provisioning latency behave differently from a container on
+# the same host.
+#
+# It never runs on `pull_request`, because a PR-triggered job with access to
+# secrets is a credential-exfiltration path from any fork.
+#
+# ---------------------------------------------------------------------------
+# What it will own (U2/U3; not written yet)
+# ---------------------------------------------------------------------------
+#   * Real-Neon provisioning end to end: create project, role, database, apply
+#     the tenant schema, verify a first query, tear down.
+#   * The H1 behavioural guard against a live project — >200 matching chunks,
+#     a 250-candidate request, >=200 returned. `hnsw.ef_search` defaults to 40
+#     and silently truncates the candidate pool; the failure presents as "our
+#     ranking is mediocre", never as an error.
+#   * The pooled-connection `SET LOCAL` test — two sequential queries on one
+#     pooled connection, the second seeing the default. A per-connection GUC
+#     that evaporates is a cross-tenant correctness bug with no local analogue.
+#
+# ---------------------------------------------------------------------------
+# The registration contract
+# ---------------------------------------------------------------------------
+# A real-substrate test gates itself on `BRAINZ_REAL_SUBSTRATE`, which only this
+# workflow sets:
+#
+#     const live = !!process.env.BRAINZ_REAL_SUBSTRATE;
+#     test.skipIf(!live)("H1: ef_search is set per transaction", async () => { ... });
+#
+# That keeps `bun test` honest in both directions — the blocking tier reports
+# the test as skipped rather than passing it by omission, and this workflow runs
+# the identical file with the credential present. The step below greps for that
+# marker so an empty suite reports itself instead of returning a green tick for
+# having done nothing.
+
+name: Real substrate
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily, off the hour to avoid the top-of-hour scheduling queue.
+    - cron: "37 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  real-substrate:
+    name: live Neon project
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # The `secrets` context is not available in a job-level `if`, so the gate
+      # is a step that maps the secret into `env` and publishes a boolean.
+      # A missing credential is a warning, not a failure: this workflow is
+      # cloned into forks that will never have one, and a scheduled job that
+      # fails by design trains people to ignore its notifications.
+      - name: Check for the credentials this tier needs
+        id: gate
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${NEON_API_KEY}" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Neon credential present." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Real-substrate tier not run::NEON_API_KEY is not configured for this repository, so nothing was verified against a live project."
+            {
+              echo "### Real substrate: not run"
+              echo
+              echo "\`NEON_API_KEY\` is not configured. Nothing was verified against a live"
+              echo "Neon project — the dockerized tier in \`ci.yml\` is the only evidence"
+              echo "this commit has."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Look for registered real-substrate tests
+        id: suite
+        run: |
+          set -euo pipefail
+          count=0
+          if [ -d test ]; then
+            count=$(grep -rl 'BRAINZ_REAL_SUBSTRATE' test | wc -l | tr -d ' ')
+          fi
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          if [ "${count}" -gt 0 ]; then
+            echo "registered=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "registered=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run the real-substrate suite
+        if: steps.gate.outputs.ready == 'true' && steps.suite.outputs.registered == 'true'
+        env:
+          BRAINZ_REAL_SUBSTRATE: "1"
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+        run: bun test
+
+      # Loud, not silent. A skeleton that returns a green tick for having run
+      # nothing is the same failure shape this whole workflow exists to catch.
+      - name: Report that no real-substrate tests are registered
+        if: steps.suite.outputs.registered != 'true'
+        run: |
+          set -euo pipefail
+          echo "::notice title=No real-substrate tests registered yet::Nothing in test/ gates on BRAINZ_REAL_SUBSTRATE, so this run verified nothing against a live project."
+          {
+            echo "### No real-substrate tests registered yet"
+            echo
+            echo "Nothing under \`test/\` gates on \`BRAINZ_REAL_SUBSTRATE\`, so this run"
+            echo "exercised no live substrate. The workflow is a working skeleton waiting"
+            echo "for U2 (real-Neon provisioning) and U3 (the H1 behavioural guard and the"
+            echo "pooled-connection \`SET LOCAL\` test)."
+            echo
+            echo "Until those land, **the dev-engine-masks-remote-engine hazard is"
+            echo "unguarded** — see \`docs/porting-hazards.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report that registered tests could not run
+        if: steps.gate.outputs.ready != 'true' && steps.suite.outputs.registered == 'true'
+        env:
+          # Through `env` rather than interpolated into the shell — the habit
+          # matters more than this particular value, which is a count we
+          # produced ourselves.
+          REGISTERED_FILES: ${{ steps.suite.outputs.count }}
+        run: |
+          set -euo pipefail
+          echo "::warning title=Real-substrate tests skipped::${REGISTERED_FILES} file(s) gate on BRAINZ_REAL_SUBSTRATE but no credential was available to run them."
