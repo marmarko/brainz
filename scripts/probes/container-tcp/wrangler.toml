@@ -1,0 +1,63 @@
+# Deployment config for the Assumption 4 probe. THROWAWAY — delete after use.
+#
+#   bunx wrangler deploy -c scripts/probes/container-tcp/wrangler.toml
+#   bunx wrangler delete --name brainz-probe-container-tcp     # when done
+#
+# This is a SEPARATE Worker from the fleet in the repo-root wrangler.toml. It
+# deliberately shares nothing with it: its own name, its own Durable Object
+# class, its own image, its own secrets. A probe that reconfigured the real
+# fleet in order to measure it would be changing the thing it is measuring, and
+# would leave a half-configured fleet behind when it was deleted.
+#
+# Paths here resolve relative to THIS file, so `main` and `image` point at the
+# probe directory, not the repo root.
+
+name = "brainz-probe-container-tcp"
+main = "worker.ts"
+
+compatibility_date = "2026-08-12"
+
+# The container image needs no compat flags — it is an ordinary Bun process, not
+# a Worker. `nodejs_compat` is set for the Worker itself only so this file stays
+# comparable with the fleet config.
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+[[containers]]
+class_name = "ContainerTcpProbe"
+image = "./Dockerfile"
+
+# Matches the fleet's instance type on purpose. Egress policy is not documented
+# per instance type, and "we tested on a smaller box" is exactly the sort of
+# difference that would make a negative result arguable later. `lite` would be
+# cheaper if you are only after a positive result and want to minimise spend.
+instance_type = "standard-1"
+
+# One instance. There are no tenants here, and the affinity that matters to KTD2
+# is not what is being measured.
+max_instances = 1
+
+[[durable_objects.bindings]]
+name = "PROBE_CONTAINER"
+class_name = "ContainerTcpProbe"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ContainerTcpProbe"]
+
+# ---------------------------------------------------------------------------
+# Secrets — NEVER written in this file. The repo is public.
+#
+#   bunx wrangler secret put PROBE_DATABASE_URL -c scripts/probes/container-tcp/wrangler.toml
+#   bunx wrangler secret put PROBE_AUTH_TOKEN   -c scripts/probes/container-tcp/wrangler.toml
+#
+# PROBE_DATABASE_URL is the DIRECT (non `-pooler`) connection string of a
+# throwaway Neon project. PROBE_AUTH_TOKEN is any random string; without it the
+# Worker refuses every request, because its *.workers.dev URL is public and this
+# endpoint runs SQL.
+#
+# Optional, only if you accept a wrong session-battery result:
+#   PROBE_ALLOW_POOLER = "1"
+# ---------------------------------------------------------------------------

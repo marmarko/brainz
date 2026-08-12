@@ -1,0 +1,134 @@
+/**
+ * The Worker in front of the throwaway probe container.
+ *
+ * Containers are reached *through* a Worker — a Durable Object routes to the
+ * instance — so this file is not optional scaffolding, it is the only way to
+ * make a container run at all. It mirrors the shape the real fleet uses
+ * (Worker -> DO -> Container, KTD2) so the thing being measured is the same
+ * runtime the plan intends to ship on.
+ *
+ * WHAT IT DOES NOT DO
+ * -------------------
+ * It does not open any connection itself. If the Worker connected to Neon, the
+ * result would describe the Workers runtime — which has its own outbound socket
+ * rules — and would say nothing about Containers. Every byte measured is
+ * emitted from inside the container.
+ *
+ * FAIL CLOSED
+ * -----------
+ * This endpoint runs SQL against a real Neon project and returns diagnostics.
+ * Its `*.workers.dev` URL is public and guessable. So a missing bearer token is
+ * a refusal, never a default-open, and the DSN is never echoed back.
+ */
+
+import { Container } from '@cloudflare/containers';
+
+interface ProbeEnv {
+  PROBE_CONTAINER: DurableObjectNamespace<ContainerTcpProbe>;
+  /** `wrangler secret put PROBE_DATABASE_URL` — the throwaway Neon DSN. */
+  PROBE_DATABASE_URL?: string;
+  /** `wrangler secret put PROBE_AUTH_TOKEN` — any random string you also pass locally. */
+  PROBE_AUTH_TOKEN?: string;
+  /** `"1"` to allow a `-pooler` DSN. Off by default; see container/battery.ts. */
+  PROBE_ALLOW_POOLER?: string;
+}
+
+export class ContainerTcpProbe extends Container<ProbeEnv> {
+  override defaultPort = 8080;
+
+  /**
+   * Short on purpose. This is a throwaway that should cost nothing between the
+   * two or three times it is invoked, and a cold start costs seconds, not
+   * correctness — nothing here is latency-sensitive.
+   */
+  override sleepAfter = '2m';
+
+  /**
+   * Set explicitly rather than inherited. The platform default is `true`, but
+   * this single flag is the difference between "Cloudflare blocks raw TCP" and
+   * "this container had no internet at all", and a probe whose central negative
+   * result could be caused by an unstated default is not evidence.
+   */
+  override enableInternet = true;
+
+  override envVars = { PORT: '8080' };
+}
+
+/** Length-independent-ish comparison; the token is not a password but is a bearer. */
+function tokensMatch(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+function json(body: unknown, status: number): Response {
+  return new Response(JSON.stringify(body, null, 2), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+  });
+}
+
+export default {
+  async fetch(request: Request, env: ProbeEnv): Promise<Response> {
+    const expected = env.PROBE_AUTH_TOKEN;
+    if (expected === undefined || expected === '') {
+      return json(
+        {
+          error: 'probe_not_configured',
+          detail:
+            'PROBE_AUTH_TOKEN is not set, so this endpoint refuses every request. Set it with ' +
+            '`wrangler secret put PROBE_AUTH_TOKEN` (any random string) and pass the same value ' +
+            'as PROBE_AUTH_TOKEN when running `bun run probe:container-tcp`.',
+        },
+        503,
+      );
+    }
+
+    const header = request.headers.get('authorization') ?? '';
+    const presented = header.startsWith('Bearer ') ? header.slice('Bearer '.length) : '';
+    if (!tokensMatch(presented, expected)) {
+      return json({ error: 'unauthorized' }, 401);
+    }
+
+    const url = new URL(request.url);
+    if (url.pathname !== '/probe') {
+      return json(
+        { error: 'not_found', detail: 'POST /probe is the only route.' },
+        404,
+      );
+    }
+
+    const dsn = env.PROBE_DATABASE_URL;
+    if (dsn === undefined || dsn === '') {
+      return json(
+        {
+          error: 'missing_dsn',
+          detail:
+            'PROBE_DATABASE_URL is not set. Set it with `wrangler secret put PROBE_DATABASE_URL` ' +
+            'using the DIRECT (non-pooler) connection string of a throwaway Neon project.',
+        },
+        400,
+      );
+    }
+
+    // `cf` is present on an incoming request in production and absent under
+    // `wrangler dev`; the cast keeps this file free of a workers-types import.
+    const colo = (request as unknown as { cf?: { colo?: string } }).cf?.colo ?? null;
+
+    // One fixed instance name: this probe has no tenants, and the affinity that
+    // matters to KTD2 is not what is being measured here.
+    const id = env.PROBE_CONTAINER.idFromName('assumption-4');
+    return env.PROBE_CONTAINER.get(id).fetch(
+      new Request('http://container/probe', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          dsn,
+          colo,
+          allowPooler: env.PROBE_ALLOW_POOLER === '1',
+        }),
+      }),
+    );
+  },
+};

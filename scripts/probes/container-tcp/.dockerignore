@@ -1,0 +1,22 @@
+# Build context is the probe directory. Only `container/` belongs in the image.
+#
+# The exclusions below are not just about image size. `result-*.json` files are
+# raw probe output that may name a Neon host, and RESULT.md is a working
+# document — neither has any business inside a container image, which is as
+# durable as a commit and much harder to notice.
+
+README.md
+RESULT.md
+result-*.json
+*.local.*
+
+# Host-side deployment configuration, read by wrangler, never by the container.
+wrangler.toml
+Dockerfile
+.dockerignore
+
+# The Worker and the local driver run outside the container.
+worker.ts
+probe.ts
+
+.DS_Store
