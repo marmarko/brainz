@@ -1,0 +1,2689 @@
+<title>Consumer-Grade Brain</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --bg-primary: #0a0a0f;
+    --bg-secondary: #14141f;
+    --bg-tertiary: #1e1e2e;
+    --text-primary: #e0e0e0;
+    --text-secondary: #999;
+    --text-muted: #7d7d8a;
+    --accent: #3b82f6;
+    --accent-soft: rgba(59, 130, 246, 0.12);
+    --accent-text: #8ab4f8;
+    --success: #22c55e;
+    --success-soft: rgba(34, 197, 94, 0.11);
+    --success-text: #6ee7a0;
+    --warning: #f59e0b;
+    --warning-soft: rgba(245, 158, 11, 0.11);
+    --warning-text: #fbbf24;
+    --error: #ef4444;
+    --error-soft: rgba(239, 68, 68, 0.11);
+    --error-text: #f87171;
+    --font-sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 15.5px; line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 940px; margin-inline: auto; padding: 48px 24px 96px; }
+  p, li { max-width: 72ch; }
+  a { color: var(--accent-text); text-decoration: none; border-bottom: 1px solid rgba(138,180,248,0.3); }
+  a:hover { border-bottom-color: var(--accent-text); }
+  code {
+    font-family: var(--font-mono); font-size: 0.875em;
+    background: var(--bg-tertiary); border-radius: 3px;
+    padding: 1px 5px; color: #c9c9d4;
+  }
+  strong { color: inherit; font-weight: 600; }
+  .eyebrow {
+    font-size: 11.5px; letter-spacing: 0.13em; text-transform: uppercase;
+    color: var(--text-muted); font-weight: 600; margin-bottom: 8px;
+  }
+  h1 { font-size: 34px; line-height: 1.2; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 16px; }
+  h2 {
+    font-size: 22px; font-weight: 650; letter-spacing: -0.01em;
+    margin: 56px 0 8px; padding-bottom: 10px; border-bottom: 1px solid var(--bg-tertiary);
+  }
+  h3 { font-size: 18px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.005em; }
+  h4 {
+    font-size: 13px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase;
+    color: var(--text-muted); margin: 22px 0 6px;
+  }
+  .docmeta { display: flex; flex-wrap: wrap; gap: 8px 10px; margin: 0 0 28px; font-size: 13px; }
+  .docmeta span {
+    background: var(--bg-secondary); border: 1px solid var(--bg-tertiary);
+    border-radius: 999px; padding: 3px 12px; color: var(--text-secondary);
+    font-family: var(--font-mono); font-size: 12px;
+  }
+  .lede { font-size: 17px; color: var(--text-secondary); line-height: 1.6; max-width: 70ch; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); gap: 10px; margin: 32px 0 8px; }
+  .stat { background: var(--bg-secondary); border: 1px solid var(--bg-tertiary); border-radius: 8px; padding: 14px 16px; }
+  .stat .n { font-family: var(--font-mono); font-size: 21px; font-weight: 500; color: var(--text-primary); display: block; line-height: 1.2; }
+  .stat .l { font-size: 11.5px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; margin-top: 4px; display: block; }
+  .jumplist { background: var(--bg-secondary); border: 1px solid var(--bg-tertiary); border-radius: 8px; padding: 16px 20px; margin: 20px 0 36px; }
+  .jumplist ol { margin: 0; padding-left: 20px; }
+  .jumplist li { margin: 5px 0; font-size: 14.5px; max-width: none; }
+  .jumplist a { border-bottom: none; }
+  .jumplist a:hover { border-bottom: 1px solid var(--accent-text); }
+  .jumplist .ax { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-muted); margin-left: 6px; }
+  article.idea { background: var(--bg-secondary); border: 1px solid var(--bg-tertiary); border-radius: 10px; padding: 24px 26px 26px; margin: 0 0 22px; }
+  .idea-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
+  .idnum {
+    font-family: var(--font-mono); font-size: 13px; font-weight: 500;
+    color: var(--accent-text); background: var(--accent-soft);
+    border: 1px solid rgba(59,130,246,0.25); border-radius: 999px; padding: 2px 10px; flex-shrink: 0;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; margin: 12px 0 18px; }
+  .chip {
+    font-family: var(--font-mono); font-size: 11.5px; border-radius: 999px; padding: 3px 11px;
+    border: 1px solid var(--bg-tertiary); background: var(--bg-tertiary); color: var(--text-secondary);
+  }
+  .chip.axis { background: var(--accent-soft); border-color: rgba(59,130,246,0.25); color: var(--accent-text); }
+  .chip.hi { background: var(--success-soft); border-color: rgba(34,197,94,0.25); color: var(--success-text); }
+  .chip.mid { background: var(--warning-soft); border-color: rgba(245,158,11,0.25); color: var(--warning-text); }
+  .chip.new { background: var(--success-soft); border-color: rgba(34,197,94,0.3); color: var(--success-text); }
+  .chip.crit { background: var(--error-soft); border-color: rgba(239,68,68,0.3); color: var(--error-text); }
+  article.pw { border-left: 1px solid var(--bg-tertiary); }
+  article.pw .idnum { background: var(--error-soft); border-color: rgba(239,68,68,0.25); color: var(--error-text); }
+  article.pw.imp .idnum { background: var(--warning-soft); border-color: rgba(245,158,11,0.25); color: var(--warning-text); }
+  .field { margin: 16px 0; }
+  .field p { margin: 0; }
+  .field p + p { margin-top: 10px; }
+  .basis { background: var(--bg-primary); border: 1px solid var(--bg-tertiary); border-radius: 7px; padding: 14px 16px; font-size: 14.5px; }
+  .basis .tag { font-family: var(--font-mono); font-size: 11.5px; font-weight: 500; padding: 1px 7px; border-radius: 4px; margin-right: 7px; }
+  .tag.direct { background: var(--success-soft); color: var(--success-text); }
+  .tag.external { background: var(--accent-soft); color: var(--accent-text); }
+  .tag.reasoned { background: var(--warning-soft); color: var(--warning-text); }
+  .basis p { max-width: none; }
+  .basis p + p { margin-top: 9px; }
+  .downside { background: var(--warning-soft); border: 1px solid rgba(245,158,11,0.2); border-radius: 7px; padding: 13px 16px; font-size: 14.5px; }
+  .downside p { max-width: none; margin: 0; }
+  .downside p + p { margin-top: 9px; }
+  .callout { background: var(--error-soft); border: 1px solid rgba(239,68,68,0.22); border-radius: 8px; padding: 16px 20px; margin: 24px 0; }
+  .callout .eyebrow { color: var(--error-text); }
+  .callout p { margin: 0; max-width: none; }
+  .callout p + p { margin-top: 10px; }
+  .callout.info { background: var(--accent-soft); border-color: rgba(59,130,246,0.22); }
+  .callout.info .eyebrow { color: var(--accent-text); }
+  figure { margin: 20px 0; }
+  figure svg { display: block; width: 100%; height: auto; }
+  figcaption { font-size: 13px; color: var(--text-muted); margin-top: 8px; max-width: 72ch; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; margin: 18px 0; }
+  th { text-align: left; font-size: 11.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); font-weight: 600; padding: 8px 12px; border-bottom: 1px solid var(--bg-tertiary); }
+  td { padding: 9px 12px; border-bottom: 1px solid var(--bg-tertiary); vertical-align: top; color: var(--text-secondary); }
+  td:first-child { font-family: var(--font-mono); font-size: 12.5px; color: var(--text-muted); white-space: nowrap; }
+  td.idea-name { color: var(--text-primary); font-family: var(--font-sans); font-size: 14px; }
+  .grounding-grid { display: grid; gap: 18px; margin-top: 18px; }
+  .gcard { background: var(--bg-secondary); border: 1px solid var(--bg-tertiary); border-radius: 8px; padding: 18px 20px; }
+  .gcard h4 { margin-top: 0; }
+  .gcard p, .gcard li { font-size: 14.5px; max-width: none; }
+  .gcard ul { margin: 6px 0 0; padding-left: 20px; }
+  .gcard li { margin: 5px 0; }
+  .axes { margin: 18px 0 0; padding: 0; list-style: none; }
+  .axes li { padding: 10px 0; border-bottom: 1px solid var(--bg-tertiary); font-size: 14.5px; max-width: none; }
+  .axes li:last-child { border-bottom: none; }
+  .axes .slug { font-family: var(--font-mono); font-size: 12.5px; color: var(--accent-text); margin-right: 10px; }
+  footer.composition-signal {
+    margin-top: 72px; padding-top: 20px; border-top: 1px solid var(--bg-tertiary);
+    font-size: 12.5px; color: var(--text-muted); font-family: var(--font-mono);
+  }
+  @media (max-width: 640px) {
+    .page { padding: 32px 16px 64px; }
+    h1 { font-size: 27px; }
+    article.idea { padding: 20px 18px; }
+  }
+</style>
+
+<div class="page">
+
+<div class="eyebrow">Ideation · repo-grounded</div>
+<h1>brainz — a consumer-grade personal brain</h1>
+
+<div class="docmeta">
+  <span>date <time datetime="2026-08-11">2026-08-11</time></span>
+  <span>topic consumer-grade-brain</span>
+  <span>mode repo-grounded</span>
+  <span>implementing at ~/code/brainz</span>
+  <span>reference ~/code/gbrain</span>
+</div>
+
+<p class="lede">
+  <strong>Focus:</strong> re-implement gbrain's goal — a personal AI brain — as something a
+  non-technical person can actually use. Self-contained, OAuth-only source connection,
+  automatic ingest and background synthesis, open source with a hosted consumer option,
+  hosted models and bring-your-own-keys, consumed through stateless MCP so Claude Desktop,
+  Claude Code, ChatGPT and ChatGPT Work all reach the same brain. Plus: provable per-user
+  isolation, near-zero idle cost, regular backup with a folder-structure export,
+  personal-vs-work context marking, a consumer web app and an in-chat visual app for managing
+  connections, and a way to keep inheriting gbrain's improvements while owning 100% of your
+  own code.
+</p>
+
+<div class="stats">
+  <div class="stat"><span class="n">80</span><span class="l">raw ideas</span></div>
+  <div class="stat"><span class="n">9</span><span class="l">survivors</span></div>
+  <div class="stat"><span class="n">10</span><span class="l">axes</span></div>
+  <div class="stat"><span class="n">5</span><span class="l">refuted</span></div>
+  <div class="stat"><span class="n">38</span><span class="l">parity gaps</span></div>
+  <div class="stat"><span class="n">7</span><span class="l">contradictions</span></div>
+</div>
+
+<div class="callout info">
+  <div class="eyebrow">What changed in this revision</div>
+  <p>
+    <strong>The container approach is gone.</strong> The previously top-ranked idea — run
+    unmodified gbrain in an ephemeral container and inherit ~96% of its behavior by execution
+    — was rejected: it buys inheritance at the cost of controlling your own codebase. Idea #2
+    is now a genuinely different mechanism, and its failure mode is the opposite one (quiet
+    decay rather than runtime coupling), so the design is built around <em>measuring</em> the
+    gap rather than eliminating it.
+  </p>
+  <p>
+    <strong>Management surfaces are a new axis.</strong> A consumer web app plus an in-chat
+    visual app installable in Claude and ChatGPT. The panel is the primary management surface;
+    the one moment that leaves it is OAuth consent, which opens a real browser tab the way every
+    "Sign in with Google" flow already does — see #3.
+  </p>
+</div>
+
+<div class="callout">
+  <div class="eyebrow">Capability parity audit — verdict: not yet</div>
+  <p>
+    A six-lane audit inventoried gbrain's capabilities from the repo and mapped 131 of them against
+    these nine ideas: <strong>38 critical, 51 outright gaps, 58 partial</strong>. Full report in
+    <code>docs/research/2026-08-11-capability-parity.md</code>. The verdict is that the gap is
+    almost entirely in <em>accuracy</em>, not functionality — and the three findings below are the
+    ones that matter.
+  </p>
+  <p>
+    <strong>1. Nothing in these nine cards causes the brain to be read or written at all.</strong>
+    gbrain's two most load-bearing behaviors — a signal-detector that fires on every inbound
+    message, and a brain-first rule before answering anything about a person — live in a skills
+    layer this design deleted without replacing the mechanism. The consequence compounds: no writes
+    → no debt → no consolidation → no salience or entity cards → #5's live briefing assembles over
+    an empty materialized layer and #7's upgrade prompt has nothing to count. The available fix
+    costs zero tool names — MCP's server <code>instructions</code> field, which the design never
+    mentions.
+  </p>
+  <p>
+    <strong>2. Answer quality is a ~19-stage post-retrieval pipeline; this design commits to
+    two.</strong> Unambiguously committed: RRF fusion and token-budget packing. Half-committed:
+    the vector, keyword and relational arms, and intent classification. <strong>Unmentioned:
+    thirteen</strong> — including cross-encoder reranking, which reshuffles <strong>60% of top-1
+    results</strong> on a real corpus, and the alias hop, which is the only layer bridging true
+    synonyms with zero surface overlap. Two further traps: the relational arm is worth
+    <strong>+31 P@5</strong> (49.1 against ~18 without it), but its typed edges come from LLM
+    extraction, which #7 places <em>below</em> the free-tier line — so the free tier runs the single
+    largest quality lever against an empty graph. And autocut as ported is structurally broken: it
+    reads a rerank score by design, and gbrain measured the RRF-gap alternative at 0.602 versus
+    0.569 and concluded it is mechanical decay, not signal.
+  </p>
+  <p>
+    <strong>3. Nothing measures answer quality.</strong> #2 grades the wire — tool lists, response
+    schemas, error envelopes — and will pass green while write-back drops a fact or a bad extraction
+    prompt degrades every briefing every user reads. There is no owned corpus, no P@5 or nDCG
+    number, and no absolute floor, against a reference that ships nDCG@10 ≥ 0.65 as a hard bar and
+    a 0.8 extraction-recall floor with a non-zero exit. Against the stated bar of "the same level of
+    accuracy," this is the row that makes every other row unauditable in either direction.
+  </p>
+  <p>
+    <strong>What is genuinely ahead of gbrain</strong>, and worth keeping: physical isolation as
+    structure rather than policy — a separate Neon project is stronger than the
+    <code>sourceScopeOpts</code> invariant, which is policy and has leaked twice;
+    <code>origin_context</code> as an immutable credential-derived stamp, stronger than an
+    agent-typed source line; MCP annotation hygiene, which gbrain sets nowhere; #3's "nothing
+    renders unless a user action is attached to it," which correctly kills gbrain's decorative
+    composite score; debt-triggered consolidation over a 300-second poll; and export-as-the-self-host
+    format with a CI-gated round trip.
+  </p>
+</div>
+
+<h2 id="grounding-context">Grounding Context</h2>
+
+<div class="grounding-grid">
+
+  <div class="gcard">
+    <h4>Codebase Context — what gbrain is, as a reference</h4>
+    <p>
+      Contract-first: ~110 shared operations in <code>src/core/operations.ts</code> generate
+      the CLI, the MCP server and the HTTP surface alike. Schema at migration v125. Two
+      engines swap without code change. The 5 frozen <code>MEMORY_VERBS</code> —
+      <code>recall</code>, <code>remember</code>, <code>entity</code>,
+      <code>synthesize</code>, <code>forget</code> — ship with a transport-agnostic
+      conformance certifier. 42 <code>scripts/check-*.sh</code> guards encode past
+      production failures as executable rules. A BrainBench eval corpus exists:
+      <code>evals/brainbench/_ledger.json</code> records 135 generated + 23 holdout fixtures,
+      241 gold turns, and gold-validation agreement of 0.964.
+    </p>
+    <p>
+      The friction is real and documented. The shortest install is two commands that fan out
+      into ~7 decisions. The README's recommended non-technical path asks you to stand up a
+      <em>different</em> agent platform first. There are <strong>no OAuth data
+      connectors</strong> — a source must be a git-initialized repo with committed files.
+      <code>deploy/railway/entrypoint.sh</code> runs four always-on roles, one of which is a
+      <code>while :; … sleep; done</code> loop.
+    </p>
+  </div>
+
+  <div class="gcard">
+    <h4>What the repo says about its own limits</h4>
+    <ul>
+      <li>
+        <code>SECURITY.md:163-173</code> — "OAuth and source scoping enforce isolation on the
+        <code>serve --http</code> path only. Raw Postgres reachability bypasses both."
+        Postgres RLS is opt-in; PGLite has none.
+      </li>
+      <li>
+        <code>docs/incidents/2026-05-20-lsd-cost-explosion.md</code> — one run cost
+        <strong>$50.71 against a $0.96 estimate (53×)</strong> after selection pulled 1,985
+        items instead of 12, with no mid-run circuit breaker.
+      </li>
+      <li>
+        <code>src/core/verbs.ts:295</code> — <code>forget()</code> expires a fact,
+        <em>"audit trail kept, not deleted."</em> Correct for memory; in direct tension with
+        "delete my brain."
+      </li>
+      <li>
+        <code>src/core/eval/drift-watch.ts:9-11</code> — "Too narrow … misses real
+        regressions like a chunker change. Too wide … trains the operator to ignore the
+        warning." gbrain has already thought hard about watcher signal-to-noise.
+      </li>
+    </ul>
+  </div>
+
+  <div class="gcard">
+    <h4>MCP, clients, and in-chat UI (2026)</h4>
+    <p>
+      <strong>MCP 2026-07-28</strong> retires the <code>initialize</code> handshake and
+      session IDs — servers deploy "behind a plain round-robin load balancer without shared
+      storage." DCR is deprecated in favor of Client ID Metadata Documents.
+    </p>
+    <p>
+      <strong>MCP Apps is real and ratified.</strong> SEP-1865, proposed Nov 2025, shipped as
+      the <em>first official MCP extension</em> on 2026-01-26 and folded into the extensions
+      framework locked by the 2026-07-28 release; co-authored by Anthropic and OpenAI on top
+      of the open-source <code>mcp-ui</code> project. The mechanism: a server declares a UI
+      template as a resource under the <code>ui://</code> scheme with mimeType
+      <code>text/html;profile=mcp-app</code> plus a <code>_meta.ui</code> block; a tool links
+      it via <code>_meta.ui.resourceUri</code>; the host advertises support at
+      <code>initialize</code> through the <code>io.modelcontextprotocol/ui</code> extension
+      capability and renders it in a sandboxed iframe; the view calls back over bidirectional
+      JSON-RPC via <code>postMessage</code>, and every UI-triggered action re-enters MCP's
+      normal tool-call consent path.
+    </p>
+    <p>
+      <strong>But it does not reliably render today.</strong> Claude shipped MCP Apps support
+      on 2026-01-26 with launch partners, yet open bugs run through at least June 2026
+      (<code>ext-apps#671</code>, <code>claude-ai-mcp#165/#471/#69</code>): Claude negotiates
+      the capability and fetches the resource but never mounts the iframe, falling back to a
+      text placeholder. Status <span style="color:var(--warning-text)">[unconfirmed as of
+      research]</span>. ChatGPT's Apps SDK also uses a <em>different</em> mimetype
+      (<code>text/html+skybridge</code>, its own Skybridge runtime and
+      <code>window.openai</code> API) — parallel to, not identical with, the ratified
+      cross-vendor one. Convergence is <span style="color:var(--warning-text)">[unconfirmed]</span>.
+    </p>
+    <p>
+      <strong>Other client constraints.</strong> Without Developer Mode, ChatGPT rejects any
+      server lacking exact <code>search</code>/<code>fetch</code> tools. ChatGPT Work (July 9
+      2026) and Enterprise default connectors and custom apps <strong>off</strong> pending
+      admin action, with tool definitions frozen at approval time. Apps SDK submission is
+      human-reviewed with <strong>no published SLA</strong>. Each tool costs ~550–1,400 tokens
+      of system prompt; Cursor hard-caps at 40.
+    </p>
+  </div>
+
+  <div class="gcard">
+    <h4>The OAuth constraint that settles the surface architecture</h4>
+    <p>
+      <strong>OAuth consent screens refuse iframe embedding by design.</strong>
+      <code>accounts.google.com</code> sends <code>X-Frame-Options: deny</code>, and
+      cross-site iframe cookie restrictions (Safari ITP, Chrome partitioning) break state
+      handling further. Every real implementation — Claude Custom Connectors, ChatGPT
+      connectors, generic MCP OAuth under RFC 8252 / OAuth 2.1 + PKCE — performs the exchange
+      via a full top-level redirect or a separate popup, never an in-place iframe. Mobile is
+      worse: PiP and widget surfaces get coerced to fullscreen or fail outright.
+    </p>
+    <p>
+      Consequence: "Connect Gmail" inside any AI client can only launch <em>out</em> to a real
+      top-level page and redirect back. Connection management is inherently a normal web page
+      with a real callback route.
+    </p>
+    <p>
+      Separately — and this is <strong>smaller than it first appeared</strong>. Gmail-class
+      restricted scopes do require a Google-empanelled CASA Tier 2/3 assessment renewed every 12
+      months, but assessor pricing lands at <strong>$540–$1,800 per app with a 3–4 week
+      turnaround</strong>. That is a scheduling item, not a strategic gate; Shortwave, a shipping
+      Gmail-native AI client, simply runs its own verified app and takes the annual audit. The
+      real cost is the calendar weeks, not the money.
+    </p>
+    <p>
+      <strong>The scope classes matter far more than the vendor.</strong> Calendar and Contacts
+      have <em>no</em> restricted scopes at all — merely "sensitive," which is a brand review
+      measured in days. <code>drive.file</code> with the Google Picker is non-sensitive and needs
+      nothing. But <strong>every other Drive scope is restricted</strong>, including
+      <code>drive.metadata.readonly</code> — there is no read-only middle ground — and all Gmail
+      read scopes are restricted. <strong>Microsoft Graph has no CASA equivalent</strong>:
+      publisher verification is free and takes 1–5 business days, making Outlook and OneDrive a
+      materially cheaper first mailbox than Gmail.
+    </p>
+    <p>
+      <strong>Connector economics resolve on one vendor property.</strong> Pipedream Connect bills
+      <em>per unique external user</em> rather than per connected account — three Google accounts
+      for one user cost the same as one — at $99/mo for 100 users plus $2 each after: roughly
+      <strong>$1.90/user at 1,000 and $1.99/user at 10,000</strong>. Composio is cheaper still on
+      usage-based pricing but exposes you to call-volume creep. Nango lands near $3/user. Merge at
+      $65 per linked account (~$195/user) and Paragon at five figures annually are both out.
+      Pipedream is also the only vendor documenting a production shared-OAuth-app path — Nango and
+      Arcade explicitly push you to bring your own client for multi-user production — though
+      Pipedream was <strong>acquired by Workday in November 2025</strong>, which is its own kind of
+      dependency risk.
+    </p>
+  </div>
+
+  <div class="gcard">
+    <h4>Cloudflare as substrate</h4>
+    <p>
+      Credible for "separate DB, separate file store, per user, billed to zero when idle."
+      <strong>D1</strong>: 50,000 databases/account, API-provisionable at signup, 30-day Time
+      Travel PITR, $0.75/GB-mo — but 10 GB hard cap per DB, a 1 TB per-account default, and
+      <strong>no native vector search</strong>. <strong>Neither D1 nor Durable-Object SQLite has
+      any vector type, vector index or similarity function, and neither permits loadable
+      extensions</strong> — FTS5, JSON and math only, confirmed against current docs and a full
+      changelog scan, so <code>sqlite-vec</code> is unavailable and pgvector (a Postgres
+      extension) is categorically impossible. <strong>Vectorize</strong>: 50,000 indexes/account,
+      20M vectors and 1,536 dimensions max per index, and <strong>no per-index charge</strong> —
+      billing is stored and queried dimensions only, so index-per-user costs the same as
+      namespace-per-user. ANN only; hybrid BM25 exists on Cloudflare but inside the separate
+      <strong>AI Search</strong> product (formerly AutoRAG), itself built on Vectorize.
+      <strong>Durable Objects</strong>: SQLite-backed, 10 GB each, alarms for per-user
+      scheduling, JS heap warm between requests until eviction, no account storage cap.
+      <strong>Workers</strong>: 128 MB memory on <em>both</em> Free and Paid — no tier raises it
+      — CPU configurable to 5 min/request on Paid, WASM SIMD available.
+      <strong>Workflows</strong>: GA, 50,000 concurrent
+      instances, <em>sleeping steps free</em>. <strong>AI Gateway</strong>: per-user-ID spend
+      caps. The Agents SDK speaks MCP 2026-07-28 statelessly with no session Durable Object.
+      For the web app, the 2026 default is <strong>Workers with static assets</strong>
+      (<code>assets.not_found_handling = single-page-application</code>) over Pages, with a
+      thin <code>/api/*</code> prefix.
+    </p>
+    <p>
+      At 10,000 users on a plausible shape: <strong>~$900–1,000/mo</strong> of Cloudflare, of
+      which D1 storage is ~$750. LLM inference dominates at every tier — likely 10–100× the
+      platform subtotal. R2 has no customer-managed per-object keys, and the Worker sees
+      plaintext at unwrap time, so Cloudflare stays inside the trust boundary regardless of
+      how encryption is arranged.
+    </p>
+  </div>
+
+</div>
+
+<h2 id="topic-axes">Topic Axes</h2>
+
+<ul class="axes">
+  <li><span class="slug">isolation</span>Per-tenant DB and file store, key custody, "only your agent can reach it," provable to a skeptic</li>
+  <li><span class="slug">upstream</span>Extracting gbrain's durable concepts and continuously pulling in its improvements, without a fork</li>
+  <li><span class="slug">surfaces</span>The consumer web app and the in-chat MCP visual app: connections, status, billing, context policy</li>
+  <li><span class="slug">context</span>Personal vs work inside one brain — origin capture, entity identity, leakage, severance</li>
+  <li><span class="slug">recipes</span>Daily briefings, template gallery, the OSS/hosted split, BYOK vs hosted model</li>
+  <li><span class="slug">durability</span>Backup, point-in-time restore, folder-structure export, portability, provable deletion</li>
+  <li><span class="slug">runtime</span>Scale-to-zero compute, scheduled consolidation without idle containers, LLM spend guards</li>
+  <li><span class="slug">mcp</span>Stateless transport, one server many clients, tool budget, the <code>search</code>/<code>fetch</code> contract</li>
+  <li><span class="slug">onboarding</span>Zero → working brain: first value, connector handoff, time-to-first-value</li>
+</ul>
+
+<h2 id="cross-cutting-principle">Cross-cutting principle: the brain is a data plane, not an agent</h2>
+
+<p>
+  This governs how to read all nine cards, so it sits ahead of them. <strong>The agent is on the
+  other side of the wire.</strong> It has the conversation, the user's immediate intent, and a
+  frontier model. The brain has the corpus. Judgement belongs where the context is; bulk
+  transformation belongs where the data is. Every argument for putting an agent <em>inside</em> the
+  brain is an argument for spending your money on a decision the caller's model could make better.
+</p>
+
+<p>
+  The precise distinction is between an agentic loop and a model used as a function:
+</p>
+
+<div style="overflow-x:auto">
+<table>
+  <thead><tr><th></th><th>Agentic loop</th><th>Model as a function</th></tr></thead>
+  <tbody>
+    <tr><td>Control flow</td><td>The model decides what comes next</td><td>A fixed pipeline you wrote</td></tr>
+    <tr><td>Tool selection</td><td>Yes</td><td>None</td></tr>
+    <tr><td>Iteration</td><td>Until a goal is met</td><td>One call per item</td></tr>
+    <tr><td>Cost</td><td>Unbounded ahead of time</td><td>N items × 1 call — estimable</td></tr>
+    <tr><td>Testable</td><td>Barely</td><td>Against a fixture corpus</td></tr>
+    <tr><td>Resumable</td><td>Hard</td><td>Trivially, per item</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>
+  Consolidation in #7 is entirely the right-hand column — "for each new item, extract entities with
+  a fixed prompt and a structured output; for each entity, enrich; for each contradiction candidate,
+  classify." That is a data pipeline that calls a model, not an agent. This is not pedantry: it is
+  what makes #7's three guards possible at all. You can estimate cost before running <em>only</em>
+  if fan-out is N×1. You can checkpoint <em>only</em> if items are independent. You can measure
+  against a fixture corpus <em>only</em> if the pipeline is deterministic. The 53× cost incident is
+  precisely what happens when fan-out stops being predictable.
+</p>
+
+<div class="callout info">
+  <div class="eyebrow">The read-path rule, stated precisely</div>
+  <p>
+    <strong>No unbounded, generative model call on the read path. A bounded scoring function over a
+    fixed-size candidate set is fine.</strong>
+  </p>
+  <p>
+    An earlier wording — "no server-paid model call on the read path" — banned both, and that was
+    too broad. It is why <code>synthesize</code> was correctly cut from #8, and it would also have
+    banned cross-encoder reranking, which the parity audit identifies as the single biggest
+    unclosed accuracy delta at <strong>60% of top-1 results reshuffled</strong>. Those are different
+    animals: <code>synthesize</code> takes corpus-scaled input, runs seconds to minutes, and a
+    <em>model's judgement</em> decides when to fire. A reranker takes a fixed 100 candidates, runs
+    sub-second, and fires deterministically on every query. Bounded, estimable, cacheable.
+  </p>
+  <p>
+    <strong>Consolidation may call models freely</strong> — it is batch, budgeted, checkpointed and
+    measurable. <strong>The read path may call one</strong>, if it is a scoring function with fixed
+    input size. Nothing anywhere runs a loop.
+  </p>
+</div>
+
+<p>
+  Two consequences worth stating. First, the thirteen cards the parity audit proposes are, almost
+  without exception, <em>not</em> agentic AI features — they are retrieval engineering, data
+  engineering, measurement, ops, cost control and trust. That is the category an ideation pass
+  structurally misses, and it means the remaining work is known-shaped rather than invention.
+  Second, the reranker is not free: at roughly $0.001–0.002 per query on a hosted API and ~1,500
+  queries per active user per month, it lands near <strong>$1.50–3.00/user/month</strong> against a
+  $10–20 price point. That is 7–15% of revenue for the largest single quality lever available —
+  probably worth it, and probably worth self-hosting a small cross-encoder on the consolidation
+  fleet so it becomes compute rather than per-call API spend. Either way it is a line item, not a
+  rounding error, and #8's "every remaining tool is SQL" claim no longer holds.
+</p>
+
+<h2 id="ranked-ideas">Ranked Ideas</h2>
+
+<p>
+  Ranked by basis strength × leverage × confidence — <em>not</em> by importance. #9 sits last
+  on confidence while being closest to the original complaint; that gap is still the most
+  useful thing in this document.
+</p>
+
+<div class="jumplist">
+  <ol>
+    <li><a href="#idea-1">One brain per person, physically isolated — and provable</a><span class="ax">isolation</span></li>
+    <li><a href="#idea-2">Extract, watch, re-implement — with a number for how far behind you are</a><span class="ax">upstream · new</span></li>
+    <li><a href="#idea-3">Manage in the chat panel; step out only for consent</a><span class="ax">surfaces · new</span></li>
+    <li><a href="#idea-4">Context is a credential stamp, not a user tag</a><span class="ax">context</span></li>
+    <li><a href="#idea-5">Assemble live; the client's model writes the prose</a><span class="ax">recipes</span></li>
+    <li><a href="#idea-6">Export is the self-host format; the index is rebuilt, not backed up</a><span class="ax">durability</span></li>
+    <li><a href="#idea-7">Dream while the compute is already awake</a><span class="ax">runtime</span></li>
+    <li><a href="#idea-8">Nine names on the wire, seven in front of any model</a><span class="ax">mcp · revised</span></li>
+    <li><a href="#idea-9">First value before first OAuth</a><span class="ax">onboarding</span></li>
+  </ol>
+</div>
+
+<!-- IDEA 1 -->
+<article class="idea" id="idea-1">
+  <div class="idea-head"><span class="idnum">1.</span><h3>One brain per person, physically isolated — and provable</h3></div>
+  <div class="chips">
+    <span class="chip axis">axis: isolation</span>
+    <span class="chip hi">confidence 88%</span>
+    <span class="chip">complexity Medium</span>
+  </div>
+
+  <div class="field">
+    <p>
+      Give every user <strong>their own Neon project</strong> — one project, one branch, one
+      database, one role — plus an R2 prefix for their markdown. The connection string is the
+      isolation receipt: hand a skeptical user their own <code>postgres://</code>, let them run
+      <code>\l</code>, and the promise is verified structurally in one command. No other candidate
+      substrate can do that. Then publish a machine-readable <strong>register of every component
+      that can touch more than one user's data</strong> and ship a signed
+      <code>prove_isolation</code> readout naming the caller's own project id, database and
+      storage prefix, with a public canary tenant anyone may try to read and watch fail.
+    </p>
+    <p>
+      <strong>The tenant unit must be a project, not a database.</strong> Neon's hierarchy makes
+      this decisive rather than stylistic: databases-per-branch is capped at <strong>500 on every
+      plan including Enterprise</strong>, so database-per-tenant breaks at 500 users — and worse,
+      every database inside a branch shares <em>one primary compute endpoint</em>. One tenant's
+      re-embed contends with every other tenant's query, and scale-to-zero is impossible while any
+      tenant in the project is active. Database-per-tenant is a <code>tenant_id</code> column with
+      better ergonomics. Project-per-tenant gives each user their own compute, their own storage
+      branch, their own PITR and their own connection string.
+    </p>
+    <p>
+      <strong>And it is cheap because idle is genuinely free.</strong> A suspended Neon project
+      costs <strong>$0 compute and about $0.105/month in storage</strong> while remaining a
+      separately-addressable Postgres. That is the fact that resolves the whole tension: isolation
+      you can verify and near-zero idle stop being a trade. Set the suspend delay to 1 minute (a
+      Scale-plan setting) and accept a ~500–870 ms wake on first connection per session.
+    </p>
+    <p>
+      <strong>Two operational pieces are load-bearing, not polish.</strong> Keep a <strong>warm
+      pool of 50–200 pre-provisioned, migrated, empty projects</strong> — signup assigns one and
+      stamps the user id rather than calling create-and-wait, because Neon publishes no SLA for
+      create-project → create-role → create-database → first query. Pool idle cost is ~$21/month.
+      And <strong>stagger consolidation by user-id hash</strong> across the night, bounded to ~20
+      concurrent tenants: consolidation is the only job that touches every project, and running it
+      as a thundering herd converts idle users into active ones and trips Neon's API limits at the
+      same time.
+    </p>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 880 300" role="img" aria-label="Per-tenant resources on the left, shared components that must be enumerated on the right">
+      <defs><marker id="ar1" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#3b82f6"/></marker></defs>
+      <style>
+        .lbl { font-family: Inter, sans-serif; font-size: 13px; fill: #e0e0e0; }
+        .sm  { font-family: "JetBrains Mono", monospace; font-size: 11px; fill: #9a9aa8; }
+        .hd  { font-family: Inter, sans-serif; font-size: 12px; font-weight: 600; fill: #7d7d8a; letter-spacing: .07em; }
+        .bx  { fill: #14141f; stroke: #2a2a3d; stroke-width: 1; }
+        .bxg { fill: rgba(34,197,94,.09); stroke: rgba(34,197,94,.35); stroke-width: 1; }
+        .bxw { fill: rgba(245,158,11,.10); stroke: rgba(245,158,11,.40); stroke-width: 1; }
+      </style>
+      <text x="0" y="16" class="hd">ONE NEON PROJECT PER USER</text>
+      <text x="500" y="16" class="hd">SHARED — MUST BE ENUMERATED</text>
+      <rect x="0" y="34" width="200" height="52" rx="7" class="bxg"/>
+      <text x="16" y="56" class="lbl">own compute endpoint</text><text x="16" y="74" class="sm">suspends to $0 when idle</text>
+      <rect x="0" y="98" width="200" height="52" rx="7" class="bxg"/>
+      <text x="16" y="120" class="lbl">own Postgres + pgvector</text><text x="16" y="138" class="sm">HNSW + tsvector + graph</text>
+      <rect x="0" y="162" width="200" height="52" rx="7" class="bxg"/>
+      <text x="16" y="184" class="lbl">own storage branch</text><text x="16" y="202" class="sm">own PITR · ~$0.105/mo idle</text>
+      <rect x="0" y="226" width="200" height="52" rx="7" class="bxg"/>
+      <text x="16" y="248" class="lbl">own R2 prefix</text><text x="16" y="266" class="sm">markdown · zero egress</text>
+      <line x1="212" y1="122" x2="486" y2="122" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#ar1)"/>
+      <text x="248" y="114" class="sm" paint-order="stroke fill" stroke="#0a0a0f" stroke-width="3.5">what's left is short, and that's the point</text>
+      <rect x="500" y="34" width="230" height="52" rx="7" class="bxw"/>
+      <text x="516" y="56" class="lbl">the MCP fleet</text><text x="516" y="74" class="sm">holds every connection string</text>
+      <rect x="500" y="98" width="230" height="52" rx="7" class="bxw"/>
+      <text x="516" y="120" class="lbl">Neon control plane</text><text x="516" y="138" class="sm">provisions every tenant</text>
+      <rect x="500" y="162" width="230" height="52" rx="7" class="bxw"/>
+      <text x="516" y="184" class="lbl">public entity cards</text><text x="516" y="202" class="sm">no user data — one-way</text>
+      <rect x="500" y="226" width="230" height="52" rx="7" class="bx"/>
+      <text x="516" y="248" class="lbl">prove_isolation</text><text x="516" y="266" class="sm">returns your own connection id</text>
+      <rect x="752" y="34" width="128" height="244" rx="7" class="bx"/>
+      <text x="768" y="58" class="lbl">The receipt</text>
+      <text x="768" y="80" class="sm">is a</text><text x="768" y="97" class="sm">connection</text>
+      <text x="768" y="114" class="sm">string the</text><text x="768" y="131" class="sm">user can</text>
+      <text x="768" y="148" class="sm">open and</text><text x="768" y="165" class="sm">run \l</text>
+      <text x="768" y="182" class="sm">against.</text>
+    </svg>
+    <figcaption>
+      Green = a genuine per-user boundary. Amber = a component two users share, which the
+      register forces you to name and defend rather than discover during an incident.
+    </figcaption>
+  </figure>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="tag direct">direct:</span><code>SECURITY.md:163-173</code>, verified:
+      <em>"OAuth and source scoping enforce isolation on the <code>serve --http</code> path
+      only. Raw Postgres reachability bypasses both: a container that shares Docker's default
+      bridge network with the brain's Postgres can open a direct DB session without any token
+      and read every source."</em> The project already documents that its isolation is policy,
+      not structure.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>src/core/operations.ts:794</code> shows the
+      discipline that <em>does</em> hold: <em>"FAIL-CLOSED: anything not strictly
+      <code>ctx.remote === false</code> is untrusted"</em> — routed through one resolver
+      because inlining the branch per handler was <em>"the bug class that leaked cross-source
+      reads (#1924, #1371)."</em>
+    </p>
+    <p>
+      <span class="tag external">external:</span>Neon limits, independently verified: projects per
+      account are 100 (Free/Launch), <strong>1,000 on Scale</strong> extendable in 500-project
+      blocks at $50/month, and <strong>30,000 per org on the gated Agent plan</strong>.
+      Databases-per-branch and roles-per-branch are <strong>500, hard on every plan including
+      Enterprise</strong> — which is why the tenant unit is a project. A suspended project bills
+      $0 compute; storage is $0.35/GB-month.
+    </p>
+    <p>
+      <span class="tag external">external:</span>Why not Vectorize: the topK ceiling is 100
+      (dropping to 50 only when you request values or full metadata — <em>not</em> when
+      filtering, correcting an earlier assumption), against a ported stack that asks for 100–250
+      candidates, with no batch-query API. More decisively, <strong>Vectorize ships no BM25 at
+      all</strong>, so two of the three recall arms would live in another store with no
+      transaction spanning them — a page ingested but not yet indexed is visible to the
+      full-text arm and invisible to the vector arm, and RRF silently fuses a partial universe.
+    </p>
+    <p>
+      <span class="tag external">external:</span>Why not Turso, despite the best-fitted
+      per-tenant story of any candidate: the engine with GA DiskANN vector indexing (libSQL) is
+      the one being superseded, and its successor supports <strong>exact vector search only</strong>,
+      with ANN on the roadmap and no date. Multi-DB Schemas — the migration fan-out for thousands
+      of tenant databases — is deprecated for new users, and BM25 sits behind an experimental
+      flag. Any one of those is survivable; all three on a substrate you cannot cheaply leave is
+      not.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <div class="field">
+    <p>
+      Your bar is that people <em>believe</em> their data sits in separate databases and
+      separate file stores only their agent can reach. Shared-database-plus-policy is a claim
+      — "we enforce this correctly, everywhere, forever." A separate database is a fact a
+      skeptic can test. The register and the attestation convert the fact into something
+      checkable from outside, which is the only form of trust that survives the first incident
+      anywhere in the category.
+    </p>
+  </div>
+
+  <h4>Downsides</h4>
+  <div class="downside">
+    <p>
+      <strong>This means not running the MCP server on Workers.</strong> A Hyperdrive config is
+      pinned to one connection string and the account cap is <strong>25 configs on Paid</strong> —
+      the wall is at tenant #26, not #10,000. Neon's serverless driver routes around it, but the
+      cleaner answer is that nothing about stateless MCP requires an edge runtime: a stateless
+      Node or Bun fleet gets pooled TCP, prepared statements, a per-tenant connection LRU and full
+      pgvector semantics, and each Neon compute's own PgBouncer accepts 10,000 client connections
+      per endpoint. That is a real reversal of the Cloudflare-shaped assumption the rest of this
+      document was built on, and it deserves an explicit decision rather than drift.
+    </p>
+    <p>
+      <strong>The ceiling is commercial, not technical.</strong> Scale's 1,000 projects covers
+      1,000 users; 10,000 costs 18 extra blocks at $900/month or an Agent-plan conversation;
+      100,000 is an enterprise negotiation with a company Databricks acquired for $1B — a
+      stability signal and a pricing-power signal at once. Get the ceiling and the price above
+      30,000 projects <em>in writing</em> before selling a 100k-user roadmap, because if Neon
+      won't commit on non-punitive terms the answer at that scale is self-hosted Postgres-per-tenant
+      on CloudNativePG, which costs you the scale-to-zero that made idle cheap.
+    </p>
+    <p>
+      <strong>The most likely production bug is one line.</strong> pgvector defaults
+      <code>hnsw.ef_search</code> to 40, and an HNSW scan returns at most that many rows no matter
+      what LIMIT asks for. Port the schema without <code>SET hnsw.ef_search = 250</code> per query
+      and your 250-candidate pool silently becomes 40, RRF fuses a truncated universe, and autocut
+      fires on a distribution that does not exist. gbrain documents this in
+      <code>src/core/vector-index.ts</code>; inherit the lesson, not just the schema.
+    </p>
+    <p>
+      Two smaller cautions. A naive "consolidate everyone at 03:00" cron wakes every project at
+      once and roughly doubles the bill. And Neon's AUP does not permit creating an account per
+      signup to multiply free-plan resources — read the free tier as evidence that its envelope
+      (0.5 GB, 100 CU-hr) is right-sized for a 4,000–6,000-page brain, then pay for it on one
+      account.
+    </p>
+    <p>
+      <code>prove_isolation</code> appears nowhere in gbrain — verified by grep, so any claim
+      that it comes "at zero extra cost" is false. It is new work. It also collides with the
+      seven-frozen-tools commitment if shipped as a tool; ship it as an MCP resource. And do
+      <strong>not</strong> run it live on every dashboard page load: that means deliberately
+      generating cross-tenant authz failures at consumer traffic volume, on the hot path, with
+      a permanent stream of denied-access entries in your own audit log. Batch it against the
+      canary and serve a cached, timestamped result.
+    </p>
+  </div>
+</article>
+
+<!-- IDEA 2 -->
+<article class="idea" id="idea-2">
+  <div class="idea-head"><span class="idnum">2.</span><h3>Extract, watch, re-implement — with a number for how far behind you are</h3></div>
+  <div class="chips">
+    <span class="chip axis">axis: upstream</span>
+    <span class="chip new">replaces the container approach</span>
+    <span class="chip hi">confidence 84%</span>
+    <span class="chip">complexity Medium</span>
+  </div>
+
+  <div class="field">
+    <p>
+      brainz owns 100% of its code. gbrain is a reference to learn from. The mechanism is three
+      parts, and the order matters because each one is cheap enough to survive the month it
+      ships in.
+    </p>
+    <p>
+      <strong>First, be gradeable over the wire.</strong> gbrain already ships a conformance
+      runner that speaks to <em>any</em> MCP endpoint:
+      <code>gbrain protocol conformance --target https://… --token &lt;tok&gt;</code> connects
+      over <code>StreamableHTTPClientTransport</code>, calls <code>listTools</code>, exercises
+      each verb, and emits a JSON report against the response and error schemas. Point it at
+      brainz's hosted <code>/mcp</code> in week one and you get contract conformance for
+      <strong>zero adapter code</strong> — a CI job, not a project. When it goes red, you are
+      behind on something upstream considered load-bearing enough to certify.
+    </p>
+    <p>
+      <strong>Second, read the changelog, not the code.</strong> <code>CHANGELOG.md</code> is
+      23,231 lines against <code>operations.ts</code>'s 6,449 — and it is hundreds of releases
+      of already-distilled rationale written by the person who made the decision, in a stable
+      shape (plain-English headline, before/now table, "Things to watch:", "To take advantage
+      of vX", and itemized path-scoped bullets). The code tells you <em>what</em>; this is the
+      only place the <em>why</em> survives. Run it newest-to-oldest once, collapsing
+      supersessions, to produce a dated concept snapshot pinned to a commit SHA — that is your
+      bootstrap. The SHA then turns the ongoing watcher into a pure delta job with a resumable
+      cursor. Each week, intersect the release's touched paths against a watch set before
+      spending any semantic reading; only survivors get read.
+    </p>
+    <p>
+      <strong>Third, every "not yet" is an artifact with an expiry date.</strong> One
+      <code>upstream/concepts.jsonl</code> holds a row per gbrain concept —
+      <code>implemented(where)</code> / <code>omitted(reason_code, revisit_by)</code> /
+      <code>not-yet(priority)</code> — and CI fails when a watcher-detected concept appears in
+      none of the three, <em>and</em> when a <code>revisit_by</code> date passes. That second
+      check is the whole mechanism: brainz's omissions are overwhelmingly "not on this
+      substrate <em>yet</em>," and every constraint that would drive one is a moving number.
+      Make <code>reason_code</code> a closed vocabulary
+      (<code>substrate:no-bm25</code>, <code>substrate:worker-mem-ceiling</code>,
+      <code>product:consumer-not-operator</code>, <code>policy:frozen-tool-surface</code>) and
+      after thirty omissions the ledger is a queryable design-constraint corpus — "eleven
+      omissions trace to one ceiling" becomes a substrate-migration argument produced as a
+      byproduct of saying no.
+    </p>
+    <p>
+      gbrain's scar tissue lands in the same table. Each of the 42
+      <code>scripts/check-*.sh</code> guards becomes a row —
+      <code>{failure_mechanism, what_masked_it, brainz_analog, guard, status}</code> — and
+      every unported one ships as a <strong>skipped test with a reason string</strong>, so the
+      suite prints the unguarded-hazard count on every run. The translations are concrete:
+      dev-engine-masks-remote-engine becomes a parity test that must run against remote;
+      unhandled rejection in a detached timer becomes uncaught async in an alarm handler;
+      <code>check-progress-to-stdout.sh</code> becomes "anything non-JSON-RPC on the MCP stdio
+      stream," the most common way a local MCP server dies silently.
+    </p>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 880 290" role="img" aria-label="Three upstream mechanisms: wire conformance, changelog delta watcher, and an expiring ledger">
+      <defs><marker id="ar2" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#3b82f6"/></marker></defs>
+      <style>
+        .l2 { font-family: Inter, sans-serif; font-size: 13px; fill: #e0e0e0; }
+        .s2 { font-family: "JetBrains Mono", monospace; font-size: 11px; fill: #9a9aa8; }
+        .h2x{ font-family: Inter, sans-serif; font-size: 11.5px; font-weight: 600; letter-spacing: .06em; }
+        .p2 { fill: #14141f; stroke: #2a2a3d; }
+        .g2 { fill: rgba(34,197,94,.09); stroke: rgba(34,197,94,.35); }
+        .a2 { fill: rgba(59,130,246,.10); stroke: rgba(59,130,246,.40); }
+        .w2 { fill: rgba(245,158,11,.10); stroke: rgba(245,158,11,.40); }
+      </style>
+      <text x="0" y="14" class="h2x" fill="#7d7d8a">GBRAIN (REFERENCE — NEVER A DEPENDENCY)</text>
+      <rect x="0" y="26" width="196" height="44" rx="7" class="p2"/>
+      <text x="14" y="53" class="l2">CHANGELOG.md · 23,231 ln</text>
+      <rect x="0" y="80" width="196" height="44" rx="7" class="p2"/>
+      <text x="14" y="107" class="l2">42 check-*.sh guards</text>
+      <rect x="0" y="134" width="196" height="44" rx="7" class="p2"/>
+      <text x="14" y="161" class="l2">conformance runner</text>
+      <rect x="0" y="188" width="196" height="44" rx="7" class="p2"/>
+      <text x="14" y="215" class="l2">BrainBench corpus</text>
+
+      <line x1="208" y1="48" x2="256" y2="86" stroke="#3b82f6" stroke-width="1.3" marker-end="url(#ar2)"/>
+      <line x1="208" y1="102" x2="256" y2="160" stroke="#3b82f6" stroke-width="1.3" marker-end="url(#ar2)"/>
+      <line x1="208" y1="156" x2="256" y2="52" stroke="#3b82f6" stroke-width="1.3" marker-end="url(#ar2)"/>
+
+      <text x="268" y="14" class="h2x" fill="#7d7d8a">BRAINZ DEV SYSTEM · SCHEDULED SKILL</text>
+      <rect x="268" y="26" width="240" height="52" rx="7" class="g2"/>
+      <text x="284" y="48" class="l2">wire conformance in CI</text>
+      <text x="284" y="66" class="s2">zero adapter code · week one</text>
+      <rect x="268" y="88" width="240" height="52" rx="7" class="a2"/>
+      <text x="284" y="110" class="l2">weekly changelog delta</text>
+      <text x="284" y="128" class="s2">path gate, then semantic read</text>
+      <rect x="268" y="150" width="240" height="52" rx="7" class="w2"/>
+      <text x="284" y="172" class="l2">hazard-card translation</text>
+      <text x="284" y="190" class="s2">skipped test + reason string</text>
+
+      <line x1="520" y1="52" x2="566" y2="110" stroke="#3b82f6" stroke-width="1.3" marker-end="url(#ar2)"/>
+      <line x1="520" y1="114" x2="566" y2="118" stroke="#3b82f6" stroke-width="1.3" marker-end="url(#ar2)"/>
+      <line x1="520" y1="176" x2="566" y2="126" stroke="#3b82f6" stroke-width="1.3" marker-end="url(#ar2)"/>
+
+      <rect x="578" y="60" width="302" height="112" rx="8" class="p2"/>
+      <text x="596" y="86" class="l2">upstream/concepts.jsonl</text>
+      <text x="596" y="108" class="s2">implemented(where)</text>
+      <text x="596" y="126" class="s2">omitted(reason_code, revisit_by)</text>
+      <text x="596" y="144" class="s2">not-yet(priority)</text>
+      <text x="596" y="163" class="s2" fill="#f87171">CI fails on: unclassified · passed date</text>
+
+      <rect x="0" y="246" width="880" height="42" rx="7" class="p2"/>
+      <text x="16" y="272" class="s2">The failure mode this design targets is not porting the wrong thing — it is brainz quietly stopping and nobody noticing for a year. A passed date is the only forcing question a build can ask.</text>
+    </svg>
+    <figcaption>
+      Three mechanisms, one table. Conformance answers "did we break the contract"; the
+      changelog delta answers "what did they decide"; the ledger answers "how far behind are
+      we, and is that still on purpose."
+    </figcaption>
+  </figure>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="tag direct">direct:</span><code>src/commands/protocol.ts:130-200</code> —
+      the conformance runner connects over <code>StreamableHTTPClientTransport</code> to an
+      arbitrary <code>--target</code> URL with a bearer token. Nothing about it is
+      gbrain-internal. Also verified at <code>:104</code>: <code>versioning_policy:
+      'additive-forever: … new optional fields/params may be added'</code>.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>src/core/eval/drift-watch.ts:9-11</code>,
+      verified verbatim: <em>"Too narrow … misses real regressions like a chunker change. Too
+      wide … trains the operator to ignore the warning,"</em> plus <em>"Adding to this list
+      REQUIRES a CHANGELOG line so coverage grows deliberately."</em> gbrain has already
+      solved the watcher signal-to-noise problem once, in the open, with governance attached.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>scripts/check-worker-lock-renewal-shape.sh:7-9</code>
+      — <em>"Production lost ~39 worker processes/day to this exact shape when PgBouncer
+      rotated connections during a <code>renewLock</code> call"</em>; and <code>:25</code> —
+      <em>"Intentionally bug-pattern-specific, not implementation-specific."</em> That last
+      clause is what makes a guard portable to a different substrate.
+    </p>
+    <p>
+      <span class="tag external">external:</span>Web Platform Tests with per-engine pass-rate
+      dashboards, Android CTS, and POSIX certification are the proven shape for "independent
+      implementations track one standard." The research also found that the specific pattern
+      here — an LLM watching one codebase and proposing ports into a different-language,
+      different-substrate codebase — has <strong>almost no direct precedent</strong>. Expect to
+      assemble this rather than adopt it.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <div class="field">
+    <p>
+      Rejecting the container was right, but it changes the failure mode rather than removing
+      one. A runtime dependency fails loudly; a soft dependency decays quietly. ffmpeg/libav
+      and OpenSSL/BoringSSL did not diverge because anyone decided to stop tracking — they
+      diverged because nobody could see how far behind they had drifted. Every mechanism here
+      is chosen for the same property: it <em>fails a build</em> rather than producing a digest
+      someone is supposed to read.
+    </p>
+  </div>
+
+  <h4>Downsides</h4>
+  <div class="downside">
+    <p>
+      <strong>The path gate is narrower than it looks.</strong> I checked
+      <code>drift-watch.ts</code>: <code>RETRIEVAL_WATCH_PATTERNS</code> has <strong>six</strong>
+      entries, all retrieval-quality. Nothing about auth, security or schema —
+      <code>oauth-provider.ts</code>, <code>migrate.ts</code> and the engine files, which
+      CLAUDE.md itself flags as the highest-stakes surfaces, are unwatched. So the appealing
+      "watch their filter and inherit their governance" property applies only to the retrieval
+      slice; the rest of your watch set is yours to maintain, with no self-updating property.
+    </p>
+    <p>
+      <strong>The bootstrap is itself a cost-explosion risk.</strong> "Collapse supersessions
+      across 23,231 lines" is an unbounded cross-referencing task — exactly the shape that
+      produced the $50.71-vs-$0.96 incident. Chunk per release, estimate before running, and
+      refuse over budget.
+    </p>
+    <p>
+      <strong>The hazard corpus is thinner than it sounds.</strong> Across all 42 guards, only
+      <strong>2</strong> contain masking language and <strong>1</strong> carries a quantified
+      production cost. The two best examples are the two I quoted. Most cards will ship with
+      empty <code>what_masked_it</code> and cost fields — real value, a one-afternoon
+      bootstrap, but not 42 gems.
+    </p>
+    <p>
+      <strong>BrainBench is a much bigger commitment than wire conformance</strong>, and they
+      should not be conflated. Its existing adapters (<code>claude-code</code>,
+      <code>codex</code>, <code>openclaw</code>) are all thin wrappers over the <em>same</em>
+      gbrain engine, differing only in injection shape. A brainz adapter needs an independent
+      extraction, write-back and entity-resolution engine on D1+Vectorize before fixtures
+      produce non-trivial scores — months, not a week-one shim. And tracking
+      <code>adapters/shared.ts</code> reintroduces code-level coupling to a repo you have
+      declared reference-only. Pin the fixture hash and accept lag, or you have a soft fork.
+    </p>
+    <p>
+      <strong>The ledger is the most process-shaped thing in this document and therefore the
+      most abandonable.</strong> If the CI date check is ever made non-blocking "just for this
+      sprint," the whole mechanism is decorative within a month.
+    </p>
+  </div>
+</article>
+
+<!-- IDEA 3 -->
+<article class="idea" id="idea-3">
+  <div class="idea-head"><span class="idnum">3.</span><h3>Manage in the chat panel; step out only for consent</h3></div>
+  <div class="chips">
+    <span class="chip axis">axis: surfaces</span>
+    <span class="chip new">new</span>
+    <span class="chip hi">confidence 80%</span>
+    <span class="chip">complexity Medium</span>
+  </div>
+
+  <div class="field">
+    <p>
+      You asked for both a consumer web app and an MCP visual app installable in Claude and
+      ChatGPT. Build both, with the <strong>panel as the primary management surface</strong>:
+      connection list and health, disconnect, context policy, spend and usage, export config,
+      memory browsing. All of that renders fine in a panel.
+    </p>
+    <p>
+      Exactly one moment has to leave it. <strong>OAuth consent screens cannot render in an
+      iframe</strong> — <code>accounts.google.com</code> sends <code>X-Frame-Options: deny</code>,
+      and Safari ITP plus Chrome cookie partitioning break state handling even where framing is
+      allowed. But that is not a defect in the design, it is the universal pattern: every "Sign
+      in with Google" in every app, native ones included, opens a real top-level context. Both
+      platforms ship a first-class primitive for precisely this — <code>ui/open-link</code> as a
+      view→host method in MCP Apps, <code>openExternal</code> in ChatGPT's
+      <code>window.openai</code>. A tab opens, the user consents, the callback lands, the user
+      comes back. Seconds, once per connection.
+    </p>
+    <p>
+      That leaves the web app three specific jobs rather than the whole control plane: it is the
+      <strong>OAuth callback landing page</strong> (which has to exist regardless of where
+      management lives), the <strong>fallback</strong> when panel rendering fails, and the home
+      for <strong>dense surfaces a panel is genuinely bad at</strong> — billing, long
+      configuration, browsing an export. Everything else can be in-chat.
+    </p>
+    <p>
+      <strong>Split the server by credential, not by URL.</strong> <code>/mcp</code> serves the
+      seven frozen tools to assistants. <code>/admin</code> serves connection state, billing,
+      BYOK keys, context policy and export config to the web app — and its session credential
+      is minted with <strong>zero content-read scope</strong>, asserted by a CI case that
+      expects <code>scope_denied</code> on <code>recall</code>. Anything the dashboard shows
+      <em>about memories</em> it gets by holding its own OAuth grant against the same
+      <code>/mcp</code> endpoint, so the browser is literally another MCP client. This argument
+      stands on its own — it is about keeping the management surface from becoming a side
+      channel around the MCP contract, and it does not depend on where management is authored.
+    </p>
+    <p>
+      <strong>One screen, not five.</strong> gbrain's admin SPA has pages named
+      <code>dashboard | agents | log | calibration | jobs</code> — an operator tool. The
+      consumer equivalent is a ranked action list: deterministic collectors, severity ordered
+      <code>critical &gt; warn &gt; info</code> with a capped info tail, and
+      <strong>nothing renders unless a user action is attached to it</strong>. Connection health
+      is <em>staleness against a declared cadence</em> ("nothing new from this source in 23
+      days — expected weekly"), never an API ping returning 200. A green dot that means "the
+      token is valid" while no data has arrived in three weeks is worse than no dot at all.
+    </p>
+    <p>
+      <strong>The in-chat app is real, ratified, and currently unreliable — so scope it as a
+      bonus.</strong> MCP Apps (SEP-1865) shipped as the first official MCP extension on
+      2026-01-26: <code>ui://</code> resources with mimeType
+      <code>text/html;profile=mcp-app</code>, host support advertised via the
+      <code>io.modelcontextprotocol/ui</code> capability, rendered in a sandboxed iframe, with
+      the view calling back over bidirectional JSON-RPC via <code>postMessage</code>. Build
+      against it — but ship a <strong>mandatory text twin</strong>: every panel has a
+      plain-text equivalent that is the primary path, with the panel as the upgrade. Two
+      reasons. Claude has open bugs through at least June 2026 where it negotiates the
+      capability, fetches the resource, and never mounts the iframe. And ChatGPT's Apps SDK
+      uses a <em>different</em> mimetype (<code>text/html+skybridge</code>) with its own
+      <code>window.openai</code> runtime — so "one visual app for both" is two front-ends over
+      one server, not one artifact.
+    </p>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 880 320" role="img" aria-label="Three surfaces with different credentials; OAuth must break out to a top-level browser page">
+      <defs>
+        <marker id="ar3" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#3b82f6"/></marker>
+        <marker id="ar3r" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#f59e0b"/></marker>
+      </defs>
+      <style>
+        .l3 { font-family: Inter, sans-serif; font-size: 13px; fill: #e0e0e0; }
+        .s3 { font-family: "JetBrains Mono", monospace; font-size: 11px; fill: #9a9aa8; }
+        .h3x{ font-family: Inter, sans-serif; font-size: 11.5px; font-weight: 600; letter-spacing: .06em; }
+        .b3 { fill: #14141f; stroke: #2a2a3d; }
+        .g3 { fill: rgba(34,197,94,.09); stroke: rgba(34,197,94,.35); }
+        .a3 { fill: rgba(59,130,246,.10); stroke: rgba(59,130,246,.40); }
+        .w3 { fill: rgba(245,158,11,.10); stroke: rgba(245,158,11,.40); }
+      </style>
+      <text x="0" y="14" class="h3x" fill="#7d7d8a">SURFACES</text>
+      <rect x="0" y="26" width="212" height="56" rx="7" class="a3"/>
+      <text x="16" y="48" class="l3">assistant (Claude / ChatGPT)</text>
+      <text x="16" y="68" class="s3">grant: full read + write</text>
+      <rect x="0" y="94" width="212" height="56" rx="7" class="g3"/>
+      <text x="16" y="116" class="l3">web app (control plane)</text>
+      <text x="16" y="136" class="s3">grant: ZERO content read</text>
+      <rect x="0" y="162" width="212" height="56" rx="7" class="w3"/>
+      <text x="16" y="184" class="l3">in-chat panel (readout)</text>
+      <text x="16" y="204" class="s3">rides the assistant's grant</text>
+
+      <line x1="224" y1="54" x2="292" y2="112" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#ar3)"/>
+      <line x1="224" y1="122" x2="292" y2="122" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#ar3)"/>
+      <line x1="224" y1="190" x2="292" y2="132" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#ar3)"/>
+
+      <rect x="304" y="60" width="200" height="56" rx="7" class="b3"/>
+      <text x="320" y="82" class="l3">/mcp</text>
+      <text x="320" y="102" class="s3">seven frozen tools</text>
+      <rect x="304" y="128" width="200" height="56" rx="7" class="b3"/>
+      <text x="320" y="150" class="l3">/admin</text>
+      <text x="320" y="170" class="s3">state, billing, keys, policy</text>
+
+      <line x1="516" y1="88" x2="574" y2="120" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#ar3)"/>
+      <line x1="516" y1="156" x2="574" y2="130" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#ar3)"/>
+      <rect x="586" y="96" width="294" height="60" rx="7" class="b3"/>
+      <text x="602" y="120" class="l3">one D1 + R2 prefix per user</text>
+      <text x="602" y="140" class="s3">CI asserts /admin gets scope_denied on recall</text>
+
+      <rect x="0" y="240" width="880" height="76" rx="8" class="w3"/>
+      <text x="16" y="264" class="h3x" fill="#fbbf24">THE ONE EXCURSION</text>
+      <text x="16" y="288" class="s3">"Connect Gmail" cannot render in an iframe — accounts.google.com sends X-Frame-Options: deny. So it opens a real tab,</text>
+      <text x="16" y="306" class="s3">via ui/open-link (MCP Apps) or openExternal (Apps SDK), and comes back. Same as every Sign-in-with-Google anywhere.</text>
+      <line x1="640" y1="196" x2="640" y2="234" stroke="#f59e0b" stroke-width="1.5" marker-end="url(#ar3r)"/>
+    </svg>
+    <figcaption>
+      Three surfaces, three grants, one brain. The boundary that matters is the credential, not
+      the URL — which is what makes the "MCP only" rule enforceable rather than aspirational.
+      The tab excursion is a supported flow on both platforms, not a workaround.
+    </figcaption>
+  </figure>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="tag external">external:</span>SEP-1865 "MCP Apps" — proposed Nov 2025,
+      shipped as the first official MCP extension 2026-01-26, co-authored by Anthropic and
+      OpenAI on the <code>mcp-ui</code> project, folded into the extensions framework locked by
+      the 2026-07-28 spec. Mechanism verified from the spec: <code>ui://</code> scheme,
+      <code>text/html;profile=mcp-app</code>, <code>io.modelcontextprotocol/ui</code> capability
+      at <code>initialize</code>, sandboxed iframe, JSON-RPC over <code>postMessage</code>
+      (<code>tools/call</code>, <code>resources/read</code>, <code>ui/request-display-mode</code>).
+    </p>
+    <p>
+      <span class="tag external">external:</span>The rendering gap is documented in open issues
+      through at least June 2026 (<code>ext-apps#671</code>,
+      <code>claude-ai-mcp#165/#471/#69</code>) — Claude negotiates and fetches but never mounts,
+      falling back to a text placeholder. No confirmed fix found. Marked
+      <span style="color:var(--warning-text)">[unconfirmed current status]</span>, which is
+      exactly why the text twin is mandatory rather than nice-to-have.
+    </p>
+    <p>
+      <span class="tag external">external:</span>OAuth-in-iframe is blocked by provider policy
+      (<code>X-Frame-Options: deny</code>), compounded by Safari ITP and Chrome cookie
+      partitioning — so consent always happens in a top-level context. Both platforms provide the
+      primitive: MCP Apps defines <code>ui/open-link</code> among its view→host JSON-RPC methods,
+      and the Apps SDK exposes <code>openExternal</code> on <code>window.openai</code>. Claude
+      registers one fixed callback (<code>https://claude.ai/api/mcp/auth_callback</code>);
+      ChatGPT pops a temporary out-of-frame link and returns control after. The excursion is
+      designed for, not worked around.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>src/commands/serve-http.ts:2062-2064</code>
+      hardcodes <code>remote: true</code> and <code>sourceId: tokenSourceId</code> for every
+      HTTP caller, so a browser grant needs no new trust mechanism. The ranked-action model is
+      verified at <code>src/core/advisor/run.ts</code> (9 deterministic collectors,
+      <code>SEV_RANK = { critical: 0, warn: 1, info: 2 }</code>), and the staleness vocabulary
+      verbatim at <code>src/commands/integrations.ts:360</code> — <em>"last event … exceeds
+      max_age … the sense has stopped producing data."</em>
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <div class="field">
+    <p>
+      The in-chat management app you asked for is buildable, and the OAuth hop is not what stops
+      it — that hop is one tab, once per connection, indistinguishable from every sign-in flow a
+      consumer already performs without noticing. What actually needs hedging is rendering
+      reliability, and the hedge is cheap: a text twin per panel. The zero-read-grant split is
+      the part worth committing to regardless of which surface wins, because it is the only
+      construction where the management surface cannot become a side channel around the MCP
+      contract, and it is testable in CI on day one rather than asserted in a security page.
+    </p>
+  </div>
+
+  <h4>Downsides</h4>
+  <div class="downside">
+    <p>
+      <strong>Panel actions are tool calls, and that fights the freeze.</strong> An MCP Apps view
+      calls back into the server via <code>tools/call</code>, re-entering the normal consent
+      path. So "disconnect this source" from the panel is either a management <em>tool</em> —
+      breaking #8's seven-tool commitment — or it rides a resource plus the claim-URL primitive.
+      This is the sharp version of contradiction #2 and it lands hardest here, because a
+      management panel is mostly write actions.
+    </p>
+    <p>
+      <strong>"No second read API to build" is false, and pitching it that way will cost you
+      the meeting.</strong> gbrain's <code>serve-http.ts</code> runs exactly 20
+      <code>/admin/api/*</code> endpoints (agents, sources, stats, health-indicators, jobs
+      watch, calibration ×3, requests, api-keys ×3, client register/rescope/revoke, magic-link,
+      sign-out-everywhere). Every one is non-content, but all of them still have to exist. This
+      shrinks the privileged read API; it does not eliminate it.
+    </p>
+    <p>
+      <strong>The worked example does not survive the schema.</strong> <code>recall</code>'s
+      <code>total</code> is query- and budget-scoped, so a brain-wide item count ("2,140
+      memories") is <em>not</em> obtainable by being an ordinary MCP client. Every consumer
+      dashboard number is therefore either an MCP resource or an eighth tool — and #8 forbids
+      the latter. Decide which before building the empty state.
+    </p>
+    <p>
+      <strong>The staleness model presupposes sources that declare a cadence at connect
+      time</strong>, which presupposes an ingestion substrate brainz does not have. In v1 it
+      applies only to what exists (file/folder sync, export destinations, device pairing), not
+      to Gmail or Notion.
+    </p>
+    <p>
+      Apps SDK submission is human-reviewed with no published SLA — do not gate a launch date
+      on it. And ChatGPT Work/Enterprise default connectors and custom apps <strong>off</strong>
+      pending admin action, so a personal-account-only design silently underperforms on exactly
+      the seats that pay.
+    </p>
+  </div>
+</article>
+
+<!-- IDEA 4 -->
+<article class="idea" id="idea-4">
+  <div class="idea-head"><span class="idnum">4.</span><h3>Context is a credential stamp, not a user tag</h3></div>
+  <div class="chips">
+    <span class="chip axis">axis: context</span>
+    <span class="chip hi">confidence 87%</span>
+    <span class="chip">complexity Medium</span>
+  </div>
+
+  <div class="field">
+    <p>
+      Personal and work live in the same store, marked — but the mark has to be
+      <strong>derived, not asserted</strong>. Stamp every row with an immutable
+      <code>origin_context</code> computed from the connected account that produced it
+      (<code>provider + account_id + issuer</code>), never a user-typed tag and never editable
+      by an agent.
+    </p>
+    <p>
+      Then split it in two, because origin and subject are different questions. A dentist
+      appointment on your work calendar has <code>origin=work, subject=personal</code>; a job
+      offer in personal Gmail is the reverse. <strong>Access fencing runs on origin only</strong>
+      — cheap, provable, fail-closed. <strong>Ranking, categorization and briefing composition
+      use subject</strong> — inferred, multi-valued, confidence-scored, mutable. The hard rule:
+      a subject inference may <em>narrow</em> what a caller sees; it may never <em>widen</em>
+      it. Never put an LLM guess on the access-control path.
+    </p>
+    <p>
+      Three consequences follow. <strong>Derived rows inherit the union of their inputs'
+      contexts</strong> — otherwise the nightly cycle reads both halves, writes an unlabeled
+      synthesis, embeds it, and you have built a laundering machine. <strong>One entity, many
+      context-faceted claims</strong> — a colleague who is also a friend is one
+      <code>alice-example</code> with two facets, because two entities makes "when did I last
+      talk to Alice" unanswerable and no primitive exists to stitch them later.
+      <strong>Severance is a state transition, not a delete</strong> — leaving a job purges
+      artifacts ingested through the employer's credential, preserves entity identity and
+      user-authored facts, and re-derives every mixed artifact with the tombstoned
+      contributions removed.
+    </p>
+    <p>
+      <strong>This is also how enterprise works.</strong> In ChatGPT Work the admin approves one
+      connector per workspace and tool definitions freeze at approval, so connector identity
+      cannot be per-user. Separate the two acts: the admin approves the connector, each employee
+      <em>claims</em> a brain. A first call from an unclaimed seat returns a
+      <code>scope_denied</code>-shaped envelope carrying a single-use claim URL; redeeming it
+      binds a grant to that individual. The grant issued through the <em>work</em> connector is
+      minted to read <code>origin: work</code> only, so the personal half is structurally
+      invisible from the employer-approved path rather than filtered in UI. The user's personal
+      Claude Desktop connector holds a second grant reading both.
+    </p>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 880 250" role="img" aria-label="Origin context gates access; subject context shapes ranking and may only narrow, never widen">
+      <defs><marker id="ar4" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#3b82f6"/></marker></defs>
+      <style>
+        .l4 { font-family: Inter, sans-serif; font-size: 13px; fill: #e0e0e0; }
+        .s4 { font-family: "JetBrains Mono", monospace; font-size: 11px; fill: #9a9aa8; }
+        .h4x{ font-family: Inter, sans-serif; font-size: 12px; font-weight: 600; letter-spacing: .06em; }
+        .b4 { fill: #14141f; stroke: #2a2a3d; }
+        .g4 { fill: rgba(34,197,94,.09); stroke: rgba(34,197,94,.35); }
+        .a4 { fill: rgba(59,130,246,.10); stroke: rgba(59,130,246,.40); }
+        .e4 { fill: rgba(239,68,68,.10); stroke: rgba(239,68,68,.40); }
+      </style>
+      <rect x="0" y="60" width="176" height="66" rx="8" class="b4"/>
+      <text x="16" y="86" class="l4">an ingested row</text><text x="16" y="107" class="s4">from one credential</text>
+      <line x1="188" y1="76" x2="242" y2="52" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#ar4)"/>
+      <line x1="188" y1="110" x2="242" y2="146" stroke="#3b82f6" stroke-width="1.4" marker-end="url(#ar4)"/>
+      <rect x="254" y="14" width="250" height="76" rx="8" class="g4"/>
+      <text x="270" y="38" class="h4x" fill="#6ee7a0">ORIGIN_CONTEXT</text>
+      <text x="270" y="60" class="s4">immutable · credential-derived</text>
+      <text x="270" y="78" class="s4">gates access · fail-closed</text>
+      <rect x="254" y="120" width="250" height="76" rx="8" class="a4"/>
+      <text x="270" y="144" class="h4x" fill="#8ab4f8">SUBJECT_CONTEXT</text>
+      <text x="270" y="166" class="s4">inferred · multi-valued</text>
+      <text x="270" y="184" class="s4">shapes ranking + briefings</text>
+      <path d="M 400 116 L 400 96" stroke="#ef4444" stroke-width="1.6" fill="none"/>
+      <line x1="392" y1="100" x2="408" y2="112" stroke="#ef4444" stroke-width="2"/>
+      <line x1="408" y1="100" x2="392" y2="112" stroke="#ef4444" stroke-width="2"/>
+      <text x="418" y="110" class="s4" fill="#f87171">inference can never widen access</text>
+      <rect x="580" y="14" width="300" height="76" rx="8" class="b4"/>
+      <text x="596" y="38" class="l4">unattributed is a loud state</text>
+      <text x="596" y="60" class="s4">never a silent default bucket —</text>
+      <text x="596" y="78" class="s4">it goes to a review queue</text>
+      <rect x="580" y="120" width="300" height="76" rx="8" class="b4"/>
+      <text x="596" y="144" class="l4">the bridge is the product</text>
+      <text x="596" y="166" class="s4">your 3pm candidate is your</text>
+      <text x="596" y="184" class="s4">friend's brother — one brain only</text>
+      <rect x="0" y="212" width="880" height="38" rx="7" class="e4"/>
+      <text x="16" y="236" class="s4" fill="#f87171">Asymmetry: work→personal leakage is embarrassing. personal→work can end a career. They do not get one symmetric rule.</text>
+    </svg>
+    <figcaption>
+      Two fields, two jobs. Origin is cheap and provable and decides who may read. Subject is
+      fallible and useful and decides what surfaces first.
+    </figcaption>
+  </figure>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="tag direct">direct:</span><code>docs/architecture/brains-and-sources.md:136</code>
+      lists <em>"You need data isolation between work and personal"</em> as a reason to adopt the
+      <em>two-brain</em> topology, and <code>:50</code> offers <code>--source</code> with
+      <code>federated=false</code> as the alternative. Both existing answers fail your
+      constraint — a brain boundary makes the halves un-joinable, and
+      <code>federated=false</code> makes the work half invisible to unqualified reads. Context
+      needs a third axis.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>src/core/pglite-schema.ts:1074</code> and
+      <code>:1092</code> — both alias tables are source-scoped, and
+      <code>brains-and-sources.md:215</code> states <em>"Cross-brain federation is YOUR JOB,
+      not the DB's."</em> So modeling context as a source or a brain means the same person
+      becomes two unrelated entities with no primitive to relate them.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>src/core/verbs.ts:94-99</code> —
+      <code>remember</code> throws <code>provenance_required</code> and refuses an empty value.
+      Every fact already carries the attribution severance needs; it only has to become
+      structured rather than free text.
+    </p>
+    <p>
+      <span class="tag reasoned">reasoned:</span>The dream cycle is six phases and every one
+      writes <em>new</em> rows derived from old ones, so a context column on ingested rows alone
+      is defeated on the first nightly run. Information-flow control (Jif, Flume, Asbestos) is
+      the field that solved this: labels propagate through computation, declassification is an
+      explicit privileged act, and the check applies to the derived value rather than its
+      sources.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <div class="field">
+    <p>
+      Entity identity is the spine of a brain, and this is the one decision here that is
+      genuinely hard to reverse. Getting it right also unlocks what separation alone never
+      sells: the <strong>bridge</strong>. Two brains can keep your lives apart; only one brain
+      can tell you the candidate you are interviewing at 3pm is your friend's brother, or that
+      the vendor you are about to sign is a personal friend. Concentrating all cross-context
+      exposure into one named section means exactly one surface needs a leakage policy instead
+      of every surface needing one.
+    </p>
+  </div>
+
+  <h4>Downsides</h4>
+  <div class="downside">
+    <p>
+      <strong>You inherit the pattern, not the code.</strong> gbrain's
+      <code>allowedSources[]</code> fences by <em>which repo</em>, not by an origin tag
+      <em>within</em> a source. This needs a genuinely new grant field
+      (<code>allowedOrigins[]</code>) plus a new fence site in <code>sourceScopeOpts</code>.
+    </p>
+    <p>
+      <strong>The legal story is not the security story.</strong> One brain across both means
+      employer-relevant content lives in a consumer-owned per-user D1 — technically sound,
+      legally unexamined. Data residency, legal hold and offboarding expectations all collide
+      here, and none of it is priced. This is an unowned product decision, not an engineering
+      contradiction.
+    </p>
+    <p>
+      Label propagation through a six-phase derivation pipeline fails silently: a single
+      <code>?? 'default'</code> fallback of the sort already present at
+      <code>src/core/verbs.ts:136</code> becomes a misattribution, which under this model is a
+      security bug rather than a tidiness one. And because origin must be immutable by design, a
+      mis-stamped item is unfixable by the user — you need an explicit re-stamp path or support
+      tickets will be your product.
+    </p>
+  </div>
+</article>
+
+<!-- IDEA 5 -->
+<article class="idea" id="idea-5">
+  <div class="idea-head"><span class="idnum">5.</span><h3>Assemble live; the client's model writes the prose</h3></div>
+  <div class="chips">
+    <span class="chip axis">axis: recipes</span>
+    <span class="chip hi">confidence 85%</span>
+    <span class="chip">complexity Medium</span>
+  </div>
+
+  <div class="field">
+    <p>
+      <strong>The briefing never needed a hosted LLM at all.</strong> gbrain's briefing skill
+      declares <code>tools: [search, query, get_page, list_pages, get_timeline]</code> and
+      <code>mutating: false</code> — every declared tool is a read op. The celebrated narrative
+      voice in the README is written by the <em>calling</em> agent. So return one structured
+      bundle — today's meetings, participant cards, open commitments, stale-with-relevance flags,
+      each with citations — and let Claude or ChatGPT write the paragraph on the subscription the
+      user already pays for.
+    </p>
+    <p>
+      Which means <strong>assemble it at request time</strong>. From the brain's side a briefing
+      is six to ten SQL queries against one Postgres — tens to low hundreds of milliseconds on a
+      warm compute, against an <code>entity()</code> path that already carries a CI-gated p99
+      under 100 ms. There is nothing to pre-render, and pre-rendering would mean waking every
+      suspended project nightly to produce documents most users will not read that day — exactly
+      the thundering herd #1 warns about, and exactly the scheduled-work-for-inactive-users
+      pattern #7 rejects.
+    </p>
+    <p>
+      <strong>The boundary is what produced the data, not when the user asks.</strong> Anything an
+      LLM produced — salience scores, entity cards, the contradiction set, extracted commitments —
+      is materialized by consolidation and simply read. Anything that is retrieval and arrangement
+      happens live. The prose happens in the client's turn, on the client's budget, and gets better
+      every time their model does.
+    </p>
+    <p>
+      The one thing to bound hard: <strong>no request-time operation whose fan-out scales with
+      corpus size</strong>. A briefing that ranks salience by scanning every page is not a
+      request-time operation; one that reads a materialized salience score is. That distinction is
+      the difference between a fast tool call and the $50.71-against-$0.96 incident, where
+      selection pulled 1,985 items instead of 12. Note that this is a rule about <em>fan-out</em>,
+      not about model calls as such — a reranker over a fixed 100-candidate pool satisfies it, which
+      is why the cross-cutting principle above permits one on the read path and #8 does not.
+    </p>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 880 240" role="img" aria-label="One press run per user produces an edition every client fetches without further LLM calls">
+      <defs><marker id="ar5" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#22c55e"/></marker></defs>
+      <style>
+        .l5 { font-family: Inter, sans-serif; font-size: 13px; fill: #e0e0e0; }
+        .s5 { font-family: "JetBrains Mono", monospace; font-size: 11px; fill: #9a9aa8; }
+        .h5x{ font-family: Inter, sans-serif; font-size: 11.5px; font-weight: 600; letter-spacing: .06em; }
+        .b5 { fill: #14141f; stroke: #2a2a3d; }
+        .g5 { fill: rgba(34,197,94,.09); stroke: rgba(34,197,94,.35); }
+        .w5 { fill: rgba(245,158,11,.10); stroke: rgba(245,158,11,.40); }
+      </style>
+      <text x="0" y="16" class="h5x" fill="#7d7d8a">CONSOLIDATION · LLM WORK · DEBT-TRIGGERED</text>
+      <rect x="0" y="30" width="200" height="70" rx="8" class="w5"/>
+      <text x="16" y="54" class="l5">what a model produced</text>
+      <text x="16" y="74" class="s5">salience · entity cards</text><text x="16" y="91" class="s5">contradictions · commitments</text>
+      <line x1="212" y1="65" x2="268" y2="65" stroke="#22c55e" stroke-width="1.5" marker-end="url(#ar5)"/>
+      <text x="216" y="55" class="s5" paint-order="stroke fill" stroke="#0a0a0f" stroke-width="3.5">materialized</text>
+      <rect x="280" y="30" width="188" height="70" rx="8" class="g5"/>
+      <text x="296" y="54" class="l5">the user's Postgres</text>
+      <text x="296" y="74" class="s5">facts, chunks, edges,</text><text x="296" y="91" class="s5">embeddings, salience</text>
+      <text x="536" y="16" class="h5x" fill="#7d7d8a">REQUEST TIME · SQL ONLY · NO LLM SPEND</text>
+      <rect x="536" y="30" width="180" height="70" rx="8" class="g5"/>
+      <text x="552" y="54" class="l5">assemble the bundle</text>
+      <text x="552" y="74" class="s5">6–10 queries, ~100ms warm</text>
+      <text x="552" y="91" class="s5">fresh by construction</text>
+      <line x1="480" y1="65" x2="524" y2="65" stroke="#22c55e" stroke-width="1.5" marker-end="url(#ar5)"/>
+      <line x1="728" y1="65" x2="772" y2="65" stroke="#22c55e" stroke-width="1.5" marker-end="url(#ar5)"/>
+      <rect x="784" y="30" width="96" height="70" rx="8" class="b5"/>
+      <text x="798" y="54" class="l5">the client</text>
+      <text x="798" y="74" class="s5">writes the</text><text x="798" y="91" class="s5">prose, pays</text>
+      <rect x="0" y="128" width="880" height="52" rx="8" class="w5"/>
+      <text x="18" y="152" class="l5">The one hard bound</text>
+      <text x="18" y="171" class="s5">No request-time operation whose fan-out scales with corpus size. Read a materialized salience score; never scan every page to compute one.</text>
+      <rect x="0" y="192" width="880" height="40" rx="8" class="b5"/>
+      <text x="18" y="217" class="s5">Rejected: pre-rendering a nightly edition for every user — it wakes 10,000 suspended projects to produce documents most of them will not read.</text>
+    </svg>
+    <figcaption>
+      The split is by what produced the data, not by when the user asks. Model output is
+      materialized once; retrieval and arrangement happen live; prose happens in the client's turn.
+    </figcaption>
+  </figure>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="tag direct">direct:</span><code>skills/briefing/SKILL.md:8-14</code>, verified
+      exactly: <code>tools: [search, query, get_page, list_pages, get_timeline]</code>,
+      <code>mutating: false</code>. Phases at <code>:58-74</code> are pure retrieval. No
+      generation step is declared.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>synthesize</code> is marked
+      <strong>EXPENSIVE</strong> in the frozen verb contract and returns a
+      <code>cost{…usd_estimate}</code> block. The contract itself flags it as the thing not to
+      call on a hot path.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>skills/reports/SKILL.md</code> already writes
+      to <code>reports/{category}/{YYYY-MM-DD-HHMM}.md</code> — the printed-edition artifact
+      exists. What is missing is any push step: the skill is pull-only, so a non-technical user
+      who "sets up a daily briefing" gets a file they will never open.
+    </p>
+    <p>
+      <span class="tag external">external:</span>Zapier and IFTTT galleries work because each
+      template is a two-endpoint, single-trigger→single-action unit a user can preview before
+      enabling; they decay when templates need multi-step config. A recipe as "a section of your
+      paper" fits that shape.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <div class="field">
+    <p>
+      This settles the largest cost question in the product. LLM inference dominates the platform
+      bill by 10–100×, and press-time batching lands it once per user per day inside a budget
+      instead of once per client per ask. It makes BYOK the natural default rather than a tier,
+      and the briefing improves for free every time the client's model improves. It also lands
+      ChatGPT's <code>fetch</code> contract without extra work.
+    </p>
+  </div>
+
+  <h4>Downsides</h4>
+  <div class="downside">
+    <p>
+      A printed edition is stale by construction. The dateline makes that honest but not good —
+      the stop-press path has to actually work, and "high-salience change after press time" is a
+      judgment call you now make automatically.
+    </p>
+    <p>
+      Pushing prose generation to the client means you no longer control the briefing's voice,
+      which is a real product surface. And a briefing that only lands as a fetchable document
+      still has no delivery channel — the pull-only gap is narrowed, not closed.
+    </p>
+  </div>
+</article>
+
+<!-- IDEA 6 -->
+<article class="idea" id="idea-6">
+  <div class="idea-head"><span class="idnum">6.</span><h3>Export is the self-host format; the index is rebuilt, not backed up</h3></div>
+  <div class="chips">
+    <span class="chip axis">axis: durability</span>
+    <span class="chip hi">confidence 90%</span>
+    <span class="chip">complexity Low–Medium</span>
+  </div>
+
+  <div class="field">
+    <p>
+      <code>gbrain export</code> already writes one markdown file per page, with frontmatter,
+      into a slug-derived folder structure — exactly the shape a self-hosted brain consumes via
+      <code>sources add --path</code>. Pin that as a contract: <strong>the export IS a working
+      brain</strong>, not a dump. Hosted-to-self-host migration becomes export +
+      <code>git init</code> + <code>sources add</code> with no converter in between.
+    </p>
+    <p>
+      Backup then splits along the line you drew. <strong>Files get real backup</strong> —
+      versioned, replicated object storage, because they are the source of truth. <strong>The
+      index does not get a bespoke backup at all</strong> — it is derived, so recovery prefers
+      platform PITR or a wipe-and-resync from files. That deletes an entire recurring cost line
+      for every idle user. One exception must be named: <code>db_only</code> pages are
+      deliberately not file-backed and need file-equivalent treatment of their own.
+    </p>
+    <p>
+      Two additions make it a guarantee. <strong>Scheduled self-export to a destination the user
+      owns</strong> — a bucket, a Drive, a local machine — with a bounded nag if never
+      configured; that, not a button nobody presses, is what protects a user if the company
+      disappears. And <strong>portability parity as a CI-gated round-trip test</strong> — init,
+      sync a fixture brain, export, import into a fresh instance, diff — pinned the way engine
+      parity already is.
+    </p>
+  </div>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="tag direct">direct:</span><code>src/commands/export.ts:110-126</code>,
+      verified: writes <code>page.frontmatter</code>, <code>page.compiled_truth</code> and
+      <code>page.timeline</code> to <code>join(outDir, page.slug + '.md')</code>, splitting
+      <code>page.slug.split('/')</code> to preserve folder nesting.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>src/core/storage-config.ts:362-363</code> —
+      <code>db_only</code> pages are <em>"deliberately… rarely file-backed,"</em> and
+      <code>export.ts:73-99</code> already implements <code>--restore-only</code> to reconstruct
+      exactly that tier back to files. Rebuild-from-DB is a first-class operation, not a
+      hypothetical.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span>CLAUDE.md's engine-parity invariant — the two
+      engines <em>"move in lockstep… pinned by <code>test/e2e/engine-parity.test.ts</code>"</em>
+      — is a proven in-repo template for two things that must stay interchangeable.
+    </p>
+    <p>
+      <span class="tag external">external:</span>Rewind/Limitless was acquired Dec 5 2025 and
+      sunset Dec 19 2025 — fourteen days. "Trust the vendor to still exist" is not a safe default
+      in this category.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <div class="field">
+    <p>
+      You asked for regular backup and for export as files in a folder structure with the DB as a
+      backup. The strong version is not two new subsystems — it is recognizing that one already
+      exists and the other is mostly unnecessary. Making the export format identical to the OSS
+      input format turns open-source positioning into a real exit ramp, and it is the cheapest
+      credibility available.
+    </p>
+  </div>
+
+  <h4>Downsides</h4>
+  <div class="downside">
+    <p>
+      <strong>Encryption and recoverability pull against each other, and this is unresolved.</strong>
+      A per-tenant-encrypted backup nobody can decrypt after a lost password is a tombstone. Pick
+      a default explicitly — operator-escrowed wrapping key (low support burden, operator inside
+      the trust boundary, say so) or a self-custody recovery phrase shown once (honest, and
+      guarantees some users lose everything). Letting this default silently to "encrypted, no
+      recovery" is a trust disaster.
+    </p>
+    <p>
+      Deletion is genuinely awkward: <code>src/core/verbs.ts:295</code> — <em>"The fact is
+      expired (audit trail kept), not deleted"</em> — while account deletion must be final. The
+      cleanest available proof is to make the platform's 30-day PITR ceiling the deletion SLA,
+      provable because the restore mechanism cannot reach further back. But that makes account
+      deletion a separate hard path, not an extension of the memory verb, and users will
+      encounter both semantics.
+    </p>
+    <p>
+      Full-brain export is the highest-blast-radius operation in the system — the one op that
+      legitimately reads everything at once. It should not be an ordinary scoped MCP tool.
+    </p>
+  </div>
+</article>
+
+<!-- IDEA 7 -->
+<article class="idea" id="idea-7">
+  <div class="idea-head"><span class="idnum">7.</span><h3>Dream while the compute is already awake</h3></div>
+  <div class="chips">
+    <span class="chip axis">axis: runtime</span>
+    <span class="chip hi">confidence 82%</span>
+    <span class="chip">complexity Medium</span>
+  </div>
+
+  <div class="field">
+    <p>
+      A nightly cron means 10,000 model cycles per night whether or not anything changed. Invert
+      it: the brain accrues <strong>consolidation debt</strong> — unconsolidated facts, unresolved
+      contradictions, merge candidates — and a cycle fires when debt crosses a threshold or ages
+      past a ceiling. A user who added nothing pays nothing.
+    </p>
+    <p>
+      <strong>Per-tenant databases break the obvious trigger, and that is load-bearing.</strong>
+      With one shared database you would ask "who has unconsolidated facts?" in a single query.
+      Across 10,000 separate Neon projects there is no cross-tenant query, and waking every
+      project to ask <em>is</em> the thundering herd. So a control plane is forced: one shared
+      Postgres holding no user content, one row per user — <code>last_consolidated_at</code>,
+      <code>pending_debt</code>, <code>next_due_at</code>, tier, a reference to their connection
+      string. Writes increment that row as a side effect; the scheduler asks that table who is
+      due. It is one cheap query, and it is the only place a cross-user question can be asked.
+    </p>
+    <p>
+      <strong>Then the scheduling insight the substrate hands you: consolidate while they are
+      active, not at 3am.</strong> A cycle costs a compute wake (~500–870 ms) plus the
+      compute-seconds it runs. If the user is mid-session their project is already awake and you
+      pay neither. And a user who just finished a long conversation with their agent is precisely
+      the user with fresh debt. So the default trigger is opportunistic — debt above threshold
+      <em>and</em> compute already warm — with a time ceiling as the backstop for dormant brains,
+      those staggered by user-id hash at ~20 concurrent. This inverts the sleep metaphor
+      deliberately: you consolidate in the conversation's aftermath, not overnight.
+    </p>
+    <p>
+      <strong>It runs on its own fleet.</strong> Cycles last minutes, need real memory for
+      embedding batches, and must not autoscale on request volume — so a stateless worker fleet
+      pulls from a queue, opens one user's connection string, runs the cycle, closes. Separate
+      from the MCP request fleet for the same reason MCP moved off Workers.
+    </p>
+    <p>
+      <strong>The cycle runs cheap-to-expensive so a budget ceiling truncates into a coherent
+      state rather than a failure.</strong> Deterministic phases first — dedup, link resolution,
+      staleness marking, rule-based entity merge, embedding-space clustering — none of which calls
+      a model. <strong>The free tier stops there</strong>, which makes the free/paid boundary a
+      mechanism rather than a quota, and writes its own upgrade prompt: <em>"your brain found 14
+      contradictions it can't resolve without thinking."</em> Then the model phases: extraction,
+      enrichment, contradiction resolution, salience scoring. Then materialize exactly what a
+      model produced — salience, entity cards, the contradiction set, extracted commitments —
+      because that is what the live briefing in #5 reads. Truncating after the deterministic half
+      leaves a brain <em>consolidated but not dreamt</em>, which is a state you can describe to a
+      user.
+    </p>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 880 300" role="img" aria-label="Debt accumulates in a control plane; cycles run opportunistically on warm computes; phases run cheap to expensive">
+      <defs><marker id="ar7" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#3b82f6"/></marker></defs>
+      <style>
+        .l7 { font-family: Inter, sans-serif; font-size: 13px; fill: #e0e0e0; }
+        .s7 { font-family: "JetBrains Mono", monospace; font-size: 11px; fill: #9a9aa8; }
+        .h7 { font-family: Inter, sans-serif; font-size: 11.5px; font-weight: 600; letter-spacing: .06em; }
+        .b7 { fill: #14141f; stroke: #2a2a3d; }
+        .g7 { fill: rgba(34,197,94,.09); stroke: rgba(34,197,94,.35); }
+        .w7 { fill: rgba(245,158,11,.10); stroke: rgba(245,158,11,.40); }
+      </style>
+
+      <text x="0" y="14" class="h7" fill="#7d7d8a">TRIGGER — THE ONLY CROSS-USER QUESTION</text>
+      <rect x="0" y="26" width="150" height="52" rx="7" class="b7"/>
+      <text x="14" y="48" class="l7">a write lands</text><text x="14" y="67" class="s7">in one user's brain</text>
+      <line x1="162" y1="52" x2="196" y2="52" stroke="#3b82f6" stroke-width="1.3" marker-end="url(#ar7)"/>
+      <rect x="208" y="26" width="190" height="52" rx="7" class="b7"/>
+      <text x="222" y="48" class="l7">control plane: debt++</text><text x="222" y="67" class="s7">shared · holds no content</text>
+      <line x1="410" y1="52" x2="444" y2="52" stroke="#3b82f6" stroke-width="1.3" marker-end="url(#ar7)"/>
+      <rect x="456" y="26" width="200" height="52" rx="7" class="g7"/>
+      <text x="470" y="48" class="l7">warm? run now</text><text x="470" y="67" class="s7">no wake · no extra cost</text>
+      <rect x="668" y="26" width="212" height="52" rx="7" class="w7"/>
+      <text x="682" y="48" class="l7">else: time ceiling</text><text x="682" y="67" class="s7">queued · 20 concurrent</text>
+
+      <text x="0" y="118" class="h7" fill="#7d7d8a">THE CYCLE — CHEAP TO EXPENSIVE</text>
+      <rect x="0" y="130" width="160" height="58" rx="7" class="g7"/>
+      <text x="14" y="152" class="l7">dedup · links</text><text x="14" y="171" class="s7">staleness marking</text>
+      <rect x="172" y="130" width="160" height="58" rx="7" class="g7"/>
+      <text x="186" y="152" class="l7">merge · cluster</text><text x="186" y="171" class="s7">rule-based, no model</text>
+
+      <line x1="344" y1="124" x2="344" y2="200" stroke="#22c55e" stroke-width="1.5" stroke-dasharray="4 3"/>
+      <text x="352" y="212" class="s7" fill="#6ee7a0">free tier stops here</text>
+
+      <rect x="356" y="130" width="160" height="58" rx="7" class="w7"/>
+      <text x="370" y="152" class="l7">extract · enrich</text><text x="370" y="171" class="s7">model calls begin</text>
+      <rect x="528" y="130" width="160" height="58" rx="7" class="w7"/>
+      <text x="542" y="152" class="l7">contradictions</text><text x="542" y="171" class="s7">salience scoring</text>
+      <rect x="700" y="130" width="180" height="58" rx="7" class="b7"/>
+      <text x="714" y="152" class="l7">materialize</text><text x="714" y="171" class="s7">what #5 reads live</text>
+
+      <rect x="0" y="240" width="880" height="56" rx="8" class="b7"/>
+      <text x="16" y="264" class="l7">Three guards, all inherited from failures gbrain already paid for</text>
+      <text x="16" y="284" class="s7">budget cap with mid-run abort (the 53× incident) · checkpoint so a killed cycle never re-pays for model calls · 20-tenant concurrency, the dial that sets the bill</text>
+    </svg>
+    <figcaption>
+      The control plane is the only place a cross-user question can be asked, because per-tenant
+      databases make "who needs work?" unanswerable any other way. Everything downstream is
+      per-user and bounded.
+    </figcaption>
+  </figure>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="tag direct">direct:</span><code>skills/briefing/SKILL.md:47-49</code>,
+      verified: <em>"Pending consolidation footer — when <code>pending_consolidation_count &gt;
+      0</code>, note <code>N facts await dream-cycle consolidation</code>."</em> The debt metric
+      already exists and is already shown to the user; nothing treats it as a trigger.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>src/commands/autopilot.ts:390</code> — the
+      interval defaults to 300 seconds, polling regardless of change. The two most recent commits
+      on the deploy branch are both dream-<em>scheduler</em> bugs, not brain bugs.
+      Debt-triggering retires the bug class along with the cost.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>src/core/advisor/run.ts:21-32</code> — nine
+      deterministic collectors already produce a ranked, user-visible action list with zero LLM
+      calls. In-repo proof that a useful free tier does not require inference.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span>gbrain's own checkpointing precedent — sync banks
+      progress into the append-only <code>op_checkpoint_paths</code> table so a killed run resumes
+      and <code>last_commit</code> only advances on true completion. A consolidation cycle that
+      dies at minute eight must not re-pay for the model calls from minutes one through seven;
+      the same discipline applies, checkpointed in the user's own database.
+    </p>
+    <p>
+      <span class="tag external">external:</span>Neon suspends an idle project to $0 compute,
+      leaving only ~$0.105/month of storage — so "storage follows activity" needs no
+      hot/cold tiering of your own design. The platform does it. What remains yours is deciding
+      <em>when to wake</em>, which is what the debt trigger governs.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <div class="field">
+    <p>
+      You named this constraint directly, and gbrain shows it in its most literal form: a
+      container whose job, ~99.9% of its uptime, is <code>sleep</code>. Making the dominant
+      recurring cost proportional to <em>usage</em> rather than <em>headcount</em> is the
+      difference between a $10–20/mo price working and not. The opportunistic trigger goes one
+      further — it makes the marginal cost of consolidating an active user approximately zero,
+      because you were paying for that warm compute anyway.
+    </p>
+  </div>
+
+  <h4>Downsides</h4>
+  <div class="downside">
+    <p>
+      <strong>The control plane is a genuinely shared component and belongs in #1's register.</strong>
+      It holds no user content — ids, counters, timestamps, tier — but it is a single store with a
+      row for every user, and the consolidation fleet holds every connection string. Both are
+      unavoidable if you manage the infrastructure, which is the deal being offered, but they must
+      be named in the register rather than discovered by a reader later.
+    </p>
+    <p>
+      <strong>Opportunistic consolidation can make an active session feel slow</strong> if it
+      contends with the user's own queries on a 0.25 CU compute. It has to run genuinely out of
+      band — a queue entry, not an inline step after a write — and even then a heavy cycle on a
+      small compute competes for the same connection pool. The safe version triggers on
+      <em>session end</em> while the compute is still warm rather than mid-session.
+    </p>
+    <p>
+      Debt thresholds are a new tuning surface with no prior art: too low and you have re-invented
+      the cron, too high and a heavy user's brain goes stale exactly when it matters. The time
+      ceiling is load-bearing rather than a backstop — a user who is never active would otherwise
+      never consolidate at all. And a free tier that never calls a model is only attractive if
+      deterministic sleep produces visible value, which is an assumption, not a measurement.
+    </p>
+    <p>
+      The 20-tenant concurrency bound is the dial that sets the bill (~$4,125/mo versus ~$9,200 at
+      10k users), and it is easy to raise under pressure without anyone noticing the cost. Finally:
+      dreaming is <strong>not</strong> differentiation any more — Anthropic shipped Dreams,
+      OpenAI shipped Dreaming V3, and Mem0 shipped Dream, all in 2026, all using the same sleep
+      metaphor. What differentiates here is the zero-model free tier and the fact that an idle user
+      costs $0.105/month because nothing runs for them at all.
+    </p>
+  </div>
+</article>
+
+<!-- IDEA 8 -->
+<article class="idea" id="idea-8">
+  <div class="idea-head"><span class="idnum">8.</span><h3>Nine names on the wire, seven in front of any model</h3></div>
+  <div class="chips">
+    <span class="chip axis">axis: mcp</span>
+    <span class="chip new">revised — the number is now derived</span>
+    <span class="chip mid">confidence 76%</span>
+    <span class="chip">complexity High</span>
+  </div>
+
+  <div class="field">
+    <p>
+      The old card froze a number it never derived. Replace it with a rule that derives one.
+      <strong>A capability earns its own tool name only when (a) its <em>response contract</em>
+      cannot be a variant of an existing tool's, or (b) something outside the model — a client's
+      consent UI, an enterprise admin, or a protocol mandate — gates on it per tool.</strong>
+      Test (a) applies to the response, not the input: input schemas absorb anything, response
+      contracts do not. Test (b) is law rather than taste, because MCP attaches
+      <code>readOnlyHint</code> / <code>destructiveHint</code> / <code>idempotentHint</code> and
+      every client's write-gating <em>per tool</em> — there is no per-argument annotation, and no
+      cost annotation exists anywhere in the 2026-07-28 schema. Two capabilities needing different
+      consent structurally cannot be one tool.
+    </p>
+    <p>
+      Run the rule against the actual jobs and it yields <strong>nine names, seven advertised to
+      any model, one no model is meant to see</strong>. At 550–1,400 tokens per definition, seven
+      is 3.9k–9.8k of system prompt — an order of magnitude under Cursor's 40-tool cap, which was
+      never the binding constraint. Per-client token load was.
+    </p>
+    <p>
+      <strong>Select the surface by endpoint, not by client identity.</strong> This is the
+      load-bearing correction. <code>io.modelcontextprotocol/clientInfo</code> is self-reported and
+      clients only <em>SHOULD</em> send it, so sniffing it to decide whether to advertise
+      <code>search</code>/<code>fetch</code> means one missing header gets the connector rejected
+      outright by ChatGPT. Instead publish two connector URLs and let the user pick at install:
+      <code>/mcp</code> (Claude Desktop, Claude Code, Cursor, anything unknown — the portable
+      default, which also carries <code>search</code>/<code>fetch</code> as aliases so a misrouted
+      ChatGPT install still works) and <code>/openai</code>. The OAuth grant binds to the endpoint.
+      The spec's clause that <code>tools/list</code> "MAY vary by the authorization presented on
+      the request" covers a per-grant surface; it does not cover a per-claimed-identity one. The
+      honesty invariant is CI-enforced: <strong>for a given authenticated identity, every read and
+      write is reachable from every endpoint — only names and shapes vary.</strong>
+      <code>search(q).results[].id</code> must equal <code>recall({query:q}).results[].id</code> in
+      order. One handler, two projections, never two retrieval stacks.
+    </p>
+    <p>
+      <strong><code>synthesize</code> does not survive.</strong> Two of three design lanes kept it;
+      the argument for cutting it is economic. It is the only verb whose marginal cost lands on
+      brainz rather than the caller, its cost scales with the user's corpus, and a <em>model's
+      judgement</em> decides when to spend it — the exact shape that produced a documented 53×
+      overrun in the reference codebase. The live-assembly decision in #5 removed its flagship use,
+      and the caller already has a frontier model with the whole conversation in context, which a
+      server-side model does not. The capability moves to nightly consolidation: same money, spent
+      where it can be estimated before running, capped mid-run, and amortized across every future
+      read. Keep it dispatchable-but-unadvertised, returning <code>unavailable</code> with a
+      <code>suggestion</code> pointing at <code>briefing</code>, so a caller carrying the frozen
+      five gets an actionable error rather than <code>unknown_tool</code>. State the consequence
+      plainly: brainz does not pass gbrain's certifier, and declares
+      <code>memory-verbs-v1-partial</code> with a published delta rather than pretending.
+    </p>
+    <p>
+      <strong>The two homeless capabilities land in <code>brain</code>, and the attestation also
+      rides <code>_meta</code> on every response.</strong> These are not redundant — they have
+      different consumers. An unconditional <code>_meta["brainz.app/brain"]</code> stamp carrying
+      project id, database, storage prefix, signature and counts is the stronger trust artifact,
+      because an attestation you must ask for proves a claim while one stamped on every response is
+      a property. But <code>_meta</code> is invisible to the model, so a user asking Claude "is my
+      data actually isolated?" gets nothing from it. <code>brain</code> is the model-reachable
+      rendering, and it is read-only — which is why it survives on the one surface where writes
+      default off.
+    </p>
+    <p>
+      <strong>Panel writes live in <code>manage</code>: reversible actions only, nonce-gated,
+      advertised to nobody.</strong> An MCP Apps view calls back via <code>tools/call</code>, so
+      <code>manage</code> is dispatchable on <code>/mcp</code> but excluded from its advertised
+      list, admitted only when the call carries a short-TTL nonce minted into the panel HTML at
+      <code>resources/read</code> time. The action enum is
+      <code>set_context_policy | set_spend_cap | pause_source | resume_source</code>. Disconnect,
+      delete, export and sharing deep-link to the web app with a signed URL instead — removing the
+      catastrophic actions rather than annotating around them is what lets
+      <code>destructiveHint: false</code> stay honest.
+    </p>
+    <p>
+      <strong>The growth channel, honestly: resources are not one.</strong> Drop that claim
+      entirely. On both ChatGPT tiers the resources primitive is functionally absent — and
+      OpenAI's decision to reinvent "discover then read" as <code>search</code>/<code>fetch</code>
+      <em>tools</em>, in a spec that already had resources, is the strongest evidence available. On
+      Claude Desktop resources are user-attach-only. On Claude Code they are genuinely
+      model-initiated, but only because Claude Code re-exposes them <em>as tools</em>, so the
+      manifest stays frozen while the effective entry-point count grows identically — accounting,
+      not saving. The real ladder, in order: <strong>optional argument → connection state →
+      response envelope → unadvertised panel action → a new name.</strong> And note the asymmetry
+      that makes this non-obvious: arguments are free on three clients but <em>not</em> on ChatGPT
+      Work, where a new optional param is a definition change requiring an admin re-scan. The
+      <strong>response envelope is the only channel free on all four</strong>, precisely because
+      responses are not part of the definition an admin approves. So the enterprise operating rule
+      is: put growth in responses, and batch request-schema changes into dated releases.
+    </p>
+    <p>
+      <strong>"Frozen forever" becomes two differently-enforced commitments.</strong> A
+      <em>permanent semantic freeze</em> — a field named X never changes meaning or type, enum
+      values frozen, <code>required→optional</code> safe and <code>optional→required</code> banned
+      forever — plus <em>dated manifest releases</em> (<code>surface-2026-08</code>, at most two a
+      year, announced 90 days ahead, with the server honoring both epochs simultaneously keyed on
+      the approved digest so there is no flag day). The written trip-wire for when a new name is
+      mandatory: a different response <em>type</em>; a different consent class; a latency class
+      more than 10× from the host tool's published promise; a hard external mandate; a caller that
+      is not a model; or the host verb exceeding <strong>8 model-facing optional params</strong>.
+      Counter-rule: same response type, same consent class, same latency class, fits the budget →
+      it is an argument, and continuing to argue is the drift.
+    </p>
+  </div>
+
+  <h4>The tool set</h4>
+  <div style="overflow-x:auto">
+  <table>
+    <thead><tr><th>Tool</th><th>Purpose</th><th>Who pays</th><th>Advertised on</th><th>Why it earns a name</th></tr></thead>
+    <tbody>
+      <tr><td>recall</td><td>Relevance-ranked read over consolidated facts and chunks; budget-packed; relational arm behind an intent classifier; cross-encoder rerank over the candidate pool. Params cut to 8.</td><td>caller, <strong>plus a bounded brainz cost per query</strong> (the rerank — see the cross-cutting principle)</td><td><code>/mcp</code></td><td>Test (a) — the only ranked read. Graph traversal folds in rather than getting its own name.</td></tr>
+      <tr><td>search</td><td><code>recall</code>'s query mode under OpenAI's mandated schema, dual-encoded as <code>structuredContent</code> + JSON text.</td><td>caller</td><td>both</td><td>Trip-wire (4). A forced synonym, not a capability — one handler, pinned by an equivalence test.</td></tr>
+      <tr><td>fetch</td><td>One identified item in full by opaque id. No ranking, no budget truncation.</td><td>caller</td><td>both</td><td>Test (a), derived independently of the mandate: a whole document does not fit a token-budgeted chunk response.</td></tr>
+      <tr><td>entity</td><td>One person/company/project as a typed card. Zero LLM. Never errors on a miss.</td><td>caller</td><td>both</td><td>Both tests. A latency promise attaches to a tool name or nowhere.</td></tr>
+      <tr><td>briefing</td><td>The standing bundle for a moment, assembled by SQL over pre-consolidated facts. The caller's model writes the prose.</td><td>caller</td><td>both</td><td>Test (a): fixed multi-section shape. Also where continuity lives now that the spec retired sessions.</td></tr>
+      <tr><td>remember</td><td>The single create path — one fact or one long-form note, provenance mandatory.</td><td>caller</td><td>both, write-gated</td><td>Trip-wire (2): write consent class.</td></tr>
+      <tr><td>forget</td><td>Expire a fact by id. Idempotent, audit trail kept, never deleted.</td><td>neither</td><td>both, write-gated</td><td>Trip-wire (2) as hard law — a retraction carries <code>destructiveHint: true</code> where a create carries false.</td></tr>
+      <tr><td>brain</td><td>Read-only self-report: inventory counts, health, signed isolation attestation, definitions digest, the per-endpoint tool matrix.</td><td>neither</td><td>both</td><td>Trip-wire (2) inverted — the trust artifact must be a read, or it dies where writes default off.</td></tr>
+      <tr><td>manage</td><td>Panel control plane, reversible actions only, nonce-required.</td><td>neither</td><td><strong>nowhere</strong></td><td>Trip-wire (5): the caller is deterministic iframe code, not a model.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p style="font-size:13.5px;color:var(--text-muted)">
+    One detail worth stealing: set <code>openWorldHint: false</code> on all nine. gbrain sets it
+    nowhere, so every tool inherits the spec default <code>true</code> — telling clients these
+    tools touch an unbounded external world. For a per-user Neon project that is simply false, and
+    it never gets fixed once shipped.
+  </p>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="tag direct">direct:</span><code>src/core/verbs.ts:5-14</code> and
+      <code>src/mcp/surface.ts:56</code>, verified: <em>"Frozen contract… field names and
+      semantics in v1 never change; additions are forever-additive."</em> Two-layer fail-closed
+      filtering already exists — ListTools advertises the filtered set, hidden ops return
+      <code>unknown_tool</code>.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>src/commands/protocol.ts:104</code> —
+      <code>versioning_policy: 'additive-forever: … new optional fields/params may be added'</code>.
+      That is what makes the <code>setup</code> envelope field legal rather than a protocol break.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>src/core/operations.ts:4585</code> —
+      <code>recall</code> ships <strong>10</strong> params, two of which fail the rule:
+      <code>supersessions</code> ("return only the supersession audit log") is a mode switch, a
+      second tool wearing recall's name, and <code>grep</code> is documented "Applied client-side
+      after recall" — pure surface tax. Cutting both lands at 8 and leaves room for
+      <code>relation</code>/<code>depth</code>.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>src/core/verbs.ts:303</code> gives
+      <code>forget</code> <code>destructiveHint: true, idempotentHint: true</code> while
+      <code>:82</code> gives <code>remember</code> only <code>idempotentHint</code>. Two writes,
+      two annotation profiles — which is precisely why they cannot be one tool.
+    </p>
+    <p>
+      <span class="tag external">external:</span>The grounding pass, which is what killed the
+      resources strategy: <strong>model-initiated resource access exists only in Claude Code</strong>,
+      which implements it by re-exposing resources as tools. Claude Desktop is user-attach-only
+      ("Click the '+' button… then select Connectors"), and both ChatGPT tiers do not exercise the
+      resources primitive at all. Prompts are user-controlled by spec everywhere. Output schemas,
+      by contrast, are current and were <em>loosened</em> in 2026-07-28 (SEP-2106) — servers MUST
+      conform, clients SHOULD validate — so richer structured returns are a real channel.
+    </p>
+    <p>
+      <span class="tag external">external:</span>The live <code>ToolAnnotations</code> schema
+      carries <code>title</code>, <code>readOnlyHint</code>, <code>destructiveHint</code>,
+      <code>idempotentHint</code>, <code>openWorldHint</code> — and <strong>no cost hint of any
+      kind</strong>. The spec also warns clients to treat annotations as untrusted unless the
+      server is trusted, so they cannot gate real security decisions.
+    </p>
+    <p>
+      <span class="tag reasoned">reasoned:</span>Argument-growth is preferable not because it is
+      cheaper — a marginal param is ~25–60 tokens against a ~190-token tool floor — but because it
+      is <strong>recoverable</strong>. A wrong parameter returns <code>invalid_params</code> plus a
+      <code>suggestion</code> and self-corrects next turn; a wrong tool choice returns a plausible
+      wrong answer and teaches nothing. Every trip-wire condition is a case where the server cannot
+      catch and teach the error.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <div class="field">
+    <p>
+      The commissioning question was "why seven?" and the honest answer was "no reason." This
+      number is a consequence: eight jobs, one wearing two names for disjoint audiences, one no
+      model selects. Change the jobs and the number moves, which is what makes it a rule rather
+      than a target.
+    </p>
+    <p>
+      Three corrections do the real work. The <strong>endpoint fix</strong> turns per-client
+      tailoring from a self-reported-header gamble into an install-time choice bound to an OAuth
+      grant. <strong>Cutting <code>synthesize</code></strong> is the decision that changes the cost
+      structure — not because it makes reads free, but because it removes the one call whose size a
+      <em>model</em> chose. What remains is SQL, a sub-cent embedding on write, and a bounded rerank
+      on read: all three estimable per query in advance, which is the property that matters at a
+      $10–20/mo price point. And <strong>moving the attestation into <code>_meta</code> on every
+      response</strong> while keeping <code>brain</code> as its model-reachable rendering upgrades
+      the trust claim from something a caller must think to request into a property of the
+      connection.
+    </p>
+  </div>
+
+  <h4>Downsides</h4>
+  <div class="downside">
+    <p>
+      <strong><code>entity</code>'s latency promise collides with the substrate.</strong> Per-user
+      Neon with scale-to-zero takes ~500–870 ms to accept its first query — on exactly the call an
+      agent makes first. Keeping projects warm contradicts the economics the whole design rests on.
+      So the promise must be restated as warm-p99 &lt; 100 ms plus a separate cold-start budget and
+      a <code>cold_start: true</code> flag. That is weaker than gbrain's, on the tool whose entire
+      justification for a name <em>is</em> the promise.
+    </p>
+    <p>
+      <strong>Cutting <code>synthesize</code> forfeits the demo.</strong> "Ask it anything and it
+      reasons over your whole life" pitches better than "it hands your agent the right evidence,"
+      and two of three independent lanes kept the verb. The mitigation — that
+      <code>briefing</code> plus budget-packed <code>recall</code> should be indistinguishable in
+      output quality, since the caller's model writes the prose either way — is a claim to verify
+      against real transcripts before any marketing page commits to it.
+    </p>
+    <p>
+      <strong><code>manage</code>'s invisibility is unresolved.</strong> Whether hosts forward
+      <code>tools/call</code> for a name absent from <code>tools/list</code> is unconfirmed. If they
+      refuse, it becomes the eighth advertised tool at ~700 tokens on every request — safe, since a
+      model has no nonce and gets <code>invalid_params</code>, but the "no model sees more than
+      seven" claim becomes eight, one of which is noise for the model.
+    </p>
+    <p>
+      <strong><code>recall(entity:)</code> and the <code>entity</code> tool overlap, and this
+      revision did not remove it.</strong> One filters ranked evidence, the other looks up a card —
+      different response types, so both pass test (a) — but a model can still pick wrong.
+      Descriptions disambiguate; nothing enforces it. That is a live instance of the
+      overlapping-tools failure the card cites elsewhere.
+    </p>
+    <p>
+      <strong>Two endpoints means two golden manifests and two conformance profiles</strong>, and
+      the cross-surface equivalence test covers ranking and body equality but <em>not</em>
+      authorization. A scope check added to <code>fetch</code> and not to <code>recall({id})</code>
+      is a cross-source leak that test will not catch — the auth check has to live in shared
+      dispatch below both handlers, and nothing structural enforces that.
+    </p>
+    <p>
+      <strong>Whether OpenAI's connector review accepts a <code>/openai</code> surface carrying
+      five tools beyond the mandated two is unconfirmed</strong> — no review-policy document
+      surfaced. If a reviewer requires the compatibility pair alone, then <code>entity</code>,
+      <code>briefing</code>, <code>remember</code>, <code>forget</code> and <code>brain</code> must
+      ride inside <code>fetch</code>'s id grammar on that endpoint: workable, materially worse, and
+      a redesign of half this card. The enterprise freeze's granularity is likewise unconfirmed, so
+      the design assumes conservatively that a description edit costs a re-scan.
+    </p>
+    <p>
+      <strong>The 8-param budget is a judgment call, not a measurement</strong>, calibrated on one
+      codebase's most-loaded verb — and gbrain's +13–17pp hierarchical-dispatch result was measured
+      on markdown routing tables, not live <code>tools/list</code> selection. If the number is
+      wrong it is probably too generous.
+    </p>
+  </div>
+</article>
+
+<!-- IDEA 9 -->
+<article class="idea" id="idea-9">
+  <div class="idea-head"><span class="idnum">9.</span><h3>First value before first OAuth</h3></div>
+  <div class="chips">
+    <span class="chip axis">axis: onboarding</span>
+    <span class="chip mid">confidence 70%</span>
+    <span class="chip">complexity Medium</span>
+  </div>
+
+  <div class="field">
+    <p>
+      Delete the CLI from the consumer path. <strong>Adding the connector URL in Claude Desktop or
+      ChatGPT IS the install</strong> — the brain provisions server-side the first time a token is
+      minted against it. Zero setup questions: engine, embedding provider and search mode all have
+      one right answer on a hosted tier.
+    </p>
+    <p>
+      <strong>The empty state is not a connector grid.</strong> It is one act: tell the assistant
+      one thing about yourself. The install flow ends inside the chat client, so
+      <code>remember</code> fires there and <code>recall</code> returns it seconds later — target
+      is first stored-and-retrieved memory in under 60 seconds with zero third-party consent
+      screens. Connectors are offered only <em>after</em> the loop has been felt, and never
+      through a management tool: when <code>recall</code> returns empty or flags
+      <code>search_degraded</code>, the envelope carries the claim URL from #8. On mobile, where
+      clicking a chat link is unreliable, the same claim renders as a six-character pairing code
+      plus QR typed at an already-authenticated page.
+    </p>
+    <p>
+      <strong>The index is a cache, not a prerequisite</strong> — <code>recall</code> answers from
+      minute zero against whatever is reachable and returns <code>search_degraded: true</code>
+      with a specific statement of what is not indexed yet, while the index quietly overtakes it.
+      And <strong>pre-seed the public half of the graph</strong>: every user who connects mail has
+      messages from Stripe, GitHub, Delta, their bank, and today every brain would spend its own
+      LLM extraction deriving the same public facts. Ship a signed public authority file of entity
+      cards and aliases — the shared record — while holdings stay per-user and never leave.
+      Libraries stopped re-cataloging every book in 1901.
+    </p>
+  </div>
+
+  <h4>Basis</h4>
+  <div class="basis">
+    <p>
+      <span class="tag direct">direct:</span><code>README.md:78-94</code>, verified verbatim:
+      <em>"GBrain is designed to be installed and operated by an AI agent… If you don't already
+      have an AI agent platform running, start with one of these… ~30 minutes."</em> The flagship
+      non-technical path requires standing up a different agent platform first.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span><code>src/core/sources-ops.ts:337-348</code>,
+      verified: gbrain <em>"never auto-git inits the directory (that would cross the consent
+      boundary… a <code>--path</code> source is the user's own external directory)."</em> That
+      boundary is <em>correct</em> for self-hosted paths and simply does not apply to storage the
+      hosted service owns.
+    </p>
+    <p>
+      <span class="tag direct">direct:</span>The frozen <code>recall</code> signature already
+      returns <code>search_degraded?</code>. The field for an honest cold start exists in the
+      protocol; nothing treats it as an onboarding primitive.
+    </p>
+    <p>
+      <span class="tag external">external:</span>The Library of Congress card distribution service
+      (1901) and later OCLC made cataloging cooperative; MARC separates the <em>bibliographic
+      record</em> (shared) from the <em>holdings record</em> (local). The constraint structure
+      matches on all four points: high per-item derivation cost, near-total overlap on the shared
+      portion, zero overlap on the local portion, and a hard prohibition on the local portion
+      leaving.
+    </p>
+  </div>
+
+  <h4>Rationale</h4>
+  <div class="field">
+    <p>
+      This decouples launch from a certification you do not control, and inverts the funnel so the
+      memory loop is experienced before mailbox access is requested — the only sequencing under
+      which that grant is a reasonable ask. The authority file is also the only genuine network
+      effect in the whole set: the one mechanism that gets cheaper per user as users grow.
+    </p>
+  </div>
+
+  <h4>Downsides</h4>
+  <div class="downside">
+    <p>
+      <strong>The connector layer is still not solved, and this idea assumes it exists
+      eventually.</strong> Gmail-class scopes need CASA Tier 2/3, re-certified annually, on a
+      multi-week timeline. Connector vendors are priced for B2B tenant counts. Two escape hatches
+      were generated and both are weaker than they look: borrowing the client's existing
+      connectors assumes cross-server OAuth token sharing that no evidence supports, and a
+      per-user ingest email trades OAuth cost for spam, spoofing and deliverability infrastructure
+      nobody has priced.
+    </p>
+    <p>
+      <strong>The whole shape presupposes brainz builds OAuth connectors at all.</strong> If the
+      answer is "file and folder sync forever," the CASA argument is moot and this collapses to
+      ordinary onboarding advice. Decide that before scoping it.
+    </p>
+    <p>
+      The authority file is a product surface with real maintenance cost and its own accuracy
+      liability, and it must flow strictly one way or it silently becomes a cross-user channel.
+    </p>
+  </div>
+</article>
+
+<div class="callout">
+  <div class="eyebrow">Contradictions to resolve before building</div>
+  <p>
+    <strong>1 and 2 — resolved by the #8 revision.</strong> Both <code>prove_isolation</code> and
+    brain-wide inventory counts now live in the read-only <code>brain</code> tool, with the
+    attestation additionally stamped into <code>_meta</code> on every response. The earlier
+    resolution — "ship them as MCP resources" — turned out to be unavailable: the grounding pass
+    found model-initiated resource access exists on only one of the four target clients, so a
+    resource would have been unreachable for most users. Recording it here because the reasoning
+    generalizes: any capability parked on resources needs the same check.
+  </p>
+  <p>
+    <strong>3. Zero-knowledge encryption vs. server-side synthesis (#5, #7).</strong> LLM calls
+    need plaintext in the compute plane — including BYOK. A service that genuinely "cannot read
+    your files at rest" cannot also run consolidation. The honest maximum: no decryptable key at
+    rest on our side, plaintext only inside one isolate for one authorized request, and a receipt
+    each time. Pick that and say it precisely, or drop the claim.
+  </p>
+  <p>
+    <strong>4. Cold storage (#7) vs. the <code>entity()</code> p99 &lt; 100 ms promise (#8).</strong>
+    A hydrate-on-demand brain cannot honor a sub-100ms guarantee on first touch. Scope the SLA to
+    warm brains, or scope eviction to brains with no live client connected.
+  </p>
+  <p>
+    <strong>5. Hard-delete on revoke (#6) vs. <code>forget</code>'s never-delete semantics.</strong>
+    Two deletion semantics in one product; users will hit both. #6 makes the hard delete cheap
+    because derived data is rebuildable — but it must be an explicit decision, not an emergent one.
+  </p>
+  <p>
+    <strong>6. Gateway-enforced spend caps vs. BYOK privacy.</strong> Per-user-ID caps from a vendor
+    gateway require routing the user's own provider key and raw prompt text through a third-party
+    proxy. gbrain's own gateway instantiates native providers with no <code>baseURL</code> — direct
+    to provider. "Your memories transit our AI vendor's proxy so we can meter you" is a privacy
+    regression traded for a billing convenience. Name the trade before adopting it.
+  </p>
+  <p>
+    <strong>7. Origin-fenced work grant (#4) vs. one-D1-per-user (#1).</strong> #1's isolation unit
+    is the person; #4's fence is the origin. Together they place employer content inside a
+    consumer-owned database — technically sound, legally unexamined. Not an engineering
+    contradiction; an unowned product decision.
+  </p>
+</div>
+
+<h2 id="parity-work">Parity Work</h2>
+
+<p>
+  These thirteen are different in kind from the nine above. Those are ranked ideation candidates —
+  directions you might take. <strong>These are what the capability audit found missing</strong>, and
+  they are not optional if the bar is "the same level of accuracy and functionality." They carry a
+  priority rather than a confidence, because their existence is not in question — only their
+  sequencing.
+</p>
+<p>
+  Almost none of them are agentic AI features. They are retrieval engineering, data engineering,
+  measurement, ops, cost control and trust — the substrate a memory product needs to work, and
+  precisely the category an ideation pass structurally misses. That is the reassuring read: the
+  remaining work is known-shaped rather than invention.
+</p>
+
+<div class="jumplist">
+  <ol>
+    <li><a href="#pw-1">The brain ships the instructions that make the agent use it</a></li>
+    <li><a href="#pw-2">Ranking is a stack, not a query</a></li>
+    <li><a href="#pw-3">Measure the answer, not the wire</a></li>
+    <li><a href="#pw-4">The write path: what happens before the tool returns</a></li>
+    <li><a href="#pw-5">Decide the schema before the first project is provisioned</a></li>
+    <li><a href="#pw-6">Migrate ten thousand databases without waking them</a></li>
+    <li><a href="#pw-7">The first import is the biggest bill you will ever send</a></li>
+    <li><a href="#pw-8">Nothing the model wrote is true until something says so</a></li>
+    <li><a href="#pw-9">Undo, versions, and the delete that actually deletes</a></li>
+    <li><a href="#pw-10">Ingestion is a substrate, not a connector list</a></li>
+    <li><a href="#pw-11">Junk is most of what a mailbox contains</a></li>
+    <li><a href="#pw-12">Screenshots are memory too</a></li>
+    <li><a href="#pw-13">A brain that changes overnight should say so</a></li>
+  </ol>
+</div>
+
+<article class="idea pw" id="pw-1">
+  <div class="idea-head"><span class="idnum">P1.</span><h3>The brain ships the instructions that make the agent use it</h3></div>
+  <div class="chips"><span class="chip crit">critical</span><span class="chip">complexity Low</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      Nothing in the nine ideas causes the brain to be read or written. <code>remember</code> is
+      "the single create path" called by a caller nobody instructs; <code>recall</code> is a ranked
+      read the host model has no directive to reach for. gbrain's two most load-bearing behaviors
+      are not tools at all — a <strong>signal-detector that fires on every inbound message</strong>
+      (capture) and a <strong>brain-first rule before answering anything about a person</strong>
+      (retrieval). Both live in a skills layer this design deleted as operator machinery, without
+      replacing the mechanism.
+    </p>
+    <p>
+      The failure compounds rather than degrades: no writes → no consolidation debt → no cycles →
+      no salience, entity cards or contradictions → #5's live briefing assembles over an empty
+      materialized layer, and #7's "14 contradictions" upgrade prompt has nothing to count. A brain
+      that is technically correct and never invoked is indistinguishable from no brain, while still
+      billing you for consolidation.
+    </p>
+    <p>
+      The mechanism costs <strong>zero tool names</strong>: MCP's server <code>instructions</code>
+      field, plus the tool descriptions, plus #8's response envelope. A capture-and-consult
+      directive the brain ships to whichever client connects. Treat it as a versioned asset under
+      #8's manifest-epoch rule — descriptions freeze at enterprise approval, so this is a dated
+      release, not prose someone edits on a Tuesday. And it needs the same evaluation as any other
+      quality lever: a held-out intent fixture set with strict and lenient scoring, CI-gated, since
+      gbrain's own +13–17pp routing result was measured on markdown routing tables rather than live
+      <code>tools/list</code> selection.
+    </p>
+  </div>
+</article>
+
+<article class="idea pw" id="pw-2">
+  <div class="idea-head"><span class="idnum">P2.</span><h3>Ranking is a stack, not a query</h3></div>
+  <div class="chips"><span class="chip crit">critical</span><span class="chip">complexity High</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      gbrain's answer quality does not come from <code>pgvector + tsvector + RRF</code>. It comes
+      from roughly nineteen stages that run <em>after</em> the candidate pool exists. This design
+      commits to two of them unambiguously, half-commits to four, and does not mention thirteen.
+      Every one of the missing stages fails silently — answers get quietly worse and nothing errors.
+    </p>
+    <p>
+      <strong>The unmade decision underneath most of them is one question: does <code>recall</code>
+      get a rerank call and a query embedding, and who pays?</strong> The cross-cutting principle
+      above answers the "may we" — a bounded scoring function over a fixed candidate set is
+      permitted. What remains is the number: roughly $1.50–3.00 per active user per month on a
+      hosted reranker, or compute if you self-host a small cross-encoder on the consolidation fleet.
+    </p>
+    <h4>What has to be built</h4>
+    <p>
+      <strong>A shared normalizer</strong> (NFKC + lowercase + whitespace) applied on write
+      <em>and</em> read — the only thing keeping alias and title matching from drifting between
+      index and query. <strong>Intent classification as a ranking input</strong>, not just the
+      relational router #8 committed to: it sets the fusion weights, the effective RRF k, the
+      exact-match boost and the recency tilt. Without it "who is Bob" and "what did I say last
+      week" rank identically, which is most of what a consumer asks.
+      <strong>Query-vs-document embedding asymmetry</strong> — both leading providers are
+      asymmetric, and using the document encoder for queries quietly degrades every search.
+    </p>
+    <p>
+      <strong>The alias hop</strong> — exact-title, then alias table, then slug-suffix — is the only
+      layer that bridges true synonyms with zero surface overlap. Nicknames, maiden names, "the Acme
+      deal": the consumer case is heavier than gbrain's. <strong>Cross-encoder reranking</strong>
+      reshuffles <strong>60% of top-1 results</strong> on a real corpus and fails open, which makes
+      it the single biggest unclosed delta with a purely economic objection.
+      <strong>Autocut must read the rerank score</strong>, not the RRF gap — gbrain measured the
+      alternative at 0.602 versus 0.569 and concluded it is mechanical decay rather than signal, so
+      porting autocut onto RRF gap cuts on noise and is a precision regression with no error.
+    </p>
+    <p>
+      <strong>Title-phrase boost</strong> is the most visible failure when absent, and doubly so
+      here: OpenAI's mandated <code>search</code> projection returns <code>{id, title, url}</code>,
+      so on that surface the title is <em>all the user sees</em>.
+      <strong>Per-prefix recency decay</strong> (14–60 day half-life on churn content) matters
+      because consumer queries are overwhelmingly temporal and the committed connectors — mail,
+      calendar, chat — are exactly the high-churn content. <strong>Source-type boost and hard
+      excludes</strong> are gbrain's <em>first</em> line of defense against contradictions, settled
+      by ranking before any model phase adjudicates; note this requires letting origin inform rank,
+      which #4 currently forbids, so that card needs amending.
+    </p>
+    <p>
+      <strong>Graph adjacency and cross-source corroboration</strong> is where brainz is uniquely
+      advantaged — origin stamps make "calendar <em>and</em> mail both attest this" free, and gbrain
+      has no equivalent signal. <strong>The compiled-truth boost</strong> (2.0× on a canonical
+      summary chunk) is why "who is Sarah" returns the current-state answer instead of 200 raw
+      emails — and #7's consolidation output list contains no canonical summary chunk today, so this
+      is a change there too. <strong>Four-layer read-time dedup</strong> — top-3 per page, 0.85
+      Jaccard, a 60% page-type cap, 2 chunks per page — stops one verbose page monopolizing the
+      answer; mail threads and chat transcripts are near-duplicate-heavy by nature, worse than a
+      curated wiki. Plus <strong>return policy</strong> (intent-adaptive sizing),
+      <strong>evidence and <code>create_safety</code> on the envelope</strong> so the writing agent
+      knows whether the thing already exists, and <strong>contextual-retrieval wrapping</strong> at
+      embed time, which matters most on exactly the short fragments a mailbox produces.
+    </p>
+  </div>
+</article>
+
+<article class="idea pw" id="pw-3">
+  <div class="idea-head"><span class="idnum">P3.</span><h3>Measure the answer, not the wire</h3></div>
+  <div class="chips"><span class="chip crit">critical</span><span class="chip">complexity Medium</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      #2 grades the wire — tool lists, response schemas, error envelopes — and it will pass green
+      while write-back drops a fact, while recall misses something injected two sessions ago, or
+      while a bad extraction prompt degrades every briefing every user reads. Keep the two
+      explicitly separate so they are never conflated: conformance proves you speak the protocol,
+      and proves nothing about whether the answers are right.
+    </p>
+    <p>
+      Against the stated bar of "the same level of accuracy," this is the row that makes every other
+      row unauditable in either direction. What is needed: an <strong>owned fixture corpus</strong>;
+      a regression arm <em>and</em> an absolute floor (gbrain ships nDCG@10 ≥ 0.65 as a hard bar);
+      <strong>named-entity gates</strong> in the shape gbrain uses — title-substring Hit@1 ≥ 0.95,
+      alias Hit@1 ≥ 0.98, dilution Hit@3 = 1.0; an <strong>extraction recall floor</strong> (0.8,
+      non-zero exit); and grading of <strong>what consolidation produced</strong>, which is stored
+      rather than recomputed — so a bad prompt is permanent and invisible.
+    </p>
+    <p>
+      Two structural choices decide whether this survives its first quarter. <strong>Split the suite
+      into a deterministic always-blocking half</strong> (seeded PRNG, zero model calls) and a
+      sampled model-judged half on the canary — otherwise a noisy, model-priced gate gets marked
+      non-blocking within a month, which is the exact death #2 predicts for its own ledger. And
+      <strong>set per-question-type floors rather than an aggregate</strong>: brainz's query mix is
+      unusually heterogeneous — relational, named-entity, temporal, context-fenced — and an
+      aggregate is especially good at hiding one collapsed category that users experience as "it
+      never remembers people."
+    </p>
+    <p>
+      Per-tenant, across 10,000 isolated databases, the only quality signal that works is
+      content-free telemetry: production <code>avg_rank1_score</code> drift. And give #1's canary
+      tenant a second job — a nightly fixture run through the real <code>/mcp</code> on the real
+      substrate, which doubles as the continuous post-deploy path check for extensions, GUCs (note
+      <code>ef_search</code> is per-connection and can evaporate), indexes, the queue, and opening a
+      tenant connection string.
+    </p>
+  </div>
+</article>
+
+<article class="idea pw" id="pw-4">
+  <div class="idea-head"><span class="idnum">P4.</span><h3>The write path: what happens before the tool returns</h3></div>
+  <div class="chips"><span class="chip crit">critical</span><span class="chip">complexity Medium</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      #8 says "SQL plus a sub-cent embedding on write." #7 says extraction is "a queue entry, not an
+      inline step after a write." Nothing says where chunking, link extraction and fact embedding
+      actually sit — and until that split is named, those two cost claims cannot be reconciled and
+      every chunking capability is homeless.
+    </p>
+    <p>
+      gbrain's split is deliberate and worth copying: <strong>facts embed synchronously</strong>, so
+      downstream classifiers have vectors immediately; <strong>chunks are backfillable</strong>; and
+      <strong>links are watermarked</strong>. One correction to gbrain's shape rather than a copy:
+      link extraction being async means "who did I just say Alice works with" answers wrong
+      immediately after being told. Make it synchronous or sub-second, and make it
+      <em>reconcile</em> rather than accumulate — removing stale edges, not just adding new ones.
+    </p>
+    <p>
+      Three specifics that are cheap now and unfixable later. There is <strong>no chunking spec at
+      all</strong> — pick one chunker deliberately and record the choice, since it is quality-affecting
+      even when only one ships. A <strong>hard 6,000-character safety cap</strong>: gbrain hit two
+      production bugs where over-limit chunks failed embedding <em>forever</em>, silently. And
+      <strong>CJK-aware sizing</strong> — at ≥30% CJK, switch to per-character counting; without it
+      CJK text counts as one giant word, overflows the embedder, and the page imports but never
+      becomes searchable. A consumer product going global inherits that on day one.
+    </p>
+    <p>
+      Finally, <strong>contextual-retrieval wrapping</strong> — prefixing each chunk with its
+      document title and a synopsis at embed time. The title tier is free and belongs on the write
+      path; the synopsis tier is a model call and belongs in #7's model phase.
+    </p>
+  </div>
+</article>
+
+<article class="idea pw" id="pw-5">
+  <div class="idea-head"><span class="idnum">P5.</span><h3>Decide the schema before the first project is provisioned</h3></div>
+  <div class="chips"><span class="chip crit">critical</span><span class="chip">complexity Low</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      Four decisions are per-tenant, made at provision time, and unfixable by an optional argument.
+      #8's additive-forever escape hatch future-proofs the <em>tool surface</em>; it does nothing for
+      the <em>storage layout</em>. Every one of these gets baked into every project you create,
+      starting with the first.
+    </p>
+    <p>
+      <strong>FTS language.</strong> It configures the write-side trigger functions, so changing it
+      means recreating triggers and backfilling the whole tenant. Ship an English default silently
+      and every non-English user runs one of three recall arms through an English stemmer,
+      permanently, with no signal that anything is wrong. <strong>The image embedding column.</strong>
+      Adding a second vector column later is a schema migration across N databases (see P6), not a
+      parameter — decide now even if the feature ships later (P12).
+      <strong>Embedding dimensions.</strong> pgvector's HNSW index caps at <strong>2,000
+      dimensions</strong> for <code>vector</code> (4,000 for <code>halfvec</code>), which makes
+      several plausible defaults unindexable. <strong>Taxonomy version</strong>, since brainz owns
+      taxonomy centrally once schema packs are dropped.
+    </p>
+    <p>
+      On the model itself: name it and record the measured basis. gbrain's answer is directly
+      transferable and both halves of it are load-bearing on cards brainz has already committed —
+      ZeroEntropy <code>zembed-1</code> at 1280d, which beat OpenAI on 11 of 20 and Voyage on 4 of
+      20, at <strong>442ms versus 973ms</strong> and <strong>$0.05 versus $0.13 per million</strong>.
+      Latency matters for <code>entity</code>'s promise; price matters for P7. Also stamp a
+      <strong>per-page provenance signature</strong> so that a same-width model swap re-embeds only
+      the affected pages rather than the whole fleet.
+    </p>
+  </div>
+</article>
+
+<article class="idea pw" id="pw-6">
+  <div class="idea-head"><span class="idnum">P6.</span><h3>Migrate ten thousand databases without waking them</h3></div>
+  <div class="chips"><span class="chip crit">critical</span><span class="chip">complexity High</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      gbrain runs 120 ordered migrations against one database. brainz must run them across N
+      databases, most suspended at $0 and requiring a <em>paid wake</em> to touch, with
+      partial-failure states the stateless fleet has to tolerate at request time. The substrate
+      comparison rejected Neon's Multi-DB Schemas partly over migration fan-out — the fan-out did
+      not disappear, it moved here.
+    </p>
+    <p>
+      Build it on #7's existing machinery rather than a second system: a <strong>schema version on
+      the control-plane row</strong> and the same warm-compute-opportunistic trigger. A tenant whose
+      compute is already awake migrates for free; dormant tenants migrate on their next wake, or on
+      a bounded sweep at the same ~20 concurrency. The request path must tolerate finding a tenant
+      behind — either migrate inline before serving or fail with a typed error the fleet retries,
+      but never serve against a schema it does not understand.
+    </p>
+    <p>
+      The half that is not migration at all: <strong>per-tenant feature flags</strong>. Without them
+      a new chunker or a revised extractor prompt can only ship all-at-once across every isolated
+      project — no canary, no staged rollout, no way to compare. That is the mechanism P13 needs,
+      and it belongs on the same control-plane row.
+    </p>
+  </div>
+</article>
+
+<article class="idea pw" id="pw-7">
+  <div class="idea-head"><span class="idnum">P7.</span><h3>The first import is the biggest bill you will ever send</h3></div>
+  <div class="chips"><span class="chip crit">critical</span><span class="chip">complexity Medium</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      #7's budget cap is debt-triggered and therefore never sees the one event that dwarfs
+      everything after it. First Gmail connect is tens of thousands of items to chunk and embed in a
+      single burst, for a flat-priced user, on a 0.25 CU compute. At $10–20/month, COGS per user
+      <em>is</em> the business model, and this is the moment it is decided.
+    </p>
+    <p>
+      gbrain's pre-flight gate is delta-aware, prompts interactively, and auto-defers to a capped
+      background job when non-interactive. The consumer form of that prompt is not a guard, it is a
+      <strong>product moment</strong>: <em>"importing 41,000 emails — start with the last 90
+      days?"</em> That is a better first run than a progress bar, and it halves the bill. Pair it
+      with a bounded first window by default and a visible way to widen it later.
+    </p>
+    <p>
+      Two mechanisms go with it. A <strong>rolling per-tenant spend counter</strong> on the
+      control-plane row — which already carries <code>tier</code> and <code>pending_debt</code> and
+      which the scheduler already reads, so this is a column rather than a system. And a
+      <strong>hard fail on an unpriced model</strong>: gbrain's budget tracker refuses to proceed
+      when a cap is set and the model is absent from the pricing map, because an unmetered path does
+      not surface as an error, it surfaces as a bill.
+    </p>
+  </div>
+</article>
+
+<article class="idea pw" id="pw-8">
+  <div class="idea-head"><span class="idnum">P8.</span><h3>Nothing the model wrote is true until something says so</h3></div>
+  <div class="chips"><span class="chip crit">critical</span><span class="chip">complexity Medium</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      gbrain assumes an operator who promotes or rejects auto-extractions and demotes everything
+      unverified until they act. brainz has no operator by construction — #3's action enum has no
+      review verb and #9 deletes the CLI. So <strong>essentially 100% of derived knowledge is
+      "unverified" in gbrain's sense, ranked as if the user had typed it</strong>, with no flag for
+      the consuming model to weigh it by.
+    </p>
+    <p>
+      Three mechanisms close it. A <strong>trust level carried on the origin stamp</strong> — #4
+      makes origin a fence only; it should also say whether a claim was stated by the user,
+      extracted by a model, or inferred. A <strong>confidence gate on automated mutation</strong>,
+      in gbrain's explicit shape: ≥0.8 auto-apply, 0.5–0.8 queue for review, &lt;0.5 skip and log.
+      And a <strong>one-tap confirm/reject</strong> through the envelope and the panel, since a
+      review queue with no reviewer is just a slower gap.
+    </p>
+    <p>
+      <strong>One naming change in #7 is a real decision, not a wording fix.</strong> That card calls
+      its phase contradiction <em>resolution</em>. Silently overwriting a user's recorded opinion
+      with a model's judgment is the most trust-destroying write a memory product can make, and
+      gbrain's equivalent phase is deliberately <strong>report-only</strong>. Make it report-only
+      here too and let the user resolve.
+    </p>
+    <p>
+      Two guards, both absent. <strong>Prompt-injection sanitization in and out</strong> — Gmail
+      bodies are attacker-authored text flowing into durable memory the user's agent later reads
+      back, which is a direct injection channel into their assistant. And an <strong>anti-loop
+      guard</strong>: #7's cycle reads the store it writes, so the self-extraction loop is
+      structurally present and unguarded — a model phase extracting facts from its own prior output
+      drifts with nothing reporting it.
+    </p>
+  </div>
+</article>
+
+<article class="idea pw" id="pw-9">
+  <div class="idea-head"><span class="idnum">P9.</span><h3>Undo, versions, and the delete that actually deletes</h3></div>
+  <div class="chips"><span class="chip crit">critical</span><span class="chip">complexity Medium</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      The design has no data lifecycle. No page versioning or revert. No soft delete, restore, TTL
+      trash or hard purge. No blast-radius preview before a destructive operation. And no erasure
+      path — <code>forget</code> is expire-not-delete and explicitly distinct from account deletion,
+      which is left undefined across Neon, R2 and the control plane.
+    </p>
+    <p>
+      For a consumer product this is simultaneously the legal surface and the most trust-critical
+      behavior in the product, and the sentence that names it is: <strong>undo, after a nightly model
+      phase rewrote something you told it.</strong> P8 reduces how often that happens; this is what
+      you need when it happens anyway.
+    </p>
+    <p>
+      gbrain's shape ports directly: <strong>three layers on every destructive op</strong> — impact
+      preview, typed confirmation, soft-delete with a TTL — plus a 72-hour tombstone cascading to
+      chunks, links and relations, and <code>get_versions</code> / <code>revert_version</code> on a
+      page. Note this makes #4's severance a destructive operation with neither preview nor undo
+      today, and severance re-derives every mixed artifact — so the preview must show what will be
+      <em>recomputed</em>, not just what will be removed.
+    </p>
+  </div>
+</article>
+
+<article class="idea pw" id="pw-10">
+  <div class="idea-head"><span class="idnum">P10.</span><h3>Ingestion is a substrate, not a connector list</h3></div>
+  <div class="chips"><span class="chip crit">critical</span><span class="chip">complexity High</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      "Automatic ingest and background synthesis" is currently manual-by-proxy — #3's own downside
+      concedes there is no ingestion substrate. Missing: recurring pull, per-source cadence,
+      idempotent staggered retries, per-source locking, resumability. Missing more consequentially, a
+      <strong>per-item ingest log</strong> — not a nicety, since #3's "nothing new from this source in
+      23 days" and #9's "a specific statement of what is not indexed yet" both structurally require
+      it.
+    </p>
+    <p>
+      <strong>Preserve the raw payload.</strong> #6's exported file is the <em>rendered</em> page,
+      not the connector's original. Without the original, re-deriving every page with a better
+      extractor after a prompt improvement is impossible fleet-wide — which means every
+      extraction-quality improvement applies only to content ingested after it shipped.
+    </p>
+    <p>
+      <strong>Conversation content has no path in at all.</strong> An MCP server sees tool calls, not
+      transcripts, so the thing gbrain's synthesis phase exists for cannot reach brainz through the
+      protocol. The one path that works is the one brainz has not designed: <strong>bulk import of a
+      user-uploaded chat export</strong>. Both Claude and ChatGPT offer data exports; parsing one is
+      a well-defined job and the only way conversational memory arrives in volume.
+    </p>
+    <p>
+      Widen the worker fleet from one queue with one job class into a <strong>typed job
+      runner</strong> — consolidate, ingest, export, backfill, re-embed — with re-enqueue on worker
+      death, stall detection, max-attempts dead-lettering, and poison-job protection, since under
+      debt triggering a tenant that crashes the worker is permanently due. Note the lock-renewal
+      hazard specifically: gbrain lost ~39 worker processes per day to renewals over a pooled
+      connection, and a per-tenant connection LRU reproduces exactly that shape.
+    </p>
+  </div>
+</article>
+
+<article class="idea pw imp" id="pw-11">
+  <div class="idea-head"><span class="idnum">P11.</span><h3>Junk is most of what a mailbox contains</h3></div>
+  <div class="chips"><span class="chip mid">important</span><span class="chip">complexity Low</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      A Gmail corpus is majority newsletter, receipt and notification boilerplate. With no
+      ingest-time sanity gate, all of it gets chunked, embedded, paid for, ranked, and consolidated
+      over. This sits <strong>upstream of every ranking and dedup finding in P2</strong> — the
+      cheapest quality improvement available is not indexing the junk in the first place, and it is
+      simultaneously the cheapest cost reduction.
+    </p>
+    <p>
+      gbrain's shape is a content-sanity pass plus a <strong>two-marker quarantine</strong>: hidden
+      entirely, versus warned-but-still-searchable. The distinction matters because a receipt is
+      junk until the day you need the receipt.
+    </p>
+    <p>
+      One guardrail seam to answer deliberately rather than by default: classification is either
+      cheap heuristics you run yourself, or a model call — and if it is a model call, "do we send
+      your mail body to a third-party classifier" is a question the isolation story in #1 has to
+      answer out loud rather than in a subprocessor list.
+    </p>
+  </div>
+</article>
+
+<article class="idea pw imp" id="pw-12">
+  <div class="idea-head"><span class="idnum">P12.</span><h3>Screenshots are memory too</h3></div>
+  <div class="chips"><span class="chip mid">important</span><span class="chip">complexity Medium</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      The dominant consumer image is a screenshot, and a screenshot is mostly text. "Find the
+      screenshot with the wifi password" is a real query that fails completely today. There is also
+      no stated policy for what <code>remember</code> does with a PDF, a voice memo or a photo —
+      which happens in week one, not year two.
+    </p>
+    <p>
+      <strong>OCR-to-text is the minimum viable answer</strong>, and it is a model call, so it
+      belongs in #7's model phase rather than the write path — consistent with the cross-cutting
+      principle. Text extracted from an image then flows through the ordinary chunk-and-embed path
+      and is retrievable by the same stack as everything else, with no image-vector arm required.
+    </p>
+    <p>
+      Record the image-embedding arm as a <strong>dated omission</strong> with a
+      <code>revisit_by</code> in #2's ledger — but make the schema decision <em>now</em> (P5), since
+      adding a second vector column later is a migration across every tenant rather than an optional
+      argument.
+    </p>
+  </div>
+</article>
+
+<article class="idea pw imp" id="pw-13">
+  <div class="idea-head"><span class="idnum">P13.</span><h3>A brain that changes overnight should say so</h3></div>
+  <div class="chips"><span class="chip mid">important</span><span class="chip">complexity Low</span><span class="chip axis">new card</span></div>
+  <div class="field">
+    <p>
+      A gbrain user <em>runs</em> the upgrade: they get a banner, a migration skill, and a
+      self-upgrade audit trail. A brainz user's memory changes behavior overnight with no notice, no
+      changelog channel, and no consent — and under P8 a model phase may have rewritten something
+      they wrote. Managing the infrastructure is the deal being offered; changing what someone
+      remembers without telling them is not part of it.
+    </p>
+    <p>
+      What that needs: a <strong>change record per tenant</strong> — what shipped, what it did to
+      your memory, and what you can do about it — surfaced through <code>brain</code> so it is
+      model-reachable rather than panel-only, and staged through P6's per-tenant feature flags so a
+      change reaches a canary cohort before the fleet.
+    </p>
+    <p>
+      The same channel carries the growth surface. In a product with no docs, no CLI and no settings
+      screen, <strong>capability discovery is the only way a user learns what their brain can
+      do</strong> — which makes this the one card here that is also a product feature rather than
+      only a safeguard.
+    </p>
+  </div>
+</article>
+
+<h2 id="rejection-summary">Rejection Summary</h2>
+
+<table>
+  <thead><tr><th>#</th><th>Idea</th><th>Reason rejected</th></tr></thead>
+  <tbody>
+    <tr><td>prior #2</td><td class="idea-name">Run unmodified gbrain in a container as the batch kernel</td><td><strong>Rejected by you</strong> — "too restricting." It also fought its own storage design: unmodified gbrain hard-requires a git repo and Postgres, not R2 and D1. Replaced entirely by #2.</td></tr>
+    <tr><td>30</td><td class="idea-name">Hotel key-card epoch revocation</td><td><strong>Basis refuted</strong> — the cited <code>mcp/dispatch.ts:1-7</code> is a parity docstring; no epoch or revocation content exists there.</td></tr>
+    <tr><td>s-3</td><td class="idea-name">Two connectors, one brain (as a standalone)</td><td>Verifier refuted it on the grounds that <code>origin: work</code> exists nowhere in gbrain — correct about the repo, wrong about the premise (origin is #4's design, not a claim about gbrain). Merged into #4 rather than kept separate, with the real cost surfaced: <code>allowedSources[]</code> fences by repo, so a new grant field and fence site are needed.</td></tr>
+    <tr><td>s-4</td><td class="idea-name">Green means data arrived — status as staleness</td><td>Best half merged into #3. Cut standalone because its governing scenario (Gmail/Notion declaring cadence at connect time) requires an ingestion layer that does not exist.</td></tr>
+    <tr><td>s-6</td><td class="idea-name">Revocation is the trust surface, not connection</td><td>Needs entity-and-briefing dependency computation with no analog in the repo (<code>removeSource</code> has no impact preview), collides with <code>forget</code>'s never-delete semantics, and its live-receipt-on-load pattern fights the idle-cost commitment. Revisit after the first real connector ships.</td></tr>
+    <tr><td>u-7</td><td class="idea-name">The watcher gets graded too</td><td>The empirical hook was misattributed — arXiv 2601.00753 contains the cited gating figures but discusses no reviewer bots. And <code>precision@top-3</code> needs three ranked rows reaching terminal disposition per cycle; at personal scale "three consecutive bad cycles" could take half a year. #2's <code>revisit_by</code> buys the same protection for far less machinery.</td></tr>
+    <tr><td>u-8</td><td class="idea-name">Four artifact classes, two clocks</td><td><strong>Refuted</strong> — <code>gbrain --tools-json</code> emits only <code>{name, description, parameters}</code> (16 lines total), so diffing it cannot catch result-field or error-vocabulary drift as claimed. The class-routing insight survived by substituting the real artifact (<code>protocol conformance --target</code>), which is what produced #2.</td></tr>
+    <tr><td>u-5</td><td class="idea-name">Pay upstream in fixtures</td><td>The privacy scripts are closed-vocabulary greps over a hardcoded contact list, not a de-identification pipeline for arbitrary consumer PII — and <code>_ledger.json</code> frames "deliberately no LLM pass" as controlled-difficulty design, not a gap upstream wants filled. Donating real consumer turns from a personal-data product is legal exposure, not a gift.</td></tr>
+    <tr><td>34, 48</td><td class="idea-name">Borrow the client's connectors / zero-auth ingest address</td><td>Both mis-cited, and both weaker than they appear: cross-server OAuth token sharing is unevidenced; the ingest address trades CASA cost for unpriced spam and deliverability infrastructure. Retained only as noted escape hatches under #9.</td></tr>
+    <tr><td>26, 21, 29, 31, 28</td><td class="idea-name">Split custody · compaction ratio · pharmacy refills · the MEL · sleep-not-dreaming</td><td>Metaphors outrunning their citations, or single snapshots presented as trends. Surviving halves folded into #1, #6 and #7.</td></tr>
+    <tr><td>various</td><td class="idea-name">18 duplicate proposals across isolation, runtime, tool-surface and encryption</td><td>Collapsed into #1, #7, #8 and #6 respectively. Note that per-connected-account databases were specifically overruled by your instruction to keep personal and work in the same store, marked.</td></tr>
+  </tbody>
+</table>
+
+<p style="font-size:13px;color:var(--text-muted);max-width:72ch;">
+  Every axis produced at least one survivor. 80 candidates were generated across two rounds before
+  any filtering; fresh-context verifiers that never saw the generation checked cited lines directly
+  against the repo, and their meeting-test judgment was allowed to override the generating agents'
+  own. Five candidates were refuted outright on citations that do not exist or do not say what was
+  claimed. Two verifier verdicts were overruled and the reasons are recorded in the relevant cards.
+</p>
+
+<footer class="composition-signal">
+  Composed 2026-08-11 by ce-ideate for <code>~/code/brainz</code>, grounded in
+  <code>~/code/gbrain</code> @ <code>66121287</code> (branch <code>marmarko/railway-deploy</code>)
+  plus external research on MCP Apps (SEP-1865), client capabilities, and Cloudflare platform limits.
+</footer>
+
+</div>

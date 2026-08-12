@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment and credentials.
+# The repo is public from commit one and the working tree references credentials
+# that unlock a real mailbox. This list is a convenience, NOT the control —
+# GitHub push protection and the gitleaks CI job are the controls (U1 step 5).
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!**/*.public.key
+.dev.vars
+.wrangler/
+
+# Probe output — may contain account identifiers or connection strings
+scripts/probes/**/result-*.json
+scripts/probes/**/*.local.*
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Test + coverage
+coverage/

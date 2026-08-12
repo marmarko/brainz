@@ -1,0 +1,28 @@
+{
+  "name": "brainz",
+  "version": "0.1.0",
+  "description": "A consumer-grade personal AI brain, served over stateless MCP.",
+  "license": "AGPL-3.0-only",
+  "private": false,
+  "type": "module",
+  "engines": {
+    "bun": ">=1.3.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "ledger:check": "bun run scripts/check-ledger.ts",
+    "eval:blocking": "bun run scripts/not-yet.ts eval:blocking U7",
+    "eval:canary": "bun run scripts/not-yet.ts eval:canary U7",
+    "eval:live-parity": "bun run scripts/not-yet.ts eval:live-parity U7",
+    "conformance": "bun run scripts/not-yet.ts conformance U7",
+    "test:roundtrip": "bun run scripts/not-yet.ts test:roundtrip U17",
+    "probe:scheduled-task": "bun run scripts/probes/scheduled-task/serve.ts",
+    "probe:container-tcp": "bun run scripts/probes/container-tcp/probe.ts",
+    "probe:r2": "bun run scripts/probes/r2-boundary/probe.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}
