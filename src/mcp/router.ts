@@ -1,20 +1,10 @@
 /**
- * The Worker entrypoint in front of both container fleets (U1 step 6, KTD2).
+ * The Worker entrypoint in front of both container fleets (U1 step 6, KTD2),
+ * now carrying U6's auth layer and the edge limiter.
  *
  * Cloudflare Containers are reached *through* a Worker: a Durable Object routes
  * to instances, so the shape is Worker -> DO -> Container, not Worker-instead-of-
  * Container. This file is that Worker plus the two DO classes.
- *
- * WHY THIS IS U1 AND NOT U6
- * -------------------------
- * The MCP protocol handling is U6's. What lives here is the routing seam, and
- * it belongs to Phase 0 for two reasons. First, the plan makes the deployed
- * runtime a Phase 0 deliverable rather than an assumption — U6's connector
- * connection, U9's week of polling and U13's two-week bake all verify against a
- * continuously running fleet, and a wrangler config whose entry point does not
- * exist deploys nothing. Second, tenant affinity is a KTD2 decision, not an
- * implementation detail, and the decision has to be expressed in code before
- * anything routes.
  *
  * TENANT AFFINITY IS THE WHOLE POINT
  * ----------------------------------
@@ -29,15 +19,41 @@
  * throughput is bounded by one container instance. For a personal brain that is
  * the right trade; it would not be for a shared workspace.
  *
- * NOT YET SERVING TRAFFIC
- * -----------------------
- * `fetch` below resolves a tenant and proves the routing seam, then returns 501
- * rather than pretending to speak MCP. U6 replaces the placeholder with the real
- * surface. Returning 501 is deliberate: a stub that returned 200 would make an
- * unimplemented server look healthy to every uptime check pointed at it.
+ * WHY THE REQUEST LOGIC IS NOT IN THIS FILE
+ * -----------------------------------------
+ * `@cloudflare/containers` imports `cloudflare:workers`, a runtime built-in that
+ * exists only inside workerd — so nothing importing this module can be loaded by
+ * a blocking test. The routing and admission logic therefore lives in
+ * `edge.ts`, which imports no platform module and is exercised directly by
+ * `test/mcp/router.test.ts`. What stays here is the deployment surface: the two
+ * Container classes and the binding hand-off, which are exercised by deploying.
+ *
+ * THE TENANT COMES FROM THE CREDENTIAL, AND ONLY FROM THE CREDENTIAL
+ * -----------------------------------------------------------------
+ * U1 left `resolveTenant` returning `null` because no auth layer existed. It now
+ * reads the tenant id **out of the presented token** (`edge.ts`), and the direction matters
+ * more than the mechanism: a tenant id taken from a request parameter is a
+ * cross-tenant routing bug, and it would be one the connection LRU then caches.
+ * The id is a routing hint and nothing more — it is not authorisation, and the
+ * signature that makes it one is checked inside the container, in `dispatch.ts`,
+ * against a secret only the fleet identity for that tenant can resolve. A
+ * request holding a forged token therefore reaches an instance and is refused
+ * there; it never reaches a database.
+ *
+ * THE LIMITER RUNS BEFORE THE INSTANCE
+ * ------------------------------------
+ * `/mcp` is a public origin in front of scale-to-zero containers billed per 10ms.
+ * A limiter consulted inside the instance has already paid for the instance, so
+ * a flood is billed and then rejected — R14's caps meter model spend and nothing
+ * else meters compute. Admission happens here, before the Durable Object is
+ * addressed, and the concurrency slot is released in a `finally` so an instance
+ * that falls over does not leak the tenant's ceiling.
  */
 
 import { Container } from '@cloudflare/containers';
+
+import { handleFleetRequest, type FleetBinding } from './edge.ts';
+import { createEdgeLimiter, type EdgeLimiter } from './rate-limit.ts';
 
 /** Shared by both fleets — one image, two entrypoints (see Dockerfile). */
 abstract class FleetContainer extends Container {
@@ -74,40 +90,18 @@ export class WorkerFleet extends FleetContainer {
  */
 
 /**
- * Resolve the tenant this request belongs to.
- *
- * U6 owns the real resolution: the tenant comes from the authenticated bearer
- * grant, never from a request parameter. That direction matters more than the
- * placeholder — a tenant id taken from user-supplied input is a cross-tenant
- * routing bug, and it would be one that the connection LRU then caches.
- *
- * Until U6 lands there is no auth layer, so this returns null and the request
- * is refused rather than being routed somewhere arbitrary.
+ * One limiter per isolate. The state is per-isolate rather than global, which is
+ * a real weakening under a distributed flood and the accepted alpha shape: the
+ * alternative is a Durable Object round-trip on every unauthenticated request,
+ * which is itself the billed work the limiter exists to avoid.
  */
-function resolveTenant(_request: Request): string | null {
-  return null;
-}
+const limiter: EdgeLimiter = createEdgeLimiter({ now: () => Date.now() });
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const tenantId = resolveTenant(request);
-
-    if (tenantId === null) {
-      return Response.json(
-        {
-          error: 'not_implemented',
-          detail:
-            'The MCP surface lands in U6. This Worker currently proves the ' +
-            'routing seam only: no bearer grant can be resolved yet, so no ' +
-            'request can be attributed to a tenant, so nothing is routed.',
-        },
-        { status: 501 },
-      );
-    }
-
-    // The affinity rule, in one line: the DO id is derived from the tenant id,
-    // so the same tenant reaches the same instance and its warm connections.
-    const id = env.MCP_FLEET.idFromName(tenantId);
-    return env.MCP_FLEET.get(id).fetch(request);
+  fetch(request: Request, env: Env): Promise<Response> {
+    return handleFleetRequest(request, {
+      fleet: env.MCP_FLEET as unknown as FleetBinding<unknown>,
+      limiter,
+    });
   },
 };
