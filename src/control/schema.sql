@@ -167,6 +167,18 @@ CREATE TABLE control.tenant (
   -- that started long ago and finished.
   provisioning_started_at  timestamptz                  NOT NULL DEFAULT now(),
   provisioning_attempts    integer                      NOT NULL DEFAULT 0,
+
+  -- The fencing token: which attempt owns this row. Taking the row over
+  -- increments it, and every write a provisioning run makes is conditional on
+  -- it (`… WHERE tenant_id = $1 AND provisioning_lease = $2`). Without it,
+  -- "`ready` is an absolute stop" is a read taken once at the top of a run and
+  -- every write below it is unconditional — so a run that was declared stale
+  -- and taken over can still bank `failed` on top of a live tenant's `ready`
+  -- row, and the retry that a recorded failure invites deletes their database.
+  -- An integer rather than an opaque id on purpose: this table's alphabets are
+  -- for text it must be *unable* to hold, and a counter needs none of them.
+  provisioning_lease       integer                      NOT NULL DEFAULT 0,
+
   ready_at                 timestamptz,
   failure_code             control.provisioning_failure,
 
@@ -176,6 +188,7 @@ CREATE TABLE control.tenant (
     pending_debt >= 0
     AND schema_version >= 0
     AND provisioning_attempts >= 0
+    AND provisioning_lease >= 0
     AND spend_micro_usd >= 0
     AND rank1_sample_count >= 0
     AND (spend_cap_micro_usd IS NULL OR spend_cap_micro_usd >= 0)
@@ -199,6 +212,21 @@ CREATE TABLE control.tenant (
 
   CONSTRAINT failed_tenants_name_a_code CHECK (
     state <> 'failed' OR failure_code IS NOT NULL
+  ),
+
+  -- `ready_at` is the moment this tenant became servable, so a row that is not
+  -- being served cannot carry one. `deleting` is admitted because U17's
+  -- lifecycle moves a tenant that *was* ready; `provisioning` and `failed` are
+  -- not, and that is the point.
+  --
+  -- This is the contradiction the fencing token exists to prevent, written down
+  -- where the database can refuse it: a row saying `failed` while still holding
+  -- the `ready_at` of a live tenant is what a straggling run produced when its
+  -- writes were unconditional, and it is what the next ordinary retry read
+  -- before deleting a user's database. Detectable states should be
+  -- unrepresentable, not merely unwritten.
+  CONSTRAINT only_served_tenants_carry_a_ready_at CHECK (
+    ready_at IS NULL OR state IN ('ready', 'deleting')
   ),
 
   -- The prefix belongs to this tenant, and that is all this constraint claims.

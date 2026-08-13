@@ -32,6 +32,7 @@ import {
   createInMemoryCredentialMinter,
   createTenantStorage,
   hashUntrustedSegment,
+  MINT_CLOCK_SKEW_MS,
   prefixCovers,
   type KeyFailureReason,
   type KeyResult,
@@ -264,7 +265,7 @@ describe('tenant storage accessor', () => {
       ['%2E%2E%2Falice2', 'encoded_separator'],
       ['', 'empty_segment'],
       ['a b', 'illegal_character'],
-      ['a b', 'illegal_character'],
+      ['a\u0000b', 'illegal_character'],
       ['réunion', 'illegal_character'],
       ['.hidden', 'illegal_character'],
       ['%', 'illegal_character'],
@@ -467,6 +468,121 @@ describe('tenant storage accessor', () => {
       for (const request of minter.requests) {
         expect(request.prefix.endsWith('/')).toBe(true);
       }
+    });
+  });
+
+  /**
+   * The guard the module docstring calls "the one place that substitution is
+   * detectable" — and, until these tests, the one guard nothing exercised.
+   * `createInMemoryCredentialMinter` echoes back what it is asked for, so the
+   * fake cannot express the failure the check exists for; a lying minter can.
+   *
+   * A credential's reach is three things, not one: the prefix it covers, what it
+   * may do there, and how long it may do it for. A minter that echoed the prefix
+   * while substituting either of the other two would widen R9's boundary
+   * silently, and every existing test would still pass.
+   */
+  describe('a minter that lies about the scope it returned is caught', () => {
+    function lyingStorage(lie: (honest: ScopedCredential) => ScopedCredential): TenantStorage {
+      return createTenantStorage({
+        minter: {
+          mint: async (request: MintRequest) => {
+            const honest = await createInMemoryCredentialMinter({
+              parentAccessKeyId: PARENT_ACCESS_KEY_ID,
+              parentSecretAccessKey: PARENT_SECRET_ACCESS_KEY,
+              now: () => clockMs,
+            }).mint(request);
+            return lie(honest);
+          },
+        },
+        credentialTtlSeconds: CREDENTIAL_TTL_SECONDS,
+        cacheTtlMs: CACHE_TTL_MS,
+        now: () => clockMs,
+      });
+    }
+
+    test('a credential scoped to a different prefix is refused, not cached', async () => {
+      // The sibling's prefix, returned for this tenant's request: the accessor
+      // would hand the request path a working credential for someone else's
+      // objects.
+      const lying = lyingStorage((honest) => ({
+        ...honest,
+        prefix: `tenants/${SIBLING}/` as TenantPrefix,
+      }));
+
+      await expect(lying.credentialFor(fleetIdentity(TENANT), TENANT)).rejects.toThrow(
+        'scoped to a different prefix',
+      );
+    });
+
+    test('a credential carrying a permission nobody asked for is refused', async () => {
+      // `R2ObjectPermission` excludes `admin-*` at compile time only. A minter is
+      // a network response, and a response is not a type — so an admin-scoped
+      // credential labelled as an object one would be accepted, cached, and
+      // handed out.
+      const lying = lyingStorage((honest) => ({
+        ...honest,
+        permission: 'object-read-only' as ScopedCredential['permission'],
+      }));
+
+      await expect(lying.credentialFor(fleetIdentity(TENANT), TENANT)).rejects.toThrow(
+        'a different permission',
+      );
+    });
+
+    test('a credential outliving the TTL it was minted for is refused', async () => {
+      // Lifetime is scope in the dimension nobody looks at: a credential that
+      // outlives its window is a boundary that outlives its revocation.
+      const lying = lyingStorage((honest) => ({
+        ...honest,
+        expiresAtMs: honest.expiresAtMs + 24 * 60 * 60 * 1_000,
+      }));
+
+      await expect(lying.credentialFor(fleetIdentity(TENANT), TENANT)).rejects.toThrow(
+        'outliving the requested TTL',
+      );
+    });
+
+    test('a credential that is already expired is refused rather than served once', async () => {
+      const lying = lyingStorage((honest) => ({ ...honest, expiresAtMs: clockMs - 1 }));
+
+      await expect(lying.credentialFor(fleetIdentity(TENANT), TENANT)).rejects.toThrow(
+        'already-expired',
+      );
+    });
+
+    test('a minter answering exactly what it was asked is accepted', async () => {
+      // The positive control. A guard that refuses everything proves nothing.
+      const honestStorage = lyingStorage((honest) => honest);
+
+      const credential = unwrapCredential(
+        await honestStorage.credentialFor(fleetIdentity(TENANT), TENANT),
+      );
+
+      expect(credential.prefix as string).toBe('tenants/alice/');
+      expect(credential.permission).toBe('object-read-write');
+      expect(credential.expiresAtMs).toBe(clockMs + CREDENTIAL_TTL_SECONDS * 1_000);
+    });
+
+    test('a small clock disagreement is tolerated, a large one is not', async () => {
+      // A remote minter computes the expiry on its own clock. Seconds of skew is
+      // ordinary; a quarter of an hour is a wider credential than was requested.
+      const skewed = lyingStorage((honest) => ({
+        ...honest,
+        expiresAtMs: honest.expiresAtMs + MINT_CLOCK_SKEW_MS - 1,
+      }));
+      const credential = unwrapCredential(
+        await skewed.credentialFor(fleetIdentity(TENANT), TENANT),
+      );
+      expect(credential.expiresAtMs).toBeGreaterThan(clockMs);
+
+      const beyond = lyingStorage((honest) => ({
+        ...honest,
+        expiresAtMs: honest.expiresAtMs + MINT_CLOCK_SKEW_MS + 1,
+      }));
+      await expect(beyond.credentialFor(fleetIdentity(TENANT), TENANT)).rejects.toThrow(
+        'outliving the requested TTL',
+      );
     });
   });
 

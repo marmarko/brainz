@@ -37,6 +37,8 @@ interface Recorded {
   readonly url: string;
   readonly headers: Record<string, string>;
   readonly body: unknown;
+  /** Whether the caller's cancellation actually reached the request. */
+  readonly signal: AbortSignal | null | undefined;
 }
 
 interface Canned {
@@ -63,6 +65,7 @@ function fetcher(queue: readonly Canned[]): { fetch: FetchLike; calls: Recorded[
       url: String(url),
       headers,
       body: rawBody === undefined ? undefined : JSON.parse(rawBody),
+      signal: init?.signal,
     });
 
     const canned = queue[index];
@@ -213,6 +216,88 @@ describe('creating the role and database', () => {
       }),
     ).rejects.toThrow(NeonApiError);
     expect(calls).toHaveLength(1);
+  });
+});
+
+/**
+ * The deadline provisioning enforces is only a real bound if the HTTP call it
+ * wraps can be cut off. A request left hanging on a socket outlives the run's
+ * deadline and then the window after which its control-plane row is presumed
+ * dead — at which point a second run legitimately takes the tenant over while
+ * this one is still in flight, which is the interleave `provision.ts` spends a
+ * fencing token surviving. So the signal is asserted on the wire, not in a
+ * comment.
+ */
+describe('the caller can actually cancel', () => {
+  // Declared here rather than reused from the block above: these tests are about
+  // cancellation, and borrowing another describe's fixtures would couple them.
+  const ROLE: Canned = { status: 201, body: { role: { name: 'brainz_owner' } } };
+  const DATABASE: Canned = { status: 201, body: { database: { name: 'brainz' } } };
+  const URI: Canned = {
+    status: 200,
+    body: { uri: 'postgres://brainz_owner:pw-fake@ep-fake.example.invalid/brainz' },
+  };
+
+  test('the signal is passed into fetch on project create', async () => {
+    const controller = new AbortController();
+    const { neon, calls } = api([CREATED_PROJECT]);
+
+    await neon.createProject({
+      name: 'brainz-alice',
+      suspendTimeoutSeconds: 60,
+      signal: controller.signal,
+    });
+
+    expect(calls[0]?.signal).toBe(controller.signal);
+  });
+
+  test('the signal reaches every call the role/database create makes', async () => {
+    const controller = new AbortController();
+    const { neon, calls } = api([ROLE, DATABASE, URI]);
+
+    await neon.createRoleAndDatabase({
+      projectId: 'proj-fake-1',
+      branchId: 'br-fake-1',
+      roleName: 'brainz_owner',
+      databaseName: 'brainz',
+      signal: controller.signal,
+    });
+
+    expect(calls).toHaveLength(3);
+    expect(calls.every((call) => call.signal === controller.signal)).toBe(true);
+  });
+
+  test('an aborted run stops retrying instead of sleeping through its backoff', async () => {
+    // A `423` is retryable, and ordinarily this makes four calls. Once the run
+    // has been cancelled the answer is already known and nobody is waiting for
+    // it, so spending the backoff and trying again is pure cost.
+    const controller = new AbortController();
+    controller.abort();
+    const { neon, calls } = api([
+      { status: 423, body: { message: 'project already has an operation in progress' } },
+      ROLE,
+      DATABASE,
+      URI,
+    ]);
+
+    await expect(
+      neon.createRoleAndDatabase({
+        projectId: 'proj-fake-1',
+        branchId: 'br-fake-1',
+        roleName: 'brainz_owner',
+        databaseName: 'brainz',
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow(NeonApiError);
+    expect(calls).toHaveLength(1);
+  });
+
+  test('a request with no signal carries none — the field is not invented', async () => {
+    const { neon, calls } = api([CREATED_PROJECT]);
+
+    await neon.createProject({ name: 'brainz-alice', suspendTimeoutSeconds: 60 });
+
+    expect(calls[0]?.signal ?? undefined).toBeUndefined();
   });
 });
 

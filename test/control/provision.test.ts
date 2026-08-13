@@ -78,6 +78,7 @@ import {
   type SchemaApplyRequest,
   type TenantPatch,
   type TenantRecord,
+  type UpdateOutcome,
 } from '../../src/control/provision.ts';
 
 /** Siblings by construction: one id is a strict prefix of the other. */
@@ -274,6 +275,10 @@ function createStoreFake(log: string[]): StoreFake {
       throw new Error('CHECK failed_tenants_name_a_code');
     }
 
+    if (record.readyAt !== null && record.state !== 'ready' && record.state !== 'deleting') {
+      throw new Error('CHECK only_served_tenants_carry_a_ready_at');
+    }
+
     if (record.storagePrefix !== null) {
       const belongs =
         record.storagePrefix === `${record.tenantId}/` ||
@@ -281,7 +286,7 @@ function createStoreFake(log: string[]): StoreFake {
       if (!belongs) throw new Error('CHECK storage_prefix_belongs_to_this_tenant');
     }
 
-    if (record.schemaVersion < 0 || record.provisioningAttempts < 0) {
+    if (record.schemaVersion < 0 || record.provisioningAttempts < 0 || record.provisioningLease < 0) {
       throw new Error('CHECK tenant_counters_are_non_negative');
     }
 
@@ -319,7 +324,7 @@ function createStoreFake(log: string[]): StoreFake {
       return Promise.resolve({ inserted: true, record: row });
     },
 
-    update(tenantId, patch) {
+    update(tenantId, expectedLease, patch) {
       const keys = Object.keys(patch).sort().join('+');
       log.push(`store.update[${keys}]`);
       patches.push(patch);
@@ -327,10 +332,17 @@ function createStoreFake(log: string[]): StoreFake {
       const existing = rows.get(tenantId);
       if (existing === undefined) throw new Error('control-plane fake: no such row');
 
+      // The compare-and-set, modelled the way Postgres would run it: one
+      // statement, and a row whose lease has moved on is simply not matched. An
+      // empty patch is still a lease check, per the port's contract.
+      if (existing.provisioningLease !== expectedLease) {
+        return Promise.resolve({ applied: false, current: existing });
+      }
+
       const next: TenantRecord = { ...existing, ...patch };
       checkRow(next);
       rows.set(tenantId, next);
-      return Promise.resolve(next);
+      return Promise.resolve({ applied: true, record: next });
     },
   };
 }
@@ -352,7 +364,12 @@ function createBearerFake(log: string[]): BearerGrantMinter & { serial: number; 
 /** Wraps the real secret store so writes and revocations land in the call log. */
 function observeSecrets(inner: TenantSecretStore, log: string[]): TenantSecretStore {
   return {
-    resolve: (caller, tenantId) => inner.resolve(caller, tenantId),
+    resolve: (caller, tenantId) => {
+      // Nothing provisioning holds can call this — the port it declares has no
+      // `resolve`. Recorded anyway, so the claim has a runtime witness too.
+      log.push('secrets.resolve');
+      return inner.resolve(caller, tenantId);
+    },
     put: (caller, tenantId, secret) => {
       log.push('secrets.put');
       return inner.put(caller, tenantId, secret);
@@ -485,6 +502,9 @@ describe('tenant provisioning', () => {
         'store.update[schemaVersion]',
         'schema.verifyFirstQuery',
         'bearer.mint',
+        // The lease check that runs immediately before a write to a store that
+        // has no lease of its own.
+        'store.update[]',
         'secrets.put',
         'store.update[bearerSecretRef+connectionSecretRef]',
         'store.update[failureCode+readyAt+state]',
@@ -709,9 +729,9 @@ describe('tenant provisioning', () => {
       // that is not ready — and the retry rotates it away.
       const failingStore: ControlPlaneStore = {
         ...store,
-        update: (tenantId, patch) => {
+        update: (tenantId, expectedLease, patch) => {
           if (patch.state === 'ready') throw new Error('control plane fake: crashed before ready');
-          return store.update(tenantId, patch);
+          return store.update(tenantId, expectedLease, patch);
         },
       };
       deps = { ...deps, store: failingStore };
@@ -727,9 +747,9 @@ describe('tenant provisioning', () => {
     test('a retry after a stranded grant rotates the bearer rather than reusing it', async () => {
       const failingStore: ControlPlaneStore = {
         ...store,
-        update: (tenantId, patch) => {
+        update: (tenantId, expectedLease, patch) => {
           if (patch.state === 'ready') throw new Error('control plane fake: crashed before ready');
-          return store.update(tenantId, patch);
+          return store.update(tenantId, expectedLease, patch);
         },
       };
       deps = { ...deps, store: failingStore };
@@ -740,9 +760,18 @@ describe('tenant provisioning', () => {
 
       clockMs += DEFAULT_STALE_PROVISIONING_MS + 1;
       deps = { ...deps, store };
+      log.length = 0;
       const second = await provision();
 
       expect(second.ok).toBe(true);
+      // The property this test *names* is revocation, so revocation is what it
+      // checks. Comparing the grant before and after passes either way — the
+      // write at the end of the run overwrites the entry regardless — so the
+      // ordered call log is the only witness that the stranded grant was
+      // actually revoked rather than merely replaced.
+      expect(log.indexOf('secrets.revoke')).toBeGreaterThanOrEqual(0);
+      expect(log.indexOf('secrets.revoke')).toBeLessThan(log.indexOf('secrets.put'));
+
       const after = await secretStore.resolve(fleetIdentity(TENANT), TENANT);
       expect(after.ok).toBe(true);
       if (!before.ok || !after.ok) return;
@@ -873,9 +902,9 @@ describe('tenant provisioning', () => {
         ...deps,
         store: {
           ...store,
-          update: (tenantId, patch) => {
+          update: (tenantId, expectedLease, patch) => {
             if (patch.state === 'ready') throw new Error('control plane fake: crashed before ready');
-            return store.update(tenantId, patch);
+            return store.update(tenantId, expectedLease, patch);
           },
         },
       };
@@ -943,6 +972,252 @@ describe('tenant provisioning', () => {
   });
 
   // -------------------------------------------------------------------------
+  /**
+   * Two runs overlapping **in time**, which is the case every other test in this
+   * file misses: the sequential "concurrency" tests above all let the first run
+   * return before the second starts, so the interleave that actually destroys a
+   * tenant has never been exercised.
+   *
+   * The interleave is not exotic and needs no bug to reach. The deadline is
+   * cooperative — it is observed between phases — so a provider call that hangs
+   * outlives it, and then outlives the stale window too. At that point the
+   * takeover is *legitimate*: the row looks abandoned because, from the outside,
+   * an abandoned run and a stuck one are the same row.
+   */
+  describe('two runs overlapping in time', () => {
+    /** A promise the test opens by hand, so a run can be suspended mid-call. */
+    function gate(): { readonly promise: Promise<void>; open: () => void } {
+      let open = (): void => {};
+      const promise = new Promise<void>((resolve) => {
+        open = (): void => {
+          resolve();
+        };
+      });
+      return { promise, open };
+    }
+
+    /**
+     * Suspends the run inside `createRoleAndDatabase` — a provider call, the
+     * place a run really does hang — and hands the test the two ends of it.
+     */
+    function hangingNeon(outcome: 'throw' | 'succeed'): {
+      readonly neon: NeonProjectApi;
+      readonly inside: Promise<void>;
+      readonly release: () => void;
+    } {
+      const entered = gate();
+      const held = gate();
+      return {
+        inside: entered.promise,
+        release: held.open,
+        neon: {
+          ...neon,
+          createRoleAndDatabase: async (req) => {
+            entered.open();
+            await held.promise;
+            if (outcome === 'throw') throw new Error('neon fake: the provider gave up');
+            return neon.createRoleAndDatabase(req);
+          },
+        },
+      };
+    }
+
+    test('a straggler that wakes after a takeover cannot flip the ready tenant to failed', async () => {
+      const hung = hangingNeon('throw');
+
+      const runA = provisionTenant({ ...deps, neon: hung.neon }, request());
+      await hung.inside;
+      expect(row().state).toBe('provisioning');
+
+      // The clock passes the stale window while A is stuck inside the provider
+      // call. Nothing tells A; nothing can.
+      clockMs += DEFAULT_STALE_PROVISIONING_MS + 1;
+
+      const runB = await provision();
+      expect(runB.ok).toBe(true);
+      expect(row().state).toBe('ready');
+      const readyProject = row().neonProjectId ?? '';
+      const readyAt = row().readyAt;
+      expect(readyProject).not.toBe('');
+
+      hung.release();
+      const resultA = await runA;
+      expect(resultA).toEqual({ ok: false, reason: 'superseded', recorded: false });
+
+      // The row a live user is being served from, after the straggler reported.
+      expect(row().state).toBe('ready');
+      expect(row().readyAt).toBe(readyAt);
+      expect(row().neonProjectId).toBe(readyProject);
+
+      // And the consequence that makes this critical rather than untidy: a
+      // `failed` row is retryable at once, and the retry is the one thing that
+      // deletes. An ordinary retry must be a no-op here, not a demolition.
+      const runC = await provision();
+      expect(runC.ok).toBe(true);
+      if (runC.ok) expect(runC.alreadyReady).toBe(true);
+      expect(neon.live.has(readyProject)).toBe(true);
+    });
+
+    test('a straggler that wakes and SUCCEEDS does not re-provision over the ready row', async () => {
+      // The variant that needs no failure at all: the straggler simply carries
+      // on, re-running the later phases against a row that is already ready.
+      // Both runs report success, the bearer the user was handed is rotated
+      // away, and the secret store ends up holding a connection string for a
+      // project the takeover deleted — addressable but misconfigured, with
+      // nothing anywhere recording a failure.
+      const hung = hangingNeon('succeed');
+
+      const runA = provisionTenant({ ...deps, neon: hung.neon }, request());
+      await hung.inside;
+
+      clockMs += DEFAULT_STALE_PROVISIONING_MS + 1;
+      const runB = await provision();
+      expect(runB.ok).toBe(true);
+
+      const served = await secretStore.resolve(fleetIdentity(TENANT), TENANT);
+      expect(served.ok).toBe(true);
+      const readyProject = row().neonProjectId ?? '';
+      const readyAt = row().readyAt;
+
+      hung.release();
+      const resultA = await runA;
+
+      expect(resultA).toEqual({ ok: false, reason: 'superseded', recorded: false });
+      expect(row().state).toBe('ready');
+      expect(row().readyAt).toBe(readyAt);
+      expect(row().neonProjectId).toBe(readyProject);
+      expect(neon.live.has(readyProject)).toBe(true);
+
+      // The grant the user is holding is still the grant that routes to them.
+      const after = await secretStore.resolve(fleetIdentity(TENANT), TENANT);
+      expect(after.ok).toBe(true);
+      if (!served.ok || !after.ok) return;
+      expect(after.secret.bearerGrant).toBe(served.secret.bearerGrant);
+    });
+
+    test('two retries of a failed row create one billable project, not two', async () => {
+      // A `failed` row has no staleness gate — deliberately, so a user at a
+      // signup form is not made to wait out a stale window. Two retries
+      // therefore both pass triage, and without a conditional claim both create
+      // a real, billable project. The loser's is referenced by nothing and, once
+      // the winner is ready, cleanup never runs again: it is orphaned forever.
+      neon.failCreateProject = 'throw';
+      await provision();
+      expect(row().state).toBe('failed');
+      neon.failCreateProject = 'none';
+
+      // Both runs read the failed row before either of them writes.
+      let waiting = 0;
+      const bothRead = gate();
+      const racingStore: ControlPlaneStore = {
+        ...store,
+        get: async (tenantId) => {
+          const found = await store.get(tenantId);
+          waiting += 1;
+          if (waiting >= 2) bothRead.open();
+          await bothRead.promise;
+          return found;
+        },
+      };
+      const racing: ProvisionDeps = { ...deps, store: racingStore };
+
+      const [first, second] = await Promise.all([
+        provisionTenant(racing, request()),
+        provisionTenant(racing, request()),
+      ]);
+
+      expect([first.ok, second.ok].filter(Boolean)).toHaveLength(1);
+      const loser = first.ok ? second : first;
+      expect(loser).toEqual({
+        ok: false,
+        reason: 'provisioning_in_progress',
+        recorded: false,
+      });
+      expect(neon.live.size).toBe(1);
+      expect(neon.live.has(row().neonProjectId ?? '')).toBe(true);
+    });
+
+    test('a superseded run does not leave the project it created behind', async () => {
+      // The straggler created a project under its own lease. Nothing references
+      // it — the row names the winner's — so the one thing a superseded run may
+      // still do is undo its own work.
+      const entered = gate();
+      const held = gate();
+      const slowNeon: NeonProjectApi = {
+        ...neon,
+        // Suspended *before* the create, so the takeover's sweep has already run
+        // by the time this project comes into existence. Nothing else will ever
+        // look for it: the sweep runs on the retry path, and once the winner is
+        // ready there is no retry.
+        createProject: async (req) => {
+          entered.open();
+          await held.promise;
+          return neon.createProject(req);
+        },
+      };
+
+      const runA = provisionTenant({ ...deps, neon: slowNeon }, request());
+      await entered.promise;
+      clockMs += DEFAULT_STALE_PROVISIONING_MS + 1;
+      const runB = await provision();
+      expect(runB.ok).toBe(true);
+      const readyProject = row().neonProjectId ?? '';
+
+      held.open();
+      expect(await runA).toEqual({ ok: false, reason: 'superseded', recorded: false });
+
+      // A billable project, referenced by nothing and swept by nobody, is what a
+      // superseded run leaves behind if it walks away silently.
+      expect([...neon.live.keys()]).toEqual([readyProject]);
+    });
+
+    test('taking a row over advances the lease, and the previous holder cannot write', async () => {
+      neon.failCreateProject = 'throw';
+      await provision();
+      const before = row().provisioningLease;
+
+      neon.failCreateProject = 'none';
+      await provision();
+      expect(row().provisioningLease).toBe(before + 1);
+
+      const stale: UpdateOutcome = await store.update(TENANT, before, {
+        state: 'failed',
+        failureCode: 'timed_out',
+      });
+      expect(stale.applied).toBe(false);
+      expect(row().state).toBe('ready');
+      expect(row().failureCode).toBeNull();
+
+      // Positive control: the lease the row actually holds is still writable, so
+      // the refusal above is the fence and not a store that refuses everything.
+      const held = await store.update(TENANT, row().provisioningLease, { schemaVersion: 2 });
+      expect(held.applied).toBe(true);
+    });
+
+    test('cleanup refuses to run against a row that reached ready, whatever its state says', async () => {
+      await provision();
+      const live = row();
+
+      // The row `schema.sql` now refuses to store, handed to provisioning
+      // anyway: `state='failed'` while the `ready_at` of a live tenant is still
+      // on it. The lease is the first control and the CHECK is the second; this
+      // is what is left when both are subverted, and it must abort rather than
+      // proceed on a suspicion.
+      const contradictory: TenantRecord = { ...live, state: 'failed', failureCode: 'timed_out' };
+      const lyingStore: ControlPlaneStore = {
+        ...store,
+        get: () => Promise.resolve(contradictory),
+      };
+      deps = { ...deps, store: lyingStore };
+
+      await expect(provision()).rejects.toThrow(
+        'cleanup must never run against a tenant that reached ready',
+      );
+      expect(neon.live.has(live.neonProjectId ?? '')).toBe(true);
+    });
+  });
+
+  // -------------------------------------------------------------------------
   describe('the wall clock and the abort signal', () => {
     test('a run that overruns its deadline is failed as timed_out, not left hanging', async () => {
       const slowNeon: NeonProjectApi = {
@@ -982,6 +1257,101 @@ describe('tenant provisioning', () => {
 
       expect(result).toEqual({ ok: false, reason: 'cancelled', recorded: true });
       expect(log).not.toContain('schema.apply');
+    });
+
+    test('every port call is handed a signal, and an abort ends a call in flight', async () => {
+      // The deadline used to be advisory: it was read between phases and never
+      // reached the call itself, so a provider that never answered outlived both
+      // the deadline and the window after which this run's row is presumed dead.
+      const controller = new AbortController();
+      const seen: (AbortSignal | undefined)[] = [];
+      const signalNeon: NeonProjectApi = {
+        ...neon,
+        createProject: (req) => {
+          seen.push(req.signal);
+          return neon.createProject(req);
+        },
+        createRoleAndDatabase: (req) => {
+          seen.push(req.signal);
+          // A call that will never answer on its own. Only the signal ends it.
+          return new Promise((_resolve, reject) => {
+            req.signal?.addEventListener('abort', () => reject(new Error('aborted')), {
+              once: true,
+            });
+            controller.abort();
+          });
+        },
+      };
+      deps = { ...deps, neon: signalNeon };
+
+      const result = await provisionTenant(deps, {
+        tenantId: TENANT,
+        ftsLanguage: LANGUAGE,
+        signal: controller.signal,
+      });
+
+      expect(result).toEqual({ ok: false, reason: 'cancelled', recorded: true });
+      expect(seen).toHaveLength(2);
+      expect(seen.every((signal) => signal !== undefined)).toBe(true);
+    });
+
+    test('a provider call that never returns is ended by the deadline, and recorded as timed_out', async () => {
+      // A real, tiny wall-clock deadline. The injected clock never moves here,
+      // so nothing cooperative can end this run: if the signal did not reach the
+      // port, this test would hang — which is precisely what a hung provisioning
+      // run does in production.
+      const hangingNeon: NeonProjectApi = {
+        ...neon,
+        createProject: (req) =>
+          new Promise((_resolve, reject) => {
+            req.signal?.addEventListener('abort', () => reject(new Error('aborted')), {
+              once: true,
+            });
+          }),
+      };
+      deps = { ...deps, neon: hangingNeon, deadlineMs: 5 };
+
+      const result = await provision();
+
+      expect(result).toEqual({ ok: false, reason: 'timed_out', recorded: true });
+      expect(row().failureCode).toBe('timed_out');
+    });
+
+    test('an interrupted call is recorded as the interruption, not as a provider failure', async () => {
+      // The code a run banks is read by an operator and by the retry. Naming the
+      // provider for a call the run itself cut off is a lie in the one record
+      // anybody has.
+      const controller = new AbortController();
+      const abortingNeon: NeonProjectApi = {
+        ...neon,
+        createProject: (req) =>
+          new Promise((_resolve, reject) => {
+            req.signal?.addEventListener('abort', () => reject(new Error('aborted')), {
+              once: true,
+            });
+            controller.abort();
+          }),
+      };
+      deps = { ...deps, neon: abortingNeon };
+
+      const result = await provisionTenant(deps, {
+        tenantId: TENANT,
+        ftsLanguage: LANGUAGE,
+        signal: controller.signal,
+      });
+
+      expect(result).toEqual({ ok: false, reason: 'cancelled', recorded: true });
+    });
+
+    test('a stale window that does not outlive the deadline is refused, not obeyed', async () => {
+      // The ordering was asserted for the two defaults and never for the values
+      // actually in force. Reversed, the module manufactures its own takeover: a
+      // live run is declared dead while it is still working.
+      deps = { ...deps, deadlineMs: 60_000, staleAfterMs: 60_000 };
+
+      await expect(provision()).rejects.toThrow('stale window must outlive');
+      expect(store.rows.size).toBe(0);
+      expect(neon.live.size).toBe(0);
     });
 
     test('a run aborted before it starts touches nothing', async () => {
@@ -1048,14 +1418,37 @@ describe('tenant provisioning', () => {
     });
 
     test('the prefix source provisioning accepts is narrower than the accessor', () => {
-      // A structural assertion, and the point is what it *cannot* express: a
-      // value with only `prefixFor` satisfies the dependency, so no future edit
-      // can reach `credentialFor` through it without changing this type.
+      // The point is what this port *cannot* express. Asserting the key count of
+      // a literal the test just wrote proves nothing about the type; reaching
+      // for the method that must not be there is the assertion that goes red if
+      // the port ever widens, because `bun test` strips types but `tsc` does not.
       const narrow: ProvisionDeps['storage'] = {
         prefixFor: (): PrefixResult => ({ ok: false, reason: 'scope_denied' }),
       };
       expect(typeof narrow.prefixFor).toBe('function');
-      expect(Object.keys(narrow)).toEqual(['prefixFor']);
+      // @ts-expect-error — `credentialFor` is not on this port, deliberately.
+      expect(narrow.credentialFor).toBeUndefined();
+    });
+
+    test('provisioning cannot read a secret, and does not', async () => {
+      // The same narrowing at the higher-stakes seam. A module that writes every
+      // tenant's connection string and bearer has no business being *able* to
+      // read them, and the port it declares is what makes that a type property
+      // rather than a habit.
+      const narrow: ProvisionDeps['secrets'] = {
+        put: () => Promise.resolve({ ok: true }),
+        revoke: () => Promise.resolve({ ok: true }),
+      };
+      expect(typeof narrow.put).toBe('function');
+      expect(typeof narrow.revoke).toBe('function');
+      // @ts-expect-error — a writer has no `resolve`: provisioning is
+      // type-incapable of reading any tenant's secret.
+      expect(narrow.resolve).toBeUndefined();
+
+      // The runtime half: the full store is what is actually injected here, and
+      // provisioning never reaches for the read it cannot declare.
+      await provision();
+      expect(log).not.toContain('secrets.resolve');
     });
   });
 
@@ -1096,6 +1489,18 @@ describe('tenant provisioning', () => {
 
       expect(() => store.put({ ...row(), state: 'failed', failureCode: null })).toThrow(
         'failed_tenants_name_a_code',
+      );
+    });
+
+    test('the fake rejects a failed row still carrying ready_at, as Postgres would', async () => {
+      // The exact row a straggling run used to produce, and the reason the next
+      // ordinary retry deleted a live user's database: `failed` is retryable at
+      // once, and `ready_at` was left behind to prove the tenant had been
+      // served. Neither the schema nor this fake could refuse it before.
+      await provision();
+
+      expect(() => store.put({ ...row(), state: 'failed', failureCode: 'timed_out' })).toThrow(
+        'only_served_tenants_carry_a_ready_at',
       );
     });
 

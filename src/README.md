@@ -23,4 +23,10 @@ error.
 **Every tenant-scoped read derives its scope from authenticated context.** No
 call site constructs a database key, an object-storage prefix, or a connection
 from request input. One accessor per boundary, and the scope check lives below
-the handlers so it cannot be forgotten at a call site.
+the handlers so it cannot be forgotten at a call site. For object storage this
+is enforced rather than agreed: `test/control/accessor-boundary.test.ts` scans
+every file under `src/` and fails on a cast to the branded prefix and key types,
+on a second copy of the prefix layout, and on any use of the de-branded
+`storage_prefix` outside the module that records it. Until a module derives
+something it should not, the invariant is held by that scan and not by there
+being little code.

@@ -38,6 +38,14 @@
  * project create can come back `423 Locked`. `423`, `429` and 5xx retry with
  * exponential backoff; every other 4xx is final, because retrying a rejection is
  * just a slower rejection.
+ *
+ * **The caller's signal reaches the socket.** Provisioning's deadline is only a
+ * real bound if the HTTP call it wraps can actually be cut off; a request left
+ * hanging on a socket outlives the run's deadline and then the window after
+ * which its control-plane row is presumed dead, at which point a second run
+ * legitimately takes the tenant over while this one is still in flight. So the
+ * signal is passed into `fetch`, and an aborted run stops retrying rather than
+ * sleeping through its backoff.
  */
 
 import type {
@@ -124,6 +132,7 @@ export function createNeonProjectApi(options: NeonApiOptions): NeonProjectApi {
     path: string,
     body?: unknown,
     okStatuses?: ReadonlySet<number>,
+    signal?: AbortSignal,
   ): Promise<{ readonly status: number; readonly body: unknown }> {
     let lastStatus = 0;
 
@@ -136,6 +145,7 @@ export function createNeonProjectApi(options: NeonApiOptions): NeonProjectApi {
           ...(body === undefined ? {} : { 'content-type': 'application/json' }),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(signal === undefined ? {} : { signal }),
       };
 
       const response = await doFetch(`${baseUrl}${path}`, init);
@@ -149,7 +159,9 @@ export function createNeonProjectApi(options: NeonApiOptions): NeonProjectApi {
       }
 
       const retryable = RETRYABLE_STATUSES.has(response.status) || response.status >= 500;
-      if (!retryable || attempt === maxAttempts) break;
+      // An aborted run must not spend its backoff sleeping and then try again:
+      // the answer is already known and nobody is waiting for it.
+      if (!retryable || attempt === maxAttempts || signal?.aborted === true) break;
 
       await sleep(DEFAULT_BACKOFF_MS * 2 ** (attempt - 1));
     }
@@ -159,18 +171,25 @@ export function createNeonProjectApi(options: NeonApiOptions): NeonProjectApi {
 
   return {
     async createProject(request: CreateProjectRequest): Promise<CreatedProject> {
-      const { body } = await call('createProject', 'POST', '/projects', {
-        project: {
-          name: request.name,
-          region_id: regionId,
-          pg_version: pgVersion,
-          ...(options.orgId === undefined ? {} : { org_id: options.orgId }),
-          default_endpoint_settings: {
-            // U2 step 5. Neon's own default is 0 — never suspend.
-            suspend_timeout_seconds: request.suspendTimeoutSeconds,
+      const { body } = await call(
+        'createProject',
+        'POST',
+        '/projects',
+        {
+          project: {
+            name: request.name,
+            region_id: regionId,
+            pg_version: pgVersion,
+            ...(options.orgId === undefined ? {} : { org_id: options.orgId }),
+            default_endpoint_settings: {
+              // U2 step 5. Neon's own default is 0 — never suspend.
+              suspend_timeout_seconds: request.suspendTimeoutSeconds,
+            },
           },
         },
-      });
+        undefined,
+        request.signal,
+      );
 
       return {
         projectId: readString('createProject', body, ['project', 'id']),
@@ -183,14 +202,24 @@ export function createNeonProjectApi(options: NeonApiOptions): NeonProjectApi {
     ): Promise<CreatedRoleAndDatabase> {
       const branchPath = `/projects/${encodeURIComponent(request.projectId)}/branches/${encodeURIComponent(request.branchId)}`;
 
-      const role = await call('createRole', 'POST', `${branchPath}/roles`, {
-        role: { name: request.roleName },
-      });
+      const role = await call(
+        'createRole',
+        'POST',
+        `${branchPath}/roles`,
+        { role: { name: request.roleName } },
+        undefined,
+        request.signal,
+      );
       const roleName = readString('createRole', role.body, ['role', 'name']);
 
-      const database = await call('createDatabase', 'POST', `${branchPath}/databases`, {
-        database: { name: request.databaseName, owner_name: roleName },
-      });
+      const database = await call(
+        'createDatabase',
+        'POST',
+        `${branchPath}/databases`,
+        { database: { name: request.databaseName, owner_name: roleName } },
+        undefined,
+        request.signal,
+      );
       const databaseName = readString('createDatabase', database.body, ['database', 'name']);
 
       const query = new URLSearchParams({
@@ -202,6 +231,9 @@ export function createNeonProjectApi(options: NeonApiOptions): NeonProjectApi {
         'connectionUri',
         'GET',
         `/projects/${encodeURIComponent(request.projectId)}/connection_uri?${query.toString()}`,
+        undefined,
+        undefined,
+        request.signal,
       );
 
       return {
@@ -213,7 +245,9 @@ export function createNeonProjectApi(options: NeonApiOptions): NeonProjectApi {
 
     async deleteProject(projectId: string): Promise<void> {
       // Idempotent by necessity: the retry path deletes projects a previous
-      // retry may already have removed.
+      // retry may already have removed. Deliberately un-signalled: cleanup is
+      // what makes a cancelled run cheap, so cancelling the cancellation is the
+      // one place an abort would leave a billable resource behind.
       await call(
         'deleteProject',
         'DELETE',

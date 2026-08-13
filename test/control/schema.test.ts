@@ -44,8 +44,31 @@ import { describe, expect, test } from 'bun:test';
 
 import { isValidTenantId } from '../../src/control/secrets.ts';
 
-const SCHEMA_PATH = `${import.meta.dir}/../../src/control/schema.sql`;
+const SRC_DIR = `${import.meta.dir}/../../src`;
+const CONTROL_SCHEMA = 'control/schema.sql';
+const SCHEMA_PATH = `${SRC_DIR}/${CONTROL_SCHEMA}`;
 const SCHEMA_SQL = await Bun.file(SCHEMA_PATH).text();
+
+/**
+ * Every SQL file in `src/`, enumerated rather than listed. The guard below used
+ * to read one hardcoded path, so a future *column* could not slip past it but a
+ * future *file* escaped it entirely — and this schema's own header says U10's
+ * typed job table is expected to land later. A file that nobody classified is a
+ * file nobody guarded.
+ */
+const SQL_FILES: readonly string[] = [
+  ...new Bun.Glob('**/*.sql').scanSync({ cwd: SRC_DIR }),
+]
+  .map((name) => name.split('\\').join('/'))
+  .sort();
+
+const SQL_SOURCES: ReadonlyMap<string, string> = new Map(
+  await Promise.all(
+    SQL_FILES.map(
+      async (name): Promise<[string, string]> => [name, await Bun.file(`${SRC_DIR}/${name}`).text()],
+    ),
+  ),
+);
 
 // ---------------------------------------------------------------------------
 // A small, deliberately fail-closed SQL reader.
@@ -1076,6 +1099,10 @@ describe('nullability follows the invariant, and every column is classified', ()
     'updated_at',
     'provisioning_started_at',
     'provisioning_attempts',
+    // The fencing token. NOT NULL because "which attempt owns this row" has an
+    // answer from the moment the row exists: a nullable lease would make the
+    // compare-and-set that protects a live tenant silently skippable.
+    'provisioning_lease',
   ];
 
   /**
@@ -1341,5 +1368,115 @@ describe('the file is structurally sound', () => {
     );
     const declared = [...schema.enums, ...schema.domains].map((d) => bareName(d.name));
     expect(declared.filter((name) => !used.has(name))).toEqual([]);
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Which SQL files this guard covers, and what happens to one it does not.
+//
+// The content-free rule belongs to the *control plane*, not to SQL in general:
+// U3's `src/schema/tenant.sql` holds the user's own words by design, and a
+// guard that failed on it would be deleted rather than obeyed. So every SQL
+// file in `src/` is enumerated and then classified — under `src/control/` it is
+// content-free-guarded, and anywhere else it must be named here with a reason.
+// An unclassified file is a finding, which means a new schema file cannot be
+// added silently in either direction: the author either accepts the guard or
+// writes down why it does not apply.
+// ---------------------------------------------------------------------------
+
+interface ContentBearingEntry {
+  readonly path: string;
+  readonly because: string;
+}
+
+/** Empty today: nothing outside the control plane has a schema yet. */
+const CONTENT_BEARING_SQL: readonly ContentBearingEntry[] = [];
+
+const CONTROL_PREFIX = 'control/';
+
+function findUnclassifiedSql(
+  paths: readonly string[],
+  classified: readonly ContentBearingEntry[] = CONTENT_BEARING_SQL,
+): string[] {
+  const named = new Set(classified.map((entry) => entry.path));
+  const findings: string[] = [];
+
+  for (const path of paths) {
+    if (path.startsWith(CONTROL_PREFIX)) continue;
+    if (named.has(path)) continue;
+    findings.push(
+      `${path}: no classification — say whether the control plane's content-free rule applies to it`,
+    );
+  }
+
+  return findings;
+}
+
+describe('every SQL file in the tree is accounted for', () => {
+  test('the enumeration finds the control-plane schema', () => {
+    // An empty glob must fail rather than pass: a guard that enumerates nothing
+    // reports green for everything.
+    expect(SQL_FILES.length).toBeGreaterThanOrEqual(1);
+    expect(SQL_FILES).toContain(CONTROL_SCHEMA);
+    expect(SQL_SOURCES.get(CONTROL_SCHEMA)).toBe(SCHEMA_SQL);
+  });
+
+  test('no SQL file in src/ is unclassified', () => {
+    expect(findUnclassifiedSql(SQL_FILES)).toEqual([]);
+  });
+
+  test('every control-plane SQL file is content-free, not just this one', () => {
+    const findings: string[] = [];
+    for (const [path, sql] of SQL_SOURCES) {
+      if (!path.startsWith(CONTROL_PREFIX)) continue;
+      const parsed = parseSchema(sql);
+      // Same fail-closed reading the primary file gets: a parser that shrugged
+      // at an unfamiliar statement would be a guard that unusual DDL disables.
+      for (const statement of parsed.unrecognized) {
+        findings.push(`${path}: unrecognized statement ${JSON.stringify(statement.slice(0, 60))}`);
+      }
+      for (const finding of findContentShapedColumns(parsed)) findings.push(`${path}: ${finding}`);
+    }
+    expect(findings).toEqual([]);
+  });
+
+  test('a future SQL file outside the control plane is a finding until someone classifies it', () => {
+    // U3's tenant schema is the concrete case, and the right outcome is that it
+    // stops this test until its author states, in writing, that it holds user
+    // content on purpose.
+    expect(findUnclassifiedSql(['control/schema.sql', 'schema/tenant.sql'])).toEqual([
+      "schema/tenant.sql: no classification — say whether the control plane's content-free rule applies to it",
+    ]);
+  });
+
+  test('a classified file is accepted, and its justification is not a shrug', () => {
+    const classified: ContentBearingEntry[] = [
+      {
+        path: 'schema/tenant.sql',
+        because:
+          'the per-tenant schema holds the user\'s own documents and chunks by design; the content-free rule is the control plane\'s, not this file\'s',
+      },
+    ];
+    expect(findUnclassifiedSql(['schema/tenant.sql'], classified)).toEqual([]);
+    for (const entry of [...classified, ...CONTENT_BEARING_SQL]) {
+      expect(entry.because.length).toBeGreaterThan(40);
+    }
+  });
+
+  test('a future control-plane SQL file is guarded without being listed anywhere', () => {
+    // The half the hardcoded path could not do. U10's job table is expected to
+    // land in this directory, and it inherits the guard by living there.
+    const jobs = parseSchema(`
+CREATE DOMAIN control.tenant_id AS varchar(63)
+  CONSTRAINT tenant_id_is_a_slug CHECK (VALUE ~ '^[a-z0-9][a-z0-9-]{0,62}$');
+CREATE TABLE control.job (
+  tenant_id control.tenant_id NOT NULL,
+  payload jsonb,
+  CONSTRAINT job_pkey PRIMARY KEY (tenant_id)
+);
+`);
+    expect(findContentShapedColumns(jobs)).toHaveLength(1);
+    expect(findUnclassifiedSql(['control/jobs.sql'])).toEqual([]);
   });
 });

@@ -211,6 +211,15 @@ export const CACHE_SAFETY_MARGIN_MS = 60_000;
 /** Sized as in `secrets.ts`: ~500 warm tenants per instance under DO affinity. */
 export const DEFAULT_MAX_ENTRIES = 512;
 
+/**
+ * How far ahead of the requested TTL a minted expiry may sit before it is
+ * treated as a widened scope rather than a clock disagreement. A remote minter
+ * computes the expiry on its own clock, so a few seconds of skew is ordinary and
+ * a quarter of an hour is not. The cache is bounded independently
+ * (`cacheDeadline`), so this bounds the *credential*, not how long it is served.
+ */
+export const MINT_CLOCK_SKEW_MS = 60_000;
+
 /** The request path gets object read/write on its own prefix, and nothing else. */
 const CREDENTIAL_PERMISSION: R2ObjectPermission = 'object-read-write';
 
@@ -511,6 +520,8 @@ export function createTenantStorage(options: TenantStorageOptions): TenantStorag
       const cached = readCache(prefix);
       if (cached !== undefined) return { ok: true, credential: cached };
 
+      // Read before the await, so mint latency can only make the check stricter.
+      const requestedAt = now();
       const minted = frozenCredential(
         await minter.mint({
           prefix,
@@ -522,8 +533,27 @@ export function createTenantStorage(options: TenantStorageOptions): TenantStorag
       // A minter that returned a different scope than it was asked for would
       // widen the boundary silently, and the credential would still work. Fail
       // loudly instead: this is the one place that substitution is detectable.
+      //
+      // **Scope is all three of these**, not just the prefix. A credential's
+      // reach is the prefix it covers, what it may do there, and how long it may
+      // do it for, so a minter that echoed the prefix while substituting the
+      // permission or extending the lifetime would widen the boundary through
+      // the two fields nobody was checking. `R2ObjectPermission` excludes
+      // `admin-*` at compile time only; a production minter is a network
+      // response, and a response is not a type.
       if (minted.prefix !== prefix) {
         throw new Error('invariant: minter returned a credential scoped to a different prefix');
+      }
+      if (minted.permission !== CREDENTIAL_PERMISSION) {
+        throw new Error('invariant: minter returned a credential with a different permission');
+      }
+      if (minted.expiresAtMs > requestedAt + credentialTtlSeconds * 1_000 + MINT_CLOCK_SKEW_MS) {
+        throw new Error('invariant: minter returned a credential outliving the requested TTL');
+      }
+      // Not a widening, but not a credential either: the cache would drop it on
+      // the next read and every request would re-mint against a 403.
+      if (minted.expiresAtMs <= requestedAt) {
+        throw new Error('invariant: minter returned an already-expired credential');
       }
 
       writeCache(prefix, minted);

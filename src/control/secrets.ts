@@ -131,13 +131,27 @@ export interface SecretBackend {
   delete(namespace: string): Promise<void>;
 }
 
-export interface TenantSecretStore {
-  /** Read a tenant's secret. Permitted only for that tenant's fleet identity. */
-  resolve(caller: CallerIdentity, tenantId: string): Promise<ResolveResult>;
+/**
+ * The write half, on its own, because rule 3 above is a real boundary and not a
+ * comment: a module that writes entries has no business being *able* to read
+ * them. Provisioning (U2) declares this and never the full store, so it is
+ * type-incapable of resolving any tenant's connection string or bearer — the
+ * same narrowing `provision.ts` applies to the storage accessor via
+ * `TenantPrefixSource`, applied here at the higher-stakes seam.
+ *
+ * `TenantSecretStore` extends it, so the real store satisfies it structurally
+ * and there is still exactly one declaration of what a write is.
+ */
+export interface TenantSecretWriter {
   /** Create or rotate an entry. Control plane only. Invalidates the cache. */
   put(caller: CallerIdentity, tenantId: string, secret: TenantSecret): Promise<WriteResult>;
   /** Remove an entry. Control plane only. Invalidates the cache. */
   revoke(caller: CallerIdentity, tenantId: string): Promise<WriteResult>;
+}
+
+export interface TenantSecretStore extends TenantSecretWriter {
+  /** Read a tenant's secret. Permitted only for that tenant's fleet identity. */
+  resolve(caller: CallerIdentity, tenantId: string): Promise<ResolveResult>;
   /** Drop a cached entry without touching the backend. Control plane only. */
   invalidate(caller: CallerIdentity, tenantId: string): Promise<WriteResult>;
 }

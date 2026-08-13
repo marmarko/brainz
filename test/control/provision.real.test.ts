@@ -118,12 +118,18 @@ function createMemoryStore(): ControlPlaneStore & { readonly rows: Map<string, T
       rows.set(record.tenantId, record);
       return Promise.resolve({ inserted: true, record });
     },
-    update: (tenantId: string, patch: TenantPatch) => {
+    update: (tenantId: string, expectedLease: number, patch: TenantPatch) => {
       const existing = rows.get(tenantId);
       if (existing === undefined) throw new Error(`no row for ${tenantId}`);
+      // The lease is compared even here: the benchmark runs one attempt per
+      // tenant, so a refusal would mean the harness itself is racing, and that
+      // is worth failing on rather than papering over.
+      if (existing.provisioningLease !== expectedLease) {
+        return Promise.resolve({ applied: false as const, current: existing });
+      }
       const next: TenantRecord = { ...existing, ...patch };
       rows.set(tenantId, next);
-      return Promise.resolve(next);
+      return Promise.resolve({ applied: true as const, record: next });
     },
   };
 }
