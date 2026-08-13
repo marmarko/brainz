@@ -32,7 +32,10 @@ import {
   type ControlSignals,
   type SignalSink,
 } from '../../src/mcp/control-signals.ts';
+import type { ClientCapabilities } from '../../src/mcp/client-capabilities.ts';
 import { dispatch, type DispatchDeps, type DispatchResult } from '../../src/mcp/dispatch.ts';
+import type { ResumeInput } from '../../src/mcp/manage-gate.ts';
+import { createSettingsBackend } from '../../src/mcp/settings.ts';
 import {
   createInMemoryAuthorizationStore,
   mintTenantBearer,
@@ -69,7 +72,14 @@ export interface McpFixture {
   call(
     tool: string,
     args?: Record<string, unknown>,
-    options?: { readonly authorization?: string | null; readonly endpoint?: Endpoint },
+    options?: {
+      readonly authorization?: string | null;
+      readonly endpoint?: Endpoint;
+      /** What this request's `_meta` declared (2026-07-28). Absent by default. */
+      readonly capabilities?: ClientCapabilities;
+      /** SEP-2322's echoed state and answers. */
+      readonly resume?: ResumeInput;
+    },
   ): Promise<DispatchResult>;
   close(): Promise<void>;
 }
@@ -137,6 +147,10 @@ export async function createMcpFixture(
     signals,
     gateway: gateway.gateway,
     now: () => new Date(clock),
+    // The real backend against the real control plane and the real tenant
+    // database. A stub would let `manage` report `applied` for a write that
+    // never landed, which is the one thing these tests exist to catch.
+    settings: createSettingsBackend(controlSql),
   };
 
   return {
@@ -165,6 +179,10 @@ export async function createMcpFixture(
             callOptions.authorization === undefined ? `Bearer ${bearer}` : callOptions.authorization,
           tool,
           args,
+          ...(callOptions.capabilities === undefined
+            ? {}
+            : { clientCapabilities: callOptions.capabilities }),
+          ...(callOptions.resume === undefined ? {} : { resume: callOptions.resume }),
         },
       );
     },

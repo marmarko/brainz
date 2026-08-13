@@ -42,7 +42,9 @@
 
 import { createHash } from 'node:crypto';
 
+import type { ClientCapabilities } from '../client-capabilities.ts';
 import { CAPTURE_AND_CONSULT_CLAUSE, UNTRUSTED_DATA_CLAUSE } from '../instructions.ts';
+import { PANEL_RESOURCE_URI } from '../panel.ts';
 
 export const ENDPOINTS = ['mcp', 'openai'] as const;
 export type Endpoint = (typeof ENDPOINTS)[number];
@@ -329,9 +331,64 @@ export function toolByName(name: string): ToolDef | undefined {
   return BY_NAME.get(name);
 }
 
-/** What `tools/list` returns on an endpoint. Exactly seven names, by construction. */
+/**
+ * The seven names advertised to a model on an endpoint, unconditionally.
+ *
+ * Read by the envelope's referential check, `brain`'s published matrix and the
+ * definitions digest — all of which describe the *definition table*, which does
+ * not vary per request. `listedTools` is what `tools/list` answers with, and it
+ * does.
+ */
 export function advertisedTools(endpoint: Endpoint): readonly ToolDef[] {
   return TOOLS.filter((tool) => tool.advertisedOn.includes(endpoint));
+}
+
+/** One entry in a `tools/list` answer: the definition, plus any `_meta` it carries. */
+export interface ListedTool {
+  readonly def: ToolDef;
+  readonly meta?: Record<string, unknown>;
+}
+
+/**
+ * What `tools/list` answers, for *this* client.
+ *
+ * **`manage` is listed, and the visibility is what keeps it away from models.**
+ * MCP Apps (SEP-1865) defines `_meta.ui.visibility`: `["app"]` means the
+ * rendered panel may call it and the model may not, and a conformant host MUST
+ * reject an app's `tools/call` for a tool that does not carry it. So the tool
+ * has to *be* in the list for the panel path to work at all — a tool absent
+ * from `tools/list` has no visibility array for the host to check. The roadmap's
+ * open question about hosts forwarding calls for unadvertised names is retired
+ * by that, not answered.
+ *
+ * **On a client without the extension it becomes an ordinary eighth name**, and
+ * that is the roadmap's stated fallback cost. The replacement control is not the
+ * listing — it is the gate, which requires a confirmation the client has to
+ * declare it can ask for (`manage-gate.ts`).
+ *
+ * **The carrier is `brain`.** A host preloads a panel from the `_meta.ui.resourceUri`
+ * on a tool the *model* can call, and `manage` is app-only by construction. `brain`
+ * is the natural one: read-only, no model call, and its JSON is already the
+ * panel's text twin.
+ */
+export function listedTools(
+  endpoint: Endpoint,
+  capabilities: ClientCapabilities,
+): readonly ListedTool[] {
+  const listed: ListedTool[] = advertisedTools(endpoint).map((def) =>
+    capabilities.ui && def.name === 'brain'
+      ? { def, meta: { ui: { resourceUri: PANEL_RESOURCE_URI } } }
+      : { def },
+  );
+
+  const manage = BY_NAME.get('manage');
+  if (manage !== undefined && manage.dispatchableOn.includes(endpoint)) {
+    listed.push(
+      capabilities.ui ? { def: manage, meta: { ui: { visibility: ['app'] } } } : { def: manage },
+    );
+  }
+
+  return listed;
 }
 
 export function isDispatchable(name: string, endpoint: Endpoint): boolean {

@@ -30,6 +30,7 @@
  */
 
 import type { ModelGateway } from '../ai/gateway.ts';
+import type { PauseAuthority } from '../ingest/pause.ts';
 import {
   assertServableSchema,
   TenantSchemaBehindError,
@@ -38,8 +39,16 @@ import {
 import { fleetIdentity, type TenantSecretStore } from '../control/secrets.ts';
 import type { Grant } from '../core/search/fence.ts';
 import type { AccessLog, ResultClass } from './access-log.ts';
+import { NO_CLIENT_CAPABILITIES, type ClientCapabilities } from './client-capabilities.ts';
 import type { ControlSignals } from './control-signals.ts';
 import { mintDelimiter, type NonceSource } from './demarcation.ts';
+import {
+  resolveManageGate,
+  type InputRequired,
+  type ResumeInput,
+} from './manage-gate.ts';
+import { DEFAULT_WEB_APP_BASE_URL } from './manage-actions.ts';
+import type { SettingsBackend } from './settings.ts';
 import {
   buildEnvelope,
   envelopeViolations,
@@ -91,10 +100,6 @@ export const DEFAULT_WRITE_ORIGIN = 'personal:agent';
  */
 export const UNAUTHORIZED_MESSAGE = 'That credential is not one this server issued.';
 
-export interface PanelNonces {
-  verify(nonce: string, tenantId: string, nowMs: number): boolean;
-}
-
 export interface DispatchDeps {
   readonly endpoint: Endpoint;
   readonly secrets: TenantSecretStore;
@@ -105,7 +110,16 @@ export interface DispatchDeps {
   readonly gateway: ModelGateway;
   readonly now: () => Date;
   readonly nonceSource?: NonceSource;
-  readonly panelNonces?: PanelNonces;
+  /**
+   * Where a `manage` action lands (U14).
+   *
+   * Optional, and its absence is a refusal rather than a no-op: a settings port
+   * that silently succeeds is what makes `applied: true` a lie, and no test
+   * that did not re-read the store would ever see it.
+   */
+  readonly settings?: SettingsBackend;
+  /** The origin a web-app deep link points at. */
+  readonly webAppBaseUrl?: string;
   readonly writeOrigin?: string;
 }
 
@@ -119,6 +133,23 @@ export interface DispatchRequest {
    * mailbox starves the inactivity debounce forever.
    */
   readonly userOriginated?: boolean;
+  /**
+   * What this request's `_meta` said the client can do (2026-07-28).
+   *
+   * Per request, because there is no handshake left to remember it on, and
+   * absent by default because every capability it can carry *widens* what the
+   * caller may reach.
+   */
+  readonly clientCapabilities?: ClientCapabilities;
+  /**
+   * A multi-round-trip resume (SEP-2322): the echoed `requestState` and the
+   * answers.
+   *
+   * Carried on the request rather than inside `args`, because that is where the
+   * spec puts it and because a tool schema that declared a confirmation
+   * parameter would be publishing a control the model gets to fill in.
+   */
+  readonly resume?: ResumeInput;
 }
 
 export interface DispatchError {
@@ -135,6 +166,13 @@ export interface DispatchResult {
   /** The client lane. Invisible to the model; carries the attestation. */
   readonly meta: Record<string, unknown>;
   readonly error?: DispatchError;
+  /**
+   * Set when the call cannot proceed until the user answers something.
+   *
+   * Not an error: the server lifts it to `resultType: "input_required"` at the
+   * JSON-RPC layer and the client re-issues the same call with the answers.
+   */
+  readonly inputRequired?: InputRequired;
 }
 
 const HANDLERS: Readonly<Record<string, Handler>> = {
@@ -149,6 +187,119 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
   manage,
   synthesize,
 };
+
+/** Who the caller is, once the credential has been believed. */
+export interface AuthenticatedCaller {
+  readonly claims: GrantClaims;
+  readonly actor: { readonly grantId: string; readonly tenantId: string };
+  /**
+   * The tenant's derived signing key.
+   *
+   * Handed out here rather than re-derived per call site, so the panel nonce,
+   * the MRTR `requestState` and the access tokens are all signed with one key
+   * whose derivation lives in exactly one place. It never leaves this module's
+   * callers and is never put on a `ToolContext` — `test/mcp/guards.test.ts`
+   * refuses a handler that touches key material.
+   */
+  readonly signingKey: string;
+}
+
+export interface AuthenticationRefusal {
+  readonly code: string;
+  readonly message: string;
+  readonly resultClass: ResultClass;
+  readonly actor: { readonly grantId: string; readonly tenantId: string };
+}
+
+export type AuthenticationOutcome =
+  | { readonly ok: true; readonly caller: AuthenticatedCaller }
+  | { readonly ok: false; readonly refusal: AuthenticationRefusal };
+
+/**
+ * The credential path, extracted so `resources/read` shares it.
+ *
+ * **It is shared rather than copied for the reason this module's history
+ * records.** The version of this file that had three ways to fail
+ * authentication said something different on the third, which was a
+ * tenant-existence oracle reachable with no credential at all. A second surface
+ * with its own copy of these checks is that bug waiting to be rewritten, and it
+ * would be invisible to a suite that only tests one of them.
+ */
+export async function authenticate(
+  deps: DispatchDeps,
+  authorization: string | null,
+): Promise<AuthenticationOutcome> {
+  const writeOrigin = deps.writeOrigin ?? DEFAULT_WRITE_ORIGIN;
+  const nowMs = deps.now().getTime();
+
+  const presented = authorization === null ? '' : stripBearer(authorization);
+  const tenantId = presented.length === 0 ? null : tenantOfToken(presented);
+
+  const resolved =
+    tenantId === null ? null : await deps.secrets.resolve(fleetIdentity(tenantId), tenantId);
+
+  // An unresolvable tenant becomes an empty stored bearer rather than an early
+  // return, so the unknown-tenant path and the wrong-secret path run the same
+  // verification and produce the same refusal.
+  const claims =
+    tenantId === null
+      ? null
+      : verifyCredential(
+          presented,
+          resolved?.ok === true ? resolved.secret.bearerGrant : '',
+          nowMs,
+          { tenantId, endpoint: deps.endpoint, writeOrigin },
+        );
+
+  if (claims === null || resolved?.ok !== true) {
+    return {
+      ok: false,
+      refusal: {
+        code: 'unauthorized',
+        message: UNAUTHORIZED_MESSAGE,
+        resultClass: 'unauthorized',
+        actor: { grantId: 'anonymous', tenantId: tenantId ?? 'unknown' },
+      },
+    };
+  }
+
+  const actor = { grantId: claims.grantId, tenantId: claims.tenantId };
+
+  // A self-contained token cannot be withdrawn by rewriting it, so revocation
+  // is a list and it is consulted on every call — including the ones that would
+  // otherwise never touch the store.
+  if (deps.store.isRevoked(claims.grantId)) {
+    return {
+      ok: false,
+      refusal: {
+        code: 'unauthorized',
+        message: 'This grant has been revoked.',
+        resultClass: 'unauthorized',
+        actor,
+      },
+    };
+  }
+
+  // An OAuth grant binds to the endpoint it was issued for. A token minted for
+  // the portable surface presenting itself at the ChatGPT surface is a
+  // different advertised tool set and a different consent story.
+  if (claims.endpoint !== deps.endpoint) {
+    return {
+      ok: false,
+      refusal: {
+        code: 'unauthorized',
+        message: 'This grant is bound to a different endpoint.',
+        resultClass: 'unauthorized',
+        actor,
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    caller: { claims, actor, signingKey: deriveSigningKey(resolved.secret.bearerGrant) },
+  };
+}
 
 /** The one entry point. Every surface — HTTP, panel, test — comes through here. */
 export async function dispatch(
@@ -177,86 +328,73 @@ export async function dispatch(
     };
   };
 
-  const anonymous = { grantId: 'anonymous', tenantId: 'unknown' };
-
   // ---- 1. The credential, before anything else touches a database. ---------
-  const presented = request.authorization === null ? '' : stripBearer(request.authorization);
-  const tenantId = presented.length === 0 ? null : tenantOfToken(presented);
-
+  //
   // Every way of failing to authenticate leaves through **one** return, with one
-  // message. The version this replaced had three, and the third said something
-  // different — "not valid for this brain" once a tenant resolved, "not one this
-  // server issued" when it did not. That is a tenant-existence oracle: same
-  // credential shape, same alphabet, different sentence, and an unauthenticated
-  // caller enumerates which tenant ids the fleet serves without ever reading a
-  // row. Content-free is not the same as disclosure-free, which is exactly why
-  // this one survived a suite that checks every refusal is typed.
-  const resolved =
-    tenantId === null ? null : await deps.secrets.resolve(fleetIdentity(tenantId), tenantId);
-
-  // An unresolvable tenant becomes an empty stored bearer rather than an early
-  // return, so the unknown-tenant path and the wrong-secret path run the same
-  // verification and produce the same refusal.
-  const claims =
-    tenantId === null
-      ? null
-      : verifyCredential(presented, resolved?.ok === true ? resolved.secret.bearerGrant : '', now.getTime(), {
-          tenantId,
-          endpoint: deps.endpoint,
-          writeOrigin,
-        });
-
-  if (claims === null) {
-    return refuse('unauthorized', UNAUTHORIZED_MESSAGE, 'unauthorized', {
-      grantId: 'anonymous',
-      tenantId: tenantId ?? 'unknown',
-    });
-  }
-  if (resolved?.ok !== true) {
-    // Unreachable — a null `resolved` cannot produce claims — and kept so the
-    // narrowing below is a property of the code rather than of the reader.
-    return refuse('unauthorized', UNAUTHORIZED_MESSAGE, 'unauthorized', anonymous);
+  // message — see `authenticate`, which `resources/read` shares rather than
+  // reimplements. The version this replaced had three returns, and the third
+  // said something different, which was a tenant-existence oracle reachable with
+  // no credential at all.
+  const authenticated = await authenticate(deps, request.authorization);
+  if (!authenticated.ok) {
+    const { code, message, resultClass, actor: who } = authenticated.refusal;
+    return refuse(code, message, resultClass, who);
   }
 
   // From here down the tenant is the *authenticated* one — `verifyCredential`
   // refuses an access token whose claims name a different tenant than the one
   // its secret was resolved for, so these are the same string with one of them
   // carrying a proof.
+  const { claims, actor, signingKey } = authenticated.caller;
   const authenticatedTenantId = claims.tenantId;
-  const actor = { grantId: claims.grantId, tenantId: authenticatedTenantId };
 
-  // A self-contained token cannot be withdrawn by rewriting it, so revocation
-  // is a list and it is consulted on every call — including the ones that would
-  // otherwise never touch the store.
-  if (deps.store.isRevoked(claims.grantId)) {
-    return refuse('unauthorized', 'This grant has been revoked.', 'unauthorized', actor);
-  }
-
-  // An OAuth grant binds to the endpoint it was issued for. A token minted for
-  // the portable surface presenting itself at the ChatGPT surface is a
-  // different advertised tool set and a different consent story.
-  if (claims.endpoint !== deps.endpoint) {
-    return refuse('unauthorized', 'This grant is bound to a different endpoint.', 'unauthorized', actor);
-  }
-
-  // ---- 2. The tool, before the database is opened. -------------------------
+  // ---- 2. The tool, and its gate, before the database is opened. -----------
   const def = toolByName(request.tool);
   if (def === undefined || !isDispatchable(request.tool, deps.endpoint)) {
     return refuse('unknown_tool', `No tool named ${JSON.stringify(request.tool)}.`, 'unknown_tool', actor);
   }
 
+  // U14's gate. It lives here rather than in the handler for the reason
+  // `test/mcp/guards.test.ts` writes down about `panel_nonce`: a gate a handler
+  // could choose not to check is not a gate. `manage` is the only tool that
+  // carries it, and it is the only tool that changes a setting.
+  let authority: PauseAuthority = 'panel';
   if (def.requiresPanelNonce === true) {
-    const supplied = typeof request.args.panel_nonce === 'string' ? request.args.panel_nonce : '';
-    const accepted =
-      supplied.length > 0 && (deps.panelNonces?.verify(supplied, authenticatedTenantId, now.getTime()) ?? false);
-    if (!accepted) {
-      return refuse(
-        'invalid_params',
-        'This tool requires a panel nonce, which is minted into a panel view rather than offered to a model.',
-        'invalid_params',
-        actor,
-      );
+    const gate = resolveManageGate({
+      action: typeof request.args.action === 'string' ? request.args.action.trim() : null,
+      value: typeof request.args.value === 'string' ? request.args.value : null,
+      panelNonce: typeof request.args.panel_nonce === 'string' ? request.args.panel_nonce : '',
+      capabilities: request.clientCapabilities ?? NO_CLIENT_CAPABILITIES,
+      resume: request.resume,
+      signingKey,
+      tenantId: authenticatedTenantId,
+      callerKey: claims.grantId,
+      nowMs: now.getTime(),
+      webAppBaseUrl: deps.webAppBaseUrl ?? DEFAULT_WEB_APP_BASE_URL,
+    });
+
+    if (gate.kind === 'refuse') {
+      const resultClass = RESULT_CLASS_BY_CODE[gate.code] ?? 'error';
+      return refuse(gate.code, gate.message, resultClass, actor, {
+        ...(gate.suggestion === undefined ? {} : { suggestion: gate.suggestion }),
+      });
     }
+    if (gate.kind === 'ask') {
+      // Not an error: the call is suspended, not refused, and the server lifts
+      // this to `resultType: "input_required"`. It is logged as an ordinary
+      // outcome and — the property the tests re-read the store for — no handler
+      // has run, so nothing has been written.
+      log(deps, now, actor, request.tool, 'ok');
+      return {
+        ok: true,
+        resultClass: 'ok',
+        content: { confirmation_required: true, detail: gate.message },
+        envelope: buildEnvelope({ endpoint: deps.endpoint }),
+        meta: {},
+        inputRequired: gate.inputRequired,
+      };
+    }
+    authority = gate.authority;
   }
 
   // ---- 3. The tenant's database, by an identity that reaches no other. -----
@@ -305,6 +443,14 @@ export async function dispatch(
     nonce,
     coldStart,
     endpoint: deps.endpoint,
+    // U14. A bound port rather than a connection: a handler that could reach
+    // the control plane directly would have moved the boundary into itself,
+    // which is what `test/mcp/guards.test.ts` scans for. `null` when the fleet
+    // wired no backend, and `manage` answers `unavailable` rather than
+    // pretending to have applied something.
+    settings: deps.settings?.forTenant({ tenantId: authenticatedTenantId, sql }) ?? null,
+    authority,
+    webAppBaseUrl: deps.webAppBaseUrl ?? DEFAULT_WEB_APP_BASE_URL,
     async indexState() {
       cachedState ??= await indexState(sql, grant);
       return cachedState;

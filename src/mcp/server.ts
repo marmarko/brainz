@@ -49,7 +49,9 @@ import {
   type RegistrationAllowlist,
 } from './oauth.ts';
 import { PROTOCOL_VERSION } from './envelope.ts';
-import { advertisedTools, inputSchemaFor, type Endpoint } from './tools/index.ts';
+import { readClientCapabilities, UI_EXTENSION } from './client-capabilities.ts';
+import { listResources, readResource } from './resources.ts';
+import { inputSchemaFor, listedTools, type Endpoint } from './tools/index.ts';
 import { fleetIdentity } from '../control/secrets.ts';
 import { DEFAULT_WRITE_ORIGIN } from './dispatch.ts';
 
@@ -132,14 +134,27 @@ async function handleRpc(deps: ServerDeps, request: Request, endpoint: Endpoint)
   const id = body.id ?? null;
   const authorization = request.headers.get('authorization');
 
+  // 2026-07-28 puts the client's capabilities on **every** request rather than
+  // on a handshake, which is what lets a stateless instance decide per call
+  // whether this caller can render a panel or be asked a question. Absent reads
+  // as absent, and every capability it carries widens what the caller may reach
+  // — so the branch that grants least is the default. See
+  // `client-capabilities.ts`.
+  const clientCapabilities = readClientCapabilities(body.params?._meta);
+
   switch (body.method) {
     case 'initialize':
       return rpcResult(id, {
         protocolVersion: PROTOCOL_VERSION,
-        // Tools only. Resources exist for the panel view (U14) and prompts are
-        // user-controlled everywhere, so advertising either here would promise a
-        // channel this server does not serve.
-        capabilities: { tools: { listChanged: false } },
+        // Resources are advertised because U14's panel is one, and it is the
+        // only one: everything readable about the brain goes through the fenced
+        // tool handlers. Prompts are user-controlled everywhere, so advertising
+        // them would promise a channel this server does not serve.
+        capabilities: {
+          tools: { listChanged: false },
+          resources: { listChanged: false, subscribe: false },
+          extensions: { [UI_EXTENSION]: {} },
+        },
         serverInfo: { name: 'brainz', version: INSTRUCTIONS_RELEASE },
         instructions: SERVER_INSTRUCTIONS,
       });
@@ -152,13 +167,27 @@ async function handleRpc(deps: ServerDeps, request: Request, endpoint: Endpoint)
 
     case 'tools/list':
       return rpcResult(id, {
-        tools: advertisedTools(endpoint).map((tool) => ({
-          name: tool.name,
-          description: tool.description,
-          inputSchema: inputSchemaFor(tool),
-          annotations: tool.annotations,
+        tools: listedTools(endpoint, clientCapabilities).map((listed) => ({
+          name: listed.def.name,
+          description: listed.def.description,
+          inputSchema: inputSchemaFor(listed.def),
+          annotations: listed.def.annotations,
+          ...(listed.meta === undefined ? {} : { _meta: listed.meta }),
         })),
       });
+
+    case 'resources/list':
+      return rpcResult(id, { resources: listResources(clientCapabilities) });
+
+    case 'resources/read': {
+      const uri = typeof body.params?.uri === 'string' ? body.params.uri : '';
+      const result = await readResource({ ...deps, endpoint }, { authorization, uri, clientCapabilities });
+      if (result.error?.code === 'unauthorized') return unauthorized(deps);
+      if (!result.ok) {
+        return rpcError(id, -32002, result.error?.message ?? 'that resource could not be read');
+      }
+      return rpcResult(id, { contents: result.contents, _meta: result.meta });
+    }
 
     case 'tools/call': {
       const name = typeof body.params?.name === 'string' ? body.params.name : '';
@@ -166,7 +195,23 @@ async function handleRpc(deps: ServerDeps, request: Request, endpoint: Endpoint)
 
       const result = await dispatch(
         { ...deps, endpoint },
-        { authorization, tool: name, args },
+        {
+          authorization,
+          tool: name,
+          args,
+          clientCapabilities,
+          // SEP-2322's resume, read off the request rather than out of the
+          // tool's arguments: a schema that declared a confirmation parameter
+          // would be publishing a control the model gets to fill in.
+          resume: {
+            ...(typeof body.params?.requestState === 'string'
+              ? { requestState: body.params.requestState }
+              : {}),
+            ...(isObject(body.params?.inputResponses)
+              ? { inputResponses: body.params.inputResponses }
+              : {}),
+          },
+        },
       );
 
       if (result.error?.code === 'unauthorized') return unauthorized(deps);
@@ -176,6 +221,10 @@ async function handleRpc(deps: ServerDeps, request: Request, endpoint: Endpoint)
     default:
       return rpcError(id, -32601, `unknown method ${JSON.stringify(body.method)}`);
   }
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -191,6 +240,18 @@ function toolResult(result: DispatchResult): Record<string, unknown> {
     : { error: result.error, ...result.envelope };
 
   return {
+    // The `input_required` lift (SEP-2322). It is a *result type*, not an
+    // error, so it sits beside the content rather than replacing it — and the
+    // content is deliberately still there, because a client that ignores
+    // multi-round-trip requests must read a plain sentence saying the change
+    // needs confirming and where to make it, rather than an empty success.
+    ...(result.inputRequired === undefined
+      ? {}
+      : {
+          resultType: 'input_required',
+          inputRequests: result.inputRequired.inputRequests,
+          requestState: result.inputRequired.requestState,
+        }),
     content: [{ type: 'text', text: JSON.stringify(payload) }],
     structuredContent: payload,
     _meta: result.meta,

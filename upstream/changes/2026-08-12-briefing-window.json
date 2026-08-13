@@ -1,0 +1,9 @@
+{
+  "id": "2026-08-12-briefing-window",
+  "released_on": "2026-08-12",
+  "flag": "briefing_today",
+  "headline": "A daily briefing now covers the day you asked about.",
+  "what_changed": "The briefing selected meetings by when they were written down rather than by when they happen, so an event added last week for today could be missed and one added today for next month could appear. It now selects by when the meeting occurs, and the window you ask for is the window you get.",
+  "what_it_did_to_your_memory": "Nothing in your brain changed — no page, fact or entity was rewritten. What changed is which of them a briefing picks up.",
+  "what_you_can_do": "Nothing. If a past briefing looked wrong to you, this is likely why; asking again will now answer for the day you name."
+}

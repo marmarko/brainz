@@ -78,16 +78,34 @@ describe('stateless streamable HTTP', () => {
     expect(second.status).toBe(200);
   });
 
-  test('tools/list advertises seven names and the endpoint decides which seven', async () => {
-    const portable = (await (await server.fetch(rpc('tools/list', {}))).json()) as {
-      result: { tools: { name: string }[] };
+  test('tools/list names seven for a model, and the endpoint decides which seven', async () => {
+    // **The seven is now a property of the *host*, not of the list.** U14 lists
+    // `manage` with `_meta.ui.visibility: ["app"]` to a client that declared the
+    // MCP Apps extension, because a conformant host MUST reject an app's call to
+    // a tool that does not carry it — so the tool has to be in the list for the
+    // panel to reach it, and the host is what keeps it out of the model's view.
+    // The assertion below is therefore "seven model-visible", not "seven rows".
+    const uiMeta = {
+      'io.modelcontextprotocol/clientCapabilities': {
+        extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } },
+      },
+    };
+    type Listed = { name: string; _meta?: { ui?: { visibility?: string[] } } };
+
+    const portable = (await (await server.fetch(rpc('tools/list', { _meta: uiMeta }))).json()) as {
+      result: { tools: Listed[] };
     };
     const openai = (await (
-      await server.fetch(rpc('tools/list', {}, { path: '/openai' }))
-    ).json()) as { result: { tools: { name: string }[] } };
+      await server.fetch(rpc('tools/list', { _meta: uiMeta }, { path: '/openai' }))
+    ).json()) as { result: { tools: Listed[] } };
 
-    const portableNames = portable.result.tools.map((tool) => tool.name);
-    const openaiNames = openai.result.tools.map((tool) => tool.name);
+    const modelVisible = (tools: Listed[]): string[] =>
+      tools
+        .filter((tool) => tool._meta?.ui?.visibility?.includes('model') !== false)
+        .map((tool) => tool.name);
+
+    const portableNames = modelVisible(portable.result.tools);
+    const openaiNames = modelVisible(openai.result.tools);
 
     expect(portableNames).toHaveLength(7);
     expect(openaiNames).toHaveLength(7);
@@ -99,6 +117,32 @@ describe('stateless streamable HTTP', () => {
       expect(names).not.toContain('manage');
       expect(names).not.toContain('synthesize');
     }
+
+    // The panel's carrier: a host preloads the view from a tool the model can
+    // call, and `manage` is app-only by construction.
+    const brain = portable.result.tools.find((tool) => tool.name === 'brain');
+    expect((brain?._meta?.ui as { resourceUri?: string } | undefined)?.resourceUri).toBe(
+      'ui://brainz/panel',
+    );
+  });
+
+  test('a client without the ui extension sees manage as an ordinary eighth name', async () => {
+    // The roadmap's stated fallback cost, asserted rather than assumed. The
+    // replacement control is not the listing — it is the confirm gate, which
+    // `test/mcp/manage.test.ts` walks.
+    const body = (await (await server.fetch(rpc('tools/list', {}))).json()) as {
+      result: { tools: { name: string; _meta?: unknown }[] };
+    };
+    const names = body.result.tools.map((tool) => tool.name);
+    expect(names).toHaveLength(8);
+    expect(names).toContain('manage');
+    expect(body.result.tools.find((tool) => tool.name === 'manage')?._meta).toBeUndefined();
+
+    const openai = (await (
+      await server.fetch(rpc('tools/list', {}, { path: '/openai' }))
+    ).json()) as { result: { tools: { name: string }[] } };
+    // `/openai` never dispatches it, so it is never listed there either.
+    expect(openai.result.tools.map((tool) => tool.name)).not.toContain('manage');
   });
 
   test('every advertised tool ships a schema and annotations on the wire', async () => {

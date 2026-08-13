@@ -191,11 +191,16 @@ describe('the advertised surface', () => {
     expect(result.error?.code).toBe('unknown_tool');
   });
 
-  test('a hidden tool is dispatchable, not unknown — but refused without its nonce', async () => {
+  test('manage is dispatchable, not unknown — and a client that declared nothing gets refused', async () => {
+    // U14's fallback row, and the one a caller reaches by default: a request
+    // that declared no client capabilities can neither hold a panel nonce (only
+    // mintable on a ui-capable `resources/read`) nor be asked to confirm, so
+    // the gate refuses and hands over the web app. `test/mcp/manage.test.ts`
+    // walks the other two rows.
     const result = await fixture.call('manage', { action: 'set_spend_cap', value: '100' });
     expect(result.ok).toBe(false);
-    expect(result.error?.code).toBe('invalid_params');
-    expect(result.error?.message).toMatch(/nonce/i);
+    expect(result.error?.code).toBe('scope_denied');
+    expect(result.error?.message).toMatch(/app\.brainz\.test\/manage\/set_spend_cap/);
   });
 
   test('synthesize is dispatchable and answers unavailable with a suggestion', async () => {

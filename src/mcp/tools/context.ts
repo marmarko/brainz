@@ -19,10 +19,12 @@ import type { SQL } from 'bun';
 import type { ModelGateway } from '../../ai/gateway.ts';
 import type { CallerIdentity } from '../../control/secrets.ts';
 import type { Grant } from '../../core/search/fence.ts';
+import type { PauseAuthority } from '../../ingest/pause.ts';
 import type { ResultClass } from '../access-log.ts';
 import { demarcateIfExternal } from '../demarcation.ts';
 import type { Degraded, IndexState, NextCall, SetupHint } from '../envelope.ts';
 import type { Record_ } from '../reads.ts';
+import type { SettingsPort } from '../settings.ts';
 import type { Endpoint } from './index.ts';
 
 export interface ToolContext {
@@ -53,6 +55,28 @@ export interface ToolContext {
   /** True when this request paid for the tenant's wake. */
   readonly coldStart: boolean;
   readonly endpoint: Endpoint;
+  /**
+   * Where a `manage` action lands, bound to this tenant by dispatch (U14).
+   *
+   * `null` when the fleet wired no settings backend, and the handler answers
+   * `unavailable` rather than reporting a change it did not make. A port rather
+   * than a connection because the two stores live in two databases and a
+   * handler may reach neither: `test/mcp/guards.test.ts` fails a handler that
+   * writes SQL, which is the structural form of "the boundary sits below the
+   * handlers".
+   */
+  readonly settings: SettingsPort | null;
+  /**
+   * How this call was authorised beyond the credential.
+   *
+   * `panel` for a call carrying a short-TTL panel nonce, `agent_confirmed` for
+   * one the connected agent made and the user approved through an elicitation.
+   * Recorded rather than flattened because R12a's whole point is that those are
+   * different events — and neither is `user_out_of_band`.
+   */
+  readonly authority: PauseAuthority;
+  /** The origin a web-app deep link points at. */
+  readonly webAppBaseUrl: string;
   /**
    * What the substrate holds, counted lazily and memoised per request.
    *

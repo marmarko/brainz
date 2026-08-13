@@ -1421,6 +1421,11 @@ const CONTENT_BEARING_SQL: readonly ContentBearingEntry[] = [
     because:
       "the deletion-handle rung adds one column to the tenant's own `attachment` table, and a provider's id for a provider's object is content in the same sense `occurred_at` is: the sender chose it, it decides nothing about access, and it names a file inside one tenant's own database; the control plane holds ids, counters, timestamps, tier and connection-string references, and a Drive file id is none of those",
   },
+  {
+    path: 'schema/migrations/v7-panel-settings.sql',
+    because:
+      "U14's panel-settings rung holds no user content: a policy name from a closed set, a connector name from a closed set, a timestamp, and which surface authorised a pause. It is named here rather than exempted for the reason rung 4 gives — a file that happens to be content-free today is exactly the one a later column gets added to — and it lives in the tenant rather than the control plane because a user's own preference is theirs, and the spend cap, which genuinely is a control-plane counter, stays on the control-plane row where it already was",
+  },
 ];
 
 const CONTROL_PREFIX = 'control/';

@@ -117,6 +117,13 @@ const EXPECTED_TABLES: ReadonlyMap<string, TableClass> = new Map([
   // nothing about anybody's content. A fence over a bookmark would be a second
   // copy of a fence that already holds on every row the bookmark points at.
   ['briefing_cursor', 'operational'],
+
+  // U14's rung. One table, no origin column and no origin trigger: it names a
+  // connector source, a moment, and which surface authorised the pause. It
+  // asserts nothing about anybody's content, and the thing it does assert — the
+  // authorising channel — is the R12a distinction `review_queue.closed_by`
+  // makes one table over, kept rather than flattened into "the user".
+  ['source_pause', 'operational'],
 ]);
 
 const SHARED_ORIGIN_TRIGGER_FUNCTION = 'refuse_origin_change';
@@ -296,9 +303,23 @@ describe('R15 — origin and subject, on every content row, enumerated', () => {
       const originColumns = columns.filter(
         (c) => c.column === 'origin_context' || c.column === 'origin_contexts',
       );
+
       // A vacuous scan would report a clean sheet for a schema with no fences at
-      // all, which is exactly the failure the enumeration exists to catch.
-      expect(originColumns.length).toBeGreaterThanOrEqual(EXPECTED_TABLES.size / 2);
+      // all, which is exactly the failure the enumeration exists to catch. The
+      // floor is stated against the tables that are *supposed* to carry a fence
+      // — every table this file classes `content:*` — rather than as a fraction
+      // of the whole catalog. The fraction was a proxy for the same thing and it
+      // drifts: adding one deliberately origin-free table (U14's `source_pause`)
+      // moved the denominator and nearly failed a schema in which nothing had
+      // changed about origins at all. This form cannot drift, and it is
+      // strictly stronger: it names which tables must appear, not how many.
+      const mustBeFenced = [...EXPECTED_TABLES]
+        .filter(([, klass]) => klass.startsWith('content:'))
+        .map(([table]) => table)
+        .sort();
+      expect(mustBeFenced.length).toBeGreaterThanOrEqual(8);
+      const fenced = new Set(originColumns.map((c) => c.table));
+      expect([...mustBeFenced].filter((table) => !fenced.has(table))).toEqual([]);
 
       for (const column of originColumns) {
         const guarding = triggers.filter(

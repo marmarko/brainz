@@ -367,6 +367,16 @@ export function connectorGateQueue(
  * `already_open` is the queue's own answer, from the unique index, not a check
  * here: a caller-side "is one already running" is a check that ran before the
  * value it protects was used.
+ *
+ * **`paused` is checked before the cadence, and it is what makes U14's
+ * `pause_source` a fact rather than a setting.** The caller supplies it — read
+ * from `source_pause` via `readPausedSources` — rather than this function
+ * opening the tenant database, because the scheduler already holds a connection
+ * and reads every tenant's pause set once per sweep rather than once per source.
+ * A user who paused their mailbox and watched it keep pulling would be right to
+ * conclude the button does nothing, so this refusal is named in the outcome
+ * rather than folded into `not_due`, which would make a pause look like a
+ * cadence that had not come round yet.
  */
 export async function enqueuePullIfDue(
   queue: JobQueue,
@@ -375,8 +385,13 @@ export async function enqueuePullIfDue(
     readonly state: ConnectorState;
     readonly now: Date;
     readonly trigger?: JobTrigger;
+    /** True when U14's `source_pause` holds a row for this source. */
+    readonly paused?: boolean;
   },
-): Promise<EnqueueOutcome | { readonly enqueued: false; readonly reason: 'not_due' }> {
+): Promise<
+  EnqueueOutcome | { readonly enqueued: false; readonly reason: 'not_due' | 'paused' }
+> {
+  if (request.paused === true) return { enqueued: false, reason: 'paused' };
   if (!isPullDue(request.state, request.now)) return { enqueued: false, reason: 'not_due' };
   return queue.enqueue({
     tenantId: request.tenantId,

@@ -49,6 +49,7 @@ export const MIGRATIONS: readonly TenantMigration[] = [
   { version: 4, name: 'briefing-cursor', file: 'migrations/v4-briefing.sql' },
   { version: 5, name: 'page-occurred-at', file: 'migrations/v5-occurred-at.sql' },
   { version: 6, name: 'attachment-external-ref', file: 'migrations/v6-attachment-external-ref.sql' },
+  { version: 7, name: 'panel-settings', file: 'migrations/v7-panel-settings.sql' },
 ];
 
 /** The version this code applies to a fresh tenant, derived rather than typed twice. */

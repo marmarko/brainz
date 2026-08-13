@@ -1,0 +1,508 @@
+/**
+ * U14 — `manage`, and the three ways a call is authorised or refused.
+ *
+ * **The shape of every test here.** `manage` is the one tool on this surface
+ * that changes something, on a connection that also carries ingested
+ * third-party content. So each case asserts two things and not one: the typed
+ * outcome, *and* the store re-read straight out of Postgres. A gate that
+ * returns the right error while the write already happened is the failure this
+ * file exists to catch, and asserting only the error code cannot see it.
+ *
+ * The stores are read with plain SQL rather than through the settings port, on
+ * purpose: a port that both writes and reports is a port that can agree with
+ * itself about a write that never landed.
+ */
+
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+
+import { NO_CLIENT_CAPABILITIES } from '../../src/mcp/client-capabilities.ts';
+import { deepLinkFor, MANAGE_ACTIONS } from '../../src/mcp/panel.ts';
+import { PANEL_NONCE_TTL_MS } from '../../src/mcp/panel-token.ts';
+import { PANEL_RESOURCE_URI } from '../../src/mcp/panel.ts';
+import { readResource } from '../../src/mcp/resources.ts';
+import { createMcpFixture, type McpFixture } from './fixture.ts';
+
+const PANEL_CLIENT = { ui: true, elicitation: false } as const;
+const ELICITING_CLIENT = { ui: false, elicitation: true } as const;
+
+let fixture: McpFixture;
+
+/** The three stores, read directly. */
+async function stores(): Promise<{
+  spendCap: number | null;
+  contextPolicy: string | null;
+  paused: Array<{ source: string; by: string }>;
+}> {
+  const capRows = (await fixture.controlSql`
+    SELECT spend_cap_micro_usd::bigint AS cap FROM control.tenant WHERE tenant_id = ${fixture.tenantId}
+  `) as Array<{ cap: string | number | null }>;
+  const policyRows = (await fixture.sql`
+    SELECT context_policy FROM tenant_setting
+  `) as Array<{ context_policy: string | null }>;
+  const pausedRows = (await fixture.sql`
+    SELECT source, paused_by FROM source_pause ORDER BY source
+  `) as Array<{ source: string; paused_by: string }>;
+
+  const cap = capRows[0]?.cap;
+  return {
+    spendCap: cap === null || cap === undefined ? null : Number(cap),
+    contextPolicy: policyRows[0]?.context_policy ?? null,
+    paused: pausedRows.map((row) => ({ source: row.source, by: row.paused_by })),
+  };
+}
+
+async function mintNonce(): Promise<string> {
+  const result = await readResource(fixture.deps, {
+    authorization: `Bearer ${fixture.bearer}`,
+    uri: PANEL_RESOURCE_URI,
+    clientCapabilities: PANEL_CLIENT,
+  });
+  const nonce = result.meta?.['brainz.app/panel_nonce'];
+  if (typeof nonce !== 'string') throw new Error('resources/read minted no nonce');
+  return nonce;
+}
+
+beforeAll(async () => {
+  fixture = await createMcpFixture('manage_gate');
+});
+
+afterAll(async () => {
+  await fixture.close();
+});
+
+beforeEach(async () => {
+  await fixture.sql`DELETE FROM source_pause`;
+  await fixture.sql`UPDATE tenant_setting SET context_policy = NULL`;
+  await fixture.controlSql`
+    UPDATE control.tenant SET spend_cap_micro_usd = NULL WHERE tenant_id = ${fixture.tenantId}
+  `;
+});
+
+describe('the panel branch — a nonce, and nothing else', () => {
+  test('a nonce from resources/read applies the change', async () => {
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail', panel_nonce: await mintNonce() },
+      { capabilities: PANEL_CLIENT },
+    );
+
+    expect(result.ok).toBe(true);
+    expect((result.content as { applied: boolean }).applied).toBe(true);
+    expect((await stores()).paused).toEqual([{ source: 'gmail', by: 'panel' }]);
+  });
+
+  test('a model calling manage with no nonce is refused, and writes nothing', async () => {
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      { capabilities: PANEL_CLIENT },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe('invalid_params');
+    expect((await stores()).paused).toEqual([]);
+  });
+
+  test('a nonce past its TTL is refused, and writes nothing', async () => {
+    const nonce = await mintNonce();
+
+    // One millisecond inside the window still works, so the refusal below is
+    // about expiry rather than about the nonce never having been valid.
+    fixture.advance(PANEL_NONCE_TTL_MS - 1);
+    const inTime = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'calendar', panel_nonce: nonce },
+      { capabilities: PANEL_CLIENT },
+    );
+    expect(inTime.ok).toBe(true);
+
+    fixture.advance(2);
+    const expired = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'drive', panel_nonce: nonce },
+      { capabilities: PANEL_CLIENT },
+    );
+
+    expect(expired.ok).toBe(false);
+    expect(expired.error?.code).toBe('invalid_params');
+    expect((await stores()).paused.map((row) => row.source)).toEqual(['calendar']);
+  });
+
+  test('a nonce minted for another brain is refused, and writes nothing', async () => {
+    const other = await createMcpFixture('manage_gate_other', { tenantId: 't-manage-other' });
+    try {
+      const foreign = await readResource(other.deps, {
+        authorization: `Bearer ${other.bearer}`,
+        uri: PANEL_RESOURCE_URI,
+        clientCapabilities: PANEL_CLIENT,
+      });
+      const nonce = foreign.meta?.['brainz.app/panel_nonce'];
+      expect(typeof nonce).toBe('string');
+
+      const result = await fixture.call(
+        'manage',
+        { action: 'pause_source', value: 'gmail', panel_nonce: String(nonce) },
+        { capabilities: PANEL_CLIENT },
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.error?.code).toBe('invalid_params');
+      expect((await stores()).paused).toEqual([]);
+    } finally {
+      await other.close();
+    }
+  });
+
+  test('elicitation never substitutes for a nonce on a panel-capable client', async () => {
+    // The precedence rule: a host that can render a panel must produce a panel
+    // credential. Answering a confirmation instead would let the model reach a
+    // gate that was never about confirmation.
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      {
+        capabilities: { ui: true, elicitation: true },
+        resume: { inputResponses: { confirm: true } },
+      },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.inputRequired).toBeUndefined();
+    expect((await stores()).paused).toEqual([]);
+  });
+
+  test('the panel branch is where set_context_policy still lives', async () => {
+    const result = await fixture.call(
+      'manage',
+      { action: 'set_context_policy', value: 'personal_only', panel_nonce: await mintNonce() },
+      { capabilities: PANEL_CLIENT },
+    );
+
+    expect(result.ok).toBe(true);
+    expect((await stores()).contextPolicy).toBe('personal_only');
+  });
+});
+
+describe('the fallback branch — confirm, or refuse', () => {
+  test('without elicitation, manage refuses and hands over the deep link', async () => {
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      { capabilities: NO_CLIENT_CAPABILITIES },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe('scope_denied');
+    expect(result.error?.message).toContain(deepLinkFor('pause_source', 'https://app.brainz.test'));
+    expect(result.inputRequired).toBeUndefined();
+    expect((await stores()).paused).toEqual([]);
+  });
+
+  test('without elicitation, answering a confirmation that was never asked changes nothing', async () => {
+    // The fail-closed half. A host that cannot elicit could still *claim* an
+    // answer; the gate must key on the capability, not on the answer.
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      {
+        capabilities: NO_CLIENT_CAPABILITIES,
+        resume: { inputResponses: { confirm: true } },
+      },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe('scope_denied');
+    expect((await stores()).paused).toEqual([]);
+  });
+
+  test('with elicitation, the first call asks and does not act', async () => {
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      { capabilities: ELICITING_CLIENT },
+    );
+
+    expect(result.inputRequired?.inputRequests.confirm?.type).toBe('elicitation');
+    expect(typeof result.inputRequired?.requestState).toBe('string');
+    expect((await stores()).paused).toEqual([]);
+  });
+
+  test('the echoed requestState plus a yes applies it, recorded as agent-confirmed', async () => {
+    const asked = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      { capabilities: ELICITING_CLIENT },
+    );
+    const requestState = asked.inputRequired?.requestState ?? '';
+
+    const applied = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      {
+        capabilities: ELICITING_CLIENT,
+        resume: { requestState, inputResponses: { confirm: true } },
+      },
+    );
+
+    expect(applied.ok).toBe(true);
+    // Never `user_out_of_band`: the agent issued this call and the user waved
+    // it through inside an agent-driven turn. R12a's distinction survives.
+    expect((await stores()).paused).toEqual([{ source: 'gmail', by: 'agent_confirmed' }]);
+  });
+
+  test('a no is a no', async () => {
+    const asked = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      { capabilities: ELICITING_CLIENT },
+    );
+
+    const declined = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      {
+        capabilities: ELICITING_CLIENT,
+        resume: {
+          requestState: asked.inputRequired?.requestState ?? '',
+          inputResponses: { confirm: false },
+        },
+      },
+    );
+
+    expect(declined.ok).toBe(false);
+    expect((await stores()).paused).toEqual([]);
+  });
+
+  test('the confirmed change is the one that happens — a swapped retry changes nothing', async () => {
+    const asked = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      { capabilities: ELICITING_CLIENT },
+    );
+
+    const swapped = await fixture.call(
+      'manage',
+      { action: 'set_spend_cap', value: '0' },
+      {
+        capabilities: ELICITING_CLIENT,
+        resume: {
+          requestState: asked.inputRequired?.requestState ?? '',
+          inputResponses: { confirm: true },
+        },
+      },
+    );
+
+    expect(swapped.ok).toBe(false);
+    const after = await stores();
+    expect(after.spendCap).toBeNull();
+    expect(after.paused).toEqual([]);
+  });
+
+  test('a requestState past its TTL is refused, and writes nothing', async () => {
+    const asked = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      { capabilities: ELICITING_CLIENT },
+    );
+
+    fixture.advance(PANEL_NONCE_TTL_MS + 1);
+    const stale = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      {
+        capabilities: ELICITING_CLIENT,
+        resume: {
+          requestState: asked.inputRequired?.requestState ?? '',
+          inputResponses: { confirm: true },
+        },
+      },
+    );
+
+    expect(stale.ok).toBe(false);
+    expect((await stores()).paused).toEqual([]);
+  });
+
+  test('a forged requestState is refused, and writes nothing', async () => {
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail' },
+      {
+        capabilities: ELICITING_CLIENT,
+        resume: { requestState: 'not.a.token', inputResponses: { confirm: true } },
+      },
+    );
+
+    expect(result.ok).toBe(false);
+    expect((await stores()).paused).toEqual([]);
+  });
+
+  test('set_context_policy is web-app-only here, even with a yes in hand', async () => {
+    const asked = await fixture.call(
+      'manage',
+      { action: 'set_context_policy', value: 'personal_only' },
+      { capabilities: ELICITING_CLIENT },
+    );
+
+    expect(asked.ok).toBe(false);
+    expect(asked.inputRequired).toBeUndefined();
+    expect(asked.error?.code).toBe('scope_denied');
+    expect(asked.error?.message).toContain(
+      deepLinkFor('set_context_policy', 'https://app.brainz.test'),
+    );
+    expect((await stores()).contextPolicy).toBeNull();
+  });
+
+  test('a panel nonce is not a substitute for a confirmation on a panel-less client', async () => {
+    // The nonce could only have come from a ui-capable request. Presenting one
+    // on a client that declares no ui is either a replay or a leak, and either
+    // way it is not this branch's credential — so the call is asked about, not
+    // waved through.
+    const nonce = await mintNonce();
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail', panel_nonce: nonce },
+      { capabilities: ELICITING_CLIENT },
+    );
+
+    expect(result.inputRequired).toBeDefined();
+    expect((result.content as { applied?: boolean }).applied).toBeUndefined();
+    expect((await stores()).paused).toEqual([]);
+  });
+});
+
+describe('the actions do what they say', () => {
+  test('set_spend_cap lands on the column the first-import gate reads', async () => {
+    const result = await fixture.call(
+      'manage',
+      { action: 'set_spend_cap', value: '2500000', panel_nonce: await mintNonce() },
+      { capabilities: PANEL_CLIENT },
+    );
+
+    expect(result.ok).toBe(true);
+    expect((await stores()).spendCap).toBe(2_500_000);
+  });
+
+  test('resume_source removes the pause rather than recording a second state', async () => {
+    await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail', panel_nonce: await mintNonce() },
+      { capabilities: PANEL_CLIENT },
+    );
+    const resumed = await fixture.call(
+      'manage',
+      { action: 'resume_source', value: 'gmail', panel_nonce: await mintNonce() },
+      { capabilities: PANEL_CLIENT },
+    );
+
+    expect(resumed.ok).toBe(true);
+    expect((await stores()).paused).toEqual([]);
+  });
+
+  test('a value outside the closed set is refused before it reaches a store', async () => {
+    for (const [action, value] of [
+      ['pause_source', 'not-a-connector'],
+      ['set_context_policy', 'whatever-i-like'],
+      ['set_spend_cap', 'a lot'],
+      ['set_spend_cap', '-1'],
+    ] as const) {
+      const result = await fixture.call(
+        'manage',
+        { action, value, panel_nonce: await mintNonce() },
+        { capabilities: PANEL_CLIENT },
+      );
+      expect(`${action}=${value}: ${result.ok}`).toBe(`${action}=${value}: false`);
+    }
+
+    const after = await stores();
+    expect(after.paused).toEqual([]);
+    expect(after.contextPolicy).toBeNull();
+    expect(after.spendCap).toBeNull();
+  });
+
+  test('an unknown action is refused whatever credential it carries', async () => {
+    const result = await fixture.call(
+      'manage',
+      { action: 'close_review', value: '1', panel_nonce: await mintNonce() },
+      { capabilities: PANEL_CLIENT },
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe('invalid_params');
+  });
+});
+
+describe('R12a — the review queue has no close on this surface, by ruling', () => {
+  test('the declared enum contains no review action', () => {
+    const actions = MANAGE_ACTIONS.map((entry) => entry.action);
+    expect(actions).toEqual([
+      'set_context_policy',
+      'set_spend_cap',
+      'pause_source',
+      'resume_source',
+    ]);
+    for (const action of actions) {
+      expect(`${action} mentions review: ${action.includes('review')}`).toBe(
+        `${action} mentions review: false`,
+      );
+    }
+  });
+
+  test('an open entry stays open no matter what manage is asked to do', async () => {
+    await fixture.sql`
+      INSERT INTO review_queue (kind, target_ref, proposal, confidence, origin_contexts)
+      VALUES ('entity_merge', 'entity:u14', 'merge these two', 0.6, ARRAY['personal:mail'])
+    `;
+
+    const nonce = await mintNonce();
+    for (const action of ['close_review', 'apply_review', 'set_context_policy']) {
+      await fixture.call(
+        'manage',
+        { action, value: 'entity:u14', panel_nonce: nonce },
+        { capabilities: PANEL_CLIENT },
+      );
+    }
+
+    const rows = (await fixture.sql`
+      SELECT state, closed_by FROM review_queue WHERE target_ref = 'entity:u14'
+    `) as Array<{ state: string; closed_by: string | null }>;
+    expect(rows[0]?.state).toBe('open');
+    expect(rows[0]?.closed_by).toBeNull();
+
+    await fixture.sql`DELETE FROM review_queue WHERE target_ref = 'entity:u14'`;
+  });
+
+  test('the schema still refuses agent_mcp, so the ruling is not the only thing holding', async () => {
+    let sqlstate = 'none';
+    try {
+      await fixture.sql.unsafe(`
+        INSERT INTO review_queue (kind, target_ref, proposal, confidence, state, closed_by, closed_at, origin_contexts)
+        VALUES ('entity_merge', 'entity:u14b', 'merge', 0.6, 'applied', 'agent_mcp', now(), ARRAY['personal:mail'])
+      `);
+    } catch (error) {
+      sqlstate = String((error as { errno?: string; code?: string }).errno ?? (error as { code?: string }).code ?? '');
+    }
+    expect(sqlstate).toBe('23514');
+  });
+});
+
+describe('the text twin is reachable without a panel', () => {
+  test('brain carries the management block, its values, and the deep link', async () => {
+    await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail', panel_nonce: await mintNonce() },
+      { capabilities: PANEL_CLIENT },
+    );
+
+    const result = await fixture.call('brain', {}, { capabilities: NO_CLIENT_CAPABILITIES });
+    const management = (result.content as { management?: Record<string, unknown> }).management;
+    expect(management).toBeDefined();
+    expect((management as { paused_sources: string[] }).paused_sources).toEqual(['gmail']);
+
+    const serialised = JSON.stringify(management);
+    for (const action of MANAGE_ACTIONS) {
+      expect(`${action.action} in brain: ${serialised.includes(action.action)}`).toBe(
+        `${action.action} in brain: true`,
+      );
+    }
+    expect(serialised).toContain('https://app.brainz.test');
+  });
+});

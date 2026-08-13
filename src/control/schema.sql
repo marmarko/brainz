@@ -505,3 +505,56 @@ CREATE INDEX job_reclaimable
 CREATE INDEX job_dead_letters
   ON control.job (tenant_id, kind, target)
   WHERE state = 'dead'::control.job_state;
+
+-- ===========================================================================
+-- Per-tenant feature flags (U19; the mechanism P13 asks for, P6 places here).
+--
+-- Without them a new chunker or a revised extractor prompt can only ship
+-- all-at-once across every isolated project — no canary, no staged rollout, no
+-- way to compare. `gap.per-tenant-feature-flags` in the concepts ledger has said
+-- so since U1, and named this table's absence as the gap.
+--
+-- **Why it is content-free even though it stages user-visible changes.** A flag
+-- is a name from a committed registry (`src/control/flags.ts`) and a stage from
+-- a three-value enum. The *change record* the flag stages — headline, what
+-- changed, what you can do — is a fleet-wide committed file under
+-- `upstream/changes/`, identical for every tenant. And the half that names a
+-- tenant's own memory ("41 of your pages still hold the old chunking, including
+-- …") is rendered from the tenant's own database at read time and stored
+-- nowhere. Three parts, three homes, and the only one that could carry a user's
+-- words is the one that never lands in a database at all.
+--
+-- The alphabet is the same control this file applies to every textual column:
+-- a flag name cannot be a sentence, so a "flag" carrying a note is unstorable.
+-- ===========================================================================
+
+CREATE DOMAIN control.feature_flag AS varchar(64)
+  CONSTRAINT feature_flag_is_a_slug
+  CHECK (VALUE ~ '^[a-z][a-z0-9_]{0,63}$');
+
+-- `off` is the absence of the change for this tenant; `canary` is the staged
+-- cohort; `on` is the fleet default once it has been rolled out. Three values
+-- rather than a boolean because a canary a user cannot distinguish from the
+-- general release cannot tell them they are early, and P13's channel is a
+-- consent surface before it is a rollout mechanism.
+CREATE TYPE control.flag_stage AS ENUM ('off', 'canary', 'on');
+
+CREATE TABLE control.tenant_flag (
+  tenant_id  control.tenant_id     NOT NULL,
+  flag       control.feature_flag  NOT NULL,
+  stage      control.flag_stage    NOT NULL DEFAULT 'off',
+  set_at     timestamptz           NOT NULL DEFAULT now(),
+
+  CONSTRAINT tenant_flag_pkey PRIMARY KEY (tenant_id, flag),
+
+  -- A flag outlives nothing. U17's erasure takes the tenant's staging state with
+  -- the tenant, rather than leaving rows naming an id no connection string
+  -- reaches.
+  CONSTRAINT tenant_flag_belongs_to_a_tenant FOREIGN KEY (tenant_id)
+    REFERENCES control.tenant (tenant_id) ON DELETE CASCADE
+);
+
+-- "Who is in the canary cohort for this flag" — the query a staged rollout is
+-- steered by, and the one an operator asks before widening it.
+CREATE INDEX tenant_flag_by_stage
+  ON control.tenant_flag (flag, stage);

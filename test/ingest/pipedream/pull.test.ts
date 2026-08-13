@@ -33,6 +33,7 @@ import {
   type ConnectorStateStore,
 } from '../../../src/ingest/cursor.ts';
 import { sourceStaleness } from '../../../src/ingest/log.ts';
+import { pauseSource, readPausedSources, resumeSource } from '../../../src/ingest/pause.ts';
 import {
   createIngestPullHandler,
   enqueuePullIfDue,
@@ -590,6 +591,59 @@ describe('cadence rides U10, and does not enqueue twice', () => {
     });
     expect(again.enqueued).toBe(false);
     if (!again.enqueued) expect(again.reason).toBe('already_open');
+  });
+
+  test('a paused source does not enqueue, and says so rather than looking not-due', async () => {
+    // U14's `pause_source` is a setting until something reads it, and this is
+    // the read. The source below is *due* — so a `paused` refusal here cannot be
+    // the cadence answering, which is the whole point of the two states being
+    // named separately: a user who paused their mailbox and watched it keep
+    // pulling would be right to conclude the button does nothing, and a pause
+    // reported as `not_due` looks exactly like a cadence that has not come round.
+    const state = stateFor('drive', { lastPullAt: NOW.toISOString(), cadenceSeconds: 300 });
+    const due = new Date(NOW.getTime() + 600_000);
+
+    const paused = await enqueuePullIfDue(fixture.queue, {
+      tenantId: TENANT,
+      state,
+      now: due,
+      paused: true,
+    });
+    expect(paused.enqueued).toBe(false);
+    if (!paused.enqueued) expect(paused.reason).toBe('paused');
+
+    // And the same call without the pause enqueues, so the refusal above is the
+    // pause rather than anything else about this source.
+    const resumed = await enqueuePullIfDue(fixture.queue, {
+      tenantId: TENANT,
+      state,
+      now: due,
+      paused: false,
+    });
+    expect(resumed.enqueued).toBe(true);
+  });
+});
+
+describe('the pause set is read from the tenant, not assumed', () => {
+  test('manage’s row is what the pull path reads back', async () => {
+    // The other half of the seam: `readPausedSources` over rung 7's table is
+    // what a scheduler passes to `enqueuePullIfDue`. Asserted against a real
+    // tenant database rather than a stub, because "the row exists" and "the
+    // reader finds it" are two claims and only the second one matters here.
+    expect(await readPausedSources(fixture.tenantSql)).toEqual([]);
+
+    await pauseSource(fixture.tenantSql, 'gmail', 'panel');
+    expect(await readPausedSources(fixture.tenantSql)).toEqual(['gmail']);
+
+    // Idempotent, and the second authority does not relabel the first.
+    await pauseSource(fixture.tenantSql, 'gmail', 'agent_confirmed');
+    const rows = (await fixture.tenantSql`
+      SELECT paused_by FROM source_pause WHERE source = 'gmail'
+    `) as Array<{ paused_by: string }>;
+    expect(rows[0]?.paused_by).toBe('panel');
+
+    await resumeSource(fixture.tenantSql, 'gmail');
+    expect(await readPausedSources(fixture.tenantSql)).toEqual([]);
   });
 });
 

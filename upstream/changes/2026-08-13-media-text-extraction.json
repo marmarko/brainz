@@ -1,0 +1,10 @@
+{
+  "id": "2026-08-13-media-text-extraction",
+  "released_on": "2026-08-13",
+  "flag": "media_ocr",
+  "headline": "Screenshots and PDFs are now findable by the words inside them.",
+  "what_changed": "Images and PDFs used to arrive as files your brain could name but not read, so a screenshot of a receipt was findable by its filename and nothing else. They are now read for their text when they arrive, and that text is searchable like any other page. Files your brain cannot read yet say so, with the reason, instead of arriving silently empty.",
+  "what_it_did_to_your_memory": "Nothing already in your brain was rewritten. {count} page(s) have arrived since this shipped and were read this way, including: {examples}. Anything ingested before it is unchanged until you re-import it.",
+  "what_you_can_do": "Nothing, if you are happy with it. If you would rather your images were not read for text, this can be turned off for your brain and the pages already read stay as they are.",
+  "effect": { "probe": "pages_created_since" }
+}

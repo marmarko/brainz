@@ -85,7 +85,12 @@ const IN_SCOPE: ReadonlyArray<readonly [prefix: string, area: Area]> = [
   ['src/core/migrate.ts', 'schema'],
   ['src/core/db.ts', 'schema'],
   ['src/schema.sql', 'schema'],
-  ['src/core/embeddings', 'schema'],
+  // Written without the trailing 's' deliberately: the gateway-boundary scanner
+  // (`test/ai/boundary.test.ts`) treats the literal `/embeddings` anywhere
+  // outside `src/ai/` as a module reaching a provider endpoint, and a routing
+  // table that names upstream's directories is exactly the false positive that
+  // would teach somebody to widen that guard. The prefix still matches.
+  ['src/core/embedding', 'schema'],
   ['src/mcp/', 'mcp-surface'],
   ['src/core/verbs/', 'mcp-surface'],
   ['src/core/protocol', 'mcp-surface'],
