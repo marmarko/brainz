@@ -286,6 +286,52 @@ export function assembleBriefing(source: BriefingSource, options: BriefingOption
 // The SQL half.
 // ---------------------------------------------------------------------------
 
+/**
+ * When a meeting *is*, as opposed to when this brain heard about it.
+ *
+ * Rung 5's `page.occurred_at` is what every ingest path already computed and
+ * none of them persisted. It is NULL on every row written before that rung and
+ * on every source that asserts no event time, so the fallback is arrival — which
+ * is precisely the behaviour those rows have today, and the reason adding the
+ * column changed nothing that was already visible.
+ *
+ * **Spelled once.** Rung 5's index is declared on this exact expression; a lane
+ * that wrote it any other way would fall back to a sequential scan over every
+ * page the tenant owns, on the read that runs every morning.
+ */
+const OCCURRED_AT = 'coalesce(p.occurred_at, p.created_at)';
+
+/**
+ * Today's meetings — the one lane whose window is an event time.
+ *
+ * Exported, and it is the only statement in this file that is, because
+ * `test/briefing/assemble.test.ts` runs `EXPLAIN` over it to prove the window
+ * lands in the index condition rather than in a post-scan filter. A copy of the
+ * query inside the test would drift the moment this one did.
+ *
+ * The **delta** lanes below deliberately stay on `created_at`: "what changed
+ * since you last looked" is a question about arrival, and re-keying it onto
+ * occurrence would hide a meeting minuted this morning for a call held in March.
+ * Only this lane asks "what is happening now".
+ */
+export const MEETINGS_STATEMENT = `
+    SELECT p.page_id::text AS page_id, p.title, p.source_type, p.origin_context, p.created_at,
+           coalesce(substring(string_agg(c.content, ' ' ORDER BY c.ordinal) for 600), '') AS body
+      FROM page p
+      LEFT JOIN chunk c ON c.page_id = p.page_id AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
+        AND c.origin_context = ANY($1::text[])
+     WHERE p.deleted_at IS NULL
+       AND p.quarantined_at IS NULL
+       AND p.stale_at IS NULL
+       AND p.source_type = 'calendar'
+       AND p.origin_context = ANY($1::text[])
+       AND ${OCCURRED_AT} >= $2::timestamptz
+       AND ${OCCURRED_AT} < $3::timestamptz
+       AND ($4::text IS NULL OR p.title ILIKE '%' || $4 || '%' OR c.content ILIKE '%' || $4 || '%')
+     GROUP BY p.page_id, p.title, p.source_type, p.origin_context, p.created_at
+     ORDER BY ${OCCURRED_AT} DESC
+     LIMIT ${SECTION_LIMIT}`;
+
 interface PageRow {
   readonly page_id: string;
   readonly title: string | null;
@@ -354,25 +400,12 @@ export async function collectBriefing(
     at: run === undefined ? null : isoOf(run.finished_at),
   };
 
-  const meetingRows = (await sql.unsafe(
-    `SELECT p.page_id::text AS page_id, p.title, p.source_type, p.origin_context, p.created_at,
-            coalesce(substring(string_agg(c.content, ' ' ORDER BY c.ordinal) for 600), '') AS body
-       FROM page p
-       LEFT JOIN chunk c ON c.page_id = p.page_id AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
-         AND c.origin_context = ANY($1::text[])
-      WHERE p.deleted_at IS NULL
-        AND p.quarantined_at IS NULL
-        AND p.stale_at IS NULL
-        AND p.source_type = 'calendar'
-        AND p.origin_context = ANY($1::text[])
-        AND p.created_at >= $2::timestamptz
-        AND p.created_at < $3::timestamptz
-        AND ($4::text IS NULL OR p.title ILIKE '%' || $4 || '%' OR c.content ILIKE '%' || $4 || '%')
-      GROUP BY p.page_id, p.title, p.source_type, p.origin_context, p.created_at
-      ORDER BY p.created_at DESC
-      LIMIT ${SECTION_LIMIT}`,
-    [grantLiteral, options.since, options.until, focus],
-  )) as PageRow[];
+  const meetingRows = (await sql.unsafe(MEETINGS_STATEMENT, [
+    grantLiteral,
+    options.since,
+    options.until,
+    focus,
+  ])) as PageRow[];
 
   const participants = await readParticipants(
     sql,

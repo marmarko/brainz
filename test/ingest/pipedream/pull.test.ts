@@ -296,6 +296,34 @@ describe('update and tombstone semantics', () => {
     expect(live[0]?.content_sha256).toBe(contentDigest('subject e-old', corrected));
   });
 
+  test('the event time the adapter computed reaches the page, not the pull time', async () => {
+    // `occurredAt` was computed on every pull from the first day and persisted
+    // nowhere, so the briefing's "today's meetings" was really "meetings that
+    // arrived today" — a call at 10:00 today that synced last night was absent
+    // from this morning's briefing. Asserted against the *column*, because the
+    // adapter has always produced this value and only the write is new.
+    const starts = new Date('2026-08-20T15:30:00.000Z');
+    const ref = externalRefFor('calendar', 'e-future');
+    const states = await storeWith(stateFor('calendar'));
+    const source = createFakeSource('calendar', 'calendar', [
+      page({
+        items: [item('calendar', 'e-future', mailBody('quarterly planning'), starts)],
+        nextCursor: { kind: 'delta', value: 'sync-occ' },
+      }),
+    ]);
+
+    const outcome = await pull(source, states, { window: 'all' });
+    expect(outcome.counts.written).toBe(1);
+
+    const rows = (await fixture.tenantSql`
+      SELECT occurred_at, created_at FROM page
+       WHERE external_ref = ${ref} AND deleted_at IS NULL
+    `) as Array<{ occurred_at: Date | null; created_at: Date }>;
+    expect(rows[0]?.occurred_at?.toISOString()).toBe(starts.toISOString());
+    // The two must differ, or this fixture cannot tell the columns apart.
+    expect(rows[0]?.created_at.toISOString()).not.toBe(starts.toISOString());
+  });
+
   test('a tombstone for an item this brain never held is not an error', async () => {
     const states = await storeWith(stateFor('calendar'));
     const source = createFakeSource('calendar', 'calendar', [

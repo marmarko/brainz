@@ -203,6 +203,20 @@ describe('an approved import', () => {
     // The whole difference between an importer and a bill.
     expect(fixture.transport.calls.length).toBe(before.calls);
   });
+
+  test('the item’s own event time reaches the page, not the import time', async () => {
+    // The export says these conversations happened on 2026-05-20; the import is
+    // running now. Every path already computed `occurredAt` — it bounded the
+    // import window — and then dropped it, which is what made the briefing's
+    // meetings lane a list of things that *arrived* today.
+    const rows = (await fixture.tenantSql`
+      SELECT occurred_at, created_at FROM page
+       WHERE external_ref = 'claude:conv-0' AND deleted_at IS NULL
+    `) as Array<{ occurred_at: Date | null; created_at: Date }>;
+    expect(rows[0]?.occurred_at?.toISOString()).toBe('2026-05-20T09:00:00.000Z');
+    // Different instants, or the fixture proves nothing about which one landed.
+    expect(rows[0]?.created_at.toISOString()).not.toBe('2026-05-20T09:00:00.000Z');
+  });
 });
 
 describe('a malformed conversation is logged and skipped', () => {

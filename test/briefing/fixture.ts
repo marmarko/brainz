@@ -40,16 +40,23 @@ async function insertPage(
     readonly title: string;
     readonly body: string;
     readonly createdAt: string;
+    /**
+     * When the thing happened, as a provider asserted it. Left out means the
+     * row predates rung 5 — which is what every page written before this
+     * migration looks like, so the fallback has a fixture.
+     */
+    readonly occurredAt?: string | null;
     readonly derivation?: string;
     readonly salience?: number | null;
     readonly staleAt?: string | null;
   },
 ): Promise<string> {
   const rows = (await sql`
-    INSERT INTO page (origin_context, source_type, title, created_at,
+    INSERT INTO page (origin_context, source_type, title, created_at, occurred_at,
                       embedding_model, embedding_dimensions, chunker_version, normalizer_version,
                       content_sha256, derivation, salience, salience_source, stale_at)
     VALUES (${input.origin}, ${input.sourceType}, ${input.title}, ${input.createdAt}::timestamptz,
+            ${input.occurredAt ?? null}::timestamptz,
             'fixture-model', ${EMBEDDING_DIMENSIONS}, 1, 1, ${'0'.repeat(64)},
             ${input.derivation ?? 'ingested'},
             ${input.salience ?? null},
@@ -145,6 +152,34 @@ export async function seedBrain(sql: SQL, at: string): Promise<SeededBrain> {
   if (factId === undefined) throw new Error('could not seed the fact');
 
   return { meetingPageId, notePageId, stalePageId, fencedPageId, entityId, factId };
+}
+
+/**
+ * One calendar page, with arrival and occurrence set independently.
+ *
+ * The two times are separate arguments and never defaulted to each other on
+ * purpose: a fixture where `occurred_at == created_at` on every row cannot tell
+ * a lane keyed on occurrence from one keyed on arrival, and the meetings lane
+ * was keyed on arrival for exactly as long as nobody had that fixture.
+ */
+export async function seedMeeting(
+  sql: SQL,
+  input: {
+    readonly origin: string;
+    readonly title: string;
+    readonly body: string;
+    readonly createdAt: string;
+    readonly occurredAt?: string | null;
+  },
+): Promise<string> {
+  return insertPage(sql, {
+    origin: input.origin,
+    sourceType: 'calendar',
+    title: input.title,
+    body: input.body,
+    createdAt: input.createdAt,
+    occurredAt: input.occurredAt ?? null,
+  });
 }
 
 export interface WarmOptions {

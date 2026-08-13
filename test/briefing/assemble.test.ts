@@ -26,7 +26,9 @@ import {
   briefing as assembleOverSql,
   collectBriefing,
   BRIEFING_NOT_INCLUDED,
+  MEETINGS_STATEMENT,
 } from '../../src/core/briefing/assemble.ts';
+import { textArrayLiteral } from '../../src/core/write/pg-values.ts';
 import { createMcpFixture, type McpFixture } from '../mcp/fixture.ts';
 import {
   CALENDAR,
@@ -35,6 +37,7 @@ import {
   contentCensus,
   recordRun,
   seedBrain,
+  seedMeeting,
   warmLayer,
   type SeededBrain,
 } from './fixture.ts';
@@ -291,6 +294,145 @@ async function readCursor(fixture: McpFixture, callerKey: string): Promise<strin
   `) as Array<{ at: string | null }>;
   return rows[0]?.at ?? null;
 }
+
+/**
+ * The meetings lane, keyed on when the meeting *is*.
+ *
+ * The whole point of this block is a fixture that can tell the two times apart.
+ * Every row below sets `occurred_at` and `created_at` to different instants, and
+ * the window is one day wide — narrow enough that "arrived yesterday" is outside
+ * it on arrival and inside it on occurrence. With a two-day window, or with
+ * `occurred_at == created_at` on every row, a lane keyed on arrival passes every
+ * assertion here, which is how it stayed keyed on arrival.
+ */
+describe("today's meetings are the ones happening today", () => {
+  const TODAY_SINCE = '2026-08-13T00:00:00.000Z';
+  const TODAY_UNTIL = '2026-08-14T00:00:00.000Z';
+  const today = (overrides: Record<string, unknown> = {}) =>
+    request({ since: TODAY_SINCE, until: TODAY_UNTIL, now: new Date(TODAY_UNTIL), ...overrides });
+
+  let fixture: McpFixture;
+
+  beforeAll(async () => {
+    fixture = await createMcpFixture('u12_occurrence');
+    // 'Roadmap review' arrives here with occurred_at NULL — the pre-rung-5 row,
+    // and the fixture for the fallback.
+    await seedBrain(fixture.sql, AT);
+
+    // The headline case: synced last night, happening this morning. Outside the
+    // window on arrival, inside it on occurrence.
+    await seedMeeting(fixture.sql, {
+      origin: CALENDAR,
+      title: 'Standup',
+      body: 'Standup\nWhen: 2026-08-13T10:00:00Z',
+      createdAt: '2026-08-12T18:00:00.000Z',
+      occurredAt: '2026-08-13T10:00:00.000Z',
+    });
+
+    // The inverse, and the half a one-sided fixture misses: an old meeting
+    // re-fetched this morning. Inside the window on arrival, outside on
+    // occurrence.
+    await seedMeeting(fixture.sql, {
+      origin: CALENDAR,
+      title: 'Retro from Tuesday',
+      body: 'Retro\nWhen: 2026-08-11T10:00:00Z',
+      createdAt: '2026-08-13T09:30:00.000Z',
+      occurredAt: '2026-08-11T10:00:00.000Z',
+    });
+
+    // Provider-asserted, so it must not widen anything: a meeting behind a
+    // fence this grant does not carry, occurring squarely inside the window.
+    await seedMeeting(fixture.sql, {
+      origin: WORK,
+      title: 'Board session today',
+      body: 'Board session\nWhen: 2026-08-13T11:00:00Z',
+      createdAt: '2026-08-13T08:00:00.000Z',
+      occurredAt: '2026-08-13T11:00:00.000Z',
+    });
+  });
+  afterAll(async () => {
+    await fixture.close();
+  });
+
+  test('a meeting that arrived yesterday for a call today is in this morning’s briefing', async () => {
+    const bundle = await assembleOverSql(fixture.sql, GRANT, today({ callerKey: 'bearer:occ-1' }));
+    expect(bundle.meetings.map((meeting) => meeting.title)).toContain('Standup');
+  });
+
+  test('a meeting that arrived today for a call on Tuesday is not', async () => {
+    const bundle = await assembleOverSql(fixture.sql, GRANT, today({ callerKey: 'bearer:occ-2' }));
+    expect(bundle.meetings.map((meeting) => meeting.title)).not.toContain('Retro from Tuesday');
+  });
+
+  test('a page written before the rung keeps the behaviour it has today', async () => {
+    // The backfill story, pinned: rows with no occurred_at fall back to
+    // created_at, so nothing that appears in a briefing this morning disappears
+    // from tomorrow's. There is no data backfill — see rung 5's header on why
+    // writing created_at into a provider-asserted column is worse than a null.
+    const bundle = await assembleOverSql(fixture.sql, GRANT, today({ callerKey: 'bearer:occ-3' }));
+    expect(bundle.meetings.map((meeting) => meeting.title)).toContain('Roadmap review');
+
+    const rows = (await fixture.sql`
+      SELECT count(*)::int AS n FROM page WHERE title = 'Roadmap review' AND occurred_at IS NULL
+    `) as Array<{ n: number }>;
+    expect(rows[0]?.n).toBe(1);
+  });
+
+  test('the lane sorts by occurrence too, not just filters by it', async () => {
+    // Standup occurs at 10:00 and arrived at 18:00 yesterday; the roadmap review
+    // falls back to its 09:00 arrival. Sorted by arrival, Standup is last.
+    const bundle = await assembleOverSql(fixture.sql, GRANT, today({ callerKey: 'bearer:occ-4' }));
+    const titles = bundle.meetings.map((meeting) => meeting.title);
+    // Both present first: `indexOf` returns -1 for an absent title, and -1 is
+    // less than everything, so an ordering assertion on its own is green for a
+    // lane that dropped the row entirely.
+    expect(titles).toContain('Standup');
+    expect(titles).toContain('Roadmap review');
+    expect(titles.indexOf('Standup')).toBeLessThan(titles.indexOf('Roadmap review'));
+  });
+
+  test('an event time cannot reach across the fence', async () => {
+    // `occurred_at` is a value an outside sender chooses. It orders and it
+    // windows; it decides nothing about access.
+    const bundle = await assembleOverSql(fixture.sql, GRANT, today({ callerKey: 'bearer:occ-5' }));
+    expect(bundle.meetings.map((meeting) => meeting.title)).not.toContain('Board session today');
+    const wide = await assembleOverSql(
+      fixture.sql,
+      [CALENDAR, MAIL, WORK],
+      today({ callerKey: 'bearer:occ-6' }),
+    );
+    expect(wide.meetings.map((meeting) => meeting.title)).toContain('Board session today');
+  });
+
+  test('the lane is a range scan on the index rung 5 declares', async () => {
+    // U12 kept this lane a bounded range scan on purpose — the payload is
+    // bounded by the window, not by the corpus. Re-keying it onto an expression
+    // no index carries would make the flagship read a sequential scan over every
+    // page in the brain, and nothing but the clock would say so.
+    const text = await fixture.sql.begin(async (tx) => {
+      // A fixture brain is small enough that the planner would take a
+      // sequential scan on cost alone. Penalising it does not *create* an index
+      // scan — if the lane's expression matched no index, the plan would still
+      // be a scan of `page` — so the assertion still fails when the two spellings
+      // drift apart.
+      await tx.unsafe('SET LOCAL enable_seqscan = off');
+      const plan = (await tx.unsafe(`EXPLAIN ${MEETINGS_STATEMENT}`, [
+        textArrayLiteral(GRANT),
+        TODAY_SINCE,
+        TODAY_UNTIL,
+        null,
+      ])) as Array<Record<string, string>>;
+      return plan.map((row) => Object.values(row).join(' ')).join('\n');
+    });
+    expect(text).toContain('page_live_by_occurrence');
+    // Naming the index is not enough: it leads on `origin_context`, so the
+    // planner reaches for it on the fence predicate alone even while the window
+    // is a post-scan filter on a different column. What makes this a range scan
+    // is the window living in the *index condition*.
+    const conditions = text.split('\n').filter((line) => line.includes('Index Cond'));
+    expect(conditions.some((line) => line.includes('COALESCE'))).toBe(true);
+  });
+});
 
 describe('assembly is SQL over what is already materialised', () => {
   let fixture: McpFixture;

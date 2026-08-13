@@ -47,6 +47,7 @@ export const MIGRATIONS: readonly TenantMigration[] = [
   { version: 2, name: 'knowledge-core', file: 'migrations/v2-knowledge-core.sql' },
   { version: 3, name: 'consolidation', file: 'migrations/v3-consolidation.sql' },
   { version: 4, name: 'briefing-cursor', file: 'migrations/v4-briefing.sql' },
+  { version: 5, name: 'page-occurred-at', file: 'migrations/v5-occurred-at.sql' },
 ];
 
 /** The version this code applies to a fresh tenant, derived rather than typed twice. */

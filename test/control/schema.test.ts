@@ -1411,6 +1411,11 @@ const CONTENT_BEARING_SQL: readonly ContentBearingEntry[] = [
     because:
       "U12's briefing rung holds no user content at all — a grant-derived caller key, two timestamps and a band number — so the content-free rule would pass over it; it is named here rather than exempted because the classification list is what makes a new schema file impossible to add silently, and a file that happens to be content-free today is exactly the one a later column gets added to",
   },
+  {
+    path: 'schema/migrations/v5-occurred-at.sql',
+    because:
+      "the event-time rung adds one column to the tenant's own `page` table, and what it holds is content: a `Date` header, a calendar start, a Drive `modifiedTime`, each asserted by whoever sent the item; it belongs to the same per-tenant database as the rungs above and nothing about it reaches the control plane",
+  },
 ];
 
 const CONTROL_PREFIX = 'control/';

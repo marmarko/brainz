@@ -525,6 +525,10 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
           body: item.body,
           externalRef: item.externalRef,
           ingestId: run.ingestId,
+          // The event time the source already computed, finally persisted. It
+          // is what the briefing's meetings lane windows on; before rung 5 it
+          // was computed here, used for the import window, and thrown away.
+          occurredAt: item.occurredAt,
           quarantine,
         },
       );

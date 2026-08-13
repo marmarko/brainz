@@ -106,6 +106,22 @@ export interface DocumentInput {
   /** The provider's own id for the item, and the idempotency key with the digest. */
   readonly externalRef?: string | null;
   readonly ingestId?: string | null;
+  /**
+   * When the thing happened, as the *provider* asserted it — a calendar event's
+   * start, a message's `Date`, a file's `modifiedTime`. Absent means the source
+   * did not say, which readers spell `coalesce(occurred_at, created_at)`.
+   *
+   * **Content, not provenance.** An outside sender chooses this value exactly as
+   * they choose a subject line, so it may order and window and it may decide
+   * nothing else: not visibility, not corroboration, and never access — the fence
+   * reads `origin_context`, which is credential-derived and immutable. Rung 5's
+   * header carries the full statement.
+   *
+   * It is deliberately **not** part of {@link contentDigest}: a provider that
+   * re-states an unchanged event with a jittered timestamp would otherwise
+   * re-chunk and re-embed the whole page every poll.
+   */
+  readonly occurredAt?: Date | null;
   /** Inferred, mutable, confidence-scored — R15's other half. */
   readonly subject?: { readonly context: string; readonly confidence: number } | null;
   /**
@@ -246,6 +262,7 @@ interface CommitPlan {
   readonly ingestId: string | null;
   readonly subject: { readonly context: string; readonly confidence: number } | null;
   readonly quarantined: boolean;
+  readonly occurredAt: Date | null;
   readonly digest: string;
   readonly chunks: readonly Chunk[];
   readonly facts: readonly ExtractedFact[];
@@ -287,12 +304,13 @@ async function commitWrite(
 
     const pageRows = (await tx`
       INSERT INTO page (origin_context, subject_context, subject_confidence, source_type,
-                        external_ref, ingest_id, title, taxonomy_version,
+                        external_ref, ingest_id, title, taxonomy_version, occurred_at,
                         embedding_model, embedding_dimensions, chunker_version,
                         normalizer_version, content_sha256, quarantined_at)
       VALUES (${plan.origin}, ${plan.subject?.context ?? null}, ${plan.subject?.confidence ?? null},
               ${plan.sourceType}, ${plan.externalRef}, ${plan.ingestId}::bigint, ${plan.title},
-              ${plan.settings.taxonomyVersion}, ${plan.modelId}, ${EMBEDDING_DIMENSIONS},
+              ${plan.settings.taxonomyVersion}, ${plan.occurredAt},
+              ${plan.modelId}, ${EMBEDDING_DIMENSIONS},
               ${CHUNKER_VERSION}, ${NORMALIZER_VERSION}, ${plan.digest},
               ${plan.quarantined ? new Date() : null})
       RETURNING page_id::text AS page_id
@@ -491,6 +509,7 @@ export async function ingestDocument(
       ingestId: input.ingestId ?? null,
       subject: input.subject ?? null,
       quarantined,
+      occurredAt: input.occurredAt ?? null,
       digest,
       chunks,
       facts,
@@ -622,6 +641,10 @@ export async function remember(
       ingestId: null,
       subject: input.subject ?? null,
       quarantined: false,
+      // `remember` is a person typing now. There is no provider asserting when
+      // this happened, and inventing one would put a locally-minted value in a
+      // column whose meaning is "the source said so".
+      occurredAt: null,
       digest: contentDigest(input.title, statement),
       chunks,
       // A statement no rule understands still becomes a fact; it simply implies

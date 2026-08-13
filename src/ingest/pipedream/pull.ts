@@ -841,6 +841,11 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
           body: item.body,
           externalRef: item.externalRef,
           ingestId: run.ingestId,
+          // Calendar's is the event *start*, which is the whole reason the
+          // briefing can ask "what is happening today" rather than "what
+          // arrived today". Provider-asserted, so it orders and windows and
+          // decides nothing about access.
+          occurredAt: item.occurredAt,
           quarantine,
         },
       );
