@@ -150,8 +150,20 @@ export interface ConnectToken {
   readonly connectLinkUrl: string;
 }
 
+/**
+ * What the vendor's answer actually establishes.
+ *
+ * `accepted` is the one that stops this from being a claim about evidence
+ * nobody has: a `202` says the request was queued, not that the record is gone,
+ * and reporting `deleted: true` over it puts a sentence in an erasure receipt
+ * that the vendor never said.
+ */
+export type DeletionEvidence = 'deleted' | 'already_absent' | 'accepted';
+
 export interface ExternalUserDeletion {
-  readonly deleted: true;
+  /** True only when the vendor said the record is gone, or already was. */
+  readonly deleted: boolean;
+  readonly evidence: DeletionEvidence;
   /**
    * Whether the grant was revoked **at the provider**, which is what R12's leg
    * actually promises. `unverified` until Q2 is answered in writing; promoting
@@ -224,6 +236,8 @@ export function createRateBudget(options: {
     options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
   const buckets = new Map<string, { tokens: number; at: number }>();
+  /** One waiter per key at a time — see {@link RateBudget.take}. */
+  const queues = new Map<string, Promise<void>>();
 
   function refill(key: string): { tokens: number; at: number } {
     const at = now();
@@ -235,19 +249,49 @@ export function createRateBudget(options: {
     return updated;
   }
 
-  return {
-    async take(key) {
+  /**
+   * How many sleeps one caller will sit through before it is let past anyway.
+   *
+   * Fail-open on arithmetic: a budget that could refuse would turn a pacing
+   * decision into a lost pull. High enough that the ceiling is real, finite so
+   * a clock that never advances cannot wedge a worker.
+   */
+  const MAX_WAITS = 64;
+
+  async function spend(key: string): Promise<void> {
+    for (let attempt = 0; attempt < MAX_WAITS; attempt += 1) {
       const bucket = refill(key);
       if (bucket.tokens >= 1) {
         bucket.tokens -= 1;
         return;
       }
-      const waitMs = Math.ceil(((1 - bucket.tokens) / qps) * 1_000);
-      await sleep(waitMs);
-      const after = refill(key);
-      // Fail open on arithmetic: a budget that could refuse would turn a pacing
-      // decision into a lost pull.
-      after.tokens = Math.max(0, after.tokens - 1);
+      await sleep(Math.max(1, Math.ceil(((1 - bucket.tokens) / qps) * 1_000)));
+    }
+    const bucket = refill(key);
+    bucket.tokens = Math.max(0, bucket.tokens - 1);
+  }
+
+  return {
+    /**
+     * **Waiters are serialized per key, and every one re-checks after it
+     * sleeps.** Sleeping and then decrementing unconditionally let N callers
+     * queued behind one token all wake and all spend it: the bucket goes
+     * negative, the burst is however many callers happened to be waiting, and
+     * the pacing this exists for never happened.
+     */
+    take(key) {
+      const previous = queues.get(key) ?? Promise.resolve();
+      const mine = previous.then(() => spend(key));
+      // The chain must never carry a rejection forward, or one failed sleep
+      // poisons every later caller on this key.
+      queues.set(
+        key,
+        mine.then(
+          () => undefined,
+          () => undefined,
+        ),
+      );
+      return mine;
     },
   };
 }
@@ -255,6 +299,27 @@ export function createRateBudget(options: {
 // ---------------------------------------------------------------------------
 // The client.
 // ---------------------------------------------------------------------------
+
+let processRateBudget: RateBudget | null = null;
+
+/**
+ * The one budget every client in this process shares unless told otherwise.
+ *
+ * **The vendor ceiling is per project, not per tenant.** A private default per
+ * client means N tenants each hold the full 5 QPS, every one of them reports
+ * itself within budget, and the project is throttled anyway. This makes the
+ * bound hold across one process.
+ *
+ * It does **not** bound the fleet. Several worker processes, or several
+ * machines, still multiply this by their count — a real ceiling needs shared
+ * state (a control-plane counter or a token service), which is a rung this unit
+ * does not own. Stated rather than implied, because a budget that looks global
+ * and is not is worse than one that is obviously local.
+ */
+export function sharedRateBudget(): RateBudget {
+  processRateBudget ??= createRateBudget({ qps: DEFAULT_QPS, burst: DEFAULT_BURST });
+  return processRateBudget;
+}
 
 /**
  * The same alphabet the control plane pins for a tenant id, applied to the
@@ -279,6 +344,57 @@ export function assertExternalUserId(externalUserId: string): void {
 
 /** How early a cached access token is treated as expired. */
 const TOKEN_SAFETY_MARGIN_MS = 60_000;
+
+/**
+ * The floor and ceiling on a token lifetime the vendor reports.
+ *
+ * A vendor answering `200` with `expires_in: 0` is taken at its word by a
+ * client that trusts the number: the cache is stale the moment it is written,
+ * so every single call re-mints — an unbounded mint loop against a vendor that
+ * is already unhappy. The floor has to clear the safety margin, or the clamp
+ * changes nothing.
+ */
+const MIN_TOKEN_LIFETIME_MS = 5 * 60_000;
+const MAX_TOKEN_LIFETIME_MS = 24 * 60 * 60_000;
+const DEFAULT_TOKEN_LIFETIME_MS = 3_600_000;
+
+/** The rate-budget key the vendor's own OAuth endpoint spends. */
+export const OAUTH_RATE_KEY = 'oauth';
+
+/**
+ * Why the token endpoint refused.
+ *
+ * Deliberately **not** {@link classifyHttpFailure}: that one checks the cursor
+ * case first, which is meaningless on a mint, and it would answer
+ * `auth_expired` for a 429 — a code that reads to a user as "reconnect this
+ * source" when the vendor merely asked us to wait. A connector that tells
+ * somebody their Google grant died because the vendor was busy has lost their
+ * trust for a reason that fixes itself in a second.
+ */
+export function classifyTokenFailure(status: number): PullFailureReason {
+  if (status === 429) return 'rate_limited';
+  if (status >= 500 || status === 408) return 'provider_error';
+  return 'auth_expired';
+}
+
+/**
+ * What a `DELETE /users/{id}` answer means.
+ *
+ * `classifyHttpFailure` is wrong here in two directions and both matter for an
+ * erasure leg: it answers `cursor_invalid` for the ordinary 410 that means
+ * "already deleted" (a code about a sync token, on a call that has none), and
+ * retryable `provider_error` for the 404 that means the same thing. An erasure
+ * that retries forever against an absent record reports failure on a deletion
+ * that is complete.
+ */
+export function classifyDeletion(
+  status: number,
+): { readonly deleted: boolean; readonly evidence: DeletionEvidence } | null {
+  if (status === 404 || status === 410) return { deleted: true, evidence: 'already_absent' };
+  if (status === 202) return { deleted: false, evidence: 'accepted' };
+  if (status >= 200 && status < 300) return { deleted: true, evidence: 'deleted' };
+  return null;
+}
 
 function parseJson(body: string): unknown {
   try {
@@ -326,18 +442,29 @@ export function createPipedreamClient(options: {
 }): PipedreamClient {
   const { config, transport } = options;
   const now = options.now ?? (() => new Date());
-  const rate = options.rate ?? createRateBudget({ qps: DEFAULT_QPS, burst: DEFAULT_BURST });
+  // Shared by default: the vendor ceiling is per project, so a private budget
+  // per client is N tenants each holding the whole quota. See the note there
+  // about what this still does not bound.
+  const rate = options.rate ?? sharedRateBudget();
   const base = config.baseUrl ?? DEFAULT_BASE_URL;
 
   let accessToken: { value: string; expiresAt: number } | null = null;
 
-  /** The vendor's own OAuth, cached. A refusal here is `auth_expired`. */
+  /**
+   * The vendor's own OAuth, cached and **paced**.
+   *
+   * The mint is a request to the same vendor under the same project quota. A
+   * call that spends it without asking the budget is a hole in the ceiling, and
+   * the hole is widest exactly when it hurts — a token endpoint answering
+   * short-lived tokens is minted against on every call.
+   */
   async function authorize(): Promise<ClientOutcome<string>> {
     const at = now().getTime();
     if (accessToken !== null && accessToken.expiresAt - TOKEN_SAFETY_MARGIN_MS > at) {
       return { ok: true, value: accessToken.value };
     }
 
+    await rate.take(OAUTH_RATE_KEY);
     const response = await transport.send({
       method: 'POST',
       url: `${base}/oauth/token`,
@@ -353,7 +480,11 @@ export function createPipedreamClient(options: {
 
     if (response.status < 200 || response.status >= 300) {
       accessToken = null;
-      return { ok: false, reason: 'auth_expired', status: response.status };
+      return {
+        ok: false,
+        reason: classifyTokenFailure(response.status),
+        status: response.status,
+      };
     }
 
     const body = parseJson(response.body) as { access_token?: unknown; expires_in?: unknown } | null;
@@ -361,7 +492,14 @@ export function createPipedreamClient(options: {
     if (typeof token !== 'string' || token.length === 0) {
       return { ok: false, reason: 'auth_expired', status: response.status };
     }
-    const lifetimeMs = (typeof body?.expires_in === 'number' ? body.expires_in : 3_600) * 1_000;
+    const reported =
+      typeof body?.expires_in === 'number' && Number.isFinite(body.expires_in)
+        ? body.expires_in * 1_000
+        : DEFAULT_TOKEN_LIFETIME_MS;
+    const lifetimeMs = Math.min(
+      MAX_TOKEN_LIFETIME_MS,
+      Math.max(MIN_TOKEN_LIFETIME_MS, reported),
+    );
     accessToken = { value: token, expiresAt: at + lifetimeMs };
     return { ok: true, value: token };
   }
@@ -445,16 +583,40 @@ export function createPipedreamClient(options: {
       return { ok: true, value: request.raw === true ? outcome.value.body : parseJson(outcome.value.body) };
     },
 
+    /**
+     * R12's fourth erasure leg.
+     *
+     * **This method has no caller in `src/`.** Wiring it into the erasure
+     * pipeline is U17's, and building half of that pipeline here would be worse
+     * than the gap — see the header and `docs/vendor/2026-08-12-pipedream-compliance.md`.
+     */
     async deleteExternalUser(request) {
       assertExternalUserId(request.externalUserId);
-      const outcome = await call({
+      const authorized = await authorize();
+      if (!authorized.ok) return authorized;
+
+      await rate.take('connect');
+      const response = await transport.send({
         method: 'DELETE',
         url: `${base}/connect/${config.projectId}/users/${request.externalUserId}`,
-        headers: {},
+        headers: { authorization: `Bearer ${authorized.value}` },
       });
-      if (!outcome.ok) return outcome;
-      // Not `confirmed`: see `ExternalUserDeletion`.
-      return { ok: true, value: { deleted: true, tokensRevoked: 'unverified' } };
+      if (response.status === 401) accessToken = null;
+
+      // Classified here rather than through `call`, because the shared
+      // classifier reads a 410 as an expired cursor — see `classifyDeletion`.
+      const verdict = classifyDeletion(response.status);
+      if (verdict === null) {
+        return {
+          ok: false,
+          reason: classifyHttpFailure(response.status, parseJson(response.body)),
+          status: response.status,
+        };
+      }
+
+      // Never `confirmed`: whether deletion revokes the grant AT GOOGLE is a
+      // vendor answer nobody has yet. See `ExternalUserDeletion`.
+      return { ok: true, value: { ...verdict, tokensRevoked: 'unverified' } };
     },
   };
 }

@@ -28,6 +28,7 @@ import {
   createInMemoryClaimStore,
   createPipedreamClient,
   createRateBudget,
+  sharedRateBudget,
   mintClaimUrl,
   redactClaimUrls,
   redeemClaimUrl,
@@ -393,5 +394,171 @@ describe("R12's erasure leg", () => {
 
     const outcome = await client.deleteExternalUser({ externalUserId: 'tenant-a' });
     expect(outcome.ok).toBe(false);
+  });
+});
+
+/**
+ * The vendor edges this client got wrong: a mint that could not be paced, a
+ * deletion that reported evidence it did not have, and a budget that bounded
+ * one pull rather than the fleet.
+ */
+describe('the token mint is part of the traffic it authorizes', () => {
+  test('the mint is paced by the budget, not exempt from it', async () => {
+    const taken: string[] = [];
+    const transport = withToken(createScriptedTransport());
+    transport.on('/proxy/gmail', { status: 200, body: { ok: true } });
+    const client = createPipedreamClient({
+      config: CONFIG,
+      transport,
+      now: () => NOW,
+      rate: {
+        take(key) {
+          taken.push(key);
+          return Promise.resolve();
+        },
+      },
+    });
+
+    await client.request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a' });
+
+    // The mint is a request to the same vendor under the same project quota; a
+    // call that spends it without asking is a hole in the ceiling.
+    expect(taken.length).toBe(2);
+    expect(taken[0]).toBe('oauth');
+  });
+
+  test('a token the vendor says expires immediately does not become a mint loop', async () => {
+    // `expires_in: 0` is answered verbatim: the cache is stale the moment it is
+    // written, so every call re-mints — unpaced, forever, against a vendor that
+    // is already unhappy.
+    let clock = NOW.getTime();
+    let mints = 0;
+    const transport = createScriptedTransport();
+    transport.fallback({ status: 200, body: { ok: true } });
+    for (let index = 0; index < 8; index += 1) {
+      transport.on('/oauth/token', () => {
+        mints += 1;
+        return { status: 200, body: { access_token: `t-${mints}`, expires_in: 0 } };
+      });
+    }
+    const client = createPipedreamClient({
+      config: CONFIG,
+      transport,
+      now: () => new Date(clock),
+    });
+
+    for (let index = 0; index < 4; index += 1) {
+      clock += 1_000;
+      await client.request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a' });
+    }
+
+    expect(mints).toBe(1);
+  });
+
+  test('a rate-limited mint is not reported as a dead grant', async () => {
+    // `auth_expired` reads to a user as "reconnect this source". Answering it
+    // for a 429 or a 500 tells them their Google grant died when the vendor
+    // merely asked us to wait.
+    const throttled = createScriptedTransport();
+    throttled.on('/oauth/token', { status: 429, body: { error: 'slow down' } });
+    const rateLimited = await createPipedreamClient({
+      config: CONFIG,
+      transport: throttled,
+      now: () => NOW,
+    }).request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a' });
+    expect(rateLimited.ok).toBe(false);
+    if (rateLimited.ok) return;
+    expect(rateLimited.reason).toBe('rate_limited');
+
+    const broken = createScriptedTransport();
+    broken.on('/oauth/token', { status: 503, body: { error: 'down' } });
+    const serverError = await createPipedreamClient({
+      config: CONFIG,
+      transport: broken,
+      now: () => NOW,
+    }).request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a' });
+    expect(serverError.ok).toBe(false);
+    if (serverError.ok) return;
+    expect(serverError.reason).toBe('provider_error');
+  });
+});
+
+describe('the erasure leg reports only what it observed', () => {
+  test('a 410 on the delete is "already gone", not an expired cursor', async () => {
+    // `classifyHttpFailure` checks the cursor case first, on every call. On a
+    // DELETE that means the ordinary idempotent answer comes back as
+    // `cursor_invalid` — a code about a sync token, on a call that has none.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/users/tenant-a', { status: 410, body: { error: 'gone' } });
+    const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
+
+    const outcome = await client.deleteExternalUser({ externalUserId: 'tenant-a' });
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.value.deleted).toBe(true);
+    expect(outcome.value.evidence).toBe('already_absent');
+    expect(outcome.value.tokensRevoked).toBe('unverified');
+  });
+
+  test('a 404 for a user who is already gone is not a retryable provider error', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/users/tenant-a', { status: 404, body: { error: 'no such user' } });
+    const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
+
+    const outcome = await client.deleteExternalUser({ externalUserId: 'tenant-a' });
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.value.evidence).toBe('already_absent');
+  });
+
+  test('an accepted-but-not-done deletion does not claim the record is gone', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/users/tenant-a', { status: 202, body: { status: 'queued' } });
+    const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
+
+    const outcome = await client.deleteExternalUser({ externalUserId: 'tenant-a' });
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.value.evidence).toBe('accepted');
+    expect(outcome.value.deleted).toBe(false);
+  });
+});
+
+describe('the rate budget bounds more than one pull', () => {
+  test('two clients built without an explicit budget share one', async () => {
+    // The vendor ceiling is per project, not per tenant. A private default per
+    // client means N tenants hold N times the quota and every one of them is
+    // "within budget" while the project is being throttled.
+    const first = createScriptedTransport();
+    first.on('/oauth/token', { status: 200, body: { access_token: 't', expires_in: 3600 } });
+    first.fallback({ status: 200, body: {} });
+    const second = createScriptedTransport();
+    second.on('/oauth/token', { status: 200, body: { access_token: 't', expires_in: 3600 } });
+    second.fallback({ status: 200, body: {} });
+
+    expect(sharedRateBudget()).toBe(sharedRateBudget());
+  });
+
+  test('waiters do not all proceed on one refill', async () => {
+    // `take` slept and then decremented unconditionally, so N callers queued
+    // behind one token all woke and all spent it. The bucket goes negative and
+    // the pacing it was supposed to do never happened.
+    let clock = 0;
+    const budget = createRateBudget({
+      qps: 1,
+      burst: 1,
+      now: () => clock,
+      sleep: (ms) => {
+        clock += ms;
+        return Promise.resolve();
+      },
+    });
+
+    await budget.take('gmail');
+    const started = clock;
+    await Promise.all([budget.take('gmail'), budget.take('gmail'), budget.take('gmail')]);
+
+    // Three more at 1 qps cannot happen inside one second's worth of refill.
+    expect(clock - started).toBeGreaterThanOrEqual(3_000);
   });
 });
