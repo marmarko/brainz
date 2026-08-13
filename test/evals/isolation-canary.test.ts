@@ -72,9 +72,12 @@ async function healthyCall(
   };
 }
 
+const HEALTHY_CONTROL: NonNullable<CanaryOptions['controlQuery']> = () =>
+  Promise.resolve([{ wedged: 0, total: 3 }]);
+
 const HEALTHY_DB: NonNullable<CanaryOptions['query']> = (sql) => {
   if (sql.includes('pg_extension')) return Promise.resolve([{ extname: 'vector' }]);
-  if (sql.includes('hnsw.ef_search')) return Promise.resolve([{ value: '200' }]);
+  if (sql.includes('pg_settings')) return Promise.resolve([{ setting: '40', boot_val: '40' }]);
   if (sql.includes("amname = 'hnsw'")) {
     return Promise.resolve([
       { table_name: 'chunk', column_name: 'embedding' },
@@ -83,7 +86,6 @@ const HEALTHY_DB: NonNullable<CanaryOptions['query']> = (sql) => {
       { table_name: 'entity_card', column_name: 'embedding' },
     ]);
   }
-  if (sql.includes('FROM job')) return Promise.resolve([{ wedged: 0, total: 3 }]);
   // The search-path guard's two catalog reads.
   if (sql.includes('prorettype')) {
     return Promise.resolve([{ function_name: 'refuse_origin_change_pinned', pinned: true }]);
@@ -157,6 +159,7 @@ describe('a healthy deployment passes, and the pass is earned', () => {
       tenantId: 't-canary',
       call: await healthyCall(receipt),
       query: HEALTHY_DB,
+      controlQuery: HEALTHY_CONTROL,
     });
     expect(report.counts.fail).toBe(0);
     expect(report.counts.deferred).toBe(1); // only the unpublished verification key
@@ -229,13 +232,24 @@ describe('each check fails for its own reason', () => {
     expect(outcomes.get('known_record.readable')).toBe('fail');
   });
 
-  test('ef_search left at pgvector’s default fails — H1', async () => {
+  test('an unregistered hnsw.ef_search fails — H1, and it is registration that matters', async () => {
+    // Not "the default is 40": brainz raises it per scan with SET LOCAL, so the
+    // default is expected to be 40 and checking it would measure the wrong
+    // thing. What can silently be wrong is whether the setting exists at all —
+    // Postgres accepts any prefixed custom GUC, so on a database where pgvector
+    // is not loaded the SET succeeds, changes nothing, and reads truncate.
     const receipt = await receiptFor();
     const outcomes = await probe({
       call: await healthyCall(receipt),
-      query: (sql) => (sql.includes('hnsw.ef_search') ? Promise.resolve([{ value: '40' }]) : HEALTHY_DB(sql)),
+      query: (sql) => (sql.includes('pg_settings') ? Promise.resolve([]) : HEALTHY_DB(sql)),
     });
     expect(outcomes.get('path.guc.ef_search')).toBe('fail');
+  });
+
+  test('a registered ef_search passes even though its default is 40', async () => {
+    const receipt = await receiptFor();
+    const outcomes = await probe({ call: await healthyCall(receipt), query: HEALTHY_DB });
+    expect(outcomes.get('path.guc.ef_search')).toBe('pass');
   });
 
   test('a missing HNSW index fails — H2, which nothing else would notice', async () => {
@@ -251,10 +265,31 @@ describe('each check fails for its own reason', () => {
     const receipt = await receiptFor();
     const outcomes = await probe({
       call: await healthyCall(receipt),
-      query: (sql) =>
-        sql.includes('FROM job') ? Promise.resolve([{ wedged: 2, total: 5 }]) : HEALTHY_DB(sql),
+      query: HEALTHY_DB,
+      controlQuery: () => Promise.resolve([{ wedged: 2, total: 5 }]),
     });
     expect(outcomes.get('path.queue')).toBe('fail');
+  });
+
+  test('the queue is asked of the CONTROL plane, not of a tenant', async () => {
+    // KTD1: one database per tenant, and the queue is fleet-wide. Running this
+    // probe for real is what found the first version asking a tenant database
+    // for a `job` table and reporting a failure that meant nothing.
+    let asked = '';
+    await probe({
+      call: await healthyCall(await receiptFor()),
+      query: HEALTHY_DB,
+      controlQuery: (sql) => {
+        asked = sql;
+        return Promise.resolve([{ wedged: 0, total: 1 }]);
+      },
+    });
+    expect(asked).toContain('control.job');
+  });
+
+  test('without a control database the queue check defers rather than passing', async () => {
+    const outcomes = await probe({ call: await healthyCall(await receiptFor()), query: HEALTHY_DB });
+    expect(outcomes.get('path.queue')).toBe('deferred');
   });
 
   test('an unpinned trigger function fails — H6', async () => {
@@ -277,6 +312,7 @@ describe('each check fails for its own reason', () => {
       tenantId: 't-canary',
       call: await healthyCall(receipt),
       query: () => Promise.reject(new Error('too many connections')),
+      controlQuery: HEALTHY_CONTROL,
     });
     // The read half still graded. A canary that lost its results because one
     // half could not connect would report nothing on the day it mattered most.

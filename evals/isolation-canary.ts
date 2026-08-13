@@ -44,7 +44,11 @@ import { INDEXED_VECTOR_COLUMNS } from '../src/schema/vector-index.ts';
 export type Outcome = 'pass' | 'fail' | 'deferred';
 
 /** What a check needs before it can produce anything but `deferred`. */
-export type Requirement = 'mcp_endpoint' | 'database_url' | 'published_verification_key';
+export type Requirement =
+  | 'mcp_endpoint'
+  | 'database_url'
+  | 'control_database_url'
+  | 'published_verification_key';
 
 export interface CanaryCheck {
   readonly id: string;
@@ -138,9 +142,9 @@ export const CANARY_CHECKS: readonly CanaryCheck[] = [
   },
   {
     id: 'path.guc.ef_search',
-    asserts: 'the session `hnsw.ef_search` is raised above pgvector’s default of 40',
+    asserts: '`hnsw.ef_search` is a REGISTERED setting, so the `SET LOCAL` every vector scan issues is honoured rather than accepted and ignored',
     needs: 'database_url',
-    why: 'H1, the hazard that opens `docs/porting-hazards.md`: pgvector truncates the candidate pool to `ef_search` silently. Left at the default, a read over a large corpus returns 40 candidates and no error — the result is worse and nothing says so.',
+    why: 'H1, the hazard that opens `docs/porting-hazards.md`. brainz does not rely on a database default — `withVectorScan` raises `ef_search` per transaction — so checking the default would measure the wrong thing. What can silently be wrong is whether the setting EXISTS: Postgres accepts any `prefix.name` custom GUC, so on a database where pgvector is not loaded `SET LOCAL hnsw.ef_search = 200` succeeds, changes nothing, and every read truncates at 40 with no error anywhere.',
   },
   {
     id: 'path.indexes',
@@ -151,7 +155,7 @@ export const CANARY_CHECKS: readonly CanaryCheck[] = [
   {
     id: 'path.queue',
     asserts: 'the job queue is present and not wedged — no lease older than an hour',
-    needs: 'database_url',
+    needs: 'control_database_url',
     why: 'Consolidation, embedding backfill and connector pulls all run through it. A wedged queue is a brain that stops learning while continuing to answer, which no read-side check can see.',
   },
   {
@@ -200,6 +204,15 @@ export interface CanaryOptions {
   readonly endpoint?: string | undefined;
   readonly token?: string | undefined;
   readonly databaseUrl?: string | undefined;
+  /**
+   * The control plane, which is a DIFFERENT database from the tenant's.
+   *
+   * `control.job` lives there, not in the tenant — KTD1 puts one database per
+   * tenant and the queue is fleet-wide by construction. The first version of this
+   * probe asked the tenant database for a `job` table and reported a failure that
+   * meant nothing; running it for real is what found that.
+   */
+  readonly controlDatabaseUrl?: string | undefined;
   readonly tenantId?: string | undefined;
   /** The published verification key, when there is one. */
   readonly verificationKey?: string | undefined;
@@ -207,6 +220,7 @@ export interface CanaryOptions {
   readonly call?: typeof callTool;
   /** Injected so the suite can drive the database half without a database. */
   readonly query?: (sql: string) => Promise<Record<string, unknown>[]>;
+  readonly controlQuery?: (sql: string) => Promise<Record<string, unknown>[]>;
 }
 
 /** `deferred`, with the reason stated in the words the check itself used. */
@@ -215,6 +229,8 @@ function deferFor(check: CanaryCheck): CheckResult {
     mcp_endpoint: 'no --endpoint was given, so nothing was asked of a running deployment',
     database_url:
       'no --database-url was given. This half is the post-deploy path check and needs database access, which an outside party is not expected to have',
+    control_database_url:
+      'no --control-database-url was given. The job queue lives in the control plane, which is a different database from any tenant\'s',
     published_verification_key:
       'no verification key is published yet: the attestation signer that ships is a fake, and its custody entry in docs/register.md says so',
   };
@@ -238,7 +254,10 @@ export async function runCanary(options: CanaryOptions = {}): Promise<CanaryRepo
 
   if (endpoint === undefined || token === undefined) {
     for (const check of CANARY_CHECKS) {
-      if (check.needs === 'database_url') continue;
+      // The database halves defer themselves below, and they defer for a
+      // different reason. Deferring them here too would double-count them, which
+      // the "everything deferred exactly once" assertion caught.
+      if (check.needs === 'database_url' || check.needs === 'control_database_url') continue;
       results.push(deferFor(check));
     }
   } else {
@@ -370,25 +389,53 @@ export async function runCanary(options: CanaryOptions = {}): Promise<CanaryRepo
   };
 }
 
+/**
+ * One connection for the whole half, opened lazily and closed once.
+ *
+ * **A connection per query is wrong here, not merely wasteful**, and running
+ * this against a real database is what showed it. `path.guc.ef_search` issues a
+ * statement whose entire purpose is to make pgvector's library load and register
+ * its GUCs — a side effect that belongs to the *session*. With a fresh
+ * connection per query, the next statement asked a session where the load had
+ * never happened, and the check reported a missing setting on a database that
+ * had it. The bug reported the exact hazard it was written to find, which is the
+ * worst way for a probe to be wrong.
+ */
+function connectionRunner(dsn: string): {
+  readonly run: (sql: string) => Promise<Record<string, unknown>[]>;
+  readonly close: () => Promise<void>;
+} {
+  let connection: { unsafe(sql: string): unknown; close(): Promise<void> } | undefined;
+
+  return {
+    async run(sql: string) {
+      if (connection === undefined) {
+        const { SQL } = await import('bun');
+        connection = new SQL(dsn, { max: 1 }) as unknown as typeof connection;
+      }
+      return (await connection?.unsafe(sql)) as Record<string, unknown>[];
+    },
+    async close() {
+      await connection?.close();
+      connection = undefined;
+    },
+  };
+}
+
 async function databaseChecks(options: CanaryOptions): Promise<CheckResult[]> {
+  const results: CheckResult[] = [...(await controlChecks(options))];
+
   const dbChecks = CANARY_CHECKS.filter((check) => check.needs === 'database_url');
   const query = options.query;
 
-  if (query === undefined && options.databaseUrl === undefined) return dbChecks.map(deferFor);
+  if (query === undefined && options.databaseUrl === undefined) {
+    return [...results, ...dbChecks.map(deferFor)];
+  }
 
-  const run =
-    query ??
-    (async (sql: string): Promise<Record<string, unknown>[]> => {
-      const { SQL } = await import('bun');
-      const connection = new SQL(options.databaseUrl ?? '', { max: 1 });
-      try {
-        return (await connection.unsafe(sql)) as Record<string, unknown>[];
-      } finally {
-        await connection.close();
-      }
-    });
+  const connection = query === undefined ? connectionRunner(options.databaseUrl ?? '') : undefined;
+  const run = query ?? connection?.run;
+  if (run === undefined) return [...results, ...dbChecks.map(deferFor)];
 
-  const results: CheckResult[] = [];
   const attempt = async (id: string, body: () => Promise<CheckResult>): Promise<void> => {
     try {
       results.push(await body());
@@ -407,16 +454,22 @@ async function databaseChecks(options: CanaryOptions): Promise<CheckResult[]> {
   });
 
   await attempt('path.guc.ef_search', async () => {
-    const rows = await run(`SELECT current_setting('hnsw.ef_search', true) AS value`);
-    const raw = rows[0]?.['value'];
-    const value = Number(raw ?? Number.NaN);
-    const raised = Number.isFinite(value) && value > HNSW_EF_SEARCH_DEFAULT;
+    // The library registers its GUCs when it loads, and it loads when something
+    // touches a vector column — so the read below is meaningless on a connection
+    // that has not. This statement is the load, and it doubles as proof the
+    // tenant schema is there at all.
+    await run(`SELECT count(*)::int AS n FROM chunk`);
+
+    const rows = await run(
+      `SELECT setting, boot_val FROM pg_settings WHERE name = 'hnsw.ef_search'`,
+    );
+    const registered = rows.length === 1;
     return {
       id: 'path.guc.ef_search',
-      outcome: raised ? 'pass' : 'fail',
-      detail: raised
-        ? `hnsw.ef_search is ${value}, above pgvector's default of ${HNSW_EF_SEARCH_DEFAULT}`
-        : `hnsw.ef_search reads ${JSON.stringify(raw ?? null)} — at or below the default of ${HNSW_EF_SEARCH_DEFAULT}, the candidate pool is silently truncated (H1)`,
+      outcome: registered ? 'pass' : 'fail',
+      detail: registered
+        ? `hnsw.ef_search is a registered setting (default ${String(rows[0]?.['boot_val'] ?? HNSW_EF_SEARCH_DEFAULT)}), so the SET LOCAL every scan issues is honoured`
+        : `hnsw.ef_search is not a registered setting on this database — Postgres accepts any prefixed custom GUC, so the SET LOCAL each scan issues succeeds, changes nothing, and every read truncates at ${HNSW_EF_SEARCH_DEFAULT} candidates with no error (H1)`,
     };
   });
 
@@ -444,23 +497,6 @@ async function databaseChecks(options: CanaryOptions): Promise<CheckResult[]> {
     };
   });
 
-  await attempt('path.queue', async () => {
-    const rows = await run(`
-      SELECT count(*) FILTER (WHERE lease_expires_at < now() - interval '1 hour')::int AS wedged,
-             count(*)::int AS total
-      FROM job
-    `);
-    const wedged = Number(rows[0]?.['wedged'] ?? 0);
-    return {
-      id: 'path.queue',
-      outcome: wedged === 0 ? 'pass' : 'fail',
-      detail:
-        wedged === 0
-          ? `the queue is present, ${String(rows[0]?.['total'] ?? 0)} rows, nothing wedged`
-          : `${wedged} job(s) hold a lease over an hour old — the brain answers while it has stopped learning`,
-    };
-  });
-
   await attempt('path.search_path_pinned', async () => {
     const { findUnpinnedFenceCoverage } = await import('../src/schema/search-path.ts');
     // The guard reads the catalog through a `sql.unsafe`-shaped call, which is
@@ -479,7 +515,50 @@ async function databaseChecks(options: CanaryOptions): Promise<CheckResult[]> {
     };
   });
 
+  await connection?.close();
   return results;
+}
+
+/**
+ * The control plane's half — one check, its own database.
+ *
+ * Separate because it IS separate: KTD1 gives every tenant its own database and
+ * the job queue is fleet-wide, so `control.job` is not in any tenant. The first
+ * version of this probe asked a tenant database for a `job` table and reported a
+ * failure that meant nothing. Running the artifact for real is what found it,
+ * which is the argument for shipping it runnable rather than as a plan.
+ */
+async function controlChecks(options: CanaryOptions): Promise<CheckResult[]> {
+  const checks = CANARY_CHECKS.filter((check) => check.needs === 'control_database_url');
+  const query = options.controlQuery;
+
+  if (query === undefined && options.controlDatabaseUrl === undefined) return checks.map(deferFor);
+  const connection = query === undefined ? connectionRunner(options.controlDatabaseUrl ?? '') : undefined;
+  const run = query ?? connection?.run;
+  if (run === undefined) return checks.map(deferFor);
+
+  try {
+    const rows = await run(`
+      SELECT count(*) FILTER (WHERE lease_expires_at < now() - interval '1 hour')::int AS wedged,
+             count(*)::int AS total
+      FROM control.job
+    `);
+    const wedged = Number(rows[0]?.['wedged'] ?? 0);
+    return [
+      {
+        id: 'path.queue',
+        outcome: wedged === 0 ? 'pass' : 'fail',
+        detail:
+          wedged === 0
+            ? `the queue is present, ${String(rows[0]?.['total'] ?? 0)} rows, nothing wedged`
+            : `${wedged} job(s) hold a lease over an hour old — the brain answers while it has stopped learning`,
+      },
+    ];
+  } catch (error) {
+    return [{ id: 'path.queue', outcome: 'fail', detail: `the check could not run: ${String(error)}` }];
+  } finally {
+    await connection?.close();
+  }
 }
 
 export function renderReport(report: CanaryReport): string {
@@ -519,6 +598,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     endpoint: argOf(argv, 'endpoint'),
     token: argOf(argv, 'token'),
     databaseUrl: argOf(argv, 'database-url'),
+    controlDatabaseUrl: argOf(argv, 'control-database-url'),
     tenantId: argOf(argv, 'tenant'),
     verificationKey: argOf(argv, 'verification-key'),
   });

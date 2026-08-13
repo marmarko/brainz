@@ -488,10 +488,18 @@ The register says what the blast radius is. The canary says whether the
 isolation claims still hold on a live deployment, and it is runnable by anyone:
 
 ```bash
+# Anyone, with their own token and no credential of ours.
 bun evals/isolation-canary.ts --endpoint https://<host>/mcp --token <your own bearer>
+
+# An operator, adding the post-deploy path check. Two databases, because there
+# are two: one per tenant (KTD1), and one control plane holding the job queue.
+bun evals/isolation-canary.ts \
+  --endpoint https://<host>/mcp --token <bearer> --tenant <tenant-id> \
+  --database-url postgres://…/<tenant> \
+  --control-database-url postgres://…/<control>
 ```
 
 It reports `deferred` — never `pass` — for anything it could not reach, and
 exits non-zero rather than returning a green tick for having checked nothing.
 `evals/isolation-canary.ts` documents the published known record and each check
-it makes.
+it makes, including why each one is worth re-running after every deploy.
