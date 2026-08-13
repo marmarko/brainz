@@ -27,6 +27,7 @@ import {
   classifyHttpFailure,
   createInMemoryClaimStore,
   createPipedreamClient,
+  DEFAULT_BURST,
   createRateBudget,
   sharedRateBudget,
   mintClaimUrl,
@@ -529,14 +530,36 @@ describe('the rate budget bounds more than one pull', () => {
     // The vendor ceiling is per project, not per tenant. A private default per
     // client means N tenants hold N times the quota and every one of them is
     // "within budget" while the project is being throttled.
-    const first = createScriptedTransport();
-    first.on('/oauth/token', { status: 200, body: { access_token: 't', expires_in: 3600 } });
-    first.fallback({ status: 200, body: {} });
-    const second = createScriptedTransport();
-    second.on('/oauth/token', { status: 200, body: { access_token: 't', expires_in: 3600 } });
-    second.fallback({ status: 200, body: {} });
-
+    //
+    // `google_calendar` is this file's only user of that bucket, so the burst
+    // it starts with is known and the assertion is not a race with whatever ran
+    // before it.
     expect(sharedRateBudget()).toBe(sharedRateBudget());
+
+    const clientOn = () => {
+      const transport = createScriptedTransport();
+      transport.on('/oauth/token', { status: 200, body: { access_token: 't', expires_in: 3600 } });
+      transport.fallback({ status: 200, body: {} });
+      return createPipedreamClient({ config: CONFIG, transport, now: () => new Date() });
+    };
+
+    const first = clientOn();
+    const second = clientOn();
+    const call = (client: ReturnType<typeof clientOn>) =>
+      client.request({
+        app: 'google_calendar',
+        method: 'GET',
+        path: '/events',
+        externalUserId: 'a',
+      });
+
+    // The first client spends the whole burst…
+    for (let index = 0; index < DEFAULT_BURST; index += 1) await call(first);
+
+    // …and the second one, which never met it, has to wait for a refill.
+    const started = Date.now();
+    await call(second);
+    expect(Date.now() - started).toBeGreaterThan(50);
   });
 
   test('only one caller per key waits on a timer at a time', async () => {
@@ -571,6 +594,35 @@ describe('the rate budget bounds more than one pull', () => {
       await settle();
     }
     await Promise.all(waiting);
+  });
+
+  test('a sleep that returned early does not leak a token', async () => {
+    // `sleep` is not a promise that the clock advanced by what was asked: a
+    // timer can fire early, a clock can be coarse, and the injected one in a
+    // test certainly is. Sleeping once and then decrementing regardless hands
+    // out a token the bucket never refilled — the pacing simply does not happen.
+    let clock = 0;
+    let sleeps = 0;
+    const budget = createRateBudget({
+      qps: 1,
+      burst: 1,
+      now: () => clock,
+      sleep: (ms) => {
+        sleeps += 1;
+        clock += Math.floor(ms / 2);
+        return Promise.resolve();
+      },
+    });
+
+    await budget.take('gmail');
+    const started = clock;
+    await budget.take('gmail');
+
+    expect(sleeps).toBeGreaterThan(1);
+    // One sleep's worth is exactly what the leaking version waits before it
+    // hands the token over anyway. (Integer division keeps this a hair under a
+    // full second, which is the point: the caller waited nearly twice as long.)
+    expect(clock - started).toBeGreaterThan(500);
   });
 
   test('waiters do not all proceed on one refill', async () => {

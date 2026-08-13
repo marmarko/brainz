@@ -26,8 +26,18 @@ import { CONFIG, createScriptedTransport, withToken } from '../fixture.ts';
 const NOW = new Date('2026-08-13T10:00:00.000Z');
 const SINCE = new Date('2026-05-15T00:00:00.000Z');
 
+/**
+ * A client whose pacing is a no-op.
+ *
+ * These are adapter tests: what they assert is what the adapter makes of a
+ * response, and the shared process budget would otherwise make them sleep
+ * against a real clock for reasons none of them are about. `client.test.ts`
+ * owns the budget's own behaviour.
+ */
+const UNPACED = { take: () => Promise.resolve() };
+
 function client(transport: ReturnType<typeof createScriptedTransport>) {
-  return createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
+  return createPipedreamClient({ config: CONFIG, transport, now: () => NOW, rate: UNPACED });
 }
 
 function base64url(text: string): string {
