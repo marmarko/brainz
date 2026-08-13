@@ -83,6 +83,7 @@ import {
 import type {
   EnqueueOutcome,
   EnqueueRefusal,
+  JobLease,
   JobQueue,
   JobTrigger,
 } from '../../worker/jobs.ts';
@@ -92,6 +93,7 @@ import {
   discardCursor,
   isConnectorSource,
   isPullDue,
+  normalizeAccountKey,
   pullModeFor,
   type ConnectorSource,
   type ConnectorState,
@@ -162,7 +164,67 @@ export interface PullRequest {
   readonly maxItems?: number;
 }
 
-export type PullStopReason = PullFailureReason | 'budget_exhausted' | 'model_not_priced';
+export type PullStopReason =
+  | PullFailureReason
+  | 'budget_exhausted'
+  | 'model_not_priced'
+  /** The listing reported a different account than the one on record. */
+  | 'identity_changed'
+  /** Items the page offered that this pull never got to. The cursor holds. */
+  | 'not_attempted';
+
+/** Which ingest-log code a stop is, so a stopped run says *why* it stopped. */
+function stopCodeFor(reason: PullStopReason): IngestFailureCode {
+  switch (reason) {
+    case 'budget_exhausted':
+      return 'budget_exhausted';
+    case 'identity_changed':
+    case 'not_attempted':
+      return 'cancelled';
+    case 'model_not_priced':
+      return 'provider_error';
+    default:
+      return ingestCodeFor(reason);
+  }
+}
+
+/**
+ * An item-level failure code, read back as the reason this run is incomplete.
+ *
+ * The inverse of {@link ingestCodeFor}, and lossy in the same one place: the
+ * table's `cancelled` covers both "the ceiling stopped us" and "the account
+ * went away mid-page", and both mean the same thing to the cursor.
+ */
+function reasonForCode(code: IngestFailureCode): PullStopReason {
+  switch (code) {
+    case 'rate_limited':
+      return 'rate_limited';
+    case 'auth_expired':
+      return 'auth_expired';
+    case 'budget_exhausted':
+      return 'budget_exhausted';
+    case 'cancelled':
+      return 'not_attempted';
+    default:
+      return 'provider_error';
+  }
+}
+
+/**
+ * Would asking again help?
+ *
+ * The content refusals (`empty_document`, `unknown_source_type`) are stable
+ * facts about the item and must not hold the cursor. Everything else is the
+ * fleet's own machinery failing around an item that was perfectly fine, and
+ * advancing past it loses the change for good.
+ */
+function writeLossIsRetryable(reason: WriteFailureReason): boolean {
+  return (
+    reason === 'embed_failed' ||
+    reason === 'tenant_not_configured' ||
+    reason === 'embedding_model_unknown'
+  );
+}
 
 export interface PullCounts {
   readonly written: number;
@@ -384,12 +446,16 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
 
   const run = await openRun(tenant.sql, { originContext, sourceType });
 
+  /** What the listing said this account is, once it has said it. */
+  let adoptedAccountKey: string | null = null;
+
   /** Stamp the attempt, advance the cursor if it was earned, drop a spent approval. */
   const saveState = async (nextCursorValue: ConnectorState['cursor']): Promise<boolean> => {
     const advanced = nextCursorValue !== null;
     const consumed = request.approvedMicroUsd !== undefined;
     state = {
       ...(state as ConnectorState),
+      ...(adoptedAccountKey === null ? {} : { accountKey: adoptedAccountKey }),
       // Always stamped, success or failure: it is "when this source was last
       // checked", and a failing source that never stamps it is due on every
       // tick — a poll loop against a provider that is already unhappy.
@@ -437,6 +503,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
       now: request.now,
       externalUserId: state.externalUserId,
       accountId: state.accountId,
+      accountKey: state.accountKey,
     });
 
     if (!listing.ok && listing.reason === 'cursor_invalid') {
@@ -459,6 +526,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
         now: request.now,
         externalUserId: state.externalUserId,
         accountId: state.accountId,
+        accountKey: state.accountKey,
       });
     }
 
@@ -469,6 +537,48 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     }
 
     const listed = listing.page;
+
+    // ------------------------------------------------------------------
+    // 1a. **Whose mailbox is this?** Before the tombstone sweep, before the
+    //     gate, before anything writes.
+    //
+    //     Provider ids are unique per account, not globally, so a connection
+    //     re-pointed at a different Google account offers colliding ids — and
+    //     every one of them would land as an *update* to the first account's
+    //     page: their mail tombstoned and replaced by a stranger's, under the
+    //     same origin, which is why the origin fence cannot see it. Running the
+    //     check after the sweep would be worse still: the sweep would tombstone
+    //     the first account's pages using the second's deletions.
+    // ------------------------------------------------------------------
+    const observedAccountKey = normalizeAccountKey(listed.accountKey ?? null);
+    if (
+      observedAccountKey !== null &&
+      state.accountKey !== null &&
+      observedAccountKey !== state.accountKey
+    ) {
+      await finishRun(tenant.sql, run.ingestId, {
+        outcome: 'failed',
+        failureCode: stopCodeFor('identity_changed'),
+      });
+      // The attempt is stamped, the cursor is not advanced, and the recorded
+      // identity is **not** overwritten by whoever pulled last. Re-pointing a
+      // connector at another account is a re-connect, not a poll.
+      await saveState(null);
+      return {
+        outcome: 'refused',
+        mode,
+        runId: run.ingestId,
+        decision: null,
+        estimate: null,
+        counts,
+        widen,
+        attemptedItems,
+        cursorAdvanced: false,
+        cursorInvalidated,
+        stopReason: 'identity_changed',
+      };
+    }
+    adoptedAccountKey = state.accountKey ?? observedAccountKey;
 
     // ------------------------------------------------------------------
     // 2. The junk gate — before the estimate, not merely before the write.
@@ -680,8 +790,21 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     //    counter only advances for what it accepted, so these are counted here
     //    or a run that half-read a mailbox reports a clean pull.
     // ------------------------------------------------------------------
+    /**
+     * The run did not do all its work, and re-running is the remedy.
+     *
+     * Kept apart from {@link halted}: a lost item does not stop the rest of the
+     * page from importing, and the chunk pass still has to drain what *was*
+     * written. What it does do is hold the cursor — see step 10.
+     */
+    let incomplete: PullStopReason | undefined;
+
     for (const failure of listed.failures) {
       counts.failed += 1;
+      // **A retryable refusal holds the cursor.** Counted-and-forgotten is how
+      // a 429 becomes a permanent hole: the run closes `ok`, the cursor moves
+      // past the message, and the provider never offers that change again.
+      if (failure.retryable) incomplete ??= reasonForCode(failure.reason);
       await countRunItem(tenant.sql, run.ingestId, { written: 0, quarantined: 0 });
       if (failure.externalRef !== null) {
         await recordItem(tenant.sql, {
@@ -697,7 +820,8 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     // ------------------------------------------------------------------
     // 8. The items.
     // ------------------------------------------------------------------
-    let stopReason: PullStopReason | undefined;
+    /** Processing stopped part-way, so nothing after this point should run. */
+    let halted: PullStopReason | undefined;
 
     for (const { item, verdict } of items) {
       attemptedItems += 1;
@@ -727,10 +851,13 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
           // Stop. Collecting one identical refusal per remaining item is the
           // same defect wearing a loop, and re-running costs nothing for what
           // was already written.
-          stopReason = 'budget_exhausted';
+          halted = 'budget_exhausted';
           break;
         }
         counts.failed += 1;
+        // The fetch worked and the write did not, for a reason that has nothing
+        // to do with this item's content. Same rule as a refused fetch.
+        if (writeLossIsRetryable(receipt.reason)) incomplete ??= 'provider_error';
         await countRunItem(tenant.sql, run.ingestId, { written: 0, quarantined: 0 });
         await recordItem(tenant.sql, {
           originContext,
@@ -773,7 +900,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     //    never happens. Quarantined chunks are not in this backlog — which is
     //    the structural half of "the junk gate runs before the meter".
     // ------------------------------------------------------------------
-    if (stopReason === undefined) {
+    if (halted === undefined) {
       const backlog = await runChunkEmbedBacklog({
         sql: tenant.sql,
         gateway: tenant.gateway,
@@ -781,14 +908,22 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
         caller: tenant.caller,
         budget,
       });
-      if (backlog.failure === 'budget_exhausted') stopReason = 'budget_exhausted';
+      if (backlog.failure === 'budget_exhausted') halted = 'budget_exhausted';
+      // Any other backlog failure leaves chunks unembedded. The rows survive
+      // (the backlog is a query over `embedding IS NULL`, not a promise this
+      // process holds), so nothing is lost — but a run that closed `ok` over it
+      // is a brain reporting itself indexed when it is not.
+      else if (backlog.failure !== undefined) incomplete ??= 'provider_error';
     }
 
     // ------------------------------------------------------------------
     // 10. The cursor — last, and only over work that is banked.
     // ------------------------------------------------------------------
+    // **Only over work that is banked, and only when nothing was lost.** A
+    // cursor that steps over a retryable refusal is the one mistake in this file
+    // that no later pull can correct: the provider offers a change once.
     const nextCursor =
-      stopReason === undefined && listed.nextCursor !== null
+      halted === undefined && incomplete === undefined && listed.nextCursor !== null
         ? {
             kind: listed.nextCursor.kind,
             value: listed.nextCursor.value,
@@ -797,10 +932,11 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
         : null;
     const cursorAdvanced = await saveState(nextCursor);
 
+    const stopReason = halted ?? incomplete;
     if (stopReason !== undefined) {
       await finishRun(tenant.sql, run.ingestId, {
         outcome: 'failed',
-        failureCode: 'budget_exhausted',
+        failureCode: stopCodeFor(stopReason),
       });
       return {
         outcome: 'stopped',
@@ -863,6 +999,15 @@ export interface PullHandlerDeps {
   ) => Promise<{ readonly source: ProviderSource; readonly states: ConnectorStateStore }>;
   readonly priceBook?: PriceBook;
   readonly maxItems?: number;
+  /**
+   * Where the pull's own result goes.
+   *
+   * Without it the handler computes `counts.failed`, `stopReason` and the widen
+   * numbers and hands them to nobody — the one place in the fleet that knows a
+   * pull lost forty messages drops the fact on the floor. The durable record is
+   * still the ingest log; this is the live one, for whatever composes the fleet.
+   */
+  readonly onResult?: (result: PullResult, lease: JobLease) => void | Promise<void>;
 }
 
 /**
@@ -892,7 +1037,7 @@ export function createIngestPullHandler(
       // fund every later pull.
       const banked = state?.backfill?.jobId === lease.jobId ? state.backfill : null;
 
-      await runPull({
+      const result = await runPull({
         tenant,
         control: deps.control,
         profile: deps.profile,
@@ -910,6 +1055,20 @@ export function createIngestPullHandler(
         ...(deps.priceBook === undefined ? {} : { priceBook: deps.priceBook }),
         ...(deps.maxItems === undefined ? {} : { maxItems: deps.maxItems }),
       });
+
+      await deps.onResult?.(result, lease);
+
+      // **A pull that never reached the provider is not a job that succeeded.**
+      // Returning quietly marks the job complete, and the source then waits a
+      // full cadence before anyone asks again — while a revoked grant or a
+      // rate-limited listing is exactly the condition a backed-off retry
+      // exists for. A `stopped` run is *not* thrown on: its cursor is held, its
+      // work is banked, and the next tick resumes it without a retry budget.
+      if (result.outcome === 'failed') {
+        throw new Error(
+          `ingest_pull for '${lease.target}' failed against the provider: ${result.stopReason ?? 'unknown'}`,
+        );
+      }
     } finally {
       await deps.closeTenant?.(tenant);
     }

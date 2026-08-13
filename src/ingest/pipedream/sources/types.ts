@@ -16,17 +16,33 @@
  * U8's folder scan, a delta feed never enumerates what still exists.
  */
 
-import type { ConnectorSource, CursorKind, PullMode } from '../../cursor.ts';
+import { normalizeAccountKey, type ConnectorSource, type CursorKind, type PullMode } from '../../cursor.ts';
 import type { SourceType } from '../../../core/write/write-path.ts';
 import type { IngestFailureCode } from '../../log.ts';
 import type { JunkInput } from '../../junk.ts';
 import type { PullFailureReason } from '../client.ts';
 
-/** `<source>:<the provider's own id>`. The idempotency key's first half. */
-export function externalRefFor(source: ConnectorSource, providerId: string): string {
+/**
+ * `<source>:<account>:<the provider's own id>`, or `<source>:<id>` when the
+ * provider does not cheaply say which account this is. The idempotency key's
+ * first half.
+ *
+ * **The account is in the key because provider ids are not global.** A Gmail
+ * message id is unique within one mailbox; two Google accounts can and do carry
+ * the same id. Without the account in the ref, reconnecting a different account
+ * makes B's colliding message arrive as an *update* to A's page — A's mail
+ * tombstoned and replaced by a stranger's, silently, with the origin fence
+ * unable to tell the two apart because both pulls carry the same origin.
+ */
+export function externalRefFor(
+  source: ConnectorSource,
+  providerId: string,
+  accountKey?: string | null,
+): string {
   const id = providerId.trim();
   if (id.length === 0) throw new Error(`refusing an empty provider id for '${source}'`);
-  return `${source}:${id}`;
+  const account = normalizeAccountKey(accountKey);
+  return account === null ? `${source}:${id}` : `${source}:${account}:${id}`;
 }
 
 /**
@@ -185,6 +201,15 @@ export interface PullPage {
    * number ("importing 1,204 of 40,000"). Null when the provider does not say.
    */
   readonly outsideWindow: number | null;
+  /**
+   * **Which account this listing came from**, when the provider says cheaply.
+   * The runner adopts it on first sight and refuses a listing that reports a
+   * different one — see {@link ConnectorState.accountKey}.
+   *
+   * Null means "not observed", never "no account": a source that cannot answer
+   * must not be read as having answered.
+   */
+  readonly accountKey?: string | null;
 }
 
 export interface ProviderListRequest {
@@ -197,6 +222,12 @@ export interface ProviderListRequest {
   readonly now: Date;
   readonly externalUserId: string;
   readonly accountId?: string | null;
+  /**
+   * The account the runner believes is connected, so an adapter that cannot
+   * re-observe it on this call (a delta, a resumed slice) still keys its refs
+   * the same way the first slice did.
+   */
+  readonly accountKey?: string | null;
 }
 
 export type ProviderListOutcome =

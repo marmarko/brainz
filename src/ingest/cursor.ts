@@ -117,6 +117,22 @@ export interface ConnectorState {
   readonly externalUserId: string;
   /** The connected account, once a claim has been redeemed. */
   readonly accountId: string | null;
+  /**
+   * **Which mailbox this is**, in the provider's own terms — Gmail's
+   * `emailAddress`, and null for a source that does not cheaply say.
+   *
+   * `accountId` above is the *connection's* id, which a reconnect replaces; this
+   * is the identity behind it, which a reconnect can silently change. The
+   * distinction is not academic: Gmail message ids are unique per mailbox, not
+   * globally, so reconnecting a different Google account makes account B's
+   * colliding id arrive as an **update** to account A's page — A's mail
+   * tombstoned and replaced by a stranger's, with both pulls carrying the same
+   * origin so the origin fence cannot tell them apart.
+   *
+   * Adopted from the first listing that reports one, and never quietly
+   * overwritten: a listing that reports a *different* account is refused.
+   */
+  readonly accountKey: string | null;
   readonly cadenceSeconds: number;
   readonly cursor: SourceCursor | null;
   readonly connectedAt: string;
@@ -130,6 +146,7 @@ export function connectSource(input: {
   readonly source: ConnectorSource;
   readonly externalUserId: string;
   readonly accountId?: string | null;
+  readonly accountKey?: string | null;
   readonly cadenceSeconds?: number;
   readonly now: Date;
 }): ConnectorState {
@@ -137,6 +154,7 @@ export function connectSource(input: {
     source: input.source,
     externalUserId: input.externalUserId,
     accountId: input.accountId ?? null,
+    accountKey: normalizeAccountKey(input.accountKey ?? null),
     cadenceSeconds: normalizeCadenceSeconds(input.source, input.cadenceSeconds),
     cursor: null,
     connectedAt: input.now.toISOString(),
@@ -144,6 +162,19 @@ export function connectSource(input: {
     lastCursorInvalidatedAt: null,
     backfill: null,
   };
+}
+
+/**
+ * The account identity, in one canonical spelling.
+ *
+ * It becomes half of an `external_ref`, so `Owner@Example.test` and
+ * `owner@example.test` must not produce two pages for one message — and a blank
+ * one must read as "no observation" rather than as an account named "".
+ */
+export function normalizeAccountKey(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().toLowerCase();
+  return trimmed.length === 0 ? null : trimmed;
 }
 
 export type PullMode = 'delta' | 'backfill';
@@ -301,6 +332,9 @@ export function parseConnectorState(parsed: unknown): ConnectorState | null {
   const accountId = record.accountId;
   if (accountId !== null && typeof accountId !== 'string') return null;
 
+  const accountKey = record.accountKey;
+  if (accountKey !== null && accountKey !== undefined && typeof accountKey !== 'string') return null;
+
   const cursor = record.cursor;
   if (cursor !== null && !isCursor(cursor)) return null;
 
@@ -319,6 +353,7 @@ export function parseConnectorState(parsed: unknown): ConnectorState | null {
     source,
     externalUserId,
     accountId: accountId ?? null,
+    accountKey: normalizeAccountKey((accountKey as string | undefined) ?? null),
     cadenceSeconds: Math.trunc(cadence as number),
     cursor:
       cursor === null

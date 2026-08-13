@@ -174,7 +174,7 @@ function headerMap(payload: Record<string, unknown> | null): Record<string, stri
   return headers;
 }
 
-function toItem(message: Record<string, unknown>): PulledItem | null {
+function toItem(message: Record<string, unknown>, accountKey: string | null): PulledItem | null {
   const id = asString(message.id);
   if (id === null) return null;
 
@@ -195,7 +195,7 @@ function toItem(message: Record<string, unknown>): PulledItem | null {
   };
 
   return {
-    externalRef: externalRefFor('gmail', id),
+    externalRef: externalRefFor('gmail', id, accountKey),
     title: headers.subject ?? null,
     body,
     occurredAt: asDate(message.internalDate),
@@ -207,6 +207,7 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
   async function fetchMessage(
     request: ProviderListRequest,
     id: string,
+    accountKey: string | null,
   ): Promise<PulledItem | PulledFailure> {
     const outcome = await api.request({
       app: APP,
@@ -223,14 +224,20 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
       // a mailbox it half-read. The provider's own status decides whether the
       // cursor may move past it — a 429 read as "broken item" loses the message
       // for good.
-      return itemFailureFor(externalRefFor('gmail', id), outcome);
+      return itemFailureFor(externalRefFor('gmail', id, accountKey), outcome);
     }
 
     const record = asRecord(outcome.value);
-    const item = record === null ? null : toItem(record);
+    const item = record === null ? null : toItem(record, accountKey);
     // A body this adapter cannot make prose out of will not become prose on the
     // next attempt either, so this one does not hold the cursor.
-    return item ?? { externalRef: externalRefFor('gmail', id), reason: 'parse_failed', retryable: false };
+    return (
+      item ?? {
+        externalRef: externalRefFor('gmail', id, accountKey),
+        reason: 'parse_failed',
+        retryable: false,
+      }
+    );
   }
 
   /**
@@ -243,15 +250,16 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
   async function collect(
     request: ProviderListRequest,
     ids: readonly string[],
+    accountKey: string | null,
   ): Promise<{ items: PulledItem[]; failures: PulledFailure[] }> {
     const items: PulledItem[] = [];
     const failures: PulledFailure[] = [];
     const ceiling = Math.max(0, request.maxItems);
     for (const id of ids.slice(ceiling)) {
-      failures.push(ceilingFailureFor(externalRefFor('gmail', id)));
+      failures.push(ceilingFailureFor(externalRefFor('gmail', id, accountKey)));
     }
     for (const id of ids.slice(0, ceiling)) {
-      const fetched = await fetchMessage(request, id);
+      const fetched = await fetchMessage(request, id, accountKey);
       if ('reason' in fetched) failures.push(fetched);
       else items.push(fetched);
     }
@@ -263,6 +271,8 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
 
     // Before the listing, always — see the header.
     let historyId = resume.deltaToken;
+    // What the runner believes, until the profile says otherwise.
+    let accountKey = request.accountKey ?? null;
     if (historyId === null) {
       const profile = await api.request({
         app: APP,
@@ -272,7 +282,11 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
         accountId: request.accountId ?? null,
       });
       if (!profile.ok) return { ok: false, reason: profile.reason };
-      historyId = asString(asRecord(profile.value)?.historyId ?? null);
+      const record = asRecord(profile.value);
+      historyId = asString(record?.historyId ?? null);
+      // The same response already carries **which mailbox this is**. Dropping it
+      // is what leaves a pulled message bound to nothing but a per-mailbox id.
+      accountKey = asString(record?.emailAddress ?? null) ?? accountKey;
     }
 
     const listed = await api.request({
@@ -295,7 +309,7 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
       .filter((id): id is string => id !== null)
       .slice(0, request.maxItems);
 
-    const { items, failures } = await collect(request, ids);
+    const { items, failures } = await collect(request, ids, accountKey);
     const nextPageToken = asString(body?.nextPageToken ?? null);
     const estimate = body?.resultSizeEstimate;
 
@@ -312,12 +326,16 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
               ? null
               : { kind: 'delta', value: historyId },
         outsideWindow: typeof estimate === 'number' ? estimate : null,
+        accountKey,
       },
     };
   }
 
   async function delta(request: ProviderListRequest): Promise<ProviderListOutcome> {
     const resume = readDeltaCursor(request.cursor);
+    // A history walk does not re-observe the mailbox; it keys its refs by what
+    // the first slice adopted, which is what the runner hands down here.
+    const accountKey = request.accountKey ?? null;
     const listed = await api.request({
       app: APP,
       method: 'GET',
@@ -385,10 +403,10 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
     const tombstones: PulledTombstone[] = [];
     for (const [id, state] of settled) {
       if (state.live) live.push(id);
-      else tombstones.push({ externalRef: externalRefFor('gmail', id), reason: state.reason });
+      else tombstones.push({ externalRef: externalRefFor('gmail', id, accountKey), reason: state.reason });
     }
 
-    const { items, failures } = await collect(request, live);
+    const { items, failures } = await collect(request, live, accountKey);
     const nextPageToken = asString(body?.nextPageToken ?? null);
     const historyId = asString(body?.historyId ?? null);
 
@@ -414,7 +432,7 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
 
     return {
       ok: true,
-      page: { items, tombstones, failures, nextCursor, outsideWindow: null },
+      page: { items, tombstones, failures, nextCursor, outsideWindow: null, accountKey },
     };
   }
 
