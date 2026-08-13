@@ -282,10 +282,24 @@ export function renderTier(result: BlockingTierResult): string {
  * shipped stages into a `Ranker`, and its own header explains why a second
  * implementation would make the floors say nothing about what the fleet runs.
  * A gate scoring a copy of the stack is a gate scoring the copy.
+ *
+ * **`deps` exists so the non-zero exit is reachable from a test.** The number
+ * this function returns is the whole reason the CI step is a gate rather than a
+ * log line, and on the shipped stack every floor is met — so without a seam the
+ * only exit code any test can observe is 0, and `return result.passed ? 0 : 1`
+ * could be edited to `return 0` with the entire suite still green. A mutation
+ * run proved exactly that. The seam is the smallest thing that makes the
+ * failing branch observable; nothing in the command's own path passes it.
  */
-export async function main(argv: readonly string[]): Promise<number> {
+export async function main(
+  argv: readonly string[],
+  deps?: { readonly ranker?: Ranker; readonly context?: TierContext },
+): Promise<number> {
   const { stackRanker } = await import('../test/core/search/corpus-ranker.ts');
-  const result = runBlockingTier({ ranker: stackRanker, context: loadTierContext() });
+  const result = runBlockingTier({
+    ranker: deps?.ranker ?? stackRanker,
+    context: deps?.context ?? loadTierContext(),
+  });
 
   if (argv.includes('--json')) {
     process.stdout.write(

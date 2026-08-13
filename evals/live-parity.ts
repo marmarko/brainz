@@ -453,7 +453,21 @@ async function reEmbedThroughProductionPath(
     if (result.output.kind !== 'embedding') continue;
     const vector = result.output.vectors[0];
     if (vector === undefined) continue;
-    out.push({ id: sample.id, encoding: sample.encoding, model: sample.model, vector });
+    // **No `model`, deliberately.** `ParityResponse.model` exists for the
+    // provider's own attribution of the vector it just returned — a provider
+    // quietly serving a different snapshot behind the same alias is a
+    // parity-class failure and `checkEmbeddingParity` has the check for it. But
+    // that attribution is not observable from here: `ModelOutput` carries only
+    // vectors, `TransportResponse` carries only output and usage, and the one
+    // model id a `GatewayResult` exposes is `metering.modelId`, which is the id
+    // this call *asked* for. Filling the field from `sample.model` — which the
+    // check above has already compared against `routedModelId` — would satisfy
+    // the guard with a value copied out of its own input, so a green run would
+    // read as "the provider served what we routed to" while nothing had been
+    // observed at all. Left absent so the check honestly skips, and the gap is
+    // recorded: provider attribution needs U20's transport to carry the
+    // response body's `model` field.
+    out.push({ id: sample.id, encoding: sample.encoding, vector });
   }
   return out;
 }
