@@ -91,6 +91,76 @@ export interface PulledTombstone {
 export interface PulledFailure {
   readonly externalRef: string | null;
   readonly reason: IngestFailureCode;
+  /**
+   * **Could asking again succeed?** The runner reads this and nothing else to
+   * decide whether the cursor may move past the item.
+   *
+   * A rate-limited fetch is the case that decides the field exists: collapsed
+   * into `provider_error` it reads as "this item is broken", the cursor advances
+   * over it, and the provider never offers that message again — a permanent hole
+   * in a mailbox, produced by a 429 the vendor expected us to retry. The other
+   * direction is a real cost too, which is why this is not simply "always hold":
+   * a message deleted between the listing and the fetch answers 404 forever, and
+   * holding the cursor for it stalls the source until somebody notices.
+   *
+   * Required, not optional. A default here would be a decision nobody made at
+   * the one place that knows the provider's status code.
+   */
+  readonly retryable: boolean;
+}
+
+/**
+ * Statuses on which asking again is worth anything: a transport that never
+ * answered, a server that failed, a timeout. Every other 4xx is the provider
+ * telling us something stable about that item.
+ */
+function statusIsWorthRetrying(status: number | null): boolean {
+  return status === null || status === 408 || status >= 500;
+}
+
+/**
+ * One provider refusal of one item, in the vocabulary the ingest log holds plus
+ * the retry verdict the cursor turns on.
+ *
+ * Written once and shared, because three adapters that each decided for
+ * themselves is three chances to collapse a 429 into "broken item" — which is
+ * exactly how this was wrong before.
+ */
+export function itemFailureFor(
+  externalRef: string | null,
+  failure: { readonly reason: PullFailureReason; readonly status: number | null },
+): PulledFailure {
+  switch (failure.reason) {
+    case 'rate_limited':
+      return { externalRef, reason: 'rate_limited', retryable: true };
+    case 'auth_expired':
+      return { externalRef, reason: 'auth_expired', retryable: true };
+    case 'not_connected':
+      return { externalRef, reason: 'cancelled', retryable: true };
+    case 'cursor_invalid':
+      // On a *single item* this is not the cursor: a 410 or a 404 on one message
+      // is that message being gone. Holding the cursor for it would wedge the
+      // source forever on an id that is never coming back.
+      return { externalRef, reason: 'provider_error', retryable: false };
+    default:
+      return {
+        externalRef,
+        reason: 'provider_error',
+        retryable: statusIsWorthRetrying(failure.status),
+      };
+  }
+}
+
+/**
+ * An item the page found but this pull's ceiling had no room to fetch.
+ *
+ * Not a slice and not a silence: the runner holds the cursor on it, so the
+ * change is offered again next time rather than being skipped for good. The
+ * remedy an operator has is a larger `maxItems`, and the row is what tells them
+ * to reach for it.
+ */
+export function ceilingFailureFor(externalRef: string): PulledFailure {
+  return { externalRef, reason: 'cancelled', retryable: true };
 }
 
 /** What the adapter hands back as the next cursor. `issuedAt` is the runner's. */

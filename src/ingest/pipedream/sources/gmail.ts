@@ -40,12 +40,15 @@
 import type { JunkInput } from '../../junk.ts';
 import type { ProviderApi } from '../client.ts';
 import {
+  RESUME_DELIMITER,
   asArray,
   asDate,
   asRecord,
   asString,
   boundBody,
+  ceilingFailureFor,
   externalRefFor,
+  itemFailureFor,
   joinResumeCursor,
   splitResumeCursor,
   type ProviderListOutcome,
@@ -80,6 +83,29 @@ function touchesRemovingLabel(change: unknown): boolean {
     const name = asString(label);
     return name !== null && REMOVING_LABELS.has(name);
   });
+}
+
+/**
+ * A delta cursor, read.
+ *
+ * Two shapes, and the second one only exists because a history walk can be
+ * longer than one page: a bare `<historyId>` is a caught-up source, and
+ * `<pageToken>~<historyId>` is a walk that stopped part-way and must resume from
+ * the id it *started* at rather than from wherever the mailbox has got to. The
+ * delimiter is safe because Google's page tokens are base64url and its history
+ * ids are digits; neither can contain a `~`.
+ */
+function readDeltaCursor(cursor: string | null): {
+  readonly startHistoryId: string | null;
+  readonly pageToken: string | null;
+} {
+  if (cursor === null) return { startHistoryId: null, pageToken: null };
+  const index = cursor.indexOf(RESUME_DELIMITER);
+  if (index < 0) return { startHistoryId: cursor, pageToken: null };
+  return {
+    pageToken: cursor.slice(0, index) || null,
+    startHistoryId: cursor.slice(index + 1) || null,
+  };
 }
 
 /** `after:YYYY/MM/DD` — Gmail's own query syntax, in UTC. */
@@ -194,22 +220,37 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
     if (!outcome.ok) {
       // A message that would not fetch is a *failure row*, not a silent skip:
       // an item nobody can account for is how a run reports a clean import of
-      // a mailbox it half-read.
-      return { externalRef: externalRefFor('gmail', id), reason: 'provider_error' };
+      // a mailbox it half-read. The provider's own status decides whether the
+      // cursor may move past it — a 429 read as "broken item" loses the message
+      // for good.
+      return itemFailureFor(externalRefFor('gmail', id), outcome);
     }
 
     const record = asRecord(outcome.value);
     const item = record === null ? null : toItem(record);
-    return item ?? { externalRef: externalRefFor('gmail', id), reason: 'parse_failed' };
+    // A body this adapter cannot make prose out of will not become prose on the
+    // next attempt either, so this one does not hold the cursor.
+    return item ?? { externalRef: externalRefFor('gmail', id), reason: 'parse_failed', retryable: false };
   }
 
+  /**
+   * Fetch what this pull's ceiling has room for, and **account for the rest**.
+   *
+   * The ids beyond the ceiling are not sliced away: they come back as retryable
+   * failure rows, which holds the cursor, which is what makes the change be
+   * offered again instead of skipped forever.
+   */
   async function collect(
     request: ProviderListRequest,
     ids: readonly string[],
   ): Promise<{ items: PulledItem[]; failures: PulledFailure[] }> {
     const items: PulledItem[] = [];
     const failures: PulledFailure[] = [];
-    for (const id of ids) {
+    const ceiling = Math.max(0, request.maxItems);
+    for (const id of ids.slice(ceiling)) {
+      failures.push(ceilingFailureFor(externalRefFor('gmail', id)));
+    }
+    for (const id of ids.slice(0, ceiling)) {
       const fetched = await fetchMessage(request, id);
       if ('reason' in fetched) failures.push(fetched);
       else items.push(fetched);
@@ -276,13 +317,15 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
   }
 
   async function delta(request: ProviderListRequest): Promise<ProviderListOutcome> {
+    const resume = readDeltaCursor(request.cursor);
     const listed = await api.request({
       app: APP,
       method: 'GET',
       path: '/gmail/v1/users/me/history',
       query: {
-        startHistoryId: request.cursor ?? '',
+        startHistoryId: resume.startHistoryId ?? '',
         maxResults: Math.min(PAGE_SIZE, Math.max(1, request.maxItems)),
+        ...(resume.pageToken === null ? {} : { pageToken: resume.pageToken }),
       },
       externalUserId: request.externalUserId,
       accountId: request.accountId ?? null,
@@ -345,18 +388,33 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
       else tombstones.push({ externalRef: externalRefFor('gmail', id), reason: state.reason });
     }
 
-    const { items, failures } = await collect(request, live.slice(0, request.maxItems));
+    const { items, failures } = await collect(request, live);
+    const nextPageToken = asString(body?.nextPageToken ?? null);
     const historyId = asString(body?.historyId ?? null);
+
+    /**
+     * **`body.historyId` is the mailbox's current record, not this page's last
+     * one.** Taking it while a `nextPageToken` is still outstanding declares the
+     * source caught up to *now* and skips every change on the pages nobody read
+     * — silently, permanently, and with the run still closing `ok`.
+     *
+     * So a truncated history walk resumes itself: the cursor stays `delta`
+     * (a `backfill` kind would send the next pull to `messages.list`, which
+     * cannot use a history page token) and carries the page token beside the
+     * start it was walking from.
+     */
+    const nextCursor =
+      nextPageToken !== null
+        ? resume.startHistoryId === null
+          ? null
+          : { kind: 'delta' as const, value: joinResumeCursor(nextPageToken, resume.startHistoryId) }
+        : historyId === null
+          ? null
+          : { kind: 'delta' as const, value: historyId };
 
     return {
       ok: true,
-      page: {
-        items,
-        tombstones,
-        failures,
-        nextCursor: historyId === null ? null : { kind: 'delta', value: historyId },
-        outsideWindow: null,
-      },
+      page: { items, tombstones, failures, nextCursor, outsideWindow: null },
     };
   }
 

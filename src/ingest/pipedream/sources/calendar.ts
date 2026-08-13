@@ -20,8 +20,11 @@ import {
   asDate,
   asRecord,
   asString,
+  RESUME_DELIMITER,
   boundBody,
+  ceilingFailureFor,
   externalRefFor,
+  joinResumeCursor,
   type ProviderListOutcome,
   type ProviderListRequest,
   type ProviderSource,
@@ -69,6 +72,21 @@ function eventBody(event: Record<string, unknown>): string {
   return boundBody(lines.join('\n').trim());
 }
 
+/**
+ * A sync cursor, read. `<syncToken>` when the source is caught up,
+ * `<pageToken>~<syncToken>` when a sync ran past one page. See
+ * {@link RESUME_DELIMITER} for why `~` is safe against Google's own tokens.
+ */
+function readSyncCursor(cursor: string | null): {
+  readonly syncToken: string | null;
+  readonly pageToken: string | null;
+} {
+  if (cursor === null) return { syncToken: null, pageToken: null };
+  const index = cursor.indexOf(RESUME_DELIMITER);
+  if (index < 0) return { syncToken: cursor, pageToken: null };
+  return { pageToken: cursor.slice(0, index) || null, syncToken: cursor.slice(index + 1) || null };
+}
+
 export function createCalendarSource(api: ProviderApi): ProviderSource {
   return {
     source: 'calendar',
@@ -76,6 +94,14 @@ export function createCalendarSource(api: ProviderApi): ProviderSource {
 
     async list(request: ProviderListRequest): Promise<ProviderListOutcome> {
       const delta = request.mode === 'delta' && request.cursor !== null;
+      // A sync that ran past one page carries both halves: `<pageToken>~<syncToken>`.
+      // Google's own incremental-sync sample keeps the sync token set and adds
+      // the page token, and the alternative — storing the bare page token — is a
+      // cursor the next pull cannot tell from a first import's continuation.
+      // A cursor with no delimiter is a plain sync token, never a page token:
+      // `splitResumeCursor` reads the bare form the other way round, which is
+      // right for a backfill's continuation and wrong here.
+      const resume = readSyncCursor(delta ? request.cursor : null);
 
       const listed = await api.request({
         app: APP,
@@ -89,7 +115,10 @@ export function createCalendarSource(api: ProviderApi): ProviderSource {
           showDeleted: true,
           singleEvents: true,
           ...(delta
-            ? { syncToken: request.cursor ?? '' }
+            ? {
+                syncToken: resume.syncToken ?? '',
+                ...(resume.pageToken === null ? {} : { pageToken: resume.pageToken }),
+              }
             : {
                 ...(request.since === null ? {} : { timeMin: request.since.toISOString() }),
                 ...(request.cursor === null ? {} : { pageToken: request.cursor }),
@@ -105,11 +134,25 @@ export function createCalendarSource(api: ProviderApi): ProviderSource {
       const tombstones: PulledTombstone[] = [];
       const failures: PulledFailure[] = [];
 
-      for (const entry of asArray(body?.items).slice(0, request.maxItems)) {
+      const offered = asArray(body?.items);
+      const ceiling = Math.max(0, request.maxItems);
+      // Beyond the ceiling is accounted for rather than sliced away: the row is
+      // retryable, which holds the cursor, which is what makes the event be
+      // offered again instead of dropped.
+      for (const entry of offered.slice(ceiling)) {
+        const id = asString(asRecord(entry)?.id ?? null);
+        failures.push(
+          id === null
+            ? { externalRef: null, reason: 'parse_failed', retryable: false }
+            : ceilingFailureFor(externalRefFor('calendar', id)),
+        );
+      }
+
+      for (const entry of offered.slice(0, ceiling)) {
         const event = asRecord(entry);
         const id = event === null ? null : asString(event.id);
         if (event === null || id === null) {
-          failures.push({ externalRef: null, reason: 'parse_failed' });
+          failures.push({ externalRef: null, reason: 'parse_failed', retryable: false });
           continue;
         }
 
@@ -120,7 +163,11 @@ export function createCalendarSource(api: ProviderApi): ProviderSource {
 
         const text = eventBody(event);
         if (text.length === 0) {
-          failures.push({ externalRef: externalRefFor('calendar', id), reason: 'parse_failed' });
+          failures.push({
+            externalRef: externalRefFor('calendar', id),
+            reason: 'parse_failed',
+            retryable: false,
+          });
           continue;
         }
 
@@ -143,12 +190,22 @@ export function createCalendarSource(api: ProviderApi): ProviderSource {
           items,
           tombstones,
           failures,
-          // A page token means the listing is unfinished: it is a *backfill*
-          // cursor, so the next slice is re-gated. Only a sync token says
-          // "caught up", and only then may the next pull skip the gate.
+          // A page token means the listing is unfinished, and *which* listing
+          // decides the cursor's kind. An unfinished first import is a
+          // `backfill` cursor, so the next slice is re-gated and re-windowed.
+          // An unfinished **sync** is still a sync: labelling it `backfill`
+          // sends the next pull down the first-import leg, where the page token
+          // is replayed against a differently-parameterised listing and the
+          // rest of the sync is lost. It carries its sync token beside it,
+          // because only the last page of a sync answers `nextSyncToken`.
           nextCursor:
             nextPageToken !== null
-              ? { kind: 'backfill', value: nextPageToken }
+              ? delta
+                ? {
+                    kind: 'delta',
+                    value: joinResumeCursor(nextPageToken, resume.syncToken),
+                  }
+                : { kind: 'backfill', value: nextPageToken }
               : nextSyncToken !== null
                 ? { kind: 'delta', value: nextSyncToken }
                 : null,

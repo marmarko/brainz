@@ -549,3 +549,263 @@ describe('drive', () => {
     expect(outcome.page.failures[0]?.reason).toBe('parse_failed');
   });
 });
+
+/**
+ * What a truncated page and a refused item must not lose.
+ *
+ * Every case below is the same defect wearing three provider costumes: the
+ * adapter answers something the runner reads as "this item is finished with",
+ * the cursor moves past it, and the change is never offered again. The brain
+ * goes quiet while every surface reports it healthy, which for a memory product
+ * is worse than crashing — the user cannot tell "nothing happened this week"
+ * from "your mail stopped syncing in March".
+ */
+describe('a page that could not be finished', () => {
+  test('a 429 on a message fetch is rate-limited and retryable, not a broken item', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/users/me/profile', { status: 200, body: { historyId: '1' } });
+    transport.on('/users/me/messages?', { status: 200, body: { messages: [{ id: 'mr1' }] } });
+    transport.on('/messages/mr1', { status: 429, body: { error: 'slow down' } });
+
+    const source = createGmailSource(client(transport));
+    const outcome = await source.list({
+      ...CONNECTION,
+      mode: 'backfill',
+      cursor: null,
+      since: SINCE,
+      maxItems: 10,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    const failure = outcome.page.failures[0];
+    expect(failure?.reason).toBe('rate_limited');
+    // The whole point: the runner must not advance the cursor past this id.
+    expect(failure?.retryable).toBe(true);
+  });
+
+  test('a 404 on a message fetch is permanent, so one dead id cannot wedge the source', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/users/me/profile', { status: 200, body: { historyId: '1' } });
+    transport.on('/users/me/messages?', { status: 200, body: { messages: [{ id: 'mr2' }] } });
+    transport.on('/messages/mr2', { status: 404, body: { error: 'not found' } });
+
+    const source = createGmailSource(client(transport));
+    const outcome = await source.list({
+      ...CONNECTION,
+      mode: 'backfill',
+      cursor: null,
+      since: SINCE,
+      maxItems: 10,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.failures[0]?.retryable).toBe(false);
+  });
+
+  test('a 429 on a drive file fetch is rate-limited and retryable', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/changes?', {
+      status: 200,
+      body: {
+        newStartPageToken: 'p-9',
+        changes: [
+          {
+            fileId: 'fr1',
+            file: { id: 'fr1', name: 'plan.txt', mimeType: 'text/plain', trashed: false },
+          },
+        ],
+      },
+    });
+    transport.on('/files/fr1', { status: 429, body: { error: 'slow down' } });
+
+    const source = createDriveSource(client(transport));
+    const outcome = await source.list({
+      ...CONNECTION,
+      mode: 'delta',
+      cursor: 'p-8',
+      since: null,
+      maxItems: 10,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.failures[0]?.reason).toBe('rate_limited');
+    expect(outcome.page.failures[0]?.retryable).toBe(true);
+  });
+
+  test('a truncated history page resumes the page rather than jumping to the mailbox head', async () => {
+    // `historyId` in the response is the mailbox's CURRENT record, not the last
+    // one on this page. Storing it while a `nextPageToken` is outstanding skips
+    // every change between the two, permanently.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/history?', {
+      status: 200,
+      body: {
+        historyId: '5600',
+        nextPageToken: 'hp-2',
+        history: [{ messagesAdded: [{ message: { id: 'mh1' } }] }],
+      },
+    });
+    transport.on('/messages/mh1', {
+      status: 200,
+      body: {
+        id: 'mh1',
+        internalDate: `${Date.UTC(2026, 6, 2)}`,
+        payload: { mimeType: 'text/plain', body: { data: base64url('a message body worth keeping') } },
+      },
+    });
+
+    const source = createGmailSource(client(transport));
+    const outcome = await source.list({
+      ...CONNECTION,
+      mode: 'delta',
+      cursor: '5500',
+      since: null,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.nextCursor?.kind).toBe('delta');
+    expect(outcome.page.nextCursor?.value).toBe('hp-2~5500');
+
+    // And the cursor it produced drives the next page off the SAME start, so the
+    // window between the page and the mailbox head is never skipped.
+    const next = withToken(createScriptedTransport());
+    next.on('/history?', { status: 200, body: { historyId: '5600', history: [] } });
+    const resumed = await createGmailSource(client(next)).list({
+      ...CONNECTION,
+      mode: 'delta',
+      cursor: 'hp-2~5500',
+      since: null,
+      maxItems: 100,
+      now: NOW,
+    });
+    expect(resumed.ok).toBe(true);
+    const url = next.requests.find((request) => request.url.includes('/history?'))?.url ?? '';
+    expect(url).toContain('startHistoryId=5500');
+    expect(url).toContain('pageToken=hp-2');
+  });
+
+  test('history changes beyond the item ceiling are failure rows, never a silent slice', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/history?', {
+      status: 200,
+      body: {
+        historyId: '5700',
+        history: [
+          { messagesAdded: [{ message: { id: 'mc1' } }] },
+          { messagesAdded: [{ message: { id: 'mc2' } }] },
+        ],
+      },
+    });
+    transport.on('/messages/mc1', {
+      status: 200,
+      body: {
+        id: 'mc1',
+        internalDate: `${Date.UTC(2026, 6, 3)}`,
+        payload: { mimeType: 'text/plain', body: { data: base64url('the first of two messages') } },
+      },
+    });
+
+    const source = createGmailSource(client(transport));
+    const outcome = await source.list({
+      ...CONNECTION,
+      mode: 'delta',
+      cursor: '5600',
+      since: null,
+      maxItems: 1,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.items.length).toBe(1);
+    const dropped = outcome.page.failures.find(
+      (failure) => failure.externalRef === externalRefFor('gmail', 'mc2'),
+    );
+    expect(dropped).toBeDefined();
+    expect(dropped?.retryable).toBe(true);
+  });
+
+  test('a truncated drive change page is a delta cursor, and it replays against /changes', async () => {
+    // A `backfill` kind here is read by `pullModeFor` as a first import, and the
+    // backfill leg hands a changes-feed token to `/drive/v3/files` — a token the
+    // wrong endpoint cannot use, on a listing the window has already re-bounded.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/changes?', {
+      status: 200,
+      body: { nextPageToken: 'cp-2', changes: [] },
+    });
+
+    const source = createDriveSource(client(transport));
+    const outcome = await source.list({
+      ...CONNECTION,
+      mode: 'delta',
+      cursor: 'cp-1',
+      since: null,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.nextCursor).toEqual({ kind: 'delta', value: 'cp-2' });
+
+    const next = withToken(createScriptedTransport());
+    next.on('/changes?', { status: 200, body: { newStartPageToken: 'cp-3', changes: [] } });
+    await createDriveSource(client(next)).list({
+      ...CONNECTION,
+      mode: 'delta',
+      cursor: 'cp-2',
+      since: null,
+      maxItems: 100,
+      now: NOW,
+    });
+    const url = next.requests.find((request) => request.url.includes('/drive/v3/'))?.url ?? '';
+    expect(url).toContain('/drive/v3/changes');
+    expect(url).toContain('pageToken=cp-2');
+  });
+
+  test('a truncated calendar sync page carries its sync token forward', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/events?', {
+      status: 200,
+      body: { nextPageToken: 'ep-2', items: [] },
+    });
+
+    const source = createCalendarSource(client(transport));
+    const outcome = await source.list({
+      ...CONNECTION,
+      mode: 'delta',
+      cursor: 'sync-1',
+      since: null,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.nextCursor).toEqual({ kind: 'delta', value: 'ep-2~sync-1' });
+
+    const next = withToken(createScriptedTransport());
+    next.on('/events?', { status: 200, body: { nextSyncToken: 'sync-2', items: [] } });
+    await createCalendarSource(client(next)).list({
+      ...CONNECTION,
+      mode: 'delta',
+      cursor: 'ep-2~sync-1',
+      since: null,
+      maxItems: 100,
+      now: NOW,
+    });
+    const url = next.requests.find((request) => request.url.includes('/events?'))?.url ?? '';
+    expect(url).toContain('syncToken=sync-1');
+    expect(url).toContain('pageToken=ep-2');
+  });
+});

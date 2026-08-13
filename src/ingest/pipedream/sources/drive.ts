@@ -22,7 +22,9 @@ import {
   asRecord,
   asString,
   boundBody,
+  ceilingFailureFor,
   externalRefFor,
+  itemFailureFor,
   joinResumeCursor,
   splitResumeCursor,
   type ProviderListOutcome,
@@ -64,13 +66,13 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
     file: Record<string, unknown>,
   ): Promise<PulledItem | PulledFailure> {
     const id = asString(file.id);
-    if (id === null) return { externalRef: null, reason: 'parse_failed' };
+    if (id === null) return { externalRef: null, reason: 'parse_failed', retryable: false };
     const externalRef = externalRefFor('drive', id);
     const mimeType = asString(file.mimeType) ?? '';
     const exportMime = exportMimeFor(mimeType);
 
     if (exportMime === null && !isTextual(mimeType)) {
-      return { externalRef, reason: 'parse_failed' };
+      return { externalRef, reason: 'parse_failed', retryable: false };
     }
 
     const outcome = await api.request({
@@ -85,12 +87,15 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
       accountId: request.accountId ?? null,
       raw: true,
     });
-    if (!outcome.ok) return { externalRef, reason: 'provider_error' };
+    // The provider's own status decides whether the cursor may move past this
+    // file: a 429 collapsed into `provider_error` reads as "this document is
+    // broken" and the edit is never offered again.
+    if (!outcome.ok) return itemFailureFor(externalRef, outcome);
 
     const text = typeof outcome.value === 'string' ? outcome.value : '';
     // A NUL byte is legal UTF-8 and never appears in a document a human wrote.
     if (text.trim().length === 0 || text.includes('\u0000')) {
-      return { externalRef, reason: 'parse_failed' };
+      return { externalRef, reason: 'parse_failed', retryable: false };
     }
 
     return {
@@ -107,7 +112,18 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
   ): Promise<{ items: PulledItem[]; failures: PulledFailure[] }> {
     const items: PulledItem[] = [];
     const failures: PulledFailure[] = [];
-    for (const file of files) {
+    const ceiling = Math.max(0, request.maxItems);
+    // Beyond the ceiling is accounted for, not sliced away: a retryable row
+    // holds the cursor, so the change is offered again rather than skipped.
+    for (const file of files.slice(ceiling)) {
+      const id = asString(file.id);
+      failures.push(
+        id === null
+          ? { externalRef: null, reason: 'parse_failed', retryable: false }
+          : ceilingFailureFor(externalRefFor('drive', id)),
+      );
+    }
+    for (const file of files.slice(0, ceiling)) {
       const fetched = await fetchContent(request, file);
       if ('reason' in fetched) failures.push(fetched);
       else items.push(fetched);
@@ -159,7 +175,7 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
       if (file !== null) live.push(file);
     }
 
-    const { items, failures } = await collect(request, live.slice(0, request.maxItems));
+    const { items, failures } = await collect(request, live);
     const nextPageToken = asString(body?.nextPageToken ?? null);
     const newStartPageToken = asString(body?.newStartPageToken ?? null);
 
@@ -169,9 +185,15 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
         items,
         tombstones,
         failures,
+        // **A truncated change page is still a delta.** The changes feed's own
+        // `nextPageToken` is what `/drive/v3/changes` wants next — it is a delta
+        // cursor in every sense. Labelling it `backfill` sends the next pull
+        // down the first-import leg, which fetches a brand-new start token and
+        // hands this changes token to `/drive/v3/files`: the wrong endpoint,
+        // a token it cannot use, and the rest of the change feed lost.
         nextCursor:
           nextPageToken !== null
-            ? { kind: 'backfill', value: nextPageToken }
+            ? { kind: 'delta', value: nextPageToken }
             : newStartPageToken === null
               ? null
               : { kind: 'delta', value: newStartPageToken },
