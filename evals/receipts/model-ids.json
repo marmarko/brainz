@@ -1,0 +1,61 @@
+{
+  "note": "KTD13's model-id pin ledger. Every op of every routing profile is either pinned by a committed eval receipt or carries a deferral naming what would close it and which unit owns closing it. An op in neither fails `bun test` (test/ai/model-id-pin.test.ts). Advancing a routed id in src/ai/routing.ts without re-scoring its op is the drift this file exists to make loud: the receipts that make R6's floors meaningful were scored against specific model ids, and 'a floor miss indicts the architecture, not the model tier' is only true while production runs those ids. Nothing is pinned yet, and that is the honest state of Phase 1 — see each deferral's note.",
+  "profiles": {
+    "hosted": {
+      "pins": [],
+      "deferrals": [
+        {
+          "ops": ["embedding"],
+          "awaiting": "the first green `bun run eval:live-parity` run against provider-sourced committed vectors",
+          "unit": "U7",
+          "note": "The two R6a receipts record embedding_source.model = synthetic-lexical-v1. That is the fixture's deterministic lexical generator (evals/embeddings.ts), NOT a routed model id — no embedding provider is reachable from this environment, so no committed vector has ever been produced by the routed model. A reader counting receipts would otherwise read the calibration receipts as pinning this op. The pin lands with the first live-parity receipt, which is the first artifact that observes the routed model at all."
+        },
+        {
+          "ops": ["rerank"],
+          "awaiting": "U12's rerank enablement and its committed cross-encoder scores",
+          "unit": "U12",
+          "note": "Rerank and autocut are off until U12; U7 commits no (query, candidate) cross-encoder scores, so nothing has been scored against this route. The live-parity job's rerank leg refuses to report a comparison until those scores exist, for the same reason."
+        },
+        {
+          "ops": ["judge"],
+          "awaiting": "the first green `bun run eval:canary` run on a live tenant",
+          "unit": "U7",
+          "note": "The canary tier is the only thing that calls the judge op. It needs a live tenant on the real substrate and a produced output to grade; until U11 ships the consolidation ops there is nothing for a judge to score, so the harness reports `nothing_gradeable` rather than a receipt."
+        },
+        {
+          "ops": ["extract", "enrich", "contradiction", "salience", "synopsis"],
+          "awaiting": "U11's exit gate — each op clears R6's canary floors with a receipt naming its model id",
+          "unit": "U11",
+          "note": "U7 owns the harness; these ops do not exist in Phase 1, so a Phase-1 gate over them would be signed off empty. The plan splits the KTD13 gate for exactly this reason (Gap #19)."
+        },
+        {
+          "ops": ["vision"],
+          "awaiting": "U21's media-to-text consolidation phase",
+          "unit": "U21",
+          "note": "image_to_text is a U21 deliverable; nothing routes through this op yet."
+        }
+      ]
+    },
+    "self-host": {
+      "pins": [],
+      "deferrals": [
+        {
+          "ops": [
+            "embedding",
+            "rerank",
+            "judge",
+            "extract",
+            "enrich",
+            "contradiction",
+            "salience",
+            "synopsis",
+            "vision"
+          ],
+          "awaiting": "a self-host scoring run, which no unit currently owns",
+          "unit": "U13",
+          "note": "The self-host profile remaps five Cloudflare-hosted rows to an operator's own endpoint serving the same weights (src/ai/routing.ts). Its ids drift independently of the hosted ones and its quality is unmeasured: no receipt in this repo was produced against it. Recorded here rather than omitted, because a profile absent from this ledger would be a profile whose ids nothing compares — which is the vacuous-guard failure this file is built against. The cost-down A/B in U13 is the first run that has a reason to score it."
+        }
+      ]
+    }
+  }
+}

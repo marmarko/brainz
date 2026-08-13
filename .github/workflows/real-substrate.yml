@@ -22,6 +22,25 @@
 # secrets is a credential-exfiltration path from any fork.
 #
 # ---------------------------------------------------------------------------
+# What it owns today (U7)
+# ---------------------------------------------------------------------------
+#   * `eval:live-parity` — the only coverage the two read-path model stages have
+#     anywhere in the two-tier design. The blocking tier's determinism comes from
+#     committed embeddings and cross-encoder scores, so it grades the CONSUMERS
+#     of those numbers and never the invocations: a swapped asymmetric prefix, a
+#     changed `dimensions` value, or a client-side truncation that skips
+#     re-normalisation all score identically there while real recall degrades.
+#     This job re-invokes both through the production `src/ai/` path and fails on
+#     divergence beyond a committed tolerance.
+#   * `eval:canary` — the nightly model-judged tier, routed as the `judge` op so
+#     the judge is never the family that produced the output being judged.
+#
+# Both commands FAIL CLOSED: no provider vectors to compare, or no gradeable
+# check, is a non-zero exit rather than a green tick for having measured
+# nothing. The steps below decide whether it is worth invoking them, which is
+# the same split the credential gate above already uses.
+#
+# ---------------------------------------------------------------------------
 # What it will own (U2/U3; not written yet)
 # ---------------------------------------------------------------------------
 #   * Real-Neon provisioning end to end: create project, role, database, apply
@@ -155,3 +174,80 @@ jobs:
         run: |
           set -euo pipefail
           echo "::warning title=Real-substrate tests skipped::${REGISTERED_FILES} file(s) gate on BRAINZ_REAL_SUBSTRATE but no credential was available to run them."
+
+      # ---------------------------------------------------------------------
+      # U7's scheduled tiers.
+      # ---------------------------------------------------------------------
+
+      # Gap #16: the blocking tier cannot see a live embedding or rerank call by
+      # construction. This is where those two stages get looked at. It needs a
+      # provider credential as well as the substrate flag — with neither, the
+      # command would refuse, which is correct but not worth a red notification
+      # every night.
+      # Same split as the credential gate: ask before invoking. The manifest
+      # carries zero provider-sourced vectors today, so the command would refuse
+      # — correctly, and every single night, which is how a scheduled red stops
+      # being read. The command's own refusal is unchanged; this step decides
+      # whether the question is worth asking.
+      - name: Is anything committed to compare against?
+        id: parity
+        run: |
+          set -euo pipefail
+          bun run eval:live-parity --preflight | tee -a "$GITHUB_OUTPUT"
+
+      - name: Live-model parity
+        if: steps.gate.outputs.ready == 'true' && steps.parity.outputs.samples != '0'
+        env:
+          BRAINZ_REAL_SUBSTRATE: "1"
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: bun run eval:live-parity
+
+      # Preflight first, for the reason the credential gate exists: while every
+      # canary check is deferred (its producing op has no committed model-id
+      # pin), invoking the tier would produce a nightly failure by design, and a
+      # scheduled job that fails by design trains people to ignore it. The
+      # command still refuses on its own; this step decides whether to ask.
+      - name: Is anything gradeable on the canary?
+        id: canary
+        run: |
+          set -euo pipefail
+          bun run eval:canary --preflight | tee -a "$GITHUB_OUTPUT"
+
+      - name: Judged quality (canary tenant)
+        # Non-blocking by contract — "nightly, non-blocking" in the Verification
+        # Contract — so a quality trend never gates a merge, but it is still run
+        # and still reported.
+        continue-on-error: true
+        if: steps.gate.outputs.ready == 'true' && steps.canary.outputs.gradeable != '0'
+        env:
+          BRAINZ_REAL_SUBSTRATE: "1"
+          BRAINZ_CANARY_TENANT: ${{ secrets.BRAINZ_CANARY_TENANT }}
+        run: bun run eval:canary
+
+      - name: Report that live parity had nothing to compare
+        if: steps.parity.outputs.samples == '0'
+        run: |
+          set -euo pipefail
+          echo "::notice title=Live parity had nothing to compare::The committed manifest carries no provider-sourced vectors, so the two read-path model stages have no live coverage."
+          {
+            echo "### Live-model parity: nothing to compare"
+            echo
+            echo "\`evals/fixtures/embeddings.manifest.jsonl\` carries only synthetic vectors,"
+            echo "so re-embedding would compare an encoder against a hash function. Until a"
+            echo "provider-sourced manifest is committed, **the embedding and rerank stages"
+            echo "have no live coverage anywhere in the two-tier design** — see Gap #16."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report that the canary had nothing to grade
+        if: steps.canary.outputs.gradeable == '0'
+        run: |
+          set -euo pipefail
+          echo "::notice title=Canary tier had nothing to grade::Every canary check is deferred — no producing op carries a committed model-id pin yet."
+          {
+            echo "### Canary tier: nothing gradeable"
+            echo
+            echo "Every check in \`evals/canary.ts\` is waiting on the unit that ships its"
+            echo "producing op (U11 for extraction, U12 for briefing). The deferral is"
+            echo "derived from \`evals/receipts/model-ids.json\`, so it clears itself the"
+            echo "day a receipt pins one of those ops — nothing here has to be remembered."
+          } >> "$GITHUB_STEP_SUMMARY"

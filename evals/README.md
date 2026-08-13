@@ -1,15 +1,36 @@
-# The eval corpus (U7, corpus half)
+# The eval corpus and the gates (U7)
 
 This directory is the **measurement apparatus** R6, R6a and KTD10 call for: an
 owned fixture corpus, a gold answer key, per-question-type query sets, the metric
-implementations the floors are expressed in, and both R6a calibration receipts.
+implementations the floors are expressed in, both R6a calibration receipts —
+and, since U6 landed, the gates that turn all of it into commands.
 
-It is deliberately **only the corpus half of U7**. The gates half — CI wiring for
-`bun run eval:blocking`, the gbrain conformance wrapper, the nightly canary tier,
-the model and embedding A/Bs, the live-model parity job, and the model-id pin
-guard — needs a running server (U6) and lands later. `eval:blocking` is still the
-failing `scripts/not-yet.ts` stub, on purpose: an unimplemented gate must never
-look green.
+The two halves were built in that order on purpose (see "Why the corpus is here
+before U5 exists" below). The gates half needed a running server, so it lands
+here now:
+
+| Command | What it is | Where it runs |
+|---|---|---|
+| `bun run eval:blocking` | R6's floors. Deterministic, zero model calls. | CI, every PR |
+| `bun run conformance` | gbrain's runner at the pinned commit, graded against the published `memory-verbs-v1-partial` delta. | CI, self-skipping while the delta records a blocker |
+| `bun run eval:live-parity` | Re-embeds and re-scores a sample through the production `src/ai/` path. | scheduled, secret-gated |
+| `bun run eval:canary` | The nightly model-judged tier, routed as the `judge` op. | nightly, non-blocking |
+| model-id pin guard | Every op of every profile is pinned by a receipt or deferred with an owner. | part of `bun test` |
+
+`package.json` is unchanged: U1 pointed every declared command at
+`scripts/not-yet.ts` so that "only the script body" would change when an
+implementation landed, and that file is now the router. A command still owned by
+a later unit (`test:roundtrip`, U17) prints exactly what it always printed and
+exits non-zero — a stub that passes makes an unimplemented gate look green.
+
+**Every one of these commands fails closed.** No provider vectors to compare, no
+gradeable canary check, no resolvable runner, a delta that was never observed:
+each is a non-zero exit naming the reason, never a green tick for having measured
+nothing. The *workflows* decide whether a run is worth invoking, using the
+precondition-step pattern `real-substrate.yml` already shipped. That split is
+deliberate — a gate that quietly excuses itself is the failure mode this whole
+unit exists to prevent, and a scheduled job that fails by design is one everybody
+learns to ignore.
 
 ## Why the corpus is here before U5 exists
 
@@ -43,7 +64,13 @@ committed with no ranking stack in the repository to tune toward.
 | `gates.ts` | R6's floors and R6a's margins, as data, plus the checker and the three-state classifier. |
 | `extraction.ts` | The rule-coverage baseline for R6's deterministic-extraction floor. |
 | `calibrate.ts` | Regenerates both receipts. |
-| `receipts/` | The committed R6a receipts. |
+| `blocking.ts` | The blocking tier as a command: two runs, one digest, `fetch` trapped. |
+| `live-parity.ts` | The scheduled parity job and its comparison rules. |
+| `live-parity-tolerance.json` | The divergence thresholds, as committed data with their rationale. |
+| `canary.ts` | The judged tier's harness: judge independence, gradeability, recall scoring. |
+| `model-pins.ts` | The model-id pin guard (KTD13). |
+| `conformance/` | The gbrain wrapper: pin verification, checkout resolution, the local server, the delta assertion. |
+| `receipts/` | The committed R6a receipts and `model-ids.json`, the pin ledger. |
 
 ## Running it
 
@@ -151,8 +178,31 @@ probes must therefore be reached by the alias hop and the graph arm.
    impossible to forget.
 
 Cross-encoder scores for every (query, candidate) pair are the other half of
-U7 step 1. They are **not** here: they belong to the gates half, which needs a
-running server. Their absence is a sequencing decision, not an oversight.
+U7 step 1, and they are still **not** here — not as a sequencing decision now but
+as a scope one. They exist to let U12's rerank and autocut enter the blocking
+tier, and both stages are off until U12 ships; fabricating a synthetic score
+manifest to have one would commit an artifact nothing reads, in the shape of a
+measurement. `eval:live-parity`'s rerank leg therefore refuses with
+`no_committed_rerank_scores` rather than reporting a comparison it did not make,
+and `evals/receipts/model-ids.json` records the `rerank` op as deferred to U12
+for the same reason.
+
+## What the gates cannot see, and what watches that
+
+The blocking tier is deterministic **because** the vectors are committed, which
+means it grades the *consumers* of those numbers and never the invocations that
+produce them. A swapped asymmetric prefix, a changed `dimensions` value, or a
+client-side truncation that skips re-normalisation all score identically here
+while real recall degrades — that is Gap #16, and it is the price of the
+zero-model-call promise rather than a bug in it.
+
+`bun run eval:live-parity` is what watches that boundary: it re-invokes both read-path
+model stages through the production `src/ai/` path and fails on divergence beyond
+`live-parity-tolerance.json`. Today it refuses — the manifest carries no
+provider-sourced vector, so there is nothing to compare — and **that refusal is
+the honest state of the two highest-leverage read stages: they have no live
+coverage anywhere.** The scheduled workflow asks before invoking, so this is a
+notice rather than a nightly red.
 
 ## Notes on how the corpus is built
 

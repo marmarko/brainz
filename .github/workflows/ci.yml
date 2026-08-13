@@ -9,11 +9,16 @@
 # Deliberately NOT wired in here:
 #   * `scripts/probes/**` — throwaway probes that need real credentials and are
 #     run by hand while an assumption is being settled.
-#   * `eval:blocking`, `eval:canary`, `eval:live-parity`, `conformance`,
-#     `test:roundtrip` — declared now so the Verification Contract's command
-#     names stay stable, implemented by U7/U17. They exit non-zero on purpose;
-#     wiring them today would make CI red from day one and train everyone to
-#     ignore it.
+#   * `eval:canary` and `eval:live-parity` — both need a live provider and a
+#     live tenant, so they ride `real-substrate.yml` behind
+#     `BRAINZ_REAL_SUBSTRATE`. A tier that calls models cannot be a fork-PR gate.
+#   * `test:roundtrip` — still declared and still deliberately failing; U17 owns
+#     it. `scripts/not-yet.ts` prints what it always printed and exits 1, because
+#     a stub that passes makes an unimplemented gate look green.
+#
+# Wired in as of U7: `eval:blocking` below, and the `conformance` job at the
+# bottom of this file (which self-skips while the published delta records a
+# blocker, rather than being red on every PR).
 #   * anything needing a live Neon project — see `real-substrate.yml`.
 
 name: CI
@@ -104,6 +109,15 @@ jobs:
       - name: Tests
         run: bun test
 
+      # R6's floors. Deterministic, zero model calls, and the command proves
+      # both rather than claiming them: it runs the tier twice and compares a
+      # digest over every per-query outcome, with `fetch` trapped for the
+      # duration so an accidental live call is a violation rather than a
+      # silently different score. Two of the eight floors report `deferred` on
+      # the committed synthetic vectors; the command prints which, every run.
+      - name: Accuracy floors (R6)
+        run: bun run eval:blocking
+
       # R7 / R20: no unclassified capability, no passed revisit date. A
       # capability may be declined; it may not be forgotten.
       - name: Concepts ledger
@@ -135,3 +149,97 @@ jobs:
             | tar -xz -C "$RUNNER_TEMP/gitleaks" gitleaks
           "$RUNNER_TEMP/gitleaks/gitleaks" version
           "$RUNNER_TEMP/gitleaks/gitleaks" git . --redact --exit-code 1
+
+  # ---------------------------------------------------------------------------
+  # Wire conformance (U7 approach step 5).
+  # ---------------------------------------------------------------------------
+  #
+  # A separate job because it fetches and builds a *different project* — gbrain,
+  # at the commit pinned in `upstream/gbrain.pin` — and the blocking job above
+  # should stay a fast, self-contained check of this repository.
+  #
+  # THE SELF-SKIP IS THE POINT, AND IT IS NOT A SOFTENED GATE.
+  # `upstream/memory-verbs-v1-partial.json` carries a `status`. While it reads
+  # `blocked`, no run has ever observed the delta — today because the pinned
+  # runner's MCP SDK caps at an older protocol version than this server
+  # advertises, so its client aborts the handshake before a single case is
+  # graded. Running the command anyway would be red on every PR, and a gate that
+  # is red on every PR is a gate everyone learns to ignore. So the preflight
+  # reads the published status and, while blocked, records a warning instead.
+  #
+  # The command itself never softens: `bun run conformance` exits non-zero the
+  # entire time, and `evals/conformance/delta.ts` refuses to certify against a
+  # blocked delta before it looks at any report. The moment somebody flips that
+  # file to `observed`, this job starts enforcing with no edit here — which is
+  # the same shape `evals/gates.ts` uses for a deferred floor.
+  conformance:
+    name: wire conformance (memory-verbs-v1-partial)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_DB: brainz_test
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://postgres@localhost:5432/brainz_test
+      BRAINZ_GBRAIN_CACHE: ${{ github.workspace }}/../gbrain-cache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Reads the published delta rather than deciding here, so the workflow and
+      # the command can never disagree about whether a verdict exists.
+      - name: Is a conformance verdict available?
+        id: delta
+        run: |
+          set -euo pipefail
+          status=$(bun --print 'JSON.parse(require("fs").readFileSync("upstream/memory-verbs-v1-partial.json","utf8")).status')
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+
+      # Keyed on the pin, so advancing `upstream/gbrain.pin` fetches a fresh
+      # tree instead of certifying against a stale one.
+      - name: Cache the pinned gbrain checkout
+        if: steps.delta.outputs.status == 'observed'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../gbrain-cache
+          key: gbrain-${{ hashFiles('upstream/gbrain.pin') }}
+
+      - name: Certify against the published delta
+        if: steps.delta.outputs.status == 'observed'
+        run: bun run conformance
+
+      - name: Report that no verdict was available
+        if: steps.delta.outputs.status != 'observed'
+        run: |
+          set -euo pipefail
+          echo "::warning title=Wire conformance not certified::upstream/memory-verbs-v1-partial.json records a blocker rather than an observed run, so nothing was certified against gbrain's runner."
+          {
+            echo "### Wire conformance: not certified"
+            echo
+            echo "\`upstream/memory-verbs-v1-partial.json\` has \`status\` other than"
+            echo "\`observed\`, so this commit has **no wire-conformance evidence**. The"
+            echo "blocker is recorded in that file; \`bun run conformance --probe\` shows"
+            echo "what the delta would be, and never exits 0."
+          } >> "$GITHUB_STEP_SUMMARY"

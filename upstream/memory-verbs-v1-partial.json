@@ -1,0 +1,14 @@
+{
+  "profile": "memory-verbs-v1-partial",
+  "protocol_version": 1,
+  "status": "blocked",
+  "blocker": {
+    "kind": "handshake_incompatible",
+    "detail": "The pinned gbrain build (v0.44.1.0) ships @modelcontextprotocol/sdk 1.29.0, whose SUPPORTED_PROTOCOL_VERSIONS end at 2025-11-25. brainz's server answers `initialize` with 2026-07-28 (src/mcp/envelope.ts PROTOCOL_VERSION) and does not negotiate down. The SDK client therefore aborts with \"Server's protocol version is not supported: 2026-07-28\" before `tools/list` is ever called, so the runner grades zero cases and prints no report. This is a wire-level incompatibility, not a verb-level deviation, and it is upstream of everything this file would otherwise describe."
+  },
+  "gbrain_commit": "fc310db3ea152e821ddb245a800956f15b8ed4fb",
+  "observed_on": "2026-08-13",
+  "rationale": "brainz declares memory-verbs-v1-PARTIAL rather than claiming conformance, and this file is where the difference is published rather than implied. `bun run conformance` grades an observed run against the `deviations` list by exact-set equality in both directions: a new non-passing case is a regression, and a declared deviation that starts passing is a stale publication that must be deleted. The list is EMPTY and the status is `blocked` because nothing has been observed yet — see `blocker`. `evals/conformance/delta.ts` refuses to certify against a blocked delta at all, before it looks at any report, so this file cannot be mistaken for a clean run; `bun run conformance` exits non-zero while it says `blocked`, and the CI job that would run it on every PR is deliberately not wired (a gate red on every PR trains people to ignore it). WHAT IS EXPECTED WHEN THIS UNBLOCKS, recorded as prose rather than as data so that a prediction can never be read as a measurement: gbrain's runner asserts that all five frozen verbs appear in tools/list and that `synthesize` carries the `[EXPENSIVE` description prefix (src/core/verbs/conformance.ts). brainz advertises seven names per endpoint and keeps `synthesize` dispatchable-but-unadvertised, returning a typed `unavailable` with a suggestion pointing at `briefing` (KTD3; docs/research/2026-08-11-tool-surface-design.md). Two case-level deviations are therefore anticipated. They are NOT listed below, because listing them would make this file assert something no run has shown. UNBLOCKING IS NOT U7's TO DO: the protocol version brainz advertises and whether the server negotiates it downward are U6's surface, and the runner's SDK floor moves when a newer gbrain release raises it — which is a U19 pin advance. Whichever lands first, re-run `bun run conformance --raw`, replace this blocker with the observed deviation set, and flip `status` to `observed` in the same change."
+  ,
+  "deviations": []
+}

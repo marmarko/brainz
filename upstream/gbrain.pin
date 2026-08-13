@@ -1,0 +1,7 @@
+{
+  "repo": "https://github.com/garrytan/gbrain.git",
+  "tag": "v0.44.1.0",
+  "commit": "fc310db3ea152e821ddb245a800956f15b8ed4fb",
+  "pinned_on": "2026-08-13",
+  "advanced_by": "U7 — first pin. gbrain's conformance runner is fetched and built at this exact commit so that upstream master cannot redden brainz CI on an unrelated PR. The tag is here for humans; the commit is what `evals/conformance/pin.ts` verifies, because a tag is a mutable ref and a force-push would change what gets built while this file reads identically. Advancing the pin is a deliberate U19 ledger action and requires re-observing the published delta in the same change — `upstream/memory-verbs-v1-partial.json` binds itself to this commit and refuses to grade against any other."
+}
