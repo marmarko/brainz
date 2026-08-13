@@ -910,6 +910,62 @@ describe('the objects a listing carries', () => {
     expect((await itemRow(ref))?.outcome).toBe('ok');
   });
 
+  test('AN ATTACHMENT WRITTEN BEFORE THE RUNG HEALS FROM THE NEXT SIGHTING', async () => {
+    // The migration's backfill story, which is otherwise only a claim in a
+    // comment. Rows written before rung 6 carry no ref and are unreachable by
+    // the sweep; nothing backfills them, because the only value a migration
+    // could write is a guess and `object_key` is a hash that does not run
+    // backwards. What fills the column is a *sighting* — and the sighting that
+    // matters is the `unchanged` one, because that is a poller's most common
+    // outcome and the path on which nothing else is written at all.
+    const ref = externalRefFor('drive', 'shot-heal');
+    const states = await storeWith(stateFor('drive'));
+    const source = createFakeSource('drive', 'document', [
+      page({ media: [mediaItem('shot-heal')], nextCursor: { kind: 'delta', value: 'd-heal-1' } }),
+      page({ media: [mediaItem('shot-heal')], nextCursor: { kind: 'delta', value: 'd-heal-2' } }),
+      page({
+        tombstones: [{ externalRef: ref, reason: 'deleted' }],
+        nextCursor: { kind: 'delta', value: 'd-heal-3' },
+      }),
+    ]);
+
+    await pull(source, states, { window: 'all' });
+    const attachmentId = await attachmentIdIn(DRIVE_ORIGIN);
+
+    // Put the row back into the shape every pre-rung attachment is in.
+    await fixture.tenantSql`
+      UPDATE attachment SET external_ref = NULL WHERE attachment_id = ${attachmentId}::bigint
+    `;
+    expect(
+      await countRows(
+        fixture.tenantSql,
+        'attachment',
+        `attachment_id = ${attachmentId} AND external_ref IS NULL`,
+      ),
+    ).toBe(1);
+
+    // The same file, offered again. Nothing about the object changed, so this
+    // is the `unchanged` path: no object written, no row rewritten, one
+    // observation recorded.
+    const again = await pull(source, states);
+    expect(again.counts.attachments).toBe(1);
+    expect(
+      await countRows(
+        fixture.tenantSql,
+        'attachment',
+        `attachment_id = ${attachmentId} AND external_ref = '${ref}'`,
+      ),
+    ).toBe(1);
+
+    // ...and the point of healing it: the row is now reachable by the deletion
+    // it was invisible to a moment ago.
+    const swept = await pull(source, states);
+    expect(swept.counts.tombstoned).toBeGreaterThan(0);
+    expect(
+      await countRows(fixture.tenantSql, 'attachment', `attachment_id = ${attachmentId} AND deleted_at IS NULL`),
+    ).toBe(0);
+  });
+
   test('an attachment cannot be retired from another origin', async () => {
     // R15 at the deletion end, on the lane this change added. A Drive pull that
     // swept attachments by ref alone would retire a mail attachment that

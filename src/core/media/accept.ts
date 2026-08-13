@@ -314,17 +314,25 @@ interface ExistingAttachment {
   readonly attachmentId: string;
   readonly contentSha256: string | null;
   readonly quarantined: boolean;
+  /** Whether the row already knows which provider object it is (rung 6). */
+  readonly hasExternalRef: boolean;
 }
 
 async function liveAttachmentByKey(sql: SQL, objectKey: string): Promise<ExistingAttachment | null> {
   const rows = (await sql`
     SELECT attachment_id::text AS attachment_id, content_sha256,
-           (quarantined_at IS NOT NULL) AS quarantined
+           (quarantined_at IS NOT NULL) AS quarantined,
+           (external_ref IS NOT NULL) AS has_external_ref
       FROM attachment
      WHERE object_key = ${objectKey} AND deleted_at IS NULL
      ORDER BY attachment_id DESC
      LIMIT 1
-  `) as Array<{ attachment_id: string; content_sha256: string | null; quarantined: boolean }>;
+  `) as Array<{
+    attachment_id: string;
+    content_sha256: string | null;
+    quarantined: boolean;
+    has_external_ref: boolean;
+  }>;
   const row = rows[0];
   return row === undefined
     ? null
@@ -332,6 +340,7 @@ async function liveAttachmentByKey(sql: SQL, objectKey: string): Promise<Existin
         attachmentId: row.attachment_id,
         contentSha256: row.content_sha256,
         quarantined: row.quarantined,
+        hasExternalRef: row.has_external_ref,
       };
 }
 
@@ -404,8 +413,13 @@ export async function acceptMedia(
   ) {
     // Nothing about the object changed, so nothing about the object is written
     // — except the one thing this sighting is evidence of, and only if the row
-    // does not already know it. See `noteExternalRef`.
-    await noteExternalRef(deps.sql, existing.attachmentId, externalRef);
+    // does not already know it. See `noteExternalRef`. The read decides, so a
+    // healed row costs a poller no write at all: `unchanged` is the common
+    // outcome on every cadence, and an unconditional guarded UPDATE would be one
+    // per file per poll, forever, to accomplish nothing.
+    if (!existing.hasExternalRef) {
+      await noteExternalRef(deps.sql, existing.attachmentId, externalRef);
+    }
     return {
       ok: true,
       status: 'unchanged',

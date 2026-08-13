@@ -59,13 +59,18 @@ server-side scheduler and no push: brainz answers when something pulls.
 model call**, which is why it still answers on a morning when a model provider
 is having a bad day. Your client writes the prose; the server ships the material.
 
+**"The window", below, is the last 24 hours** when you call it the way this
+recipe does — with no `since`. Pass one and every windowed section widens with
+it. The bundle echoes what it used back as `window`, so the answer is never a
+guess.
+
 | Section | What fills it | What leaves it empty |
 |---|---|---|
-| `meetings` | Pages whose source type is `calendar` that fall inside the window, newest first, at most 20. | No calendar connector, or nothing in the window. |
+| `meetings` | Pages whose source type is `calendar` **happening** inside the window, newest first, at most 20. Each carries `occurred_at` (when the meeting is) alongside `created_at` (when this brain heard about it). | No calendar connector, or nothing in the window. |
 | `participants` (inside each meeting) | People resolved against the brain's own entity dictionary, each with the card consolidation wrote for them. | **Dropped entirely until a model-tier consolidation cycle has completed over the brain** — see below. |
 | `commitments` | Open commitments with owner and due date, soonest first, at most 20. | Same: a model-tier artifact. |
-| `delta.changed` / `delta.stated` | Pages and facts written since **your last briefing call on this connection**. `first_read: true` the very first time. | Nothing arrived since you last looked. |
-| `stale` | Pages marked stale, ordered by how relevant the brain thinks they still are, at most 20. | Nothing has gone stale. |
+| `delta.changed` / `delta.stated` | Pages and facts written since **your last briefing call on this connection** — this recipe passes no `since`, so the bookmark governs. `first_read: true` the very first time. | Nothing arrived since you last looked. |
+| `stale` | Pages that **went stale inside the window**, ordered by how relevant the brain thinks they still are, at most 20. | Nothing went stale in the window — widen `since` to reach older ones. |
 | `counts` | Four numbers: contradictions, pending debt, pending review, uncorroborated claims. | Always present; several are structurally zero on the free tier. |
 | `coverage`, `tier`, `not_included` | Whether the bundle is `materialized` or `cold`, which tier last ran, and what a `cold` bundle is missing. | Always present. |
 | `notice` | The upgrade prompt, when it fires. | Most mornings — see "the prompt is bounded". |
@@ -93,25 +98,36 @@ clean bill of health until the bundle also says `coverage: "materialized"`.
 The same is true of `commitments`. `pending_debt` and `uncorroborated_claims`
 are the two counts that mean something on every tier.
 
-### The delta is per connection, and it moves
+### The delta is per connection, and it moves — when you let it
 
 The `delta` section is the difference between a briefing and a dashboard, and
-it works off a cursor stored against the credential the call arrived on:
+it works off a bookmark stored against the credential the call arrived on.
+Which of two things you get depends on one thing only: **whether you passed
+`since`.**
 
-- Every `briefing` call **advances that cursor** to the end of its window. That
-  is the point — tomorrow's delta covers today.
-- Once a cursor exists, the delta starts from the cursor and **ignores `since`**.
-  Asking for a week does not replay a week.
-- The cursor only ever moves forward, so a retried scheduled task cannot rewind
-  it and replay.
-- Every client sharing one connection shares one cursor. If you also run
-  [the weekly review](weekly-review.md) from the same connection, whichever
-  runs first consumes the delta for the other.
+| You call | The delta covers | The bookmark |
+|---|---|---|
+| `briefing` with no `since` | since your last such call on this connection | **moves** to the end of the window |
+| `briefing` with a `since` | exactly the window you named | **untouched** |
 
-If you want a weekly review with a genuinely weekly delta, run it from a
-separate connection. Otherwise read its `meetings` and `counts` as the weekly
-part and treat its delta as "since yesterday". The weekly-review recipe says
-this too, because it is the thing most likely to confuse a reader.
+The response says which one happened, in `delta.basis` — `"cursor"` or
+`"window"` — so you never have to guess.
+
+This recipe's prompt deliberately passes no `since`. That is what makes it a
+briefing rather than a report: today's delta is what arrived since yesterday's
+run, and tomorrow's covers today.
+
+- The bookmark only ever moves forward, so a retried scheduled task cannot
+  rewind it and replay a week.
+- Every client sharing one connection shares one bookmark. Two scheduled tasks
+  on one credential, both calling with no `since`, will split the delta between
+  them — the first to run gets it.
+- A call that names a `since` takes nothing from anybody. Ask for a week as
+  often as you like; it is a query, not a bookmark advance.
+
+That last rule is why [the weekly review](weekly-review.md) can run on the
+same connection as this recipe. It asks for seven days, gets seven days, and
+leaves your morning delta exactly where it was.
 
 ### The prompt is bounded
 

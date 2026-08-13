@@ -66,7 +66,18 @@ export interface TombstoneRefsRequest {
 }
 
 export interface TombstoneRefsResult {
+  /**
+   * How many of the refs the provider named this brain actually held and
+   * retired — the same number as {@link externalRefs}, and therefore the same
+   * number as the log rows the caller writes.
+   *
+   * Refs rather than pages, because an object is not always a page: a deleted
+   * Drive file with no transcript yet retires an `attachment` row and nothing
+   * else, and a page count would report that as nothing having happened. The
+   * rows behind it are in {@link pageIds} and {@link attachments}.
+   */
   readonly tombstoned: number;
+  /** Every page retired, including the transcripts of retired objects. */
   readonly pageIds: readonly string[];
   /** The refs that actually went, so the caller writes one log row each. */
   readonly externalRefs: readonly string[];
@@ -206,7 +217,7 @@ export async function tombstoneRefs(
   ]);
 
   return {
-    tombstoned: allPageIds.length,
+    tombstoned: swept.size,
     pageIds: allPageIds,
     externalRefs: [...swept],
     attachments: attachmentIds.length,

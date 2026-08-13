@@ -185,7 +185,21 @@ export const TOOLS: readonly ToolDef[] = [
       'The standing bundle for a moment — what changed, what is open, who is involved — assembled by SQL over what the brain already knows. You write the prose. ' +
       `${UNTRUSTED_DATA_CLAUSE}`,
     params: {
-      since: { type: 'string', description: 'ISO date the window opens. Default: 24h ago.' },
+      // Omitting `since` is a different request, not a lazier one, and the
+      // model is the caller that has to know it: with no window the delta runs
+      // from this connection's own bookmark and advances it, which is what
+      // makes a daily briefing say what arrived since yesterday. Naming a
+      // window is a plain query — it reads across the bookmark and moves
+      // nothing, so it is safe to repeat and safe to run beside a scheduled
+      // one. A description that mentioned only the default would teach a model
+      // to pass `since` every time and never see a delta at all.
+      since: {
+        type: 'string',
+        description:
+          'ISO date the window opens. Omit it for "what changed since I last looked" — that reads and advances ' +
+          'this connection\'s bookmark. Naming one asks for exactly that window and moves no bookmark. ' +
+          'Default when omitted: 24h ago. The response reports which happened in `delta.basis`.',
+      },
       until: { type: 'string', description: 'ISO date the window closes. Default: now.' },
       focus: { type: 'string', description: 'Narrow the bundle to one person, project or topic.' },
       budget_tokens: { type: 'integer', description: 'Token ceiling for the bundle.' },

@@ -8,34 +8,30 @@ that tells you whether the brain has enough in it to be worth reviewing.
 
 ---
 
-## Read this first: the delta is not weekly
+## Read this first: what the seven days cover
 
-`briefing` takes a `since` and an `until`, and most of the bundle honours them.
-The `delta` section does not, and knowing that in advance saves a confusing
-first run.
+`briefing` takes a `since` and an `until`, and **naming a `since` is what makes
+this recipe weekly.** Every windowed section then runs over the week you asked
+for, including the delta.
 
-| Section | Honours the seven-day window? |
+| Section | Over the seven-day window? |
 |---|---|
-| `meetings` | **Yes** — pages inside the window, at most 20. |
-| `delta.changed`, `delta.stated` | **No.** It starts from this connection's last briefing call, whenever that was. |
-| `stale` | **No.** It ignores the window entirely and returns the most relevant stale things, at any age. |
+| `meetings` | **Yes** — meetings *happening* in the window, at most 20. Each carries `occurred_at` beside `created_at`. |
+| `delta.changed`, `delta.stated` | **Yes**, because you named a `since`. The response says so: `delta.basis` is `"window"`. |
+| `stale` | **Yes** — things that went stale inside the window. Something that rotted in April needs a wider `since`. |
 | `commitments`, `counts` | Point in time, not a window. What is open and what is queued right now. |
 
-The delta runs off a cursor stored against the credential the call arrived on,
-and **every** briefing call advances it. So if you also run
-[the daily briefing](daily-briefing.md) on the same connection, this morning's
-run consumed the week's delta and your weekly review's "what changed" covers
-about a day.
+**Run it on whatever connection you like, as often as you like.** A call that
+names a `since` reads across the connection's bookmark without moving it, so
+this review takes nothing from [the daily briefing](daily-briefing.md) and the
+daily takes nothing from it. That is a deliberate rule and not a coincidence: a
+query is not a bookmark advance.
 
-Two honest ways to live with that:
-
-1. **Run the weekly review from a separate connection.** A second credential
-   has its own cursor, so its delta really is a week. This is the only way to
-   get a weekly delta today.
-2. **Accept it, and read the other sections as the weekly part.** The meetings
-   list, the stale flags and the counts are all genuinely week-shaped or
-   point-in-time. The delta is then "since yesterday", which is still true —
-   just not what the section name suggests.
+The consequence worth knowing in advance is the mirror of the old one: **a
+weekly review re-shows things the daily already showed you.** Seven days is
+seven days, every time you ask. If you want "what has arrived since I last
+looked", drop the `since` — but then you are running the daily recipe, on the
+daily's bookmark.
 
 ## The prompt
 
@@ -75,11 +71,20 @@ These are automated changes the system was not confident enough to apply on its
 own. High confidence applies, middling confidence queues here, low confidence
 is only logged.
 
-> **Alpha limitation: there is nowhere to close one from.** The in-chat panel
-> and the web app are where a decision is meant to land, and neither exists
-> yet. The `manage` tool accepts the call, validates it, and returns
-> `applied: false` with a note saying the settings store lands with the panel.
-> Nothing your assistant can do closes a review entry.
+> **Alpha limitation: there is nowhere to close one from, and that is by
+> design rather than by omission.** The queue records who closed an entry, and
+> the database itself admits only two answers — a decision you took out of
+> band, or one the system derived internally. `agent_mcp` is refused by a CHECK
+> constraint, because the assistant holding your tools is the same assistant
+> reading your mail: a crafted message that talked it into approving a proposal
+> would be the whole gate, defeated.
+>
+> So the close has to arrive from a surface the connected agent cannot drive —
+> the in-chat panel (**U14**) or the web app (**U15**) — and neither exists
+> yet. `manage`, the tool those surfaces would dispatch through, does not
+> currently carry a review action in its enum at all; it accepts what it does
+> declare, validates it, and returns `applied: false`. Nothing your assistant
+> can do closes a review entry, and nothing in this alpha will.
 
 So for now: read the count, and write the entries down somewhere you control if
 they matter. A rising `pending_review` over the bake is a finding to report, not

@@ -211,7 +211,7 @@ while real recall degrades. This is the only check that looks.
 
 Today it refuses: nothing provider-sourced exists to compare.
 
-### B4. The KTD13 exit gate — the five consolidation ops
+### B4. The KTD13 exit gate — the consolidation ops
 
 ```bash
 BRAINZ_REAL_SUBSTRATE=1 \
@@ -223,16 +223,17 @@ bun run eval:canary
 `bun run eval:canary --preflight` prints how many checks are gradeable and
 exits 0 without spending anything. Use it first.
 
-**Cost: $0.982664 for one full run**, committed as an estimate at
+**Cost: $1.005484 for one full run**, committed as an estimate at
 [`evals/receipts/u11-exit-gate-cost.json`](../evals/receipts/u11-exit-gate-cost.json)
 and computed from the canonical pricing table rather than guessed. The estimate
 projects every op at its output-token ceiling — the direction a run cannot
 exceed while believing it is inside the estimate. The largest single line is
-extraction at $0.62; the judge that grades the five is $0.19.
+extraction at $0.62; the judge that grades the six is $0.19; the vision seat
+folded in from [B5](#b5-the-live-vision-call) is $0.02.
 
-**What it would prove:** that `extract`, `enrich`, `contradiction`, `salience`
-and `synopsis` each clear the canary-tier floor of 0.8, with a committed
-receipt per op naming the pinned model id it was scored against. The table runs
+**What it would prove:** that `extract`, `enrich`, `contradiction`, `salience`,
+`synopsis` and `vision` each clear the canary-tier floor of 0.8, with a
+committed receipt per op naming the pinned model id it was scored against. The table runs
 a current-generation model in every seat precisely so that a floor miss indicts
 the architecture rather than the model tier — which is only true if the receipt
 names the model that actually ran. Extraction is the one to watch: it feeds
@@ -248,27 +249,27 @@ op whatever the scores say, and the cost is committed before the run.
 
 ### B5. The live vision call
 
-**There is no gate covering it.** This is a finding, not a command.
+**Folded into [B4](#b4-the-ktd13-exit-gate--the-consolidation-ops).** The gap
+this line recorded — a working, routed, priced `vision` op that no gate covered
+and no harness line would ever produce a receipt for — is closed. `vision` is in
+`EXIT_GATE_OPS` with its own check, workload row and cost line, and it defers on
+the same authorised-spend condition as the other five rather than on nothing at
+all.
 
-`transcribe` is the first model phase in the consolidation cycle and routes
-through the `vision` op. But `EXIT_GATE_OPS` in
-[`evals/exit-gate.ts`](../evals/exit-gate.ts) names five ops and `vision` is not
-among them, and the committed cost receipt carries no `vision` row in its
-workload. The Alpha-done clause "screenshots findable by their text" therefore
-has a working implementation, a routed op, a pinned model — and no scored
-receipt, and no harness line that would produce one.
+It is still **not scored**, which is why this stays in group B: it is one of the
+six ops B4's command grades, and B4's estimate now includes it.
 
-**What it would cost:** unknown, because no workload is committed for it. The
-per-item price is the cheapest seat in the routing table, which is why the phase
-runs first; the number of items is a property of a real brain.
+**What it costs:** $0.022820 of B4's total, derived rather than guessed — eight
+committed gold images at `IMAGE_INPUT_TOKENS` plus the transcription prompt, at
+the vision seat's price. The gold is at
+[`evals/fixtures/transcription.ts`](../evals/fixtures/transcription.ts) and its
+one honest limitation is stated there: the images are machine-rendered, so a
+model that reads them perfectly has been shown to read clean glyphs, not a
+photograph of a screen. Real founder screenshots are what replace it.
 
-**What it would prove:** that a founder screenshot containing text is findable
-by its contents through the ordinary retrieval stack, which is the verification
-U21 was written against.
-
-Closing this means adding `vision` to the exit gate's op list with a workload
-row, which is source work and belongs to whoever owns
-`evals/exit-gate.ts` — not to this checklist.
+**What it would prove:** that a screenshot containing text is findable by its
+contents through the ordinary retrieval stack, which is the verification U21 was
+written against.
 
 ### B6. Request-time p99 from a deployed container
 
@@ -294,7 +295,7 @@ that.
 
 ### B7. The canary tier's own floors
 
-Same command as [B4](#b4-the-ktd13-exit-gate--the-five-consolidation-ops).
+Same command as [B4](#b4-the-ktd13-exit-gate--the-consolidation-ops).
 Model-extraction recall ≥ 0.8, judged nightly and non-blocking, routed so the
 judge is never the model that produced the output it is grading.
 
@@ -457,10 +458,10 @@ The Alpha-done bullet, split into what it actually asks for:
 | Founder's real Gmail / Calendar / Drive + chat history in the brain | human | [C1](#c1-the-founders-two-week-daily-bake) |
 | Capture-and-consult works unprompted from the real clients | human | [C1](#c1-the-founders-two-week-daily-bake) |
 | All R6 floors green | **not satisfied** — 2 of 5 deferred | [A3](#a3-accuracy-floors-r6), [B1](#b1-regenerate-the-embedding-manifest-from-a-real-provider) |
-| Consolidation producing entity cards and report-only contradictions | needs an authorised paid cycle | [B4](#b4-the-ktd13-exit-gate--the-five-consolidation-ops) |
-| Screenshots findable by their text | implemented; **no gate covers the vision op** | [B5](#b5-the-live-vision-call) |
+| Consolidation producing entity cards and report-only contradictions | needs an authorised paid cycle | [B4](#b4-the-ktd13-exit-gate--the-consolidation-ops) |
+| Screenshots findable by their text | implemented; gated but **unscored** — the vision op is in the exit gate and deferred with the rest | [B5](#b5-the-live-vision-call), [B4](#b4-the-ktd13-exit-gate--the-consolidation-ops) |
 | Every model call routed and metered, recorded spend matching provider usage | routed and metered; reconciliation is human | [C3](#c3-spend-reconciliation) |
-| Exit gate green for the five consolidation ops, receipt per op naming its pinned model id | deferred, $0.98 to run | [B4](#b4-the-ktd13-exit-gate--the-five-consolidation-ops) |
+| Exit gate green for the consolidation ops, receipt per op naming its pinned model id | deferred, $1.01 to run for all six | [B4](#b4-the-ktd13-exit-gate--the-consolidation-ops) |
 | Two or three non-technical testers reaching a first answer unaided | **not run** | [C2](#c2-two-or-three-non-technical-testers-reaching-a-first-answer-unaided) |
 | Two-week daily use, spend inside the envelope, no silent failures | **not run**; detection is manual | [C1](#c1-the-founders-two-week-daily-bake) |
 
