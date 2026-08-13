@@ -44,8 +44,20 @@ export const DETERMINISTIC_PHASES = [
 
 export type DeterministicPhase = (typeof DETERMINISTIC_PHASES)[number];
 
-/** The metered half, in the plan's order: extract, enrich, wrap, report, refine. */
+/**
+ * The metered half: transcribe, then the plan's order — extract, enrich, wrap,
+ * report, refine.
+ *
+ * **`transcribe` is first, and its position is an argument rather than a
+ * preference.** U21 adds it to this tier (its output is a model call, so it
+ * belongs where calls are batched, budgeted and checkpointed), and two things
+ * put it at the head: it is the cheapest seat in KTD13's table per item, which
+ * is the same cheap→expensive rule the tier boundary follows; and it *creates*
+ * what the phases after it read. A screenshot transcribed after extraction has
+ * run is a screenshot whose text no phase sees until the next cycle.
+ */
 export const MODEL_PHASES = [
+  'transcribe',
   'extract',
   'enrich',
   'synopsis',
@@ -88,6 +100,11 @@ export const TIER_OF: Readonly<Record<CyclePhase, PhaseTier>> = Object.freeze(
  * with the deterministic one, or an op nobody grades.
  */
 export const PHASE_OP: Readonly<Record<ModelPhase, ModelOp>> = Object.freeze({
+  // KTD13's "Image / PDF → text" row. The plan's prose calls the op
+  // `image_to_text`; the table — which KTD13 says is the source of truth, not
+  // the prose — files it as `vision`, and a tenth op would be a second name for
+  // one row.
+  transcribe: 'vision',
   extract: 'extract',
   enrich: 'enrich',
   synopsis: 'synopsis',

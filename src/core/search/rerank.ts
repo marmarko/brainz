@@ -1,14 +1,14 @@
 /**
- * Stage 12 — the cross-encoder rerank, behind a flag, off until U12.
+ * Stage 12 — the cross-encoder rerank, behind a flag, on as of U12.
  *
- * **What ships here is the seam and the guarantee that it is closed.** KTD4
- * admits *bounded* scoring over a fixed candidate set at request time, and names
- * the cross-encoder as the single largest quality lever. It also names the cost:
- * enabling it puts a second synchronous external call on a path that promises a
- * warm p99, alongside the query embedding. So U5 ships the stage, the flag, and
- * the property that matters until U12 flips it — **when the flag is off, nothing
- * happens, and in particular no scorer is called.** A rerank that ran and then
- * discarded its answer would be exactly the latency this flag exists to defer.
+ * **What ships here is the seam and the guarantee that it is closed when it is
+ * closed.** KTD4 admits *bounded* scoring over a fixed candidate set at request
+ * time, and names the cross-encoder as the single largest quality lever. It also
+ * names the cost: it puts a second synchronous external call on a path that
+ * promises a warm p99, alongside the query embedding. So the property that
+ * matters in both directions is that **when the flag is off, nothing happens,
+ * and in particular no scorer is called** — a rerank that ran and then discarded
+ * its answer would be exactly the latency the flag exists to control.
  *
  * **`undefined` is the off state, not zero.** Autocut reads the rerank score and
  * only the rerank score, so it has to be able to distinguish "this candidate
@@ -63,11 +63,12 @@ export interface RerankOptions {
  * really a template divergence. A title is part of what a passage says — a mail
  * subject routinely carries the answer — so it leads.
  */
-export function rerankPassageOf(candidate: ScoredCandidate): string {
-  const title = candidate.candidate.title;
-  return title === null || title.length === 0
-    ? candidate.candidate.content
-    : `${title}\n${candidate.candidate.content}`;
+export function rerankPassageOf(candidate: {
+  readonly title: string | null;
+  readonly content: string;
+}): string {
+  const title = candidate.title;
+  return title === null || title.length === 0 ? candidate.content : `${title}\n${candidate.content}`;
 }
 
 /**

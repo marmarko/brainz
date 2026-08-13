@@ -21,9 +21,14 @@
  * stated tolerance.
  *
  * **It refuses rather than reporting a comparison it did not make.** Today the
- * committed manifest carries zero provider-sourced vectors (no embedding
- * provider is reachable from this environment) and no cross-encoder scores exist
- * at all — they arrive with U12. A job that returned success having compared
+ * committed manifest carries zero provider-sourced vectors and zero
+ * provider-sourced cross-encoder scores — neither provider is reachable from
+ * this environment. U12 committed the *score manifest*, which is what a live
+ * comparison will be made against, but every row in it is synthetic, and
+ * comparing a live `bge-reranker-base` score to a thirty-line lexical stand-in
+ * would report drift that is really a generator difference. So this leg keeps
+ * refusing until a provider-sourced score exists, on the same switch the
+ * blocking tier's rerank leg uses. A job that returned success having compared
  * nothing would be a stronger version of the exact defect it exists to catch, so
  * an empty sample is a violation and the command exits non-zero. The *workflow*
  * decides whether to invoke it; the command never lies about what it compared.
@@ -328,8 +333,10 @@ export function checkRerankParity(input: {
         {
           kind: 'no_committed_rerank_scores',
           detail:
-            'no committed (query, candidate) cross-encoder score exists, so this run compared nothing; ' +
-            'U12 commits them when rerank is enabled, and until then the rerank stage has no live coverage',
+            'no provider-sourced (query, candidate) cross-encoder score exists, so this run compared ' +
+            'nothing. U12 committed the score manifest and enabled the stage, but every row in it is ' +
+            'synthetic — comparing a live model against a lexical stand-in would report a generator ' +
+            'difference as drift. The leg starts comparing on the first provider-sourced row.',
         },
       ],
       compared: 0,
@@ -525,8 +532,9 @@ export async function main(argv: readonly string[]): Promise<number> {
   const embedding = checkEmbeddingParity({ samples, fresh, tolerance, routedModelId });
   out(renderParity('embedding', embedding));
 
-  // U12 commits the cross-encoder scores; until then this leg refuses rather
-  // than reporting a comparison it did not make.
+  // U12 committed the score manifest, and every row in it is synthetic; until a
+  // provider-sourced row exists this leg refuses rather than reporting a
+  // comparison it did not make. See `checkRerankParity`.
   const rerank = checkRerankParity({ samples: [], fresh: [], tolerance });
   out(renderParity('rerank', rerank));
 

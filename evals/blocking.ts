@@ -39,6 +39,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+import { renderBriefingLeg, runBriefingLeg, type BriefingLegResult } from './briefing.ts';
 import { CORPUS, corpusTexts, type Corpus } from './corpus.ts';
 import { loadEmbeddings, type EmbeddingIndex } from './embeddings.ts';
 import {
@@ -49,6 +50,8 @@ import {
   type RankingFloor,
 } from './gates.ts';
 import { MANIFEST_PATH } from './regenerate-embeddings.ts';
+import { RERANK_MANIFEST_PATH, scoreCorpus } from './regenerate-rerank-scores.ts';
+import { loadRerankScores, type RerankScoreIndex } from './rerank-scores.ts';
 import { runEval, type EvalReport, type Ranker } from './run.ts';
 
 export type TierViolationKind =
@@ -91,6 +94,21 @@ export interface BlockingTierResult {
 export function loadTierContext(): TierContext {
   const manifest = readFileSync(fileURLToPath(new URL(`../${MANIFEST_PATH}`, import.meta.url)), 'utf8');
   return { corpus: CORPUS, embeddings: loadEmbeddings(manifest, corpusTexts(CORPUS)) };
+}
+
+/**
+ * The committed cross-encoder scores, verified before any of them is reachable.
+ *
+ * Separate from {@link loadTierContext} because the rerank leg is separate: a
+ * tier that could not load the scores must still grade the baseline leg, and a
+ * failure here is a failure of one leg rather than of the command.
+ */
+export function loadRerankScoreIndex(): RerankScoreIndex {
+  const manifest = readFileSync(
+    fileURLToPath(new URL(`../${RERANK_MANIFEST_PATH}`, import.meta.url)),
+    'utf8',
+  );
+  return loadRerankScores(manifest, scoreCorpus());
 }
 
 /**
@@ -252,6 +270,106 @@ export function runBlockingTier(options: {
   };
 }
 
+// ---------------------------------------------------------------------------
+// The rerank leg (U12).
+// ---------------------------------------------------------------------------
+
+/**
+ * Why the shipped configuration's floors are reported rather than enforced.
+ *
+ * Stated as a value so the condition is one expression that a test can drive
+ * from both sides, rather than a branch that only ever runs one way.
+ */
+export const SYNTHETIC_SCORES_REASON =
+  'every committed (query, candidate) cross-encoder score is synthetic, and the generator is a ' +
+  'thirty-line lexical function standing in for a 278M-parameter model. Used as stage 12 uses it — ' +
+  'as the sole sort key — it is weaker than the stack it reranks, so its floor scores measure the ' +
+  'stand-in rather than the stage. One provider-sourced score anywhere and this leg enforces.';
+
+export interface RerankLegResult {
+  readonly result: BlockingTierResult;
+  /** True once a provider-sourced score exists. Counted from the manifest. */
+  readonly enforced: boolean;
+  readonly reason: string;
+  /**
+   * The violations that bind whatever the scores are.
+   *
+   * Determinism, network egress and leaks are properties of the *stages*, not of
+   * the numbers they read: a rerank that returned a fenced chunk, reached the
+   * network, or scored differently on two identical runs is broken regardless of
+   * how good the cross-encoder is. Only the floor violations are held back.
+   */
+  readonly binding: readonly TierViolation[];
+}
+
+/**
+ * Run the shipped configuration — stages 12 and 13 on — over the same corpus.
+ *
+ * **Why this leg exists.** Without it the nDCG floor keeps measuring a pipeline
+ * production no longer runs: the two highest-leverage read stages would be
+ * verified once by this unit's A/B and never again. With it, every CI run
+ * exercises the stages the fleet actually executes, in the order it executes
+ * them, and any change to either is graded.
+ *
+ * **Why its floors are not enforced yet, and why that cannot rot.** See
+ * {@link SYNTHETIC_SCORES_REASON}. The switch is `sources.provider`, counted row
+ * by row from the manifest — the same mechanism `gates.ts` uses for a floor the
+ * synthetic *vectors* cannot reach, one level up. Nothing has to be remembered
+ * and nothing has to be removed.
+ */
+export function runRerankLeg(options: {
+  readonly ranker: Ranker;
+  readonly context: TierContext;
+  readonly scores: RerankScoreIndex;
+  readonly floors?: readonly RankingFloor[];
+}): RerankLegResult {
+  const result = runBlockingTier({
+    ranker: options.ranker,
+    context: options.context,
+    ...(options.floors === undefined ? {} : { floors: options.floors }),
+  });
+  const enforced = options.scores.sources.provider > 0;
+  const binding = enforced
+    ? result.violations
+    : result.violations.filter((violation) => violation.kind !== 'floor');
+
+  return {
+    result,
+    enforced,
+    reason: enforced
+      ? 'a provider-sourced cross-encoder score exists, so the shipped configuration carries the floors'
+      : SYNTHETIC_SCORES_REASON,
+    binding,
+  };
+}
+
+export function renderRerankLeg(leg: RerankLegResult): string {
+  const lines: string[] = [];
+  lines.push(
+    `rerank leg — ranker: ${leg.result.ranker}, floors ${leg.enforced ? 'ENFORCED' : 'REPORTED (not enforced)'}`,
+  );
+  lines.push(`  ${leg.reason}`);
+  lines.push('');
+  for (const outcome of leg.result.gate.outcomes) {
+    const mark = leg.enforced
+      ? outcome.status === 'met'
+        ? 'MET     '
+        : outcome.status === 'deferred'
+          ? 'DEFERRED'
+          : 'MISSED  '
+      : 'REPORTED';
+    lines.push(
+      `  ${mark} ${outcome.floorId.padEnd(32)} ${outcome.value.toFixed(4)} / ${outcome.minimum} over ${outcome.count} queries`,
+    );
+  }
+  if (leg.binding.length > 0) {
+    lines.push('');
+    lines.push('BINDING VIOLATIONS (independent of score quality)');
+    for (const violation of leg.binding) lines.push(`  [${violation.kind}] ${violation.detail}`);
+  }
+  return lines.join('\n');
+}
+
 /** Human output. The deferral block prints on every run, pass or fail. */
 export function renderTier(result: BlockingTierResult): string {
   const lines: string[] = [];
@@ -293,13 +411,28 @@ export function renderTier(result: BlockingTierResult): string {
  */
 export async function main(
   argv: readonly string[],
-  deps?: { readonly ranker?: Ranker; readonly context?: TierContext },
+  deps?: {
+    readonly ranker?: Ranker;
+    readonly context?: TierContext;
+    readonly scores?: RerankScoreIndex;
+  },
 ): Promise<number> {
-  const { stackRanker } = await import('../test/core/search/corpus-ranker.ts');
-  const result = runBlockingTier({
-    ranker: deps?.ranker ?? stackRanker,
-    context: deps?.context ?? loadTierContext(),
-  });
+  const { stackRanker, rerankedStackRanker } = await import('../test/core/search/corpus-ranker.ts');
+  const context = deps?.context ?? loadTierContext();
+  const result = runBlockingTier({ ranker: deps?.ranker ?? stackRanker, context });
+
+  // The shipped configuration, on the same corpus, every run. Its floors bind
+  // only once a provider-sourced score exists; its determinism, egress and leak
+  // checks bind always. See `runRerankLeg`.
+  const scores = deps?.scores ?? loadRerankScoreIndex();
+  const leg = runRerankLeg({ ranker: rerankedStackRanker(scores), context, scores });
+
+  // U12's third leg: the briefing's assembly, over fixtures. Fully enforced —
+  // participant-card completeness and delta correctness are properties of the
+  // pure function and depend on no model, no database and no committed score.
+  const briefing: BriefingLegResult = runBriefingLeg();
+
+  const passed = result.passed && leg.binding.length === 0 && briefing.passed;
 
   if (argv.includes('--json')) {
     process.stdout.write(
@@ -307,20 +440,36 @@ export async function main(
         {
           ranker: result.ranker,
           digest: result.digest,
-          passed: result.passed,
+          passed,
           egress: result.egress,
           outcomes: result.gate.outcomes,
           violations: result.violations,
+          rerank_leg: {
+            ranker: leg.result.ranker,
+            digest: leg.result.digest,
+            enforced: leg.enforced,
+            reason: leg.reason,
+            score_sources: scores.sources,
+            outcomes: leg.result.gate.outcomes,
+            binding_violations: leg.binding,
+          },
+          briefing_leg: {
+            cases: briefing.cases,
+            passed: briefing.passed,
+            violations: briefing.violations,
+          },
         },
         null,
         2,
       )}\n`,
     );
   } else {
-    process.stdout.write(`${renderTier(result)}\n`);
+    process.stdout.write(
+      `${renderTier(result)}\n\n${renderRerankLeg(leg)}\n\n${renderBriefingLeg(briefing)}\n`,
+    );
   }
 
-  return result.passed ? 0 : 1;
+  return passed ? 0 : 1;
 }
 
 if (import.meta.main) {

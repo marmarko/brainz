@@ -5,31 +5,45 @@
       "pins": [],
       "deferrals": [
         {
-          "ops": ["embedding"],
+          "ops": [
+            "embedding"
+          ],
           "awaiting": "the first green `bun run eval:live-parity` run against provider-sourced committed vectors",
           "unit": "U7",
           "note": "The two R6a receipts record embedding_source.model = synthetic-lexical-v1. That is the fixture's deterministic lexical generator (evals/embeddings.ts), NOT a routed model id — no embedding provider is reachable from this environment, so no committed vector has ever been produced by the routed model. A reader counting receipts would otherwise read the calibration receipts as pinning this op. The pin lands with the first live-parity receipt, which is the first artifact that observes the routed model at all."
         },
         {
-          "ops": ["rerank"],
-          "awaiting": "U12's rerank enablement and its committed cross-encoder scores",
+          "ops": [
+            "rerank"
+          ],
+          "awaiting": "a provider-sourced (query, candidate) cross-encoder score, from `bun run eval:live-parity` or a scored `evals/fixtures/rerank-scores.manifest.jsonl`",
           "unit": "U12",
-          "note": "Rerank and autocut are off until U12; U7 commits no (query, candidate) cross-encoder scores, so nothing has been scored against this route. The live-parity job's rerank leg refuses to report a comparison until those scores exist, for the same reason."
+          "note": "U12 enabled the stage and committed the score manifest, and the pin still does not land: every row in that manifest is SYNTHETIC (`synthetic-cross-encoder-v1`, a lexical generator in `evals/rerank-scores.ts`), so nothing has been scored against the routed id. The committed A/B receipt (`evals/receipts/u12-rerank-ab.json`) records `uplift_status: deferred` for the same reason and carries the measured negative delta as the evidence. Reading that receipt as a pin would be reading a stand-in's number as the routed model's. The blocking tier's rerank leg, the live-parity rerank leg and this deferral all flip on the same switch: the first provider-sourced row in the manifest."
         },
         {
-          "ops": ["judge"],
+          "ops": [
+            "judge"
+          ],
           "awaiting": "the first green `bun run eval:canary` run on a live tenant",
           "unit": "U7",
           "note": "The canary tier is the only thing that calls the judge op. It needs a live tenant on the real substrate and a produced output to grade; until U11 ships the consolidation ops there is nothing for a judge to score, so the harness reports `nothing_gradeable` rather than a receipt."
         },
         {
-          "ops": ["extract", "enrich", "contradiction", "salience", "synopsis"],
+          "ops": [
+            "extract",
+            "enrich",
+            "contradiction",
+            "salience",
+            "synopsis"
+          ],
           "awaiting": "U11's exit gate — each op clears R6's canary floors with a receipt naming its model id",
           "unit": "U11",
           "note": "U7 owns the harness; these ops do not exist in Phase 1, so a Phase-1 gate over them would be signed off empty. The plan splits the KTD13 gate for exactly this reason (Gap #19)."
         },
         {
-          "ops": ["vision"],
+          "ops": [
+            "vision"
+          ],
           "awaiting": "U21's media-to-text consolidation phase",
           "unit": "U21",
           "note": "image_to_text is a U21 deliverable; nothing routes through this op yet."

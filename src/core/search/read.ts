@@ -152,7 +152,7 @@ async function scoreWithCrossEncoder(
         // One passage builder, shared with the eval's committed score manifest.
         // A divergent input template is exactly the drift `eval:live-parity`
         // exists to catch, and it would report as a score mismatch.
-        candidates: candidates.map((candidate) => rerankPassageOf(candidate)),
+        candidates: candidates.map((entry) => rerankPassageOf(entry.candidate)),
       },
     });
   } catch {

@@ -59,8 +59,19 @@ import { NO_SPEND } from './estimate.ts';
 import type { ModelPhase } from './phases.ts';
 import { PHASE_OP } from './phases.ts';
 
-/** Why a phase stopped short. `null` means it finished its work. */
-export type PhaseStop = 'budget_exhausted' | 'model_unavailable' | 'bad_output';
+/**
+ * Why a phase stopped short. `null` means it finished its work.
+ *
+ * `payload_unavailable` is U21's: the transcription phase reads bytes out of
+ * object storage, and an object that is not there is neither a budget problem
+ * nor a model problem. Marking the attachment done instead would retire a
+ * payload nobody ever read, which is the one thing R23 promised not to do.
+ */
+export type PhaseStop =
+  | 'budget_exhausted'
+  | 'model_unavailable'
+  | 'bad_output'
+  | 'payload_unavailable';
 
 export interface PhaseOutcome {
   readonly phase: ModelPhase;

@@ -35,6 +35,7 @@
 
 import type { Chunk, Corpus, FixtureQuery } from '../../../evals/corpus.ts';
 import { cosine, tokenize, type EmbeddingIndex } from '../../../evals/embeddings.ts';
+import type { RerankScoreIndex } from '../../../evals/rerank-scores.ts';
 import type { Ranker, RankerContext } from '../../../evals/run.ts';
 import { RESULT_LIMIT } from '../../../evals/run.ts';
 import {
@@ -665,11 +666,20 @@ export function recallOverCorpus(
   };
 }
 
-/** U5's composed stack, as a `Ranker` U7's harness can grade. */
+/**
+ * U5's composed stack with stage 12 unwired, as a `Ranker` U7's harness can
+ * grade.
+ *
+ * **This is the *baseline* leg from U12 onward, not the shipped one.** The fleet
+ * reranks; this ranker does not, and it exists so the A/B has an off arm and so
+ * the floors have a leg whose every input is real while the committed
+ * cross-encoder scores are still a stand-in. See `evals/blocking.ts` for which
+ * leg is enforced and why that moves on its own the day a provider score lands.
+ */
 export const stackRanker: Ranker = {
   name: 'u5-retrieval-stack',
   description:
-    'The composed U5 stack: shared normalizer, intent plan, three arms, RRF, alias ladder, boosts, four-layer dedup, return policy, packing. Rerank and autocut are off (U12).',
+    'The composed U5 stack: shared normalizer, intent plan, three arms, RRF, alias ladder, boosts, four-layer dedup, return policy, packing. Stage 12 is not wired, so autocut does not run either.',
   rank(query: FixtureQuery, context: RankerContext): readonly string[] {
     const { outcome, now } = recallOverCorpus(query, context, { limit: RANK_LIMIT });
     const response = composeRanking(
@@ -679,6 +689,41 @@ export const stackRanker: Ranker = {
     return response.results.map((result) => result.candidate.id);
   },
 };
+
+/**
+ * The **shipped** configuration: the same stack with stages 12 and 13 on,
+ * replaying U7's committed cross-encoder scores.
+ *
+ * A factory rather than a constant because the score index is loaded and
+ * verified by the caller — a ranker that read the manifest itself would be a
+ * ranker that could be handed an unverified one.
+ *
+ * **It states no `enabled`.** That is deliberate: it takes
+ * `RERANK_DEFAULT_ENABLED`, exactly as the production read path does, so setting
+ * the flag back to false stops both of them together and the flip is a fact this
+ * leg observes rather than a constant nobody reads.
+ */
+export function rerankedStackRanker(scores: RerankScoreIndex): Ranker {
+  return {
+    name: 'u12-shipped-stack',
+    description:
+      'The shipped configuration: every U5 stage, then the cross-encoder rerank and autocut, replaying the committed (query, candidate) scores.',
+    rank(query: FixtureQuery, context: RankerContext): readonly string[] {
+      const { outcome, now } = recallOverCorpus(query, context, { limit: RANK_LIMIT });
+      const response = composeRanking(
+        {
+          query: query.text,
+          limit: Math.min(RANK_LIMIT, RESULT_LIMIT),
+          now,
+          plan: outcome.plan,
+          rerank: { score: (entry) => scores.score(query.id, entry.candidate.id) },
+        },
+        outcome,
+      );
+      return response.results.map((result) => result.candidate.id);
+    },
+  };
+}
 
 /** The same stack with the vector arm dropped — Assumption 5's degraded read. */
 export const degradedStackRanker: Ranker = {

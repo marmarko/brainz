@@ -61,6 +61,8 @@ import {
 } from './pricing.ts';
 import {
   EMBEDDING_PIN,
+  IMAGE_INPUT_TOKENS,
+  OP_ACCEPTS_IMAGES,
   OP_KINDS,
   assertRoutable,
   routeFor,
@@ -174,8 +176,28 @@ export function createBudget(options: {
 // What a call looks like on either side of the transport.
 // ---------------------------------------------------------------------------
 
+/**
+ * One image on its way to a vision model (U21).
+ *
+ * Bytes, not a data URL: encoding is the transport's job, and a base64 string
+ * held in this type would be the payload in a second form, in memory, for every
+ * caller that only wanted to pass it along. `mediaType` travels with them
+ * because the wire format needs it and re-sniffing bytes at the transport would
+ * be a second classifier disagreeing with `src/core/media/accept.ts`.
+ */
+export interface ImagePayload {
+  readonly mediaType: string;
+  readonly bytes: Uint8Array;
+}
+
 export type ModelInput =
-  | { readonly kind: 'chat'; readonly system?: string; readonly user: string }
+  | {
+      readonly kind: 'chat';
+      readonly system?: string;
+      readonly user: string;
+      /** U21. Refused for every op but the one KTD13 points at a vision model. */
+      readonly images?: readonly ImagePayload[];
+    }
   | { readonly kind: 'embedding'; readonly texts: readonly string[] }
   | { readonly kind: 'rerank'; readonly query: string; readonly candidates: readonly string[] };
 
@@ -361,6 +383,8 @@ export type GatewayFailureReason =
   | 'scope_denied'
   | 'invalid_tenant_id'
   | 'op_kind_mismatch'
+  /** An image was handed to an op KTD13 does not point at a vision model. */
+  | 'image_not_accepted'
   | 'key_unavailable'
   | 'model_not_priced'
   | 'usage_unreported'
@@ -438,7 +462,12 @@ function estimateUsage(input: ModelInput, route: Route): TokenUsage {
   switch (input.kind) {
     case 'chat':
       return {
-        inputTokens: estimateTokens((input.system ?? '') + input.user),
+        inputTokens:
+          estimateTokens((input.system ?? '') + input.user) +
+          // An image is a few characters of prompt and a great many tokens of
+          // input. Counting only the prompt would reserve almost nothing for the
+          // most expensive part of the call — see `IMAGE_INPUT_TOKENS`.
+          (input.images?.length ?? 0) * IMAGE_INPUT_TOKENS,
         // The ceiling, not a guess: an estimate that assumes a short answer is
         // a cap that fires after the money is gone.
         outputTokens: route.maxOutputTokens,
@@ -523,6 +552,12 @@ export function createModelGateway(options: ModelGatewayOptions): ModelGateway {
       const route = routeFor(profile, op);
       const kind = OP_KINDS[op];
       if (input.kind !== kind) return { ok: false, reason: 'op_kind_mismatch' };
+      // A text model handed a prompt whose image never arrived does not fail; it
+      // answers. So the refusal is here, above the transport, and it costs
+      // nothing — no key resolved, no reservation taken, no call made.
+      if (input.kind === 'chat' && (input.images?.length ?? 0) > 0 && !OP_ACCEPTS_IMAGES[op]) {
+        return { ok: false, reason: 'image_not_accepted' };
+      }
 
       const price = priceBook.lookup(route.id);
       if (price === undefined && budget.capMicroUsd !== null) {
@@ -723,13 +758,36 @@ function readUsage(body: UnknownRecord): TokenUsage | undefined {
   return { inputTokens: input, outputTokens: output };
 }
 
+/**
+ * How an image travels on an OpenAI-compatible wire: a `data:` URL inside an
+ * `image_url` content part. Encoded here, at the last possible moment, so the
+ * base64 copy of the payload exists for the length of one request rather than
+ * for the length of every caller that passed it along.
+ */
+function imagePart(image: ImagePayload): unknown {
+  return {
+    type: 'image_url',
+    image_url: { url: `data:${image.mediaType};base64,${Buffer.from(image.bytes).toString('base64')}` },
+  };
+}
+
 function buildBody(request: TransportRequest): unknown {
   if (request.input.kind === 'chat') {
-    const messages: Array<{ role: string; content: string }> = [];
+    const images = request.input.images ?? [];
+    const messages: Array<{ role: string; content: unknown }> = [];
     if (request.input.system !== undefined) {
       messages.push({ role: 'system', content: request.input.system });
     }
-    messages.push({ role: 'user', content: request.input.user });
+    // The plain string shape when there is no image, because that is what every
+    // text model on this wire expects and a content-part array is a needless
+    // difference on the path nine ops out of ten take.
+    messages.push({
+      role: 'user',
+      content:
+        images.length === 0
+          ? request.input.user
+          : [{ type: 'text', text: request.input.user }, ...images.map(imagePart)],
+    });
     return { model: request.modelId, messages, max_tokens: request.maxOutputTokens };
   }
   if (request.input.kind === 'embedding') {

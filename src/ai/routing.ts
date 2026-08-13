@@ -78,6 +78,50 @@ export const OP_KINDS: Readonly<Record<ModelOp, OpKind>> = Object.freeze({
 });
 
 /**
+ * Which ops may be handed a picture (U21).
+ *
+ * `vision` is KTD13's "Image / PDF → text" row — the op the plan's prose calls
+ * `image_to_text` — and it is the only seat in the table pointed at a
+ * vision-language model. The rest are text models, and a text model handed a
+ * prompt whose image it never received does not fail: it answers *something*,
+ * priced, metered and plausible. So the refusal is a table, alongside
+ * {@link OP_KINDS}, rather than a check each call site could forget.
+ *
+ * Declared as a total record so a tenth op cannot be added without deciding.
+ */
+export const OP_ACCEPTS_IMAGES: Readonly<Record<ModelOp, boolean>> = Object.freeze({
+  extract: false,
+  enrich: false,
+  contradiction: false,
+  salience: false,
+  synopsis: false,
+  vision: true,
+  judge: false,
+  rerank: false,
+  embedding: false,
+});
+
+/**
+ * What one image costs in input tokens, for the pre-call estimate.
+ *
+ * **This is an assumption, not a measurement**, and it is written down here so
+ * it has one home rather than one per caller: the gateway reserves against it
+ * and U11's cycle estimate budgets against it. The number is the vision seat's
+ * per-tile encoding for a single-tile image — a screenshot, which is what U21
+ * says the dominant payload is — rounded to a flat figure.
+ *
+ * Being wrong is survivable in one direction only, which is why it is not zero
+ * and not small. The gateway's first rule is that the estimate leaves the budget
+ * *before* the provider is called; its estimator counts characters, and an image
+ * carries almost none. Reserving nothing for a picture is a cap that fires after
+ * the money is gone. Metering reconciles to the provider's own count afterwards,
+ * so this figure bounds the reservation and never the bill —
+ * `docs/research/2026-08-13-ocr-phase-cost.md` states the assumption and what
+ * would settle it.
+ */
+export const IMAGE_INPUT_TOKENS = 1_600;
+
+/**
  * Who serves the model. `cloudflare` is the hosted plane; `google` and `openai`
  * are the two content-touching third parties KTD13 admits, each with a register
  * entry; `self-host` is the operator's own endpoint.

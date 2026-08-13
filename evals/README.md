@@ -11,7 +11,7 @@ here now:
 
 | Command | What it is | Where it runs |
 |---|---|---|
-| `bun run eval:blocking` | R6's floors. Deterministic, zero model calls. | CI, every PR |
+| `bun run eval:blocking` | R6's floors, plus U12's rerank leg (the shipped configuration) and briefing leg. Deterministic, zero model calls. | CI, every PR |
 | `bun run conformance` | gbrain's runner at the pinned commit, graded against the published `memory-verbs-v1-partial` delta. | CI, self-skipping while the delta records a blocker |
 | `bun run eval:live-parity` | Re-embeds and re-scores a sample through the production `src/ai/` path. | scheduled, secret-gated |
 | `bun run eval:canary` | The nightly model-judged tier, routed as the `judge` op. | nightly, non-blocking |
@@ -55,6 +55,8 @@ committed with no ranking stack in the repository to tune toward.
 | `fixtures/extraction.ts` | Which deterministic rule family would extract each fact. |
 | `fixtures/embeddings.manifest.jsonl` | The committed embedding manifest (see below). |
 | `fixtures/embeddings.provider-sample.jsonl` | Two rows in the shape real provider vectors arrive in. |
+| `fixtures/rerank-scores.manifest.jsonl` | The committed cross-encoder scores (see below). |
+| `fixtures/rerank-scores.provider-sample.jsonl` | One row in the shape real cross-encoder scores arrive in. |
 | `corpus.ts` | The loader, which is really the validator. Fails closed, in both directions. |
 | `metrics.ts` | nDCG@10, Hit@k, the dilution metric, duplicate-occupancy. |
 | `lexical-reach.ts` | Which gold answers this corpus offers a **keyed** path to, and which ones only meaning can reach. |
@@ -64,7 +66,10 @@ committed with no ranking stack in the repository to tune toward.
 | `gates.ts` | R6's floors and R6a's margins, as data, plus the checker and the three-state classifier. |
 | `extraction.ts` | The rule-coverage baseline for R6's deterministic-extraction floor. |
 | `calibrate.ts` | Regenerates both receipts. |
-| `blocking.ts` | The blocking tier as a command: two runs, one digest, `fetch` trapped. |
+| `blocking.ts` | The blocking tier as a command: two runs, one digest, `fetch` trapped, three legs. |
+| `rerank-scores.ts` | The committed cross-encoder score format, its generator, and the verifying loader. |
+| `rerank-ab.ts` | U12's rerank on/off A/B, the cost line from the canonical table, and the two deferrals. |
+| `briefing.ts` | Briefing-shaped fixtures: participant-card completeness and delta correctness, over the pure assembler. |
 | `live-parity.ts` | The scheduled parity job and its comparison rules. |
 | `live-parity-tolerance.json` | The divergence thresholds, as committed data with their rationale. |
 | `canary.ts` | The judged tier's harness: judge independence, gradeability, recall scoring. |
@@ -177,15 +182,46 @@ probes must therefore be reached by the alias hop and the graph arm.
 4. Re-run `test/evals/` — the freshness and drift guards are what make steps 1–3
    impossible to forget.
 
-Cross-encoder scores for every (query, candidate) pair are the other half of
-U7 step 1, and they are still **not** here — not as a sequencing decision now but
-as a scope one. They exist to let U12's rerank and autocut enter the blocking
-tier, and both stages are off until U12 ships; fabricating a synthetic score
-manifest to have one would commit an artifact nothing reads, in the shape of a
-measurement. `eval:live-parity`'s rerank leg therefore refuses with
-`no_committed_rerank_scores` rather than reporting a comparison it did not make,
-and `evals/receipts/model-ids.json` records the `rerank` op as deferred to U12
-for the same reason.
+## Cross-encoder scores: what U12 committed, and what it refused to claim
+
+The other half of U7 step 1 landed at U12, and the objection U7 recorded against
+committing it — "an artifact nothing reads, in the shape of a measurement" — was
+answered by the first half of it and not the second.
+
+**What reads it now.** `fixtures/rerank-scores.manifest.jsonl` carries one
+verified score vector per query over every candidate in corpus order, and the
+blocking tier's **rerank leg** replays it on every run: the shipped
+configuration, stages 12 and 13 on, over the same corpus as the baseline leg.
+That is what stops the nDCG floor measuring a pipeline production no longer
+runs.
+
+**What it still does not claim.** Every row is `source: "synthetic"`, produced by
+a thirty-line joint-lexical generator standing in for a 278M-parameter
+cross-encoder. Stage 12 sorts by that score *and nothing else*, so an A/B over a
+stand-in measures the stand-in — and it does: the committed receipt
+(`receipts/u12-rerank-ab.json`) records a delta of **−0.161 aggregate nDCG@10**,
+with title-substring Hit@1 falling from 1.000 to 0.100. That is evidence about
+the generator, not about `@cf/baai/bge-reranker-base`, so `uplift_status` is
+`deferred` and the number is carried as the reason.
+
+Three things therefore hang off one switch — `sources.provider`, counted from
+the manifest rather than declared:
+
+| while `provider` is 0 | on the first provider-sourced row |
+|---|---|
+| the rerank leg's floors are **reported**, the baseline leg carries the enforced ones | the rerank leg's floors **enforce** |
+| the A/B receipt says `deferred` | it says `measured` |
+| `eval:live-parity`'s rerank leg refuses | it compares |
+
+None of them needs an edit. Regenerate with
+`bun run evals/regenerate-rerank-scores.ts`; the receipt with
+`bun run evals/rerank-ab.ts`. Both are idempotent, both make no network call,
+and `test/evals/rerank-leg.test.ts` / `test/evals/briefing-leg.test.ts` fail on a
+stale one.
+
+**The p99 latency KTD4 asks for is not here and cannot be**: it is a measurement
+from a deployed container. The receipt records it `deferred` and names the run
+that would produce it.
 
 ## What the gates cannot see, and what watches that
 
