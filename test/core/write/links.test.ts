@@ -27,7 +27,11 @@
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
-import { findEntityByName, resolveOrCreateEntity } from '../../../src/core/write/links.ts';
+import {
+  findEntityByName,
+  reconcileEdges,
+  resolveOrCreateEntity,
+} from '../../../src/core/write/links.ts';
 import { normalize, slugify } from '../../../src/core/write/normalize.ts';
 import { ingestDocument, remember } from '../../../src/core/write/write-path.ts';
 import {
@@ -391,6 +395,39 @@ describe('editing a page removes the edges it no longer states', () => {
     expect(await liveEdges()).toHaveLength(1);
 
     await write({ origin: 'work', ref: 'quote-2', body: 'Also a paragraph about nothing much.' });
+    expect(await liveEdges()).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  test('running out of scan keeps the edge rather than deleting it', async () => {
+    // Nothing links a fact to an edge — that is the schema's choice and the
+    // reason edges are recomputed rather than page-deleted — so "is this still
+    // implied" is a scan, and a scan on a large brain has to stop somewhere.
+    // What matters is which way it fails when it does. Keeping an unproven edge
+    // is a stale answer the next edit reconsiders; deleting one is knowledge
+    // gone, from a write that never looked at the page still asserting it. Both
+    // arms are driven here on identical state, so "gave up" cannot quietly
+    // become "found nothing".
+    const statement = 'Samantha Okonkwo is the head of platform at Verdant Systems.';
+    await reset();
+    await write({ origin: 'personal', ref: 'scan-1', body: statement });
+    expect(await liveEdges()).toHaveLength(1);
+
+    // Nothing live states it any more, so an exhaustive scan would remove it.
+    await tenant.sql`UPDATE fact SET deleted_at = now()`;
+
+    const request = {
+      facts: [],
+      previousStatements: [statement],
+      origins: ['personal'],
+      taxonomyVersion: 1,
+    };
+
+    const gaveUp = await reconcileEdges(tenant.sql, { ...request, scanLimit: 0 });
+    expect(gaveUp.removed).toBe(0);
+    expect(await liveEdges()).toHaveLength(1);
+
+    const looked = await reconcileEdges(tenant.sql, request);
+    expect(looked.removed).toBe(1);
     expect(await liveEdges()).toEqual([]);
   }, TEST_TIMEOUT_MS);
 

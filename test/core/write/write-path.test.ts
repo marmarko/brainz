@@ -31,6 +31,7 @@ import {
   createBudget,
   createInMemorySpendMeter,
   createModelGateway,
+  type ModelTransport,
 } from '../../../src/ai/gateway.ts';
 import {
   createHostedKeyPool,
@@ -45,6 +46,7 @@ import {
   embeddingModelFor,
   pendingChunkEmbeddings,
   runChunkEmbedBacklog,
+  vectorLiteral,
 } from '../../../src/core/write/embed.ts';
 import { NORMALIZER_VERSION } from '../../../src/core/write/normalize.ts';
 import { ASYNC_PHASES, SYNC_PHASES } from '../../../src/core/write/phases.ts';
@@ -57,6 +59,7 @@ import {
   createEmbeddingTransport,
   createGateway,
   createTenantFixture,
+  lexicalVector,
   setTaxonomyVersion,
   uncappedBudget,
   type TenantFixture,
@@ -381,6 +384,119 @@ describe('the asynchronous half is resumable, not promised', () => {
     });
     expect(result.embedded).toBe(0);
     expect(backfill.transport.calls).toHaveLength(0);
+  }, TEST_TIMEOUT_MS);
+
+  test('a vector another pass already committed is not overwritten by this one', async () => {
+    // The backlog is a query and not a queue — deliberately, because that is
+    // what makes a crash resumable. The price is that two workers can both read
+    // the same row as pending, and the second one comes back from the provider
+    // holding a vector for a chunk that is no longer waiting for it. The guard
+    // is `AND embedding IS NULL` on the write, and it is exercised here by
+    // making the *provider call itself* the moment the other pass lands: remove
+    // the guard and this test is the only thing in the suite that notices.
+    await reset();
+    const harness = createGateway();
+    await ingestDocument(contextFor(harness), {
+      originContext: 'personal',
+      sourceType: 'note',
+      title: null,
+      body: 'A paragraph with no extractable structure in it whatsoever.',
+    });
+    const pending = await pendingChunkEmbeddings(tenant.sql, 10);
+    expect(pending).toHaveLength(1);
+    const chunkId = pending[0]?.chunkId ?? '';
+
+    const winner = lexicalVector('the vector some other pass committed first');
+    const base = createEmbeddingTransport();
+    const racing: ModelTransport = {
+      id: 'racing',
+      async invoke(request) {
+        await tenant.sql`
+          UPDATE chunk SET embedding = ${vectorLiteral(winner)}::vector
+           WHERE chunk_id = ${chunkId}::bigint
+        `;
+        return base.invoke(request);
+      },
+    };
+
+    await runChunkEmbedBacklog({
+      sql: tenant.sql,
+      gateway: createModelGateway({
+        profile: HOSTED_PROFILE,
+        transport: racing,
+        meter: createInMemorySpendMeter(),
+        keys: {
+          store: createTenantProviderKeyStore({ backend: createInMemoryProviderKeyBackend() }),
+          hosted: createHostedKeyPool({
+            openai: 'k',
+            google: 'k',
+            cloudflare: 'k',
+            'self-host': 'k',
+          }),
+        },
+      }),
+      tenantId: TENANT,
+      caller: CALLER,
+      budget: uncappedBudget('backfill'),
+    });
+
+    const rows = (await tenant.sql`
+      SELECT (embedding <=> ${vectorLiteral(winner)}::vector) AS distance
+        FROM chunk WHERE chunk_id = ${chunkId}::bigint
+    `) as Array<{ distance: number }>;
+    expect(Number(rows[0]?.distance ?? 1)).toBeLessThan(1e-6);
+  }, TEST_TIMEOUT_MS);
+
+  test('a provider that answers with fewer vectors than texts writes nothing', async () => {
+    // The gateway checks every vector's *width* and nothing checks the count,
+    // so a provider that drops one from a batch produces an off-by-one
+    // alignment: fact two gets fact three's vector. Nothing throws, nothing is
+    // the wrong width, and the corpus is quietly mis-encoded from that write on.
+    await reset();
+    const base = createEmbeddingTransport();
+    const short: ModelTransport = {
+      id: 'short',
+      async invoke(request) {
+        const answer = await base.invoke(request);
+        if (answer.output.kind !== 'embedding') return answer;
+        return { ...answer, output: { kind: 'embedding', vectors: answer.output.vectors.slice(1) } };
+      },
+    };
+
+    const receipt = await ingestDocument(
+      {
+        sql: tenant.sql,
+        gateway: createModelGateway({
+          profile: HOSTED_PROFILE,
+          transport: short,
+          meter: createInMemorySpendMeter(),
+          keys: {
+            store: createTenantProviderKeyStore({ backend: createInMemoryProviderKeyBackend() }),
+            hosted: createHostedKeyPool({
+              openai: 'k',
+              google: 'k',
+              cloudflare: 'k',
+              'self-host': 'k',
+            }),
+          },
+        }),
+        tenantId: TENANT,
+        caller: CALLER,
+        budget: uncappedBudget(),
+      },
+      {
+        originContext: 'personal',
+        sourceType: 'document',
+        title: 'Verdant Systems',
+        body: DOCUMENT,
+      },
+    );
+
+    expect(receipt.ok).toBe(false);
+    expect(receipt.ok === false && receipt.reason).toBe('embed_failed');
+    expect(receipt.ok === false && receipt.detail).toBe('embedding_count_mismatch');
+    expect(await countRows(tenant.sql, 'page')).toBe(0);
+    expect(await countRows(tenant.sql, 'fact')).toBe(0);
   }, TEST_TIMEOUT_MS);
 });
 
@@ -727,6 +843,24 @@ describe('R16: ingestion is idempotent, and an edit reconciles rather than accum
     `) as Array<{ n: number }>;
     expect(liveChunks[0]?.n).toBeGreaterThan(0);
     expect(staleChunks[0]?.n).toBeGreaterThan(0);
+  }, TEST_TIMEOUT_MS);
+
+  test('an edited page keeps the claims it still states', async () => {
+    // The replace above tombstones the previous version's facts and re-extracts
+    // the new one — so a sentence the edit *kept* has to survive as a new row.
+    // It only does because dedup is told to ignore the page being rewritten. Let
+    // that page count as "what the brain already knows" and the kept sentence
+    // comes back `duplicate`, is not re-inserted, and is tombstoned a moment
+    // later by the same write: the claim is deleted by an edit that restated it.
+    // Nothing reports it, and only a query for the fact would ever show it.
+    const live = (await tenant.sql`
+      SELECT statement FROM fact
+       WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL
+       ORDER BY statement
+    `) as Array<{ statement: string }>;
+    const statements = live.map((row) => row.statement);
+    expect(statements).toContain('Marcus Fell founded Kettle Works.');
+    expect(statements).toContain('Kettle Works is based in Lisbon.');
   }, TEST_TIMEOUT_MS);
 
   test('an ingest run records what it wrote', async () => {

@@ -337,10 +337,12 @@ function edgeKey(edge: { subjectId: string; objectId: string; edgeType: string }
   return `${subject}|${edge.edgeType}|${object}`;
 }
 
-/** How many live statements the reconciler reads before it stops asking and
- * keeps the edge. See {@link stillImplied} for why the give-up answer is
- * "keep". */
-export const RECONCILE_SCAN_LIMIT = 20_000;
+/**
+ * How many live statements the reconciler reads before it stops asking and
+ * keeps the edge — a bound on one removal check's runtime, not a tuning knob.
+ * See {@link stillImplied} for why the give-up answer is "keep".
+ */
+export const RECONCILE_SCAN_LIMIT = 200_000;
 
 /** Rows per round trip on that scan. */
 const RECONCILE_SCAN_BATCH = 500;
@@ -371,7 +373,7 @@ const RECONCILE_SCAN_BATCH = 500;
  * gone. The two are not symmetric, so the give-up branch takes the recoverable
  * one.
  */
-async function stillImplied(db: SQL, edge: ResolvedEdge): Promise<boolean> {
+async function stillImplied(db: SQL, edge: ResolvedEdge, scanLimit: number): Promise<boolean> {
   const keysFor = async (entityId: string): Promise<string[]> => {
     const rows = (await db`
       SELECT alias FROM entity_alias WHERE entity_id = ${entityId}::bigint
@@ -395,6 +397,10 @@ async function stillImplied(db: SQL, edge: ResolvedEdge): Promise<boolean> {
   let scanned = 0;
 
   for (;;) {
+    // Checked before the read, so "gave up" and "found nothing" are distinct
+    // states rather than the same `false` arrived at two ways.
+    if (scanned >= scanLimit) return true;
+
     const rows = (await db`
       SELECT fact_id::text AS fact_id, statement FROM fact
        WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL
@@ -406,6 +412,7 @@ async function stillImplied(db: SQL, edge: ResolvedEdge): Promise<boolean> {
 
     for (const row of rows) {
       after = row.fact_id;
+      scanned += 1;
       // The cheap half of the exact test: a statement that implies this edge
       // must mention a name of each endpoint, and "mention" is a question about
       // keys, not about bytes.
@@ -429,9 +436,6 @@ async function stillImplied(db: SQL, edge: ResolvedEdge): Promise<boolean> {
         if (found === target) return true;
       }
     }
-
-    scanned += rows.length;
-    if (scanned >= RECONCILE_SCAN_LIMIT) return true;
   }
 }
 
@@ -447,6 +451,13 @@ export interface ReconcileRequest {
    * reflects what this function actually did rather than bracketing the call.
    */
   readonly onPhase?: (phase: 'resolve_entities' | 'reconcile_edges') => void;
+  /**
+   * Live statements one removal check may read before it gives up and keeps the
+   * edge. Defaults to {@link RECONCILE_SCAN_LIMIT}; present so the give-up
+   * branch is reachable from a test without building a corpus that size, since
+   * a branch nothing has watched fire is not a branch.
+   */
+  readonly scanLimit?: number;
 }
 
 export interface ReconcileResult {
@@ -515,10 +526,11 @@ export async function reconcileEdges(db: SQL, request: ReconcileRequest): Promis
     }
   }
 
+  const scanLimit = request.scanLimit ?? RECONCILE_SCAN_LIMIT;
   let removed = 0;
   for (const [key, edge] of previous) {
     if (desired.has(key)) continue;
-    if (await stillImplied(db, edge)) continue;
+    if (await stillImplied(db, edge, scanLimit)) continue;
     const [subject, object] = orient(edge.subjectId, edge.objectId, edge.edgeType);
     const result = (await db`
       UPDATE entity_edge SET deleted_at = now()

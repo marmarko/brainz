@@ -23,6 +23,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
+import { DUPLICATE_SIMILARITY } from '../../../src/core/write/dedup.ts';
 import { remember } from '../../../src/core/write/write-path.ts';
 import {
   CALLER,
@@ -30,9 +31,19 @@ import {
   countRows,
   createGateway,
   createTenantFixture,
+  lexicalVector,
   uncappedBudget,
   type TenantFixture,
 } from './fixture.ts';
+
+/** Both fixture vectors are unit length, so the dot product is the cosine. */
+function cosine(left: readonly number[], right: readonly number[]): number {
+  let total = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    total += (left[index] ?? 0) * (right[index] ?? 0);
+  }
+  return total;
+}
 
 const SETUP_TIMEOUT_MS = 120_000;
 const TEST_TIMEOUT_MS = 60_000;
@@ -251,5 +262,37 @@ describe('the same claim from two credentials is two attestations', () => {
     const again = await say('Marcus Fell founded Kettle Works.', 'personal');
     expect(again.ok === true ? again.status : '').toBe('duplicate');
     expect(await countRows(tenant.sql, 'fact')).toBe(2);
+  }, TEST_TIMEOUT_MS);
+});
+
+describe('the two signals are not one signal', () => {
+  test('the text signal decides on its own when the embedding cannot', async () => {
+    // The header claims two signals, each covering what the other cannot. Every
+    // duplicate above is one both would catch — extra spaces leave the token
+    // set identical, so the vectors agree too, and the normalized-text
+    // comparison could be deleted with nothing going red.
+    //
+    // This is the case only text can decide: a zero-width space pasted into the
+    // middle of a word. It is invisible in every diff and every test report, it
+    // splits one token into two so the vectors genuinely disagree, and it
+    // vanishes under the normalizer. Assert the embedding's helplessness first,
+    // so the test cannot quietly become a similarity test again.
+    await reset();
+    const plain = 'The spare key is in the blue tin on the third shelf.';
+    const pasted = 'The spare key is in the bl​ue tin on the third shelf.';
+    expect(pasted).not.toBe(plain);
+    expect(cosine(lexicalVector(plain), lexicalVector(pasted))).toBeLessThan(
+      DUPLICATE_SIMILARITY,
+    );
+
+    const first = await say(plain);
+    expect(first.ok && first.status).toBe('inserted');
+    const second = await say(pasted);
+
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.status).toBe('duplicate');
+    expect(second.id).toBe(first.ok ? first.id : '');
+    expect(await countRows(tenant.sql, 'fact')).toBe(1);
   }, TEST_TIMEOUT_MS);
 });
