@@ -660,3 +660,87 @@ describe('folder material carries update and tombstone semantics', () => {
     expect(await countRows(fixture.tenantSql, 'page', 'deleted_at IS NULL')).toBe(1);
   });
 });
+
+/**
+ * The junk gate, reached from the importer.
+ *
+ * `classifyJunk` had exactly two call sites and both were in the pull runner,
+ * so the MBOX fallback the vendor doc names — a consumer mailbox arriving
+ * through `runImport` rather than through a connector — would have been chunked,
+ * embedded and priced with no bulk filtering at all. `junk.ts` calls that "the
+ * single largest avoidable cost in the product".
+ */
+describe('bulk filtering is a seam both runners reach', () => {
+  const bulkHeaders = { 'list-unsubscribe': '<https://x.test/u>' };
+
+  test('a hidden item is quarantined, not embedded, and priced at zero', async () => {
+    await resetBrain();
+    const ordinary = itemFrom(`${ORIGIN}:keep-1`, proseOf('keep', 4), NOW, 'Keep me');
+    const newsletter: typeof ordinary = {
+      ...itemFrom(`${ORIGIN}:junk-1`, proseOf('newsletter', 12), NOW, 'This week in widgets'),
+      junk: { headers: bulkHeaders },
+    };
+
+    // Priced alone first, on a clean brain: the estimate is delta-aware, so
+    // comparing the other way round would compare against an already-imported
+    // item and pass for the wrong reason.
+    const alone = await runImport({ ...baseRequest({ items: [ordinary], failures: [] }) });
+    await resetBrain();
+
+    const result = await runImport({
+      ...baseRequest({ items: [ordinary, newsletter], failures: [] }),
+    });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.counts.written).toBe(1);
+    expect(result.counts.quarantined).toBe(1);
+    expect(
+      await countRows(fixture.tenantSql, 'page', `external_ref = '${ORIGIN}:junk-1' AND quarantined_at IS NOT NULL`),
+    ).toBe(1);
+    // The structural half: a quarantined page's chunks never enter the backlog.
+    expect(
+      await countRows(
+        fixture.tenantSql,
+        'chunk c JOIN page p ON p.page_id = c.page_id',
+        `p.external_ref = '${ORIGIN}:junk-1' AND c.embedding IS NULL AND c.quarantined_at IS NULL`,
+      ),
+    ).toBe(0);
+    // …and it is priced at zero characters, so the newsletter backlog cannot
+    // inflate an approval it will never spend.
+    expect(result.estimate!.items).toBe(2);
+    expect(alone.estimate!.tokens).toBeGreaterThan(0);
+    expect(result.estimate!.tokens).toBe(alone.estimate!.tokens);
+  });
+
+  test('a transactional item is warned, not hidden', async () => {
+    await resetBrain();
+    const receipt: ReturnType<typeof itemFrom> = {
+      ...itemFrom(`${ORIGIN}:warn-1`, proseOf('receipt', 4), NOW, 'Your receipt from Widget Co'),
+      junk: { headers: bulkHeaders, from: 'no-reply@widget-co.example', subject: 'Your receipt' },
+    };
+
+    const result = await runImport({ ...baseRequest({ items: [receipt], failures: [] }) });
+
+    expect(result.counts.written).toBe(1);
+    expect(result.counts.quarantined).toBe(0);
+    expect(
+      await countRows(fixture.tenantSql, 'page', `external_ref = '${ORIGIN}:warn-1' AND quarantined_at IS NULL`),
+    ).toBe(1);
+  });
+
+  test('an item that carries no headers is ordinary content', async () => {
+    // Every folder file and every chat transcript arrives this way. Reading an
+    // absent signal as junk would quarantine a whole source wholesale, and the
+    // failure would be invisible: nothing errors, the brain stops knowing things.
+    await resetBrain();
+    const result = await runImport({
+      ...baseRequest({
+        items: [itemFrom(`${ORIGIN}:plain-1`, proseOf('plain', 4), NOW, 'A note')],
+        failures: [],
+      }),
+    });
+
+    expect(result.counts.written).toBe(1);
+    expect(result.counts.quarantined).toBe(0);
+  });
+});

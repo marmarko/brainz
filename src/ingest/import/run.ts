@@ -77,6 +77,7 @@ import {
   type ImportTarget,
   type ImportWindow,
 } from '../first-import.ts';
+import { gateJunk, type JunkInput } from '../junk.ts';
 import {
   countRunItem,
   finishRun,
@@ -108,6 +109,17 @@ export interface ImportItem {
   readonly title: string | null;
   readonly body: string;
   readonly occurredAt: Date | null;
+  /**
+   * What the junk gate reads — provider headers, sender, subject, labels.
+   *
+   * Absent for a source that has none (a folder file, a chat transcript), and
+   * an absent signal reads as ordinary content on purpose: quarantining a whole
+   * source because it carries no headers is a failure nothing would report.
+   * Present for a mailbox arriving through this runner rather than through a
+   * connector — the MBOX fallback — which is the case that makes the gate worth
+   * reaching from here at all.
+   */
+  readonly junk?: JunkInput;
 }
 
 export interface ImportItemFailure {
@@ -161,6 +173,8 @@ export interface ImportCounts {
   readonly written: number;
   readonly unchanged: number;
   readonly quarantined: number;
+  /** Written, searchable, and flagged by the junk gate as transactional. */
+  readonly warned: number;
   readonly failed: number;
   readonly tombstoned: number;
 }
@@ -221,6 +235,7 @@ const EMPTY_COUNTS: ImportCounts = {
   written: 0,
   unchanged: 0,
   quarantined: 0,
+  warned: 0,
   failed: 0,
   tombstoned: 0,
 };
@@ -229,6 +244,7 @@ interface MutableCounts {
   written: number;
   unchanged: number;
   quarantined: number;
+  warned: number;
   failed: number;
   tombstoned: number;
 }
@@ -296,11 +312,16 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
     // ------------------------------------------------------------------
     // 2. One item set, used by the estimate and by the loop.
     // ------------------------------------------------------------------
-    const candidates = material.items.map((item) => ({
-      externalRef: item.externalRef,
-      contentSha256: contentDigest(item.title, item.body),
-      occurredAt: item.occurredAt,
-      characters: item.body.length,
+    // The junk gate runs **before the estimate**, not merely before the write:
+    // a hidden item is priced at zero characters, so a newsletter backlog
+    // cannot inflate an approval it will never spend. Shared with the pull
+    // runner so the two cannot disagree about what junk is.
+    const gated = gateJunk(material.items);
+    const candidates = gated.map((entry) => ({
+      externalRef: entry.item.externalRef,
+      contentSha256: contentDigest(entry.item.title, entry.item.body),
+      occurredAt: entry.item.occurredAt,
+      characters: entry.characters,
     }));
     const selection = selectWindow(candidates, {
       now: request.now,
@@ -309,7 +330,7 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
     widen = { excludedItems: selection.excluded.length, windowDays: selection.windowDays };
 
     const selected = new Set(selection.selected.map((candidate) => candidate.externalRef));
-    const items = material.items.filter((item) => selected.has(item.externalRef));
+    const items = gated.filter((entry) => selected.has(entry.item.externalRef));
 
     // ------------------------------------------------------------------
     // 3. Deletion reconciliation, **before the gate**.
@@ -487,7 +508,7 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
     // ------------------------------------------------------------------
     let stopReason: ImportStopReason | undefined;
 
-    for (const item of items) {
+    for (const { item, verdict, quarantine } of items) {
       attemptedItems += 1;
       const receipt = await ingestDocument(
         {
@@ -504,6 +525,7 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
           body: item.body,
           externalRef: item.externalRef,
           ingestId: run.ingestId,
+          quarantine,
         },
       );
 
@@ -528,9 +550,18 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
         continue;
       }
 
-      const disposition = receipt.status === 'unchanged' ? 'unchanged' : 'written';
+      const disposition =
+        receipt.status === 'unchanged'
+          ? 'unchanged'
+          : quarantine !== null
+            ? 'quarantined'
+            : 'written';
       if (disposition === 'unchanged') counts.unchanged += 1;
-      else counts.written += 1;
+      else if (disposition === 'quarantined') counts.quarantined += 1;
+      else {
+        counts.written += 1;
+        if (verdict.visibility === 'warned') counts.warned += 1;
+      }
 
       await recordItem(tenant.sql, {
         originContext: request.originContext,

@@ -112,12 +112,12 @@ import {
   type ImportTarget,
   type ImportWindow,
 } from '../first-import.ts';
-import { classifyJunk, quarantineMarkerFor, type JunkVerdict } from '../junk.ts';
+import { gateJunk } from '../junk.ts';
 import { countRunItem, finishRun, openRun, recordItem, type IngestFailureCode } from '../log.ts';
 import type { TenantRuntime } from '../import/run.ts';
 import type { PullFailureReason } from './client.ts';
 import { tombstoneRefs } from './tombstone.ts';
-import type { ProviderSource, PulledItem } from './sources/types.ts';
+import type { ProviderSource } from './sources/types.ts';
 
 /**
  * R15's origin, credential-derived and immutable: the vendor and the source
@@ -585,15 +585,15 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     //    A hidden item is priced at zero characters, so a newsletter backlog
     //    cannot inflate the approval it will never spend.
     // ------------------------------------------------------------------
-    const classified: Array<{ item: PulledItem; verdict: JunkVerdict }> = listed.items.map(
-      (item) => ({ item, verdict: classifyJunk(item.junk ?? {}) }),
-    );
+    // The same seam the import runner reaches, so neither can drift from the
+    // other about what junk is or about what a hidden item costs.
+    const classified = gateJunk(listed.items);
 
-    const candidates: ImportCandidate[] = classified.map(({ item, verdict }) => ({
-      externalRef: item.externalRef,
-      contentSha256: contentDigest(item.title, item.body),
-      occurredAt: item.occurredAt,
-      characters: verdict.visibility === 'hidden' ? 0 : item.body.length,
+    const candidates: ImportCandidate[] = classified.map((entry) => ({
+      externalRef: entry.item.externalRef,
+      contentSha256: contentDigest(entry.item.title, entry.item.body),
+      occurredAt: entry.item.occurredAt,
+      characters: entry.characters,
     }));
 
     // ------------------------------------------------------------------
@@ -823,9 +823,8 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     /** Processing stopped part-way, so nothing after this point should run. */
     let halted: PullStopReason | undefined;
 
-    for (const { item, verdict } of items) {
+    for (const { item, verdict, quarantine } of items) {
       attemptedItems += 1;
-      const quarantine = quarantineMarkerFor(verdict);
 
       const receipt = await ingestDocument(
         {

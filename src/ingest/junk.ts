@@ -198,3 +198,43 @@ export function classifyJunk(input: JunkInput): JunkVerdict {
 export function quarantineMarkerFor(verdict: JunkVerdict): string | null {
   return verdict.visibility === 'hidden' ? verdict.marker : null;
 }
+
+/** One item, gated: the verdict, what U4 is handed, and what the meter prices. */
+export interface JunkGated<T> {
+  readonly item: T;
+  readonly verdict: JunkVerdict;
+  /** Non-null hides the page and stops it ever being embedded. */
+  readonly quarantine: string | null;
+  /** What the estimate prices this item at. **Zero for a hidden one.** */
+  readonly characters: number;
+}
+
+/**
+ * **The seam both runners reach.**
+ *
+ * The verdict used to be reached inside the pull runner, which left the import
+ * runner — the path the MBOX fallback and every folder scan take — with no bulk
+ * filtering at all: a consumer mailbox arriving that way would be chunked,
+ * embedded and priced in full, which is the cost this module exists to avoid.
+ * Living here means neither runner can drift from the other about what junk is,
+ * and a new importer gets the gate by filling in `junk` rather than by
+ * remembering to call two functions in the right order.
+ *
+ * The zeroing is half the point and it is why this returns `characters` rather
+ * than leaving the caller to multiply: hidden items must be priced at nothing
+ * *before* the estimate, or a newsletter backlog inflates an approval the fleet
+ * is never going to spend.
+ */
+export function gateJunk<T extends { readonly body: string; readonly junk?: JunkInput }>(
+  items: readonly T[],
+): ReadonlyArray<JunkGated<T>> {
+  return items.map((item) => {
+    const verdict = classifyJunk(item.junk ?? {});
+    return {
+      item,
+      verdict,
+      quarantine: quarantineMarkerFor(verdict),
+      characters: verdict.visibility === 'hidden' ? 0 : item.body.length,
+    };
+  });
+}
