@@ -2,6 +2,13 @@
 
 `docs/porting-hazards.md` is the ledger. This directory is the part of it that runs.
 
+A card that has been closed keeps its file here, as the guard that closed it —
+`h1-…`, `h2-…` and `h3-…` are behavioural tests against a real Postgres with
+pgvector, reached through `DATABASE_URL` (defaulting to the CI service
+container's form) and sharing the corpus in `fixture.ts`. They are **not** gated
+behind a flag: CI always has the service container, and a hazard guard that
+skips itself is the unguarded state wearing a green tick.
+
 Every hazard whose card says **Status:** `unported` ships here as a **skipped test
 whose name is its reason**, so `bun test` prints both the count of hazards that are
 known and not yet guarded and what each one costs if it is forgotten. That number

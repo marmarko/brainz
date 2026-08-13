@@ -17,7 +17,8 @@ Status values: `guarded` · `accepted(reason)` · `unported`
 
 ## H1 — Silent candidate-pool truncation via `hnsw.ef_search`
 
-**Status:** `unported` — guard not yet written. This is the highest-priority row in the file.
+**Status:** `guarded` — `test/hazards/h1-ef-search-truncation.test.ts`, against a real Postgres +
+pgvector. Remedy in `src/schema/vector-query.ts`.
 
 **Mechanism.** pgvector defaults `hnsw.ef_search` to **40**. An HNSW index scan returns at most
 `ef_search` rows *regardless of what the query's LIMIT asks for* — the GUC sizes the scan's
@@ -91,12 +92,43 @@ exercise behavior.
 Worth asserting the fixture size itself: a guard seeded with fewer than 40 chunks silently passes
 forever and is worse than no guard.
 
+**What building it changed about the spec.** Two findings, both measured on pgvector 0.8.6 /
+PostgreSQL 17.10, both of which would have left a green guard over a live hazard:
+
+1. **The yield assertion cannot isolate this GUC once H3's remedy is present.** With
+   `hnsw.iterative_scan` on, deleting the `SET LOCAL hnsw.ef_search` statement changes the guard's
+   measured yield by nothing: the scan resumes and refills a 250-row pool out of 40-row batches.
+   H3's fix masks H1's. The guard therefore also pins `current_setting('hnsw.ef_search')` *inside
+   the helper's transaction*, which is still behaviour a lint cannot see — it reports what is in
+   effect for this transaction on this pooled connection, which is exactly what a bare `SET`
+   fails to deliver.
+2. **At fixture scale the planner does not use the index at all.** `vector(1536)` is stored out of
+   line, so the heap looks tiny and the cost model never charges for detoasting; Postgres picks a
+   sequential scan, which returns *exact* neighbours and full recall. An unasserted guard passes
+   with flying colours while measuring a query path production never takes — H2's mechanism
+   surfacing inside H1's guard. The corpus needed for the planner to choose the index unaided
+   measures at roughly 50,000 chunks, far too slow for the PR-blocking tier, so the guard forces
+   the plan and then asserts, via `EXPLAIN`, that the forcing took.
+
 ---
 
 ## H2 — The vector index that quietly isn't there
 
-**Status:** `unported` — guard not yet written. Second priority, and it shares H1's shape: a
-correct-but-degraded vector arm that no error points at.
+**Status:** `guarded` — `test/hazards/h2-missing-vector-index.test.ts`. Both halves: the
+provisioning-time assertion in `src/schema/apply.ts`, and the dimension-ceiling scanner in
+`src/schema/vector-index.ts`. It shares H1's shape: a correct-but-degraded vector arm that no
+error points at.
+
+Both halves now cover the whole schema rather than one column and one file, because the
+one-column shape was itself an instance of the hazard: a second queried vector column added
+later would have inherited a green guard. `INDEXED_VECTOR_COLUMNS` and
+`RESERVED_VECTOR_COLUMNS` (`src/schema/vector-index.ts`) name every vector column and which of
+the two it is; provisioning asserts an index for each indexed column its schema version has;
+the ceiling scan runs on every migration rung's DDL as it is applied, not only on the baseline
+file; and `test/schema/tenant-schema.test.ts` enumerates the vector columns the database
+actually has and fails on any that appears in neither list. A reserved column carries no index
+on purpose — nothing queries it — and moving it to the indexed list is what turns provisioning's
+assertion on.
 
 **Mechanism.** pgvector caps *indexable* dimensions well below storable ones:
 
@@ -164,8 +196,17 @@ architecture problem rather than two unset knobs.
 
 ## H3 — Post-filter recall collapse (H1 one layer down)
 
-**Status:** `unported` — guard not yet written. Discovered by the 2026-08-12 plan review; it is
-the reason H1's guard as specified would pass on a production-shaped query.
+**Status:** `guarded` — `test/hazards/h3-post-filter-recall.test.ts`. Remedy alongside H1's, in
+`src/schema/vector-query.ts`. Discovered by the 2026-08-12 plan review; it is the reason H1's
+guard as specified would pass on a production-shaped query.
+
+**Confirmed to reproduce before the guard was written**, because a guard that cannot go red is
+worse than none. pgvector 0.8.6 ships `hnsw.iterative_scan` defaulting to `off`, so this is live
+and not already fixed upstream. On a 5,000-chunk fixture holding 250 qualifying rows behind 100
+nearer rows that the production predicates exclude, a 250-candidate request returns: **40** rows
+at pgvector's defaults, **250** unfiltered once `ef_search` is raised, **150** once the predicates
+are added — and 250 again with `iterative_scan` set. The collapse is exactly the arithmetic the
+mechanism predicts: the scan spends its whole budget on rows the filter then discards.
 
 **Mechanism.** pgvector applies a query's `WHERE` predicates **after** the HNSW scan returns its
 `ef_search` candidates. So the GUC sizes the *scan*, not the *qualifying yield*. Raising

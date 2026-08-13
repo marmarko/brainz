@@ -1390,8 +1390,18 @@ interface ContentBearingEntry {
   readonly because: string;
 }
 
-/** Empty today: nothing outside the control plane has a schema yet. */
-const CONTENT_BEARING_SQL: readonly ContentBearingEntry[] = [];
+const CONTENT_BEARING_SQL: readonly ContentBearingEntry[] = [
+  {
+    path: 'schema/tenant.sql',
+    because:
+      "the per-tenant schema holds the user's own chunks and their text by design, one database per tenant; the content-free rule is the control plane's property, not a property of SQL in general, and a guard that failed on this file would be deleted rather than obeyed",
+  },
+  {
+    path: 'schema/migrations/v2-knowledge-core.sql',
+    because:
+      "U3's knowledge core — pages, facts, entities, edges and contradiction reports — is the same per-tenant database as the file above, one rung further up the ladder; it holds the user's own documents and the statements extracted from them by design, and it is the tenant's database rather than the control plane's",
+  },
+];
 
 const CONTROL_PREFIX = 'control/';
 
@@ -1442,11 +1452,13 @@ describe('every SQL file in the tree is accounted for', () => {
   });
 
   test('a future SQL file outside the control plane is a finding until someone classifies it', () => {
-    // U3's tenant schema is the concrete case, and the right outcome is that it
-    // stops this test until its author states, in writing, that it holds user
-    // content on purpose.
-    expect(findUnclassifiedSql(['control/schema.sql', 'schema/tenant.sql'])).toEqual([
-      "schema/tenant.sql: no classification — say whether the control plane's content-free rule applies to it",
+    // `schema/tenant.sql` was the concrete case and is now classified above, so
+    // the example moves to a file that does not exist yet — U21's media path is
+    // the next schema expected outside the control plane. The point of the test
+    // is unchanged: a new schema file stops this suite until its author states,
+    // in writing, whether it holds user content on purpose.
+    expect(findUnclassifiedSql(['control/schema.sql', 'schema/media.sql'])).toEqual([
+      "schema/media.sql: no classification — say whether the control plane's content-free rule applies to it",
     ]);
   });
 
