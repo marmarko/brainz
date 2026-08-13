@@ -1,5 +1,5 @@
 /**
- * Sixty-two evaluation queries, their gold keys, and their answerability audits.
+ * Seventy-seven evaluation queries, their gold keys, and their answerability audits.
  *
  * **Why the audit lives on the query record.** R6a's upper bound needs a
  * hand-audited answerability sample per question type: a statement, checkable by

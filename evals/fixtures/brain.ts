@@ -1,5 +1,5 @@
 /**
- * The seeded synthetic brain: forty-nine pages, seven people, six organisations,
+ * The seeded synthetic brain: sixty-four pages, seven people, six organisations,
  * two projects, a typed edge graph, superseded temporal facts, a value
  * contradiction, and five cross-origin duplicate clusters.
  *
