@@ -355,6 +355,7 @@ export interface GraphArmRequest {
   readonly entityIds: readonly string[];
   readonly grant: Grant;
   readonly limit: number;
+  readonly offset?: number;
 }
 
 /**
@@ -367,13 +368,18 @@ export interface GraphArmRequest {
  * reconciled from extracted facts, `fact` statements that mention both
  * endpoints, and `fact_source` back to chunks.
  *
- * **Two hops, ordered, and the order is the ranking.** Edge evidence first (the
- * answer to "who invested in X" is the row that states the investment), then
- * facts that merely mention the seed (the answer to "who is Sam" is whatever the
- * brain most recently asserted about Sam). Superseded facts are demoted rather
- * than dropped: a superseded statement is still the best evidence for a question
- * about the past, and dropping it here would make the temporal probes
- * unanswerable from this arm rather than merely lower-ranked.
+ * **Two hops, ordered, and the order is the ranking.** Facts naming the seed
+ * first, then facts naming only a *neighbour* the seed reaches over an edge.
+ * The second hop is not optional: "Marc's shop location" resolves a person and
+ * is answered by a statement about the shop he founded that never says his name,
+ * and a fan-out restricted to facts naming the seed cannot reach it — the arm
+ * returns his profile page and looks like it worked. Within each hop, facts
+ * naming more than one touched entity come first (the answer to "who invested in
+ * X" is the row that states the investment), then current before superseded.
+ * Superseded facts are demoted rather than dropped: a superseded statement is
+ * still the best evidence for a question about the past, and dropping it here
+ * would make the temporal probes unanswerable from this arm rather than merely
+ * lower-ranked.
  *
  * **The fence is subset on facts and edges, scalar on chunks** — see
  * `fence.ts`. Entities resolve on intersect, which happens one stage earlier;
@@ -425,7 +431,6 @@ export async function graphArm(
           AND f.quarantined_at IS NULL
           AND f.origin_contexts <@ $1::text[]
         GROUP BY f.fact_id, f.created_at, f.superseded_by
-       HAVING max(CASE WHEN nm.entity_id IN (SELECT entity_id FROM seeds) THEN 1 ELSE 0 END) = 1
      )
      SELECT ${CHUNK_COLUMNS}
        FROM evidence ev
@@ -433,12 +438,22 @@ export async function graphArm(
        JOIN chunk c ON c.chunk_id = fs.chunk_id
        LEFT JOIN page p ON p.page_id = c.page_id
       WHERE ${LIVE_AND_IN_GRANT}
-      ORDER BY (ev.entity_hits > 1) DESC,
+      ORDER BY (ev.hits_seed = 1) DESC,
+               (ev.entity_hits > 1) DESC,
                (ev.superseded_by IS NULL) DESC,
                ev.created_at DESC,
                c.chunk_id
       LIMIT $3`,
-    [textArrayLiteral(request.grant), textArrayLiteral(request.entityIds), Math.max(request.limit * 5, 100)],
+    // `candidatePoolFor`, not the arithmetic written out again. The re-export at
+    // the foot of this file exists so a caller cannot reach the formula without
+    // the name, and a hand-inlined copy is exactly the drift it guards against —
+    // it also silently dropped the offset, so page five of a graph fan-out was
+    // page one re-ranked.
+    [
+      textArrayLiteral(request.grant),
+      textArrayLiteral(request.entityIds),
+      candidatePoolFor({ limit: request.limit, offset: request.offset ?? 0 }),
+    ],
   )) as ChunkRow[];
 
   const candidates = new Map<string, Candidate>();
@@ -536,6 +551,7 @@ export async function runArms(dispatch: ArmDispatch): Promise<ArmsOutcome> {
         entityIds: dispatch.entityIds,
         grant: dispatch.grant,
         limit: dispatch.limit,
+        ...(dispatch.offset === undefined ? {} : { offset: dispatch.offset }),
       }),
     );
   }

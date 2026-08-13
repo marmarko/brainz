@@ -30,19 +30,42 @@
  * all-or-nothing at fourteen queries.
  */
 
-import { normalize, normalizeQuery, tokens } from './normalize.ts';
+import { PHRASE_STOPWORDS, normalize, normalizeQuery, stemMatch, tokens } from './normalize.ts';
 
 export interface PageRef {
   readonly pageId: string;
   readonly title: string | null;
   /** The page's chunks, in ordinal order. */
   readonly chunkIds: readonly string[];
+  /**
+   * The page's body, for the one rung that has to rank on it.
+   *
+   * Optional because three of the five rungs never read it: a page reached
+   * *because of its title* is ordered by its title. The mention rung is the
+   * exception — every page it nominates was reached by its body, and the titles
+   * of those pages ("Asks channel", "Distribution list") say nothing about which
+   * one answers the question.
+   */
+  readonly text?: string;
 }
 
 export interface EntityRef {
   readonly entityId: string;
   readonly canonicalName: string;
   readonly slug: string;
+  /**
+   * The name or alias in the query that caused this entity to resolve.
+   *
+   * Provenance, and load-bearing: `intent.ts:resolutionOf` asks whether the
+   * resolved entities account for every content word of the query, and it cannot
+   * answer that from the canonical name alone. "sokonkwo@example.com" resolves
+   * Samantha Okonkwo through a declared alias that shares no token with
+   * "Samantha Okonkwo" — without the matched key that query looks like a
+   * question *about* something rather than a query that is nothing but a name,
+   * and it is scored with the wrong plan. Absent when the substrate matched
+   * without recording which key did it.
+   */
+  readonly matchedKey?: string;
 }
 
 /**
@@ -63,6 +86,25 @@ export interface LadderLookup {
   pagesTitled(name: string): readonly PageRef[];
   /** Chunks that evidence this entity, best first. */
   evidenceFor(entityId: string): readonly string[];
+  /**
+   * Pages whose text **names** this entity, best first — whether or not any
+   * extracted fact points at them.
+   *
+   * This rung exists because the other four cannot reach a page that is neither
+   * titled with the entity nor cited by a fact, and that page is frequently the
+   * answer: "Design review notes" says what Toshiro Abe wants changed and
+   * evidences no fact at all, and the chunk that names Elena Barros is the
+   * *second* paragraph of the page whose first paragraph carries the price.
+   * Without it the alias hop can only ever return what the extractor already
+   * turned into a fact, which makes the ladder's reach a property of extraction
+   * coverage — silently, with every per-stage test green, because a stage tested
+   * on a supplied evidence list cannot notice that the supply is short.
+   *
+   * **Page-granular, like the title rungs, and that is the load-bearing half.**
+   * A chunk-granular mention rung injects the paragraph that says the name and
+   * strands the paragraph that holds the answer.
+   */
+  pagesMentioning(entityId: string): readonly PageRef[];
 }
 
 /**
@@ -86,8 +128,17 @@ export const LADDER_RUNG_WEIGHTS = {
   entity_title: 0.85,
   /** A title that contains the query, or is contained by it. */
   title_containing: 0.7,
-  /** Chunks that evidence a resolved entity. The most speculative rung. */
+  /** Chunks that evidence a resolved entity. */
   entity_evidence: 0.4,
+  /**
+   * Pages that merely name a resolved entity. The most speculative rung, and
+   * the widest: on a brain with a distribution-list footer, every entity is
+   * named on it. Its weight is low enough that being on this rung and nothing
+   * else is a nomination rather than an answer — the boosts decide which of the
+   * nominated pages is the one, which is exactly the division of labour the
+   * ladder is supposed to have.
+   */
+  entity_mention: 0.25,
 } as const;
 
 export type LadderRung = keyof typeof LADDER_RUNG_WEIGHTS;
@@ -144,8 +195,7 @@ export function aliasLadderTiers(
     return out;
   };
 
-  const exactTitle: string[] = [];
-  for (const page of lookup.pagesByTitle(normalized)) exactTitle.push(...take(page.chunkIds));
+  const exactTitle = take(byPageRank(lookup.pagesByTitle(normalized)));
 
   // A page titled with a resolved entity's canonical name, exactly or as a
   // phrase. "K&Q suppliers" resolves the organisation and then wants the page
@@ -162,24 +212,32 @@ export function aliasLadderTiers(
     // documents. "K&Q suppliers" resolves the organisation and then has to pick
     // the supplier list out of three pages titled with its name — without this
     // the rung returns them in storage order and the relocation note wins.
-    for (const page of rankByResidual(named, query, entity.canonicalName)) {
-      entityTitle.push(...take(page.chunkIds));
-    }
+    entityTitle.push(...take(byPageRank(rankByResidual(named, query, entity.canonicalName))));
   }
 
-  const titleContaining: string[] = [];
-  for (const page of lookup.pagesTitledContaining(normalized)) {
-    titleContaining.push(...take(page.chunkIds));
-  }
+  const titleContaining = take(byPageRank(lookup.pagesTitledContaining(normalized)));
 
   const evidence: string[] = [];
   for (const entity of entities) evidence.push(...take(lookup.evidenceFor(entity.entityId)));
+
+  // Ordered by the residual — the query words that are not the entity's own name
+  // — for the same reason the entity-title rung is: the name says which subject,
+  // and the remaining words say which of that subject's pages. Without it the
+  // rung returns in storage order and the distribution-list footer that names
+  // everybody competes with the page that answers the question.
+  const mentions: string[] = [];
+  for (const entity of entities) {
+    mentions.push(
+      ...take(byPageRank(rankMentions(lookup.pagesMentioning(entity.entityId), query, entity))),
+    );
+  }
 
   const tiers: LadderTier[] = [
     { rung: 'exact_title', weight: LADDER_RUNG_WEIGHTS.exact_title, ids: exactTitle },
     { rung: 'entity_title', weight: LADDER_RUNG_WEIGHTS.entity_title, ids: entityTitle },
     { rung: 'title_containing', weight: LADDER_RUNG_WEIGHTS.title_containing, ids: titleContaining },
     { rung: 'entity_evidence', weight: LADDER_RUNG_WEIGHTS.entity_evidence, ids: evidence },
+    { rung: 'entity_mention', weight: LADDER_RUNG_WEIGHTS.entity_mention, ids: mentions },
   ];
 
   return tiers.filter((tier) => tier.ids.length > 0);
@@ -200,21 +258,40 @@ export function aliasLadderRanking(
 }
 
 /**
- * Resolved entities in the order they are mentioned in the query.
+ * A page-granular rung's chunk ids, ordered so that a rung rank is a **page**
+ * rank rather than a chunk offset.
  *
- * "Priya R. at Tessellate" resolves two entities, and the question is about the
- * first one. Ordering by matched-key length instead puts the organisation first
- * — it has the longer name — and answers with the fund's memo. Position is the
- * signal that actually tracks which entity the sentence is about.
+ * **Concatenating each page's chunks was a silent recall bug and it is the one
+ * that hides best.** `foldRanked` decays with position, so with concatenation an
+ * eight-chunk page pushes the *second* page's first chunk to rank nine — the
+ * ladder then contributes a third as much for the second page as for the first,
+ * for no reason other than how the first page was chunked. On a brain whose
+ * decoys are chat firehoses (many chunks) and whose answers are short notes (one
+ * or two), that is a systematic bias toward the decoy, and nothing about it is
+ * visible in the rung's contents: the right page *is* nominated, at a rank that
+ * cannot win.
+ *
+ * Round-robin, so every nominated page's lead chunk outranks every page's second
+ * chunk, and the rung's decay tracks the ordering the rung actually computed.
  */
+function byPageRank(pages: readonly PageRef[]): string[] {
+  const out: string[] = [];
+  const depth = pages.reduce((most, page) => Math.max(most, page.chunkIds.length), 0);
+  for (let offset = 0; offset < depth; offset += 1) {
+    for (const page of pages) {
+      const id = page.chunkIds[offset];
+      if (id !== undefined) out.push(id);
+    }
+  }
+  return out;
+}
+
 /**
- * Order pages by the query terms that are *not* the entity's own name.
+ * Order an entity's own titled pages by the query terms that are *not* the
+ * entity's name — the residual says which of that subject's documents.
  *
- * Matching is prefix-based at four characters or more, which is the cheapest
- * stand-in for stemming that does not need a language: `suppliers` and
- * `supplier` share a stem, `list` and `listen` do not share four characters of
- * one being the other's prefix in the direction that matters. It is used only to
- * order one ladder rung — never to decide whether a row is returned — so its
+ * Matching is {@link stemMatch}, the language-free prefix rule. It is used only
+ * to order one ladder rung — never to decide whether a row is returned — so its
  * failure mode is a worse ordering inside a tier, not a wrong answer.
  */
 function rankByResidual(
@@ -225,9 +302,6 @@ function rankByResidual(
   const nameTokens = new Set(tokens(entityName));
   const residual = tokens(query).filter((token) => !nameTokens.has(token));
   if (residual.length === 0 || pages.length < 2) return [...pages];
-
-  const stemMatch = (a: string, b: string): boolean =>
-    a === b || (a.length >= 4 && b.startsWith(a)) || (b.length >= 4 && a.startsWith(b));
 
   return pages
     .map((page, index) => {
@@ -242,6 +316,76 @@ function rankByResidual(
     .map((entry) => entry.page);
 }
 
+/**
+ * Order the pages that merely *name* an entity by the query's residual content
+ * words, matched against the page's own text.
+ *
+ * **Three deliberate differences from {@link rankByResidual}, and each one is a
+ * failure it would otherwise take.**
+ *
+ *   1. **It reads the body, not the title.** Every page on this rung was reached
+ *      through its text; their titles are "Asks channel" and "Distribution
+ *      list". Ordering on the title here is ordering on noise, and the rung then
+ *      returns in storage order.
+ *   2. **Stopwords are dropped from the residual.** "what does Tosh want
+ *      changed" against a chat channel that asks "where does toshiro abe work
+ *      now?" matches on `does` — grammar, not subject. This is the same rule
+ *      {@link PHRASE_STOPWORDS} enforces for the title boost, applied where the
+ *      same failure appears.
+ *   3. **Distinct residual words, not occurrences.** A firehose page that repeats
+ *      one of them eight times would otherwise outrank the page that answers the
+ *      question, which is precisely the dilution these fixtures probe.
+ *
+ * Ties keep the supplied order, so the substrate's ordering survives where this
+ * has nothing to say.
+ */
+function rankMentions(
+  pages: readonly PageRef[],
+  query: string,
+  entity: EntityRef,
+): PageRef[] {
+  const nameTokens = new Set([...tokens(entity.canonicalName), ...tokens(entity.slug.replace(/-/g, ' '))]);
+  const residual = [
+    ...new Set(
+      tokens(query).filter((token) => !nameTokens.has(token) && !PHRASE_STOPWORDS.has(token)),
+    ),
+  ];
+  // **No residual, no rung.** The mention rung answers "which page *about* this
+  // entity does the question mean", and with nothing but the name asked there is
+  // no such question — every page that names the entity is equally nominated,
+  // and the rung's rank-1 goes to whichever the substrate happened to store
+  // first. On a brain with a distribution-list footer that is the page naming
+  // everybody, promoted for asking about anybody. The title and evidence rungs
+  // are the ones that answer a bare name.
+  if (residual.length === 0) return [];
+  if (pages.length < 2) return [...pages];
+
+  return pages
+    .map((page, index) => {
+      const haystack = new Set([...tokens(page.text ?? ''), ...tokens(page.title ?? '')]);
+      let hits = 0;
+      for (const token of residual) {
+        for (const candidate of haystack) {
+          if (stemMatch(token, candidate)) {
+            hits += 1;
+            break;
+          }
+        }
+      }
+      return { page, hits, index };
+    })
+    .sort((a, b) => b.hits - a.hits || a.index - b.index)
+    .map((entry) => entry.page);
+}
+
+/**
+ * Resolved entities in the order they are mentioned in the query.
+ *
+ * "Priya R. at Tessellate" resolves two entities, and the question is about the
+ * first one. Ordering by matched-key length instead puts the organisation first
+ * — it has the longer name — and answers with the fund's memo. Position is the
+ * signal that actually tracks which entity the sentence is about.
+ */
 function orderByMention(entities: readonly EntityRef[], normalizedQuery: string): EntityRef[] {
   return [...entities]
     .map((entity, index) => {

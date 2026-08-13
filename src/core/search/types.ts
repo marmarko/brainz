@@ -103,8 +103,28 @@ export interface Candidate {
   readonly live: boolean;
   /** Everything that vouches for this row. See {@link Attestation}. */
   readonly attestations: readonly Attestation[];
-  /** Entities this row evidences, for the graph-adjacency boost. */
+  /**
+   * Entities this row is adjacent to — evidenced *or* merely named.
+   *
+   * Both, because a chunk that names an entity without evidencing any extracted
+   * fact about it is often the answer, and a fact-sources-only derivation cannot
+   * see it. Which of the two a given id is comes from {@link evidenceEntityIds}.
+   */
   readonly entityIds: readonly string[];
+  /**
+   * The subset of {@link entityIds} this row is the **source of a fact** about.
+   *
+   * The distinction is a ranking one and it matters: naming an entity is the
+   * weakest statement in the whole stack — the alias ladder scores it as its most
+   * speculative rung — while being the evidence a fact was extracted from is the
+   * strongest. Paying both the same adjacency boost hands a chat channel that
+   * asks about a project the same lift as the status document that reports on it,
+   * and does it silently, because the boost's attribution shows the same number
+   * for both. Absent means "the substrate did not distinguish", which is treated
+   * as evidence-grade rather than as mention-grade only when it is empty and
+   * `entityIds` is not — see `boosts.ts:applyBoosts`.
+   */
+  readonly evidenceEntityIds?: readonly string[];
 }
 
 /** One arm's output: its name, its weight's key, and its ranking. */
@@ -130,6 +150,21 @@ export type Degradation = (typeof DEGRADATIONS)[number];
 
 /** What the arms hand the post-retrieval stack. Substrate-independent by design. */
 export interface RecallOutcome {
+  /**
+   * The plan the arms **actually ran under**, and it is required.
+   *
+   * `composeRanking` used to take the plan as an optional request field and
+   * recompute one from the query text when it was absent. That recomputed plan
+   * is the *unrefined* one: it has not seen how many entities the ladder
+   * resolved, so it can carry different arm weights, a different alias weight
+   * and a different intent from the plan that chose which arms to dispatch. A
+   * caller that omitted the field therefore got its recall decided by one plan
+   * and its ranking scored by another — no error, no warning, a plausible result
+   * list, and a measurably different one. Carrying the plan on the outcome makes
+   * the two the same object by construction; `ComposeRequest.plan` remains, as
+   * an explicit override for a caller that means it.
+   */
+  readonly plan: RankingPlan;
   readonly arms: readonly ArmResult[];
   /**
    * Every candidate any arm **or the alias ladder** returned, keyed by id and

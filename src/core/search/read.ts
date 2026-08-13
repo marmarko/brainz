@@ -1,0 +1,443 @@
+/**
+ * The request path: one function, from a question to a ranked answer.
+ *
+ * **This module exists because two things the unit promised had nowhere to
+ * live.** The stages were all written and individually tested, and *nothing
+ * composed them over a database* — so the query embedding was never issued, and
+ * Assumption 5's degraded contract was a branch in `runArms` that no caller
+ * could reach. A `null` query vector that only a test constructs is not a
+ * contract; it is a parameter. What makes the promise real is the conversion
+ * here: a gateway failure becomes a value, and the read continues.
+ *
+ * **Every model call goes through U20's gateway, by op name.** The query
+ * embedding is the `embedding` op with KTD8's query-side wrap
+ * (`write/embed.ts:queryEncoding`), which is the same op and the same wrap the
+ * write path uses for documents — one space, two encodings. Issuing it here
+ * rather than at the surface is R14's rule: the request path's spend is metered
+ * through the same gateway as everything else, and a provider reached directly
+ * from a read would be spend nobody sees.
+ *
+ * **The order is: resolve, then plan, then recall, then compose.** Resolution
+ * runs before the arms because the graph arm cannot fan out without seeds, and
+ * the plan is *refined* with what resolution found — which is why the plan
+ * travels on the outcome rather than being recomputed downstream. See
+ * `types.ts:RecallOutcome.plan`.
+ */
+
+import type { SQL } from 'bun';
+
+import { createBudget, type Budget, type ModelGateway } from '../../ai/gateway.ts';
+import type { CallerIdentity } from '../../control/secrets.ts';
+import { embedTexts, queryEncoding } from '../write/embed.ts';
+import { textArrayLiteral } from '../write/pg-values.ts';
+import {
+  aliasLadderTiers,
+  resolveEntities,
+  type EntityRef,
+  type LadderLookup,
+  type PageRef,
+} from './alias-hop.ts';
+import { hydrate, readFtsLanguage, runArms } from './arms.ts';
+import type { Grant } from './fence.ts';
+import { classifyIntent, planFor, refinePlan, resolutionOf } from './intent.ts';
+import { normalize, normalizeQuery, tokens } from './normalize.ts';
+import { composeRanking, type ComposeRequest } from './pipeline.ts';
+import type { Candidate, Degradation, RecallOutcome, SearchResponse } from './types.ts';
+
+export interface RecallRequest {
+  readonly sql: SQL;
+  readonly gateway: ModelGateway;
+  readonly tenantId: string;
+  readonly caller: CallerIdentity;
+  readonly budget?: Budget;
+  readonly query: string;
+  readonly grant: Grant;
+  readonly limit: number;
+  readonly offset?: number;
+  /** Injected, never the wall clock — see `boosts.ts`. */
+  readonly now: Date;
+  readonly compose?: Omit<ComposeRequest, 'query' | 'limit' | 'now' | 'plan'>;
+}
+
+/**
+ * The query vector, or the reason there isn't one.
+ *
+ * **A failure is a value here and that is the whole of Assumption 5's
+ * availability half.** `recall`, `search` and `entity` all need a query
+ * embedding before RRF runs, so a provider 429 would take down every read tool
+ * at once if this threw. Three arms exist precisely so one can be absent.
+ *
+ * `null` rather than a zero vector, for the reason `arms.ts` gives: a zero
+ * vector is a *silently wrong* arm, and the whole point is to be loudly partial
+ * instead of quietly wrong.
+ */
+export async function embedQuery(request: {
+  readonly gateway: ModelGateway;
+  readonly tenantId: string;
+  readonly caller: CallerIdentity;
+  readonly budget?: Budget;
+  readonly query: string;
+}): Promise<{ readonly vector: readonly number[] | null; readonly degraded: Degradation[] }> {
+  const budget = request.budget ?? UNBOUNDED_READ_BUDGET;
+
+  let outcome: Awaited<ReturnType<typeof embedTexts>>;
+  try {
+    outcome = await embedTexts({
+      gateway: request.gateway,
+      tenantId: request.tenantId,
+      caller: request.caller,
+      budget,
+      texts: [queryEncoding(request.query)],
+    });
+  } catch {
+    // The gateway reports transport failures as `{ ok: false }`, but a
+    // configuration or key-resolution error still throws — and on the read path
+    // those are the same event to a user: no vector. Catching here rather than
+    // letting one class through is deliberate; a read that 500s because a key
+    // rotated is the outage this contract exists to prevent.
+    return { vector: null, degraded: ['embedding_unavailable'] };
+  }
+
+  if (!outcome.ok) return { vector: null, degraded: ['embedding_unavailable'] };
+  const vector = outcome.vectors[0];
+  if (vector === undefined) return { vector: null, degraded: ['embedding_unavailable'] };
+  return { vector, degraded: [] };
+}
+
+/**
+ * A budget that does not cap, for callers that have not set one.
+ *
+ * The read path's per-call spend is a single embedding; the caps that matter are
+ * the tenant-level ones the gateway's meter enforces. This is the absence of a
+ * *per-request* ceiling, not the absence of metering — every call is still
+ * recorded.
+ */
+const UNBOUNDED_READ_BUDGET: Budget = createBudget({ label: 'read-path', capMicroUsd: null });
+
+/** The whole read, from a question to a ranked, fenced, packed answer. */
+export async function recall(request: RecallRequest): Promise<SearchResponse> {
+  const outcome = await recallArms(request);
+  return composeRanking(
+    {
+      query: request.query,
+      limit: request.limit,
+      now: request.now,
+      ...(request.compose ?? {}),
+    },
+    outcome,
+  );
+}
+
+/** Everything up to the composition — the substrate half, for callers that need it. */
+export async function recallArms(request: RecallRequest): Promise<RecallOutcome> {
+  const lookup = await materialiseLadder(request.sql, request.query, request.grant);
+  const seeds = resolveEntities(request.query, lookup);
+  const plan = refinePlan(
+    planFor(classifyIntent(request.query)),
+    resolutionOf(request.query, seeds),
+  );
+  const ladder = aliasLadderTiers(request.query, lookup, seeds);
+
+  const embedded = await embedQuery(request);
+  const ftsLanguage = await readFtsLanguage(request.sql);
+
+  const arms = await runArms({
+    sql: request.sql,
+    query: request.query,
+    grant: request.grant,
+    limit: request.limit,
+    ...(request.offset === undefined ? {} : { offset: request.offset }),
+    ftsLanguage,
+    entityIds: seeds.map((seed) => seed.entityId),
+    useGraphArm: plan.useGraphArm,
+    queryVector: embedded.vector,
+  });
+
+  // The ladder injects ids no arm returned, so its candidates have to be
+  // hydrated separately — and hydration is where the fence runs, so an id the
+  // grant does not cover simply vanishes rather than being filtered later.
+  const candidates = new Map<string, Candidate>(arms.candidates);
+  const missing = ladder
+    .flatMap((tier) => [...tier.ids])
+    .filter((id) => !candidates.has(id));
+  if (missing.length > 0) {
+    for (const [id, candidate] of await hydrate(request.sql, missing, request.grant)) {
+      candidates.set(id, candidate);
+    }
+  }
+
+  return {
+    plan,
+    arms: arms.arms,
+    candidates,
+    aliasLadder: ladder
+      .map((tier) => ({ ...tier, ids: tier.ids.filter((id) => candidates.has(id)) }))
+      .filter((tier) => tier.ids.length > 0),
+    resolvedEntityIds: seeds.map((seed) => seed.entityId),
+    // A **set** union, not a concatenation. Both layers legitimately report the
+    // same event — `embedQuery` because it saw the provider refuse, `runArms`
+    // because it saw a null vector — and a response that carries
+    // `['embedding_unavailable', 'embedding_unavailable']` tells U6's envelope
+    // that two things went wrong. The duplication is invisible to any test that
+    // asserts `.toContain`, which is why this one asserts the whole array.
+    degraded: [...new Set<Degradation>([...embedded.degraded, ...arms.degraded])],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The ladder, over SQL.
+// ---------------------------------------------------------------------------
+
+interface EntityRow {
+  readonly entity_id: string;
+  readonly canonical_name: string;
+  readonly name: string;
+}
+
+interface PageRow {
+  readonly page_id: string;
+  readonly title: string | null;
+  readonly chunk_ids: string[];
+  readonly text: string;
+}
+
+/**
+ * Fetch everything the ladder can need for this query, then serve it
+ * synchronously.
+ *
+ * **Materialised on purpose.** `LadderLookup` is synchronous so that the whole
+ * post-retrieval stack stays the pure function U7's blocking eval can call; if
+ * the lookup were async, the eval would be grading a second implementation. The
+ * cost is that the queries below fetch a superset of what any one rung uses, and
+ * the bound on that superset is the query itself: candidate entities are those
+ * whose name or alias appears in the query, and candidate pages are those titled
+ * near the query or naming one of those entities.
+ *
+ * **Every statement carries the fence.** Entities resolve on *intersect*
+ * (`origin_contexts && $grant`) because an entity is a name; every page and
+ * chunk the resolution then reaches is fenced on scalar membership. That split
+ * is `fence.ts`'s, read back here rather than restated.
+ */
+async function materialiseLadder(sql: SQL, query: string, grant: Grant): Promise<LadderLookup> {
+  const normalized = normalizeQuery(query);
+  const queryTokens = tokens(query);
+  const grantLiteral = textArrayLiteral(grant);
+
+  if (grant.length === 0 || queryTokens.length === 0) return EMPTY_LOOKUP;
+
+  // Entities whose canonical name or any alias appears in the query, with the
+  // name that matched travelling alongside — `intent.ts:resolutionOf` needs it.
+  const entityRows = (await sql.unsafe(
+    `SELECT e.entity_id::text AS entity_id, e.canonical_name, n.name
+       FROM entity e
+       CROSS JOIN LATERAL (
+         SELECT e.canonical_name AS name
+         UNION ALL
+         SELECT a.alias AS name FROM entity_alias a WHERE a.entity_id = e.entity_id
+       ) n
+      WHERE e.deleted_at IS NULL
+        AND e.origin_contexts && $1::text[]`,
+    [grantLiteral],
+  )) as EntityRow[];
+
+  const byEntity = new Map<string, { ref: EntityRef; keys: string[] }>();
+  for (const row of entityRows) {
+    const entry = byEntity.get(row.entity_id) ?? {
+      ref: { entityId: row.entity_id, canonicalName: row.canonical_name, slug: slugOf(row.canonical_name) },
+      keys: [],
+    };
+    const key = normalize(row.name);
+    if (key.length > 0) entry.keys.push(key);
+    byEntity.set(row.entity_id, entry);
+  }
+
+  const tokenSet = new Set(queryTokens);
+  const matched: EntityRef[] = [];
+  for (const entry of byEntity.values()) {
+    // Longest key first, so a two-word name wins over a one-word alias it
+    // contains — the same competitive rule `mentionsIn` applies to text.
+    const keys = [...entry.keys].sort((a, b) => b.length - a.length);
+    for (const key of keys) {
+      if (!tokenSet.has(key) && !(key.includes(' ') && normalized.includes(key))) continue;
+      matched.push({ ...entry.ref, matchedKey: key });
+      break;
+    }
+  }
+  matched.sort((a, b) => (b.matchedKey ?? '').length - (a.matchedKey ?? '').length);
+
+  const pages = await readPages(sql, grantLiteral);
+  const evidence = await readEvidence(sql, grantLiteral, [...byEntity.keys()]);
+  const entityIdsByPage = new Map<string, Set<string>>();
+  for (const page of pages) {
+    const haystack = normalize(`${page.title ?? ''} ${page.text}`);
+    const named = new Set<string>();
+    for (const [entityId, entry] of byEntity) {
+      if (entry.keys.some((key) => key.length > 0 && haystack.includes(key))) named.add(entityId);
+    }
+    entityIdsByPage.set(page.page_id, named);
+  }
+
+  const refFor = (page: PageRow): PageRef => ({
+    pageId: page.page_id,
+    title: page.title,
+    chunkIds: page.chunk_ids,
+    text: page.text,
+  });
+
+  return {
+    pagesByTitle(key) {
+      return pages.filter((page) => normalize(page.title ?? '') === key).map(refFor);
+    },
+    pagesTitledContaining(key) {
+      return pages
+        .filter((page) => {
+          const title = normalize(page.title ?? '');
+          if (title.length === 0 || title === key) return false;
+          return title.includes(key) || key.includes(title);
+        })
+        .map(refFor);
+    },
+    entitiesByName() {
+      return matched;
+    },
+    entitiesBySlugSuffix(suffixTokens) {
+      const wanted = new Set(suffixTokens);
+      return [...byEntity.values()]
+        .filter((entry) => {
+          const suffix = entry.ref.slug.split('-').pop() ?? '';
+          return suffix.length > 2 && wanted.has(suffix);
+        })
+        .map((entry) => entry.ref);
+    },
+    pagesTitled(name) {
+      const key = normalize(name);
+      return pages.filter((page) => normalize(page.title ?? '') === key).map(refFor);
+    },
+    evidenceFor(entityId) {
+      return evidence.get(entityId) ?? [];
+    },
+    pagesMentioning(entityId) {
+      return pages.filter((page) => entityIdsByPage.get(page.page_id)?.has(entityId) === true).map(refFor);
+    },
+  };
+}
+
+/**
+ * A canonical name as its slug, matching the DDL's slug shape.
+ *
+ * The slug-suffix rung asks whether a bare surname is the tail of an entity's
+ * slug, so it needs the slug; the column the tenant schema stores it in is U4's
+ * to add, and until then it is derived from the canonical name through the
+ * shared normalizer rather than through a second lowercasing rule.
+ */
+function slugOf(name: string): string {
+  return normalize(name)
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+/**
+ * Chunks that evidence each entity — the source chunks of facts naming it,
+ * current before superseded, newest first.
+ *
+ * Mirrors `arms.ts:graphArm`'s ordering exactly, and for the same reason: a
+ * superseded statement is demoted rather than dropped, because it is still the
+ * best evidence for a question about the past. Facts fence on **subset**
+ * (`fence.ts:fenceRow`) — the statement is a synthesis of every contributing
+ * origin, so a credential holding only some of them must not read it.
+ */
+async function readEvidence(
+  sql: SQL,
+  grantLiteral: string,
+  entityIds: readonly string[],
+): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  if (entityIds.length === 0) return out;
+
+  const rows = (await sql.unsafe(
+    `WITH seeds AS (SELECT unnest($2::bigint[]) AS entity_id),
+     names AS (
+       SELECT s.entity_id, n.name
+         FROM seeds s
+         CROSS JOIN LATERAL (
+           SELECT e.canonical_name AS name FROM entity e
+            WHERE e.entity_id = s.entity_id AND e.deleted_at IS NULL
+           UNION ALL
+           SELECT a.alias AS name FROM entity_alias a WHERE a.entity_id = s.entity_id
+         ) n
+     )
+     SELECT DISTINCT ON (nm.entity_id, c.chunk_id)
+            nm.entity_id::text AS entity_id,
+            c.chunk_id::text AS chunk_id,
+            (f.superseded_by IS NULL) AS current,
+            f.created_at
+       FROM names nm
+       JOIN fact f ON f.statement ILIKE '%' || nm.name || '%'
+       JOIN fact_source fs ON fs.fact_id = f.fact_id
+       JOIN chunk c ON c.chunk_id = fs.chunk_id
+       LEFT JOIN page p ON p.page_id = c.page_id
+      WHERE f.deleted_at IS NULL
+        AND f.quarantined_at IS NULL
+        AND f.origin_contexts <@ $1::text[]
+        AND c.deleted_at IS NULL
+        AND c.quarantined_at IS NULL
+        AND c.origin_context = ANY($1::text[])
+        AND (p.page_id IS NULL OR (p.deleted_at IS NULL AND p.quarantined_at IS NULL))
+      ORDER BY nm.entity_id, c.chunk_id, current DESC, f.created_at DESC`,
+    [grantLiteral, textArrayLiteral(entityIds)],
+  )) as Array<{ entity_id: string; chunk_id: string; current: boolean; created_at: string }>;
+
+  const ranked = new Map<string, Array<{ chunkId: string; current: boolean; at: number }>>();
+  for (const row of rows) {
+    const list = ranked.get(row.entity_id) ?? [];
+    list.push({ chunkId: row.chunk_id, current: row.current, at: Date.parse(row.created_at) || 0 });
+    ranked.set(row.entity_id, list);
+  }
+  for (const [entityId, list] of ranked) {
+    list.sort(
+      (a, b) =>
+        Number(b.current) - Number(a.current) ||
+        b.at - a.at ||
+        (a.chunkId < b.chunkId ? -1 : 1),
+    );
+    out.set(entityId, list.map((entry) => entry.chunkId));
+  }
+  return out;
+}
+
+const EMPTY_LOOKUP: LadderLookup = {
+  pagesByTitle: () => [],
+  pagesTitledContaining: () => [],
+  entitiesByName: () => [],
+  entitiesBySlugSuffix: () => [],
+  pagesTitled: () => [],
+  evidenceFor: () => [],
+  pagesMentioning: () => [],
+};
+
+/**
+ * Every live, in-grant page with its chunk ids in ordinal order and its body as
+ * one string.
+ *
+ * The body is what the mention rung ranks on, and it is aggregated in SQL rather
+ * than joined per chunk in TypeScript so that the fence is in the statement —
+ * the same rule every arm follows, for the reason hazard H3 documents.
+ */
+async function readPages(sql: SQL, grantLiteral: string): Promise<PageRow[]> {
+  return (await sql.unsafe(
+    `SELECT p.page_id::text AS page_id,
+            p.title,
+            array_agg(c.chunk_id::text ORDER BY c.ordinal, c.chunk_id) AS chunk_ids,
+            string_agg(c.content, ' ' ORDER BY c.ordinal, c.chunk_id) AS text
+       FROM page p
+       JOIN chunk c ON c.page_id = p.page_id
+      WHERE p.deleted_at IS NULL
+        AND p.quarantined_at IS NULL
+        AND c.deleted_at IS NULL
+        AND c.quarantined_at IS NULL
+        AND p.origin_context = ANY($1::text[])
+        AND c.origin_context = ANY($1::text[])
+      GROUP BY p.page_id, p.title`,
+    [grantLiteral],
+  )) as PageRow[];
+}

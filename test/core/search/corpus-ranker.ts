@@ -49,7 +49,7 @@ import {
 } from '../../../src/core/search/alias-hop.ts';
 import { CHANNEL_BY_SOURCE_TYPE } from '../../../src/core/search/arms.ts';
 import { visibleUnder } from '../../../src/core/search/fence.ts';
-import { classifyIntent, planFor, refinePlan } from '../../../src/core/search/intent.ts';
+import { classifyIntent, planFor, refinePlan, resolutionOf } from '../../../src/core/search/intent.ts';
 import { normalize, tokens } from '../../../src/core/search/normalize.ts';
 import { composeRanking } from '../../../src/core/search/pipeline.ts';
 import { candidatePoolFor } from '../../../src/schema/vector-query.ts';
@@ -77,6 +77,13 @@ interface CorpusIndex {
   readonly pages: readonly PageRef[];
   readonly entities: readonly EntityIndexEntry[];
   readonly dictionary: readonly MentionKey[];
+  /**
+   * Which entities each chunk names. The alias ladder's mention rung reads it,
+   * and so does the graph-adjacency boost — one derivation, because a rung that
+   * nominated a page the boost then could not recognise would be two different
+   * answers to "does this chunk name the entity".
+   */
+  readonly mentionsByChunk: ReadonlyMap<string, ReadonlySet<string>>;
   readonly now: Date;
 }
 
@@ -165,7 +172,15 @@ function indexOf(corpus: Corpus): CorpusIndex {
   const pagesByTitleKey = new Map<string, PageRef>();
   for (const [pageId, chunkIds] of chunksByPage) {
     const title = pageTitle.get(pageId) ?? null;
-    const ref: PageRef = { pageId, title, chunkIds };
+    const ref: PageRef = {
+      pageId,
+      title,
+      chunkIds,
+      // The page's body, which the mention rung ranks on. The SQL substrate has
+      // the same string available as `string_agg(c.content, ' ')` over the
+      // page's live chunks — see `arms.ts:pagesMentioningEntity`.
+      text: chunkIds.map((id) => candidates.get(id)?.content ?? '').join(' '),
+    };
     pages.push(ref);
     if (title !== null) {
       const key = normalize(title);
@@ -212,15 +227,26 @@ function indexOf(corpus: Corpus): CorpusIndex {
   for (const [chunkId, candidate] of candidates) {
     mentionsByChunk.set(chunkId, mentionsIn(candidate.content, dictionary));
   }
+  // The evidence half is tracked separately: a chunk that is the source of a
+  // fact about an entity is a much stronger statement than one that names it,
+  // and `boosts.ts` pays them differently.
+  const evidenceByChunk = new Map<string, Set<string>>();
   for (const entity of entities) {
     for (const chunkId of entity.evidence) {
       mentionsByChunk.get(chunkId)?.add(entity.ref.entityId);
+      (evidenceByChunk.get(chunkId) ?? evidenceByChunk.set(chunkId, new Set()).get(chunkId)!).add(
+        entity.ref.entityId,
+      );
     }
   }
   for (const [chunkId, entityIds] of mentionsByChunk) {
     const candidate = candidates.get(chunkId);
     if (candidate === undefined || entityIds.size === 0) continue;
-    candidates.set(chunkId, { ...candidate, entityIds: [...entityIds] });
+    candidates.set(chunkId, {
+      ...candidate,
+      entityIds: [...entityIds],
+      evidenceEntityIds: [...(evidenceByChunk.get(chunkId) ?? [])],
+    });
   }
 
   const index: CorpusIndex = {
@@ -234,6 +260,7 @@ function indexOf(corpus: Corpus): CorpusIndex {
     pages,
     entities,
     dictionary,
+    mentionsByChunk,
     now: new Date(newest === 0 ? Date.UTC(2026, 6, 1) : newest),
   };
   indexes.set(corpus, index);
@@ -327,7 +354,10 @@ function ladderLookup(index: CorpusIndex, visible: ReadonlySet<string>): LadderL
           const isToken = tokenSet.has(key);
           const isPhrase = key.includes(' ') && normalizedQuery.includes(key);
           if (!isToken && !isPhrase) continue;
-          out.push({ ref: entity.ref, weight: key.length });
+          // The key that matched travels with the ref: `intent.ts:resolutionOf`
+          // needs it to tell "the query is nothing but a name" from "the query
+          // asks about something".
+          out.push({ ref: { ...entity.ref, matchedKey: key }, weight: key.length });
           break;
         }
       }
@@ -351,6 +381,17 @@ function ladderLookup(index: CorpusIndex, visible: ReadonlySet<string>): LadderL
     evidenceFor(entityId) {
       const entity = index.entities.find((entry) => entry.ref.entityId === entityId);
       return entity === undefined ? [] : fenceChunks(entity.evidence);
+    },
+    pagesMentioning(entityId) {
+      const out: PageRef[] = [];
+      for (const page of index.pages) {
+        if (!page.chunkIds.some((id) => index.mentionsByChunk.get(id)?.has(entityId) === true)) {
+          continue;
+        }
+        const fenced = fencePage(page);
+        if (fenced !== null) out.push(fenced);
+      }
+      return out;
     },
   };
 }
@@ -471,6 +512,7 @@ function graphRanking(
   const rows: {
     chunkId: string;
     preferred: boolean;
+    namesSeed: boolean;
     multi: boolean;
     superseded: boolean;
     at: number;
@@ -478,7 +520,7 @@ function graphRanking(
   for (const [factId, fact] of corpus.facts) {
     const mentioned = mentionsIn(fact.statement, index.dictionary);
     const named = [...mentioned].filter((entityId) => touched.has(entityId));
-    if (!named.some((entityId) => seedIds.has(entityId))) continue;
+    if (named.length === 0) continue;
 
     const at = Date.parse(fact.validFrom);
     const multi = named.length > 1;
@@ -488,6 +530,11 @@ function graphRanking(
       rows.push({
         chunkId,
         preferred: preferredFacts.has(factId),
+        // The second hop. A fact naming only a *neighbour* is admitted, below
+        // the seed's own — "Marc's shop location" is answered by a statement
+        // about Kettle and Quill that never says Marcus, and a fan-out that
+        // stops at facts naming the seed cannot reach it. See the header.
+        namesSeed: named.some((entityId) => seedIds.has(entityId)),
         // An entity lookup ("who is Sam") wants the seed's own statements first;
         // a relational question wants the statement that spans the edge. Same
         // fan-out, opposite priority — which is the intent plan doing work.
@@ -501,6 +548,7 @@ function graphRanking(
   rows.sort(
     (a, b) =>
       Number(b.preferred) - Number(a.preferred) ||
+      Number(b.namesSeed) - Number(a.namesSeed) ||
       Number(b.multi) - Number(a.multi) ||
       Number(a.superseded) - Number(b.superseded) ||
       b.at - a.at ||
@@ -537,7 +585,7 @@ export function recallOverCorpus(
   const seeds = resolveEntities(query.text, lookup);
   // Resolution happens before the arms — the graph arm cannot fan out without
   // seeds — so the plan is refined with what resolution found.
-  const plan = refinePlan(planFor(classifyIntent(query.text)), { entityCount: seeds.length });
+  const plan = refinePlan(planFor(classifyIntent(query.text)), resolutionOf(query.text, seeds));
   const ladder = aliasLadderTiers(query.text, lookup, seeds);
 
   const arms: ArmResult[] = [];

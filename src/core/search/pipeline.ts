@@ -38,6 +38,10 @@ export interface ComposeRequest {
   readonly limit: number;
   /** Injected rather than read from the wall clock — see `boosts.ts`. */
   readonly now: Date;
+  /**
+   * Override the plan the arms ran under. Almost nothing should pass this: the
+   * outcome carries the plan, and disagreeing with it is a deliberate act.
+   */
   readonly plan?: RankingPlan;
   readonly budget?: { readonly maxTokens: number };
   readonly dedup?: Partial<DedupOptions>;
@@ -53,7 +57,10 @@ export interface ComposeRequest {
  * provider.
  */
 export function composeRanking(request: ComposeRequest, outcome: RecallOutcome): SearchResponse {
-  const plan = request.plan ?? planFor(classifyIntent(request.query));
+  // The outcome's plan, not a fresh one. See `types.ts:RecallOutcome.plan` —
+  // recomputing here silently scores the ranking under a plan the arms never
+  // ran under. `request.plan` stays as an explicit override.
+  const plan = request.plan ?? outcome.plan;
 
   // Stage 4 — weighted RRF across whichever arms ran.
   const fused = fuse(outcome.arms, { weights: plan.armWeights, k: plan.rrfK });

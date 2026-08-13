@@ -134,6 +134,45 @@ export function longestPhraseRun(haystack: string, phrase: string): string[] {
   return best;
 }
 
+/**
+ * Function words that carry no subject.
+ *
+ * **Read-side vocabulary, which is why it lives here** — two stages need the
+ * same list and for the same reason. The title boost must not fire on a run that
+ * is entirely grammar ("who is Sam" against "Dana Ilves who she is"); the alias
+ * ladder's mention rung must not order pages by which one repeats `does`. A
+ * second copy in either place would be the drift this module exists to prevent,
+ * one level up from characters.
+ *
+ * **English only, and that is a stated limitation.** KTD9 makes the FTS
+ * configuration a per-tenant provision-time decision, so a Spanish brain wants a
+ * Spanish list. It affects a ranking boost and a tie-break, never a fence or a
+ * filter, so the failure mode of a missing language is a slightly worse
+ * ordering, not a wrong answer.
+ */
+export const PHRASE_STOPWORDS: ReadonlySet<string> = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'but', 'by', 'did', 'do',
+  'does', 'for', 'from', 'has', 'have', 'he', 'her', 'his', 'how', 'i', 'in',
+  'is', 'it', 'its', 'me', 'my', 'not', 'of', 'on', 'or', 'our', 's', 'she',
+  'that', 'the', 'their', 'them', 'they', 'this', 'to', 'was', 'we', 'were',
+  'what', 'when', 'where', 'which', 'who', 'whom', 'why', 'will', 'with', 'you',
+  'your',
+]);
+
+/**
+ * The cheapest stand-in for stemming that needs no language: two tokens share a
+ * stem when one is the other's prefix at four characters or more.
+ *
+ * `suppliers`/`supplier` and `want`/`wants` pair; `list`/`listen` do not. It is
+ * used only to *order* candidates inside one ladder rung — never to decide
+ * whether a row is returned — so its failure mode is a worse ordering inside a
+ * tier, not a wrong answer. The tenant FTS configuration (KTD9) is where real
+ * stemming lives; this is the part that has to work without one.
+ */
+export function stemMatch(a: string, b: string): boolean {
+  return a === b || (a.length >= 4 && b.startsWith(a)) || (b.length >= 4 && a.startsWith(b));
+}
+
 export function phraseOverlap(haystack: string, phrase: string): number {
   const needle = tokens(phrase);
   if (needle.length === 0) return 0;

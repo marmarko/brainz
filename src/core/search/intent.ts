@@ -42,7 +42,7 @@
  * by the wrong arm is merely a worse rank.
  */
 
-import { normalizeQuery, tokens } from './normalize.ts';
+import { PHRASE_STOPWORDS, normalizeQuery, tokens } from './normalize.ts';
 
 export const INTENTS = [
   'entity_lookup',
@@ -340,16 +340,87 @@ export function planFor(classification: Classification): RankingPlan {
  * Re-labelling would also change the recency tilt and the exact-match boost,
  * neither of which the entity count says anything about.
  */
-export function refinePlan(
-  plan: RankingPlan,
-  resolved: { readonly entityCount: number },
-): RankingPlan {
-  if (plan.useGraphArm || resolved.entityCount < 2) return plan;
+export function refinePlan(plan: RankingPlan, resolved: Resolution): RankingPlan {
+  if (resolved.entityCount === 0) return plan;
+
+  // **A query that is nothing but a name IS an entity lookup, and the cue table
+  // could not know that.** `lexical` and `exploratory` are not classifications;
+  // they are the two ways of saying no cue fired. When the ladder then reports
+  // that the resolved entities account for every content word of the query, the
+  // missing cue has arrived: "sokonkwo@example.com" is "who is <person>" with
+  // the words left out, and it wants exactly the knobs `entity_lookup` sets —
+  // lexical arms nearly weightless, because the page that answers it does not
+  // repeat the query's one token, while the distribution-list footer that
+  // contains the address verbatim does.
+  //
+  // This is a re-classification and it is confined on both sides on purpose. A
+  // temporal or relational cue is real information about what was asked: "Marc's
+  // shop location now" resolves a person and is still a question about a shop,
+  // at a time. And *one* entity, because the rule below already says a query
+  // naming two of them is relational whatever its grammar — "S. Okonkwo Verdant
+  // Loom" is nothing but names and is asking for the edge between them, which is
+  // the opposite of a lookup and orders the graph arm the opposite way.
+  const named =
+    resolved.entityCount === 1 &&
+    resolved.namesWholeQuery &&
+    (plan.intent === 'lexical' || plan.intent === 'exploratory')
+      ? { ...plan, ...PLANS.entity_lookup, intent: 'entity_lookup' as const }
+      : plan;
+
+  // The two-entity rule keeps its own job: a query naming two entities is a
+  // relational question whatever its grammar, and the graph arm is the mechanism.
+  //
+  // **Dispatching the arm on *one* resolved entity was tried and measured and it
+  // is worse.** The cost argument says do it — the fan-out is cheap once seeds
+  // exist — but the ranking argument beats it: on a one-entity query with a
+  // residual, the neighbourhood's most recent assertion outranks the page the
+  // residual actually names, and "K&Q suppliers" comes back with where the shop
+  // moved to. Recorded here because "we already have seeds, so run it" is the
+  // obvious change and it is the wrong one.
+  if (named.useGraphArm || resolved.entityCount < 2) return named;
   return {
-    ...plan,
+    ...named,
     useGraphArm: true,
-    armWeights: { ...plan.armWeights, graph: PLANS.relational.armWeights.graph },
+    armWeights: { ...named.armWeights, graph: PLANS.relational.armWeights.graph },
   };
+}
+
+export interface Resolution {
+  readonly entityCount: number;
+  /**
+   * True when the resolved entities account for every *content* word of the
+   * query — see {@link resolutionOf}, which is the only thing that computes it.
+   */
+  readonly namesWholeQuery: boolean;
+}
+
+/**
+ * What resolution tells the plan, computed once so both substrates agree.
+ *
+ * Stopwords are excluded from "content word" for the same reason the title boost
+ * excludes them: "who is Sam" is a query that is nothing but a name plus
+ * grammar, and treating `who` and `is` as residual would make the commonest
+ * lookup shape in the corpus look like a question about something else.
+ */
+export function resolutionOf(
+  query: string,
+  entities: ReadonlyArray<{
+    readonly canonicalName: string;
+    readonly slug: string;
+    readonly matchedKey?: string;
+  }>,
+): Resolution {
+  const named = new Set<string>();
+  for (const entity of entities) {
+    for (const source of [entity.canonicalName, entity.slug.replace(/-/g, ' '), entity.matchedKey]) {
+      for (const token of tokens(source ?? '')) named.add(token);
+    }
+  }
+
+  const residual = tokens(query).filter(
+    (token) => !named.has(token) && !PHRASE_STOPWORDS.has(token),
+  );
+  return { entityCount: entities.length, namesWholeQuery: residual.length === 0 };
 }
 
 /** Classify and plan in one step, which is how the pipeline uses it. */

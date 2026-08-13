@@ -35,6 +35,8 @@ interface Page {
   readonly pageId: string;
   readonly title: string;
   readonly chunkIds: readonly string[];
+  /** The page's body, which only the mention rung reads. */
+  readonly text?: string;
 }
 
 interface Entity {
@@ -100,6 +102,19 @@ function lookupOver(pages: readonly Page[], entities: readonly Entity[]): Ladder
     },
     evidenceFor(entityId) {
       return entities.find((entity) => entity.entityId === entityId)?.evidence ?? [];
+    },
+    pagesMentioning(entityId) {
+      const entity = entities.find((candidate) => candidate.entityId === entityId);
+      if (entity === undefined) return [];
+      const keys = [entity.canonicalName, ...entity.aliases].map((name) => normalize(name));
+      return pages
+        .filter((page) => keys.some((key) => key.length > 0 && normalize(page.text ?? '').includes(key)))
+        .map((page) => ({
+          pageId: page.pageId,
+          title: page.title,
+          chunkIds: page.chunkIds,
+          text: page.text ?? '',
+        }));
     },
   };
 }

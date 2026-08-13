@@ -268,8 +268,16 @@ describe('R12a — corroboration', () => {
     expect(corroborationOf([external('sender:acme'), { channel: 'internal' }]).corroborated).toBe(true);
   });
 
-  test('a row with no external attestation is compiled-truth eligible without one', () => {
-    expect(corroborationOf([{ channel: 'user_curated' }]).eligibleForCompiledTruth).toBe(true);
+  test('a row with no *external* attestation is still not eligible without one', () => {
+    // **This assertion used to read the other way, and it was pinning a
+    // forgery.** The gate asked "is anything here externally sourced?", which is
+    // a question the sender answers: `CHANNEL_BY_SOURCE_TYPE` derives the
+    // channel from `source_type`, so an outsider whose content lands as a shared
+    // document or an attachment produces `user_curated` — no `external`
+    // attestation, gate cleared, nobody having attested to anything. The full
+    // set of forgeries is enumerated in `corroboration.test.ts`; this one stays
+    // here so the file that introduced the rule carries its correction.
+    expect(corroborationOf([{ channel: 'user_curated' }]).eligibleForCompiledTruth).toBe(false);
   });
 
   test('a corroborated fact outranks the same-scored fact attested externally alone', () => {
@@ -315,6 +323,7 @@ describe('the output is a total order and explains itself', () => {
         'corroboration',
         'graph',
         'recency',
+        'restatement',
         'source_type',
         'title',
         'trust',

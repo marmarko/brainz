@@ -30,7 +30,13 @@
  * happened in `fence.ts`, on `origin_context` alone, before any of this ran.
  */
 
-import { longestPhraseRun, normalizeQuery, phraseOverlap, tokens } from './normalize.ts';
+import {
+  longestPhraseRun,
+  normalizeQuery,
+  phraseOverlap,
+  tokens,
+  PHRASE_STOPWORDS,
+} from './normalize.ts';
 import type { Attestation, Candidate, RankingPlan, ScoredCandidate, SourceType } from './types.ts';
 
 /** The envelope's floor. Priors adjust a ranking; they never annihilate a row. */
@@ -88,7 +94,40 @@ export const TRUST_PRIOR: Readonly<Record<Attestation['channel'], number>> = {
 /** What a corroborated row gains. See {@link corroborationOf} for what earns it. */
 export const CORROBORATION_BOOST = 0.12;
 
-/** What a chunk evidencing a resolved entity gains. */
+/**
+ * What a chunk that restates the question instead of answering it loses.
+ *
+ * **Telling a question from an answer is a ranking problem a conversational
+ * brain cannot avoid**, and it is the one signal in this table that is about the
+ * *shape* of a chunk rather than about its provenance or its age. A brain fed
+ * from chat and mail is full of rows that mirror a query's wording exactly and
+ * assert nothing — "did the renewal price change? has the renewal price changed
+ * at all?" is the single densest lexical match for "renewal price" in a corpus
+ * that also contains the renewal terms. Every arm ranks on term overlap, so
+ * every arm ranks it first; no amount of fusion fixes that, because all three
+ * arms are wrong in the same direction.
+ *
+ * Deliberately larger than the source-type priors and deliberately smaller than
+ * the title term: a surface prior is a weak claim about where a row came from,
+ * while "this row is the question typed back" is a strong claim about the row —
+ * and still not strong enough to outvote a page whose title is the phrase asked
+ * for.
+ */
+export const RESTATEMENT_PENALTY = 0.25;
+
+/**
+ * What a chunk adjacent to a resolved entity gains — evidenced or merely named.
+ *
+ * **One number for both, and it was measured rather than assumed.** Paying a
+ * bare mention less than a fact's source chunk is the obvious refinement: the
+ * alias ladder scores a mention as its most speculative rung, so the boost
+ * "should" agree. Splitting the term was implemented and graded across the whole
+ * corpus at three ratios; at the ladder's own ratio it moved the aggregate by
+ * 0.0001 and no floor at all, and at a sharper one it cost an alias probe. A
+ * knob that does not move a measurement is a knob that will be tuned by
+ * somebody later without one, so it is not here. `Candidate.evidenceEntityIds`
+ * carries the distinction for the stage that finds a use for it.
+ */
 export const GRAPH_ADJACENCY_BOOST = 0.2;
 
 /** Extra credit when the title contains the whole query phrase, in order. */
@@ -106,21 +145,11 @@ export const TITLE_FULL_PHRASE_BONUS = 0.5;
  * titles that a query legitimately matches in part. What distinguishes the bad
  * case is not the run's length but that it carries no content.
  *
- * **English only, and that is a stated limitation.** KTD9 makes the FTS
- * configuration a per-tenant provision-time decision, so a Spanish brain wants a
- * Spanish list here; the alpha is English and this list is small enough to be
- * obviously incomplete rather than quietly wrong. It affects a ranking boost and
- * never a fence or a filter, so the failure mode of a missing language is a
- * slightly worse ordering, not a wrong answer.
+ * Re-exported rather than defined here: the alias ladder's mention rung needs
+ * the same list for the same reason, and the list lives with the rest of the
+ * shared read-side vocabulary in `normalize.ts` so it cannot exist twice.
  */
-export const PHRASE_STOPWORDS: ReadonlySet<string> = new Set([
-  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'but', 'by', 'did', 'do',
-  'does', 'for', 'from', 'has', 'have', 'he', 'her', 'his', 'how', 'i', 'in',
-  'is', 'it', 'its', 'me', 'my', 'not', 'of', 'on', 'or', 'our', 's', 'she',
-  'that', 'the', 'their', 'them', 'they', 'this', 'to', 'was', 'we', 'were',
-  'what', 'when', 'where', 'which', 'who', 'whom', 'why', 'will', 'with', 'you',
-  'your',
-]);
+export { PHRASE_STOPWORDS };
 
 // ---------------------------------------------------------------------------
 // R12a — corroboration.
@@ -141,9 +170,25 @@ export interface CorroborationVerdict {
   /** True iff a `remember` arrived over MCP. Clears nothing (R12a). */
   readonly restated: boolean;
   /**
-   * R12a's gate, for U11's compiled-truth boost: externally-sourced claims are
-   * excluded until corroborated. Computed here rather than in U11 so that one
-   * reading of the rule exists.
+   * R12a's gate, for U11's compiled-truth boost.
+   *
+   * **It is `corroborated`, and asking anything else is a forgery.** The obvious
+   * reading — "externally-sourced claims are excluded until corroborated", so
+   * admit anything that is not externally sourced — was implemented and is
+   * wrong, because *whether a row looks externally sourced is a property the
+   * sender influences*. `CHANNEL_BY_SOURCE_TYPE` derives the channel from
+   * `source_type`, so an outsider whose content arrives as a shared drive
+   * document or a mail attachment produces `user_curated`, which carries no
+   * `external` attestation and cleared the gate with nobody having attested to
+   * anything. Two more rows cleared it the same way: an `agent_mcp` restatement,
+   * which R12a says clears nothing, and a row with no attestations at all.
+   *
+   * So the gate asks the question that has an answer an outsider cannot write:
+   * did an origin the external sender cannot produce vouch for this. That is
+   * exactly {@link CorroborationVerdict.corroborated}, and the two fields are
+   * the same value on purpose rather than by accident — `test/core/search/
+   * corroboration.test.ts` pins each forgery separately so a future widening
+   * has to defeat a named attack rather than a tautology.
    */
   readonly eligibleForCompiledTruth: boolean;
 }
@@ -167,7 +212,6 @@ export function corroborationOf(attestations: readonly Attestation[]): Corrobora
   const keys = new Set<string>();
   let corroborated = false;
   let restated = false;
-  let hasExternal = false;
 
   for (const attestation of attestations) {
     switch (attestation.channel) {
@@ -175,7 +219,6 @@ export function corroborationOf(attestations: readonly Attestation[]): Corrobora
         restated = true;
         continue;
       case 'external':
-        hasExternal = true;
         keys.add(attestation.senderKey ?? 'external:unattributed');
         break;
       case 'user_out_of_band':
@@ -196,7 +239,7 @@ export function corroborationOf(attestations: readonly Attestation[]): Corrobora
     independentOrigins: keys.size,
     corroborated,
     restated,
-    eligibleForCompiledTruth: corroborated || !hasExternal,
+    eligibleForCompiledTruth: corroborated,
   };
 }
 
@@ -207,6 +250,8 @@ export function corroborationOf(attestations: readonly Attestation[]): Corrobora
 export interface BoostOptions {
   readonly corroborationBoost: number;
   readonly graphAdjacencyBoost: number;
+  /** See {@link RESTATEMENT_PENALTY}. Zero turns the term off, for the mutation. */
+  readonly restatementPenalty: number;
 }
 
 export interface BoostInputs extends Partial<BoostOptions> {
@@ -266,6 +311,73 @@ function titleTerm(candidate: Candidate, query: string, plan: RankingPlan): numb
   return plan.exactMatchBoost * (overlap + (complete ? TITLE_FULL_PHRASE_BONUS : 0));
 }
 
+/**
+ * Sentences, for the interrogative half of {@link restatementTerm}.
+ *
+ * Terminator-based and nothing cleverer. A sentence splitter that handles
+ * abbreviations and quotations is a language-specific dependency on a path that
+ * takes whatever arrives; over-splitting "e.g." costs a fraction of a ranking
+ * prior, which is the direction to be wrong in.
+ */
+function sentencesOf(text: string): string[] {
+  return text
+    .split(/(?<=[.!?])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 0);
+}
+
+/**
+ * How much this chunk looks like the question rather than its answer, in [0, 1].
+ *
+ * **Two detectors, because the failure arrives in two shapes and neither catches
+ * the other.**
+ *
+ *   1. **Interrogative.** Half or more of the chunk's sentences are questions.
+ *      "where does toshiro abe work now? toshiro abe works where these days?" is
+ *      not an answer about Toshiro Abe under any reading.
+ *   2. **Echo.** The chunk repeats the query's *own* content words far more often
+ *      than it says anything else — three occurrences per distinct matched word,
+ *      filling a third of the chunk. That is the shape of a backlog item ("ask
+ *      X about the renewal price, X has the renewal price somewhere"), which
+ *      carries no question mark at all and which every arm ranks first precisely
+ *      because the repetition is what term overlap measures.
+ *
+ * **This is a ranking prior and only a ranking prior** (KTD5). It never fences,
+ * never filters, and cannot remove a row: a chunk that genuinely answers by
+ * asking — a quoted question in a meeting note — loses a quarter of an envelope
+ * and stays in the result set.
+ */
+function restatementTerm(candidate: Candidate, query: string, penalty: number): number {
+  if (penalty === 0) return 0;
+
+  const sentences = sentencesOf(candidate.content);
+  if (sentences.length > 0) {
+    const questions = sentences.filter((sentence) => sentence.endsWith('?')).length;
+    if (questions * 2 >= sentences.length) return -penalty;
+  }
+
+  const asked = new Set(
+    tokens(query).filter((token) => !PHRASE_STOPWORDS.has(token)),
+  );
+  if (asked.size === 0) return 0;
+
+  const body = tokens(candidate.content);
+  if (body.length === 0) return 0;
+
+  const matchedDistinct = new Set<string>();
+  let occurrences = 0;
+  for (const token of body) {
+    if (!asked.has(token)) continue;
+    matchedDistinct.add(token);
+    occurrences += 1;
+  }
+  if (matchedDistinct.size === 0) return 0;
+
+  const perDistinct = occurrences / matchedDistinct.size;
+  const share = occurrences / body.length;
+  return perDistinct >= 3 && share >= 1 / 3 ? -penalty : 0;
+}
+
 function sourceTypeTerm(candidate: Candidate, plan: RankingPlan): number {
   const base = SOURCE_TYPE_PRIOR[candidate.sourceType] ?? 0;
   const lift = candidate.sourceType === 'calendar' ? plan.calendarLift : 0;
@@ -291,6 +403,7 @@ function trustTerm(candidate: Candidate): number {
 export function applyBoosts(inputs: BoostInputs): ScoredCandidate[] {
   const corroborationBoost = inputs.corroborationBoost ?? CORROBORATION_BOOST;
   const graphAdjacencyBoost = inputs.graphAdjacencyBoost ?? GRAPH_ADJACENCY_BOOST;
+  const restatementPenalty = inputs.restatementPenalty ?? RESTATEMENT_PENALTY;
   const resolved = new Set(inputs.resolvedEntityIds);
 
   const scored: ScoredCandidate[] = [];
@@ -308,17 +421,26 @@ export function applyBoosts(inputs: BoostInputs): ScoredCandidate[] {
       resolved.size > 0 && candidate.entityIds.some((entityId) => resolved.has(entityId))
         ? graphAdjacencyBoost
         : 0;
+    const restatement = restatementTerm(candidate, inputs.query, restatementPenalty);
 
     const envelope = Math.max(
       MIN_ENVELOPE,
-      1 + title + recency + sourceType + trust + corroboration + graph,
+      1 + title + recency + sourceType + trust + corroboration + graph + restatement,
     );
 
     scored.push({
       candidate,
       fused,
       score: fused * envelope,
-      boosts: { title, recency, source_type: sourceType, trust, corroboration, graph },
+      boosts: {
+        title,
+        recency,
+        source_type: sourceType,
+        trust,
+        corroboration,
+        graph,
+        restatement,
+      },
     });
   }
 
