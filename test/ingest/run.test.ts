@@ -914,6 +914,43 @@ describe('the objects a folder scan carries', () => {
     expect(await countRows(fixture.tenantSql, 'attachment')).toBe(1);
   });
 
+  test('a junk-quarantined object is stored, and stays out of the transcribe queue', async () => {
+    // The junk gate in front of the meter, applied to media on this side too.
+    // The pull runner has the same one-line pass-through, and a mirror that only
+    // covered one loop would let a mutant live in the other.
+    await resetBrain();
+
+    const result = await runImport(
+      mediaRequest({
+        items: [],
+        failures: [],
+        media: [
+          {
+            ...mediaFor('tracker.png'),
+            junk: { headers: { 'List-Unsubscribe': '<https://x.test/u>' } },
+          },
+        ],
+      }),
+    );
+
+    expect(result.counts.attachments).toBe(1);
+    const hidden = await attachmentRows('quarantined_at IS NOT NULL');
+    expect(hidden.length).toBe(1);
+    const hiddenKey = hidden[0]?.object_key ?? '';
+    expect(hiddenKey.length).toBeGreaterThan(0);
+    // Preserved (R23: extraction improves, and the fleet cannot re-derive from
+    // bytes it no longer has) and never sent to a model, because the queue
+    // predicate excludes it. Structural, not a careful caller.
+    const pending = await selectPendingAttachments(fixture.tenantSql, { limit: 50 });
+    expect(pending.map((entry) => entry.objectKey)).not.toContain(hiddenKey);
+
+    const row = (await ingestLogRows(fixture.tenantSql)).find(
+      (entry) => entry.external_ref === externalRefFor(ROOT, 'tracker.png'),
+    );
+    expect(row?.items_quarantined).toBe(1);
+    expect(row?.items_written).toBe(0);
+  });
+
   test('a refused import stores no objects at all', async () => {
     // Behind the gate, and this is the half that says so. A ceiling that
     // refused the run and a runner that banked its objects anyway would be two
