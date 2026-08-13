@@ -44,9 +44,9 @@
           "ops": [
             "vision"
           ],
-          "awaiting": "U21's media-to-text consolidation phase",
-          "unit": "U21",
-          "note": "image_to_text is a U21 deliverable; nothing routes through this op yet."
+          "awaiting": "U11's exit gate — transcription clears R6's canary floor with a receipt naming its model id",
+          "unit": "U11",
+          "note": "U21 shipped the phase, so this op now routes: `transcribe` is the first model phase of every paid cycle (src/worker/consolidate/phases.ts:PHASE_OP). What it does not have is a score. It joined EXIT_GATE_OPS with a workload row and a cost line, graded against the committed gold at evals/fixtures/transcription.ts, and it defers on the same authorised-spend condition as the other five rather than on 'nothing routes here yet', which stopped being true when the phase landed."
         }
       ]
     },

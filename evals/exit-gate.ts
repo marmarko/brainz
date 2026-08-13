@@ -1,12 +1,12 @@
 /**
- * U11's exit gate — the KTD13 model-tier check for the five consolidation ops.
+ * U11's exit gate — the KTD13 model-tier check for the consolidation ops.
  *
  * Gap Register #19 split KTD13's gate in two: U7 owns the harness, and the ops
  * that do not exist in Phase 1 are graded "at U11's exit gate ... with a
  * committed receipt per op naming the model id it was scored against". This is
  * that harness. It lands in the state the rest of U7's gates are in — built,
  * wired into `eval:canary`, and **deferred with a reason** — because grading
- * these five means live paid calls and that spend is not authorised.
+ * them means live paid calls and that spend is not authorised.
  *
  * **The failure this file is written against is a gate that passes for having
  * graded nothing.** Four things stop it, and none of them is a comment:
@@ -26,7 +26,7 @@
  *
  * **Why the checks are not new canary checks.** R6 puts exactly two floors in
  * the canary tier and `evals/canary.ts` pins that set as a whole. The exit gate
- * is U11's, it grades five ops against the same 0.8 bar, and it reports through
+ * is U11's, it grades every model-tier op against the same 0.8 bar, and it reports through
  * `eval:canary` rather than being smuggled into R6's list — so a reader counting
  * R6's floors still finds R6's floors.
  */
@@ -35,15 +35,35 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import { CANONICAL_PRICE_BOOK, costMicroUsd, type PriceBook } from '../src/ai/pricing.ts';
-import { routeFor, type ModelOp, type NamedProfile } from '../src/ai/routing.ts';
+import { IMAGE_INPUT_TOKENS, routeFor, type ModelOp, type NamedProfile } from '../src/ai/routing.ts';
+import {
+  TRANSCRIBE_SYSTEM_PROMPT,
+  TRANSCRIBE_USER_PROMPT,
+} from '../src/core/media/ocr-phase.ts';
+import { TRANSCRIPTION_GOLD } from './fixtures/transcription.ts';
 
-/** The five U11 builds and therefore owes a receipt for (KTD13, Gap #19). */
+/** The gateway's own input estimator, so the vision reservation matches it. */
+const CHARS_PER_TOKEN = 4;
+
+/**
+ * The consolidation ops that owe a receipt (KTD13, Gap #19).
+ *
+ * **Every op the cycle's model tier routes through, and it is checked against
+ * the cycle rather than remembered.** U11's verification names five and adds
+ * "(and U21's `image_to_text` when it lands)" — it landed, and for one release
+ * the gate did not follow: `vision` was implemented, routed, priced and covered
+ * by no line that could ever produce a receipt, which `docs/alpha-exit.md` B5
+ * recorded as a finding with no command attached. `test/evals/exit-gate.test.ts`
+ * compares this list against `PHASE_OP` so a seventh phase cannot be added
+ * without a gate line, the way the sixth was.
+ */
 export const EXIT_GATE_OPS = [
   'extract',
   'enrich',
   'contradiction',
   'salience',
   'synopsis',
+  'vision',
 ] as const;
 
 export type ExitGateOp = (typeof EXIT_GATE_OPS)[number];
@@ -52,7 +72,7 @@ export const COST_RECEIPT_PATH = 'evals/receipts/u11-exit-gate-cost.json';
 
 export interface ExitGateCheck {
   readonly op: ExitGateOp;
-  /** R6's canary bar. The same 0.8 for all five — see the note on each. */
+  /** R6's canary bar. The same 0.8 for every op — see the note on each. */
   readonly floor: number;
   readonly metric: string;
   /** What the op would be scored against. Named so a reader can find it. */
@@ -61,7 +81,7 @@ export interface ExitGateCheck {
 }
 
 /**
- * The five checks.
+ * The checks, one per gate op.
  *
  * Every floor is 0.8 and none of them is a number invented here: R6 gives
  * model-extraction recall ≥ 0.8 in the canary tier and gives the rest no number,
@@ -116,6 +136,18 @@ export const EXIT_GATE_CHECKS: readonly ExitGateCheck[] = [
     note:
       'The summary is the compiled-truth surface, so an unfaithful one is a fabrication with a ranking boost ' +
       'pointed at it. Faithfulness rather than coverage for that reason.',
+  },
+  {
+    op: 'vision',
+    floor: 0.8,
+    metric: 'character-level agreement with the gold transcript, per image, averaged',
+    gold: 'evals/fixtures/transcription.ts — eight rendered images whose drawn text is the expected transcript',
+    note:
+      'The Alpha-done clause is "screenshots findable by their text", and the failure mode is a plausible ' +
+      'transcript rather than a refusal: a vision model that misreads one character of a password or a booking ' +
+      'reference has produced a searchable page that answers the query with the wrong string. So the metric is ' +
+      'agreement per character rather than per document — a document-level score of "mostly right" is what that ' +
+      'failure looks like. It grades the transcript only: the text-layer PDF path makes no model call at all.',
   },
 ];
 
@@ -289,6 +321,17 @@ export interface OpWorkload {
  * entity, `contradiction` is one batched call over the live fact set, and
  * `salience` is one batched call over the pages. A number nobody derived would
  * make the receipt an opinion about cost rather than a computation of it.
+ *
+ * **`vision` is derived twice over**, because a picture costs nothing a
+ * character counter can see. Its item count is the length of the committed gold
+ * (`evals/fixtures/transcription.ts`), and its per-item input is
+ * `IMAGE_INPUT_TOKENS` — the flat single-tile figure the gateway reserves
+ * against — plus the transcription prompt the phase actually sends, at the
+ * gateway's own four-characters-per-token estimate. Both halves are imported
+ * rather than typed, so a change to either moves this receipt and fails the
+ * drift guard instead of quietly making the estimate wrong.
+ * `docs/research/2026-08-13-ocr-phase-cost.md` states what the image figure
+ * assumes and what would settle it.
  */
 export const EXIT_GATE_WORKLOAD: Readonly<Record<ExitGateOp, OpWorkload>> = Object.freeze({
   extract: { items: 60, inputTokensPerItem: 500 },
@@ -296,12 +339,18 @@ export const EXIT_GATE_WORKLOAD: Readonly<Record<ExitGateOp, OpWorkload>> = Obje
   contradiction: { items: 1, inputTokensPerItem: 12_000 },
   salience: { items: 1, inputTokensPerItem: 24_000 },
   synopsis: { items: 24, inputTokensPerItem: 500 },
+  vision: {
+    items: TRANSCRIPTION_GOLD.length,
+    inputTokensPerItem:
+      IMAGE_INPUT_TOKENS +
+      Math.ceil((TRANSCRIBE_SYSTEM_PROMPT + TRANSCRIBE_USER_PROMPT).length / CHARS_PER_TOKEN),
+  },
 });
 
 /**
  * The grading call, which is a cost line and not a footnote.
  *
- * Four of the five metrics above are model-judged, so a run that priced only the
+ * Four of the six metrics above are model-judged, so a run that priced only the
  * producers would be pricing half of it. The judge reads each op's output
  * alongside its gold set, which is why its input is the largest single figure in
  * the receipt — and why it routes through the `judge` op, never the family being

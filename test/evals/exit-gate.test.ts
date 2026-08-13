@@ -24,7 +24,18 @@
 import { describe, expect, test } from 'bun:test';
 
 import { CANONICAL_PRICE_BOOK, costMicroUsd } from '../../src/ai/pricing.ts';
-import { PROFILES, routeFor, type ModelOp } from '../../src/ai/routing.ts';
+import { IMAGE_INPUT_TOKENS, PROFILES, routeFor, type ModelOp } from '../../src/ai/routing.ts';
+import { sniffMediaType } from '../../src/core/media/accept.ts';
+import {
+  TRANSCRIBE_SYSTEM_PROMPT,
+  TRANSCRIBE_USER_PROMPT,
+} from '../../src/core/media/ocr-phase.ts';
+import { MODEL_PHASES, PHASE_OP } from '../../src/worker/consolidate/phases.ts';
+import {
+  TRANSCRIPTION_GOLD,
+  goldImage,
+  goldTranscript,
+} from '../../evals/fixtures/transcription.ts';
 import {
   COST_RECEIPT_PATH,
   EXIT_GATE_CHECKS,
@@ -39,13 +50,24 @@ import { loadPinLedger } from '../../evals/model-pins.ts';
 const profile = PROFILES.hosted;
 
 describe('the harness covers the ops U11 owes a receipt for', () => {
-  test('all five, exactly', () => {
+  test('all six, exactly — the five consolidation ops and U21’s vision seat', () => {
     expect([...EXIT_GATE_OPS].sort().join(',')).toBe(
-      'contradiction,enrich,extract,salience,synopsis',
+      'contradiction,enrich,extract,salience,synopsis,vision',
     );
     expect([...new Set(EXIT_GATE_CHECKS.map((check) => check.op))].sort()).toEqual(
       [...EXIT_GATE_OPS].sort(),
     );
+  });
+
+  test('every model phase the cycle runs is in the gate', () => {
+    // The gate's list against the cycle's list, rather than against a literal.
+    // `vision` was absent for exactly as long as nothing compared the two: the
+    // op existed, was routed and was priced, and no line would ever have
+    // produced a receipt for it (docs/alpha-exit.md B5).
+    const gated = new Set<string>(EXIT_GATE_OPS);
+    for (const phase of MODEL_PHASES) {
+      expect({ phase, gated: gated.has(PHASE_OP[phase]) }).toEqual({ phase, gated: true });
+    }
   });
 
   test('every check carries R6’s canary floor and a gold key it would score against', () => {
@@ -55,6 +77,40 @@ describe('the harness covers the ops U11 owes a receipt for', () => {
       expect(check.gold.trim().length).toBeGreaterThan(0);
       expect(check.note.trim().length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('the vision seat’s gold is real, and its workload is derived from it', () => {
+  test('every gold entry renders to an actual PNG', () => {
+    // A gold key that a decoder would refuse is a gold key nothing can be
+    // scored against — and the `gold` field would still read convincingly.
+    expect(TRANSCRIPTION_GOLD.length).toBeGreaterThan(0);
+    for (const entry of TRANSCRIPTION_GOLD) {
+      expect({ id: entry.id, type: sniffMediaType(goldImage(entry)) }).toEqual({
+        id: entry.id,
+        type: 'image/png',
+      });
+    }
+  });
+
+  test('the expected transcript is the text that was drawn, not a second copy', () => {
+    // The property that makes the key self-consistent: one string is both what
+    // the encoder drew and what a reader is graded against.
+    const wifi = TRANSCRIPTION_GOLD.find((entry) => entry.id === 'wifi-password');
+    expect(goldTranscript(wifi!)).toContain('TRQ7-4KDN-92XM');
+    // ...and the one entry whose honest answer is nothing at all.
+    const blank = TRANSCRIPTION_GOLD.find((entry) => entry.id === 'blank-notice');
+    expect(goldTranscript(blank!)).toBe('');
+  });
+
+  test('the workload counts the gold and prices the image at the routing constant', () => {
+    const work = EXIT_GATE_WORKLOAD.vision;
+    expect(work.items).toBe(TRANSCRIPTION_GOLD.length);
+    // 1,600 for the picture plus the prompt the phase actually sends, at the
+    // gateway's four-characters-per-token estimate — the figure
+    // docs/research/2026-08-13-ocr-phase-cost.md derives, not a round number.
+    const prompt = Math.ceil((TRANSCRIBE_SYSTEM_PROMPT + TRANSCRIBE_USER_PROMPT).length / 4);
+    expect(work.inputTokensPerItem).toBe(IMAGE_INPUT_TOKENS + prompt);
   });
 });
 

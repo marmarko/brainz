@@ -1,9 +1,10 @@
 {
-  "note": "Committed cost ESTIMATE for one full U11 exit-gate run — the five consolidation ops plus the judge that grades them. No model was called to produce it: every number is computed from src/ai/pricing.ts by evals/exit-gate.ts:estimateExitGateCost, and test/evals/exit-gate.test.ts recomputes it and fails on drift. There is deliberately no scored_against block: an estimate that carried one would pin a model that never ran.",
+  "note": "Committed cost ESTIMATE for one full U11 exit-gate run — the five consolidation ops, U21's vision seat, and the judge that grades them. No model was called to produce it: every number is computed from src/ai/pricing.ts by evals/exit-gate.ts:estimateExitGateCost, and test/evals/exit-gate.test.ts recomputes it and fails on drift. There is deliberately no scored_against block: an estimate that carried one would pin a model that never ran.",
   "generated_by": "evals/exit-gate.ts:estimateExitGateCost",
   "profile": "hosted",
   "authorised": false,
   "output_projection": "each op at its route maxOutputTokens ceiling — the direction a run cannot exceed while believing it is inside the estimate",
+  "vision_workload_basis": "items = the 8 committed gold images in evals/fixtures/transcription.ts; input per item = IMAGE_INPUT_TOKENS (src/ai/routing.ts) plus the transcription prompt at the gateway’s four-characters-per-token estimate. See docs/research/2026-08-13-ocr-phase-cost.md for what the image figure assumes and what would settle it.",
   "workload": {
     "extract": {
       "items": 60,
@@ -24,6 +25,10 @@
     "synopsis": {
       "items": 24,
       "input_tokens_per_item": 500
+    },
+    "vision": {
+      "items": 8,
+      "input_tokens_per_item": 1695
     },
     "judge": {
       "items": 5,
@@ -66,6 +71,13 @@
       "micro_usd": 24432,
       "usd": 0.024432
     },
+    "vision": {
+      "model_id": "@cf/meta/llama-3.2-11b-vision-instruct",
+      "input_tokens": 13560,
+      "output_tokens": 32768,
+      "micro_usd": 22816,
+      "usd": 0.022816
+    },
     "judge": {
       "model_id": "@cf/zai-org/glm-5.2",
       "input_tokens": 100000,
@@ -74,6 +86,6 @@
       "usd": 0.185056
     }
   },
-  "total_micro_usd": 982664,
-  "total_usd": 0.982664
+  "total_micro_usd": 1005480,
+  "total_usd": 1.00548
 }
