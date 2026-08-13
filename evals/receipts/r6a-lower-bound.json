@@ -5,6 +5,8 @@
   "embedding_manifest_digest": "fabb3db916ae4fff239cb6d4cd1d5ceb8b411c75badf4903f6bba72b767e592d",
   "embedding_source": {
     "kind": "synthetic",
+    "synthetic": 332,
+    "provider": 0,
     "model": "synthetic-lexical-v1",
     "generator": "lexical-hash-v1"
   },
@@ -144,11 +146,167 @@
     "headroom": 0,
     "finding": "FLAGGED: the ceiling equals the floor exactly. R6 asks deterministic extraction for 0.8 recall and this corpus puts only 0.8 of its gold facts within reach of a rule, so U6's extractor would have to be perfect on every rule-reachable fact to clear the floor and one miss fails it. That is a knife edge, and it is a fixture property rather than an implementation one. Two ways out, both belonging to the gates half of this unit rather than to the corpus half: widen the deterministic rule families so more of the gold key is reachable, or re-scope the floor to recall-over-rule-reachable-facts, which is the quantity a deterministic extractor can actually be held to. Recorded rather than resolved here, because resolving it by reclassifying facts until the number looks comfortable is the exact failure R6a exists to prevent."
   },
+  "semantic_reach": {
+    "note": "A probe is listed when the query supplied evidence the answer's whole page cannot match AND what the answer does carry is shared with at least as many other groups as the metric has slots. Under the committed synthetic vectors nothing can supply the missing half, so `evals/gates.ts` reports a floor these probes miss as `deferred` rather than met or failed. Regenerating the manifest from a real provider revokes every deferral automatically — the switch is the provider count in this receipt, not a constant anywhere.",
+    "rows": [
+      {
+        "floorId": "family.alias.hit1",
+        "queryId": "q-al-01-sam-current-title",
+        "cutoff": 1,
+        "required": [
+          "p-sam-promotion#0"
+        ],
+        "uncovered": [
+          "token:current",
+          "token:title"
+        ],
+        "dominators": 4
+      },
+      {
+        "floorId": "family.alias.hit1",
+        "queryId": "q-al-03-where-does-sam-work",
+        "cutoff": 1,
+        "required": [
+          "p-verdant-overview#2"
+        ],
+        "uncovered": [
+          "token:work"
+        ],
+        "dominators": 2
+      },
+      {
+        "floorId": "family.alias.hit1",
+        "queryId": "q-al-08-tosh-wants-changed",
+        "cutoff": 1,
+        "required": [
+          "p-tosh-review#0"
+        ],
+        "uncovered": [
+          "token:changed",
+          "token:want"
+        ],
+        "dominators": 3
+      },
+      {
+        "floorId": "family.alias.hit1",
+        "queryId": "q-al-11-marc-shop-location",
+        "cutoff": 1,
+        "required": [
+          "p-kettle-move#0"
+        ],
+        "uncovered": [
+          "entity:marcus-vandenberg",
+          "token:location",
+          "token:now"
+        ],
+        "dominators": 2
+      },
+      {
+        "floorId": "family.alias.hit1",
+        "queryId": "q-al-14-kq-suppliers",
+        "cutoff": 1,
+        "required": [
+          "p-kettle-supplier-list#0"
+        ],
+        "uncovered": [
+          "token:suppliers"
+        ],
+        "dominators": 12
+      },
+      {
+        "floorId": "family.dilution.hit3",
+        "queryId": "q-di-05-dpa",
+        "cutoff": 3,
+        "required": [
+          "p-dpa-status#0"
+        ],
+        "uncovered": [
+          "token:data",
+          "token:processing"
+        ],
+        "dominators": 4
+      },
+      {
+        "floorId": "family.dilution.hit3",
+        "queryId": "q-di-06-dpa-signed",
+        "cutoff": 3,
+        "required": [
+          "p-dpa-mail#0",
+          "p-dpa-file#0",
+          "p-dpa-chat#0"
+        ],
+        "uncovered": [
+          "token:signed",
+          "token:signed",
+          "token:signed"
+        ],
+        "dominators": 4
+      },
+      {
+        "floorId": "family.dilution.hit3",
+        "queryId": "q-di-07-roast-contract",
+        "cutoff": 3,
+        "required": [
+          "p-roast-price#0"
+        ],
+        "uncovered": [
+          "token:contract",
+          "token:terms"
+        ],
+        "dominators": 5
+      },
+      {
+        "floorId": "family.dilution.hit3",
+        "queryId": "q-di-09-pilot-brief",
+        "cutoff": 3,
+        "required": [
+          "p-pilot-outcome#0"
+        ],
+        "uncovered": [
+          "entity:project-windbreak",
+          "token:brief"
+        ],
+        "dominators": 8
+      },
+      {
+        "floorId": "family.dilution.hit3",
+        "queryId": "q-di-10-pilot-went",
+        "cutoff": 3,
+        "required": [
+          "p-pilot-brief-file#0",
+          "p-pilot-brief-mail#0",
+          "p-pilot-brief-chat#0"
+        ],
+        "uncovered": [
+          "token:go",
+          "token:go",
+          "token:go"
+        ],
+        "dominators": 4
+      },
+      {
+        "floorId": "family.dilution.hit3",
+        "queryId": "q-di-10-pilot-went",
+        "cutoff": 3,
+        "required": [
+          "p-pilot-outcome#0"
+        ],
+        "uncovered": [
+          "entity:project-windbreak",
+          "token:go"
+        ],
+        "dominators": 8
+      }
+    ],
+    "blocked_probes": 10,
+    "total_probes": 44
+  },
   "threats_to_validity": [
     "The committed vectors are synthetic (hashed lexical projections), so the vector-arm baseline is today a second lexical arm rather than an independent signal. When real embeddings land it will get stronger, the margin will narrow, and this receipt must be recomputed.",
     "A large share of the corpus's difficulty comes from a deliberate population of question-shaped chat and mail rows that lexically mirror the query set and answer nothing. That is a faithful property of conversational memory, but it means part of what the floors reward is telling a question from an answer (source-type priors, intent) rather than ranking alone.",
     "The dilution family draws ten queries from five duplicate clusters at two phrasings each. Two phrasings over one cluster is a weaker signal than two clusters would be.",
     "The corpus was authored to be hard for the naive arms measured here, which is what R6a asks for. It could not be tuned toward the ranking stack, because it was authored before U5 existed — that sequencing is the load-bearing part of U7's dependency line, not a convenience.",
-    "The alias floor at 0.98 over 14 queries is arithmetically all-or-nothing; see the granularity note in evals/gates.ts."
+    "The alias floor at 0.98 over 14 queries is arithmetically all-or-nothing; see the granularity note in evals/gates.ts.",
+    "The blocking tier's stand-in for the full-text arm scores every chunk sharing any query term, while production's `websearch_to_tsquery` ANDs its terms and recalls only chunks carrying all of them. The stand-in therefore recalls strictly more than the fleet does on multi-term queries, and these floors flatter production by that difference. Measured, not estimated: switching the stand-in to conjunctive recall moves the aggregate from 0.8269 to 0.7616 and takes the context-fenced floor below its bar. Closing it is stack work rather than fixture work and is not in this unit."
   ]
 }

@@ -120,6 +120,18 @@ export interface EmbeddingIndex {
   readonly size: number;
   /** Digest over the whole manifest, recorded in both receipts. */
   readonly manifestDigest: string;
+  /**
+   * How many verified vectors came from each source.
+   *
+   * **This is the switch every "not yet measurable" verdict hangs off**, and it
+   * is counted from the rows rather than declared anywhere. `evals/gates.ts`
+   * will only defer a floor while `provider` is zero: the day a single real
+   * vector lands, the deferral evaporates on its own and the floor is enforced
+   * again, with nobody having to remember to remove anything. A hand-written
+   * `kind: 'synthetic'` constant — which is what the R6a receipt carried — is a
+   * claim that keeps its value after it stops being true.
+   */
+  readonly sources: Readonly<Record<VectorSource, number>>;
 }
 
 function failEmbeddings(message: string): never {
@@ -311,6 +323,7 @@ export function loadEmbeddings(
 
   const vectors = new Map<string, Float32Array>();
   const seenIds = new Set<string>();
+  const sources: Record<VectorSource, number> = { synthetic: 0, provider: 0 };
 
   lines.forEach((line, index) => {
     const row = parseRow(line, index + 1);
@@ -342,6 +355,7 @@ export function loadEmbeddings(
 
     vectors.set(key, vector);
     seenIds.add(row.id);
+    sources[row.source] += 1;
   });
 
   // The orphan direction: a corpus text with no manifest row would silently
@@ -363,6 +377,7 @@ export function loadEmbeddings(
     },
     size: vectors.size,
     manifestDigest,
+    sources,
   };
 }
 

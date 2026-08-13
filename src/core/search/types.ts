@@ -125,6 +125,24 @@ export interface Candidate {
    * `entityIds` is not — see `boosts.ts:applyBoosts`.
    */
   readonly evidenceEntityIds?: readonly string[];
+  /**
+   * Entities this row's **page** names, whether or not this chunk does.
+   *
+   * A separate field rather than a widening of {@link entityIds}, because the
+   * two answer different questions and exactly one stage wants each. Adjacency
+   * is a property of the chunk: a paragraph that names nobody is not evidence
+   * about anybody, and paying it the graph boost lifts every paragraph of a
+   * profile page above the row that answers the question. A **title**, though,
+   * is a property of the page — so the title boost's residual rule
+   * (`boosts.ts:RESIDUAL_ONLY_RUN`), which asks "is this document about the
+   * subject the query named", has to ask it of the document. The chunk carrying
+   * a renewal price is routinely the first paragraph of a page whose second
+   * paragraph names the person asked about.
+   *
+   * Absent means the substrate did not distinguish, and the chunk-level set is
+   * read instead.
+   */
+  readonly pageEntityIds?: readonly string[];
 }
 
 /** One arm's output: its name, its weight's key, and its ranking. */

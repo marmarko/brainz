@@ -36,10 +36,11 @@ committed with no ranking stack in the repository to tune toward.
 | `fixtures/embeddings.provider-sample.jsonl` | Two rows in the shape real provider vectors arrive in. |
 | `corpus.ts` | The loader, which is really the validator. Fails closed, in both directions. |
 | `metrics.ts` | nDCG@10, Hit@k, the dilution metric, duplicate-occupancy. |
+| `lexical-reach.ts` | Which gold answers this corpus offers a **keyed** path to, and which ones only meaning can reach. |
 | `embeddings.ts` | The embedding fixture format, the synthetic generator, the verifying loader. |
 | `run.ts` | The harness and the `Ranker` interface U5 implements. |
 | `baselines.ts` | Two naive single-arm baselines and the gold oracle. |
-| `gates.ts` | R6's floors and R6a's margins, as data, plus the checker. |
+| `gates.ts` | R6's floors and R6a's margins, as data, plus the checker and the three-state classifier. |
 | `extraction.ts` | The rule-coverage baseline for R6's deterministic-extraction floor. |
 | `calibrate.ts` | Regenerates both receipts. |
 | `receipts/` | The committed R6a receipts. |
@@ -77,6 +78,47 @@ Read `receipts/README.md` for the tables. In summary:
 One open finding is recorded rather than resolved: the deterministic-extraction
 rule coverage is **exactly 0.80** against R6's 0.8 floor, so that floor is a
 knife edge on this corpus. See the `finding` field in the lower-bound receipt.
+
+## Which floors are provable today
+
+**Two of R6's five blocking floors are not currently being measured, and the
+suite says so on every run.** They are reported `deferred`: neither met nor
+quietly excused.
+
+| floor | state | why |
+|---|---|---|
+| aggregate nDCG@10 ≥ 0.65 | **met and enforced** | |
+| title-substring Hit@1 ≥ 0.95 | **met and enforced** | |
+| relational / named-entity / temporal / context-fenced nDCG@10 ≥ 0.65 | **met and enforced** | a mean has no probe responsible for it, so these can never be deferred |
+| alias Hit@1 ≥ 0.98 | **deferred** | two of the fourteen probes need semantic recall (`q-al-03`, `q-al-08`) |
+| dilution Hit@3 = 1.0 | **deferred** | two of the ten probes need semantic recall (`q-di-09`, `q-di-10`) |
+| deterministic extraction recall ≥ 0.8 | **not scored here** | it belongs to U6's extractor; the rule-coverage baseline is in the lower-bound receipt |
+
+**Why those four probes.** The committed vectors are synthetic (see the next
+section), so the vector arm is a second keyword arm. Each of the four has a gold
+answer this corpus offers no *keyed* path to: some content word the query
+supplies appears nowhere on the answer's page, and what the answer does carry is
+shared with at least as many other things as the metric has slots. The clearest
+case is `p-pilot-outcome`, the only page about the Windbreak pilot that never
+contains the word "Windbreak" — with lexical recall alone there is no route to
+it at all. The full derivation is `lexical-reach.ts`; the per-probe evidence is
+printed by the suite and recorded in the lower-bound receipt.
+
+**The deferral cannot rot.** It is conditional on `EmbeddingIndex.sources`,
+counted row by row from the manifest: one provider vector anywhere and every
+floor is enforced again, with no edit and nothing to remember. It is refused for
+any floor whose metric is a mean, for any floor with one reachable probe among
+its misses, and for any floor that would pass — a deferred floor at or above its
+bar is a `stale_deferral` violation. And the exact set is pinned in
+`test/core/search/floors.test.ts`, so a floor that starts or stops being deferred
+is red until somebody says so in writing.
+
+**What regenerating embeddings will change.** The four probes above become
+answerable by the vector arm — that is the whole point of the arm — and both
+floors are enforced at their full value, whatever it turns out to be. It may be
+lower than 0.98 and 1.0 on the first run; that is a real measurement of the stack
+and the honest place to start. Both R6a receipts must be recomputed at the same
+time, because the vector-arm baseline is a function of the vectors.
 
 ## Embeddings: what is real and what is a stand-in
 
@@ -130,6 +172,22 @@ running server. Their absence is a sequencing decision, not an oversight.
 - **Two pages are invisible on purpose** — one soft-deleted (R12), one
   quarantined (U9) — and both are strong lexical matches for live queries.
   Returning either is a *violation*, not a low score.
+- **A probe's `mechanisms` list is a claim, and it is checked behaviourally.**
+  `test/core/search/mechanism-sensitivity.test.ts` turns each named mechanism off
+  and re-grades the probe; a probe whose ranking is unchanged with all of them
+  off is not grading any of them, whatever its evidence sentence says. Twenty
+  probes are in that position and are listed there with reasons — ten
+  title-substring probes are answered by the alias ladder's exact-title rung
+  rather than by the title boost they name. The file also records that
+  `stack.corroboration-boost` cannot fire anywhere in this corpus, because no
+  fixture row carries an attestation kind that corroborates.
+- **The full-text stand-in recalls more than production does.** The fixture's
+  BM25 arm scores every chunk sharing any query term; production's
+  `websearch_to_tsquery` ANDs its terms and recalls only chunks carrying all of
+  them. These floors therefore flatter the fleet on multi-term queries — measured
+  at 0.8269 → 0.7616 aggregate, with the context-fenced floor going below its bar.
+  Recorded in the lower-bound receipt's threats to validity; closing it is stack
+  work rather than fixture work.
 - **The origin fence is the ranker's job, not the harness's.** The harness hands
   every ranker the whole corpus; the query carries its grant; a result outside it
   is counted, named and fatal at the gate. If the harness filtered, a ranker that

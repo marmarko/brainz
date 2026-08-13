@@ -42,8 +42,15 @@ import {
 import { HOSTED_PROFILE } from '../../../src/ai/routing.ts';
 import { fleetIdentity, type CallerIdentity } from '../../../src/control/secrets.ts';
 import { queryEncoding } from '../../../src/core/write/embed.ts';
-import { recall } from '../../../src/core/search/read.ts';
-import { EMBEDDING_DIMENSIONS, createSearchFixture, seedPage, type SearchFixture } from './fixture.ts';
+import { recall, recallArms } from '../../../src/core/search/read.ts';
+import {
+  EMBEDDING_DIMENSIONS,
+  createSearchFixture,
+  seedEntity,
+  seedFact,
+  seedPage,
+  type SearchFixture,
+} from './fixture.ts';
 
 const SETUP_TIMEOUT_MS = 180_000;
 const TEST_TIMEOUT_MS = 60_000;
@@ -197,6 +204,88 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
       });
       expect(response.degraded).toEqual(['embedding_unavailable']);
       expect(response.results).toEqual([]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+/**
+ * **A boost whose input nothing populates is a stage that does not exist.**
+ *
+ * `Candidate.entityIds` is documented at length in `types.ts` and read by two
+ * terms in `boosts.ts` — the graph-adjacency boost, and the title-phrase boost's
+ * residual-run rule. Every production call site of `arms.ts:toCandidate` took
+ * the parameter's `[]` default, so on the fleet both terms were inert while U7's
+ * eval adapter populated the field and graded them. Same failure class as the
+ * graph arm's missing relation key, one stage further down: the blocking tier
+ * measured a boost the fleet never applied.
+ *
+ * The wiring reuses the ladder lookup that has already been materialised — the
+ * mention rung's pages and the evidence rung's chunks are exactly the two halves
+ * `types.ts` describes — so it costs no extra query, and the two derivations of
+ * "does this row name the entity" stay one derivation.
+ */
+describe('the resolved entities reach the candidates the boosts score', () => {
+  test(
+    'a hydrated candidate carries the entities its page names, split by evidence grade',
+    async () => {
+      const barnacle = await seedEntity(sql, {
+        slug: 'adjacency-person',
+        name: 'Ptolemy Quillfeather',
+        type: 'person',
+        origins: ['personal:files'],
+      });
+      const [named, unnamed] = await seedPage(sql, {
+        id: 'p-adjacency',
+        title: 'Studio notes',
+        sourceType: 'note',
+        origin: 'personal:files',
+        createdAt: '2026-05-09',
+        paragraphs: [
+          'Ptolemy Quillfeather keeps the kiln at eleven hundred degrees.',
+          'The second paragraph names nobody at all and carries the number.',
+        ],
+      });
+      await seedFact(sql, {
+        statement: 'Ptolemy Quillfeather keeps the kiln at eleven hundred degrees.',
+        origins: ['personal:files'],
+        chunkIds: [named!],
+        createdAt: '2026-05-09',
+      });
+
+      const { gateway } = gatewayThat({ refuse: true });
+      const outcome = await recallArms({
+        sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        query: 'Ptolemy Quillfeather kiln',
+        grant: GRANT,
+        limit: 10,
+        now: new Date('2026-06-01T00:00:00Z'),
+      });
+
+      expect(outcome.resolvedEntityIds).toContain(barnacle);
+
+      const carrier = outcome.candidates.get(named!);
+      const sibling = outcome.candidates.get(unnamed!);
+
+      // Adjacency is chunk-granular: a paragraph that names nobody is evidence
+      // about nobody, and widening it to the page hands every paragraph of a
+      // profile the same lift as the row that answers the question.
+      expect(carrier?.entityIds).toContain(barnacle);
+      expect(sibling?.entityIds ?? []).not.toContain(barnacle);
+
+      // The page-level set is the separate one, for the title rule — a title is
+      // the page's, so the question "is this document about the subject" has to
+      // be asked of the document.
+      expect(carrier?.pageEntityIds).toContain(barnacle);
+      expect(sibling?.pageEntityIds).toContain(barnacle);
+
+      // Evidence is the strongest grade and narrower still: only the chunk the
+      // fact was extracted from carries it.
+      expect(carrier?.evidenceEntityIds).toContain(barnacle);
+      expect(sibling?.evidenceEntityIds ?? []).not.toContain(barnacle);
     },
     TEST_TIMEOUT_MS,
   );

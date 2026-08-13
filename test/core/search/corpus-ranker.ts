@@ -239,13 +239,29 @@ function indexOf(corpus: Corpus): CorpusIndex {
       );
     }
   }
+  // The page-level union, for the one stage that asks about the document rather
+  // than the paragraph: the title boost's residual rule. `read.ts` derives the
+  // same set from the ladder's page-granular mention rung. See
+  // `types.ts:Candidate.pageEntityIds`.
+  const pageEntities = new Map<string, Set<string>>();
+  for (const [pageId, chunkIds] of chunksByPage) {
+    const wholePage = new Set<string>();
+    for (const chunkId of chunkIds) {
+      for (const entityId of mentionsByChunk.get(chunkId) ?? []) wholePage.add(entityId);
+    }
+    pageEntities.set(pageId, wholePage);
+  }
+
   for (const [chunkId, entityIds] of mentionsByChunk) {
     const candidate = candidates.get(chunkId);
-    if (candidate === undefined || entityIds.size === 0) continue;
+    if (candidate === undefined) continue;
+    const pageLevel = pageEntities.get(candidate.pageId) ?? entityIds;
+    if (entityIds.size === 0 && pageLevel.size === 0) continue;
     candidates.set(chunkId, {
       ...candidate,
       entityIds: [...entityIds],
       evidenceEntityIds: [...(evidenceByChunk.get(chunkId) ?? [])],
+      pageEntityIds: [...new Set([...entityIds, ...pageLevel])],
     });
   }
 
@@ -471,10 +487,19 @@ function graphRanking(
   // The neighbourhood: entities one typed edge from a seed. The edge is fenced
   // by subset on the origins of the facts that produced it — `fence.ts:fenceRow`.
   const neighbours = new Set<string>();
-  // Facts that evidence an edge of the type the question asked about. "Where
-  // does Sam work" and "who does Sam work with" fan out over the same
-  // neighbourhood; `works_at` versus `collaborates_with` is what separates them.
-  const preferredFacts = new Set<string>();
+  // The endpoint pairs of every in-grant edge whose type the question asked
+  // about. "Where does Sam work" and "who does Sam work with" fan out over the
+  // same neighbourhood; `works_at` versus `collaborates_with` is what separates
+  // them.
+  //
+  // **Endpoints, not the edge's own fact ids.** `FixtureEdge.factIds` is a
+  // fixture-only field: the tenant schema has no fact→edge link, so a rule keyed
+  // on one has no SQL counterpart and this stand-in would be grading an arm the
+  // fleet could not run even in principle. What both substrates key on is the
+  // property a database can answer — a fact that names *both* endpoints of an
+  // asked-for edge is evidence for that relation. See `arms.ts:graphArm`'s
+  // `asked` CTE, which is this list.
+  const askedPairs: Array<readonly [string, string]> = [];
   const wanted = new Set(relations);
   for (const edge of corpus.edges) {
     if (!seedIds.has(edge.subject) && !seedIds.has(edge.object)) continue;
@@ -495,7 +520,7 @@ function graphRanking(
 
     neighbours.add(edge.subject);
     neighbours.add(edge.object);
-    if (wanted.has(edge.type)) for (const factId of edge.factIds) preferredFacts.add(factId);
+    if (wanted.has(edge.type)) askedPairs.push([edge.subject, edge.object] as const);
   }
 
   const touched = new Map<string, EntityIndexEntry>();
@@ -517,19 +542,21 @@ function graphRanking(
     superseded: boolean;
     at: number;
   }[] = [];
-  for (const [factId, fact] of corpus.facts) {
+  for (const [, fact] of corpus.facts) {
     const mentioned = mentionsIn(fact.statement, index.dictionary);
     const named = [...mentioned].filter((entityId) => touched.has(entityId));
     if (named.length === 0) continue;
 
+    const namedSet = new Set(named);
     const at = Date.parse(fact.validFrom);
     const multi = named.length > 1;
     const seedOnly = named.every((entityId) => seedIds.has(entityId));
+    const preferred = askedPairs.some(([a, b]) => namedSet.has(a) && namedSet.has(b));
     for (const chunkId of fact.sourceChunks) {
       if (!visible.has(chunkId)) continue;
       rows.push({
         chunkId,
-        preferred: preferredFacts.has(factId),
+        preferred,
         // The second hop. A fact naming only a *neighbour* is admitted, below
         // the seed's own — "Marc's shop location" is answered by a statement
         // about Kettle and Quill that never says Marcus, and a fan-out that

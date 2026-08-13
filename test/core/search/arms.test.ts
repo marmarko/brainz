@@ -59,6 +59,17 @@ const TEST_TIMEOUT_MS = 60_000;
 const PERSONAL = ['personal:mail', 'personal:files'];
 const WORK = ['work:mail', 'work:files'];
 
+/**
+ * What the plan says when no relational cue fired and the question is not a bare
+ * entity lookup — the graph arm's two ranking inputs at their least opinionated.
+ *
+ * Spelled out at every call site rather than defaulted inside `graphArm`,
+ * because a default is exactly how these two inputs came to exist in the eval
+ * adapter and nowhere else: the arm ranked one way for the fleet and another way
+ * for the blocking tier, and no type error said so.
+ */
+const NO_RELATION_PLAN = { relations: [] as readonly string[], seedFirst: false };
+
 /** 120 rows, so a 100-candidate pool is a real subset and 10 is a small one. */
 const LADDER_SIZE = 120;
 /** 1-based rank of the row the guard looks for: inside a 100 pool, outside a 10. */
@@ -300,18 +311,29 @@ describe('the graph arm', () => {
         entityIds: [verdant],
         grant: PERSONAL,
         limit: 10,
+        ...NO_RELATION_PLAN,
       });
       expect(walked.ranked).toContain(investorChunk!);
 
       // The same walk under a grant that does not hold the fact's origin.
-      const fenced = await graphArm(sql, { entityIds: [verdant], grant: WORK, limit: 10 });
+      const fenced = await graphArm(sql, {
+        entityIds: [verdant],
+        grant: WORK,
+        limit: 10,
+        ...NO_RELATION_PLAN,
+      });
       expect(fenced.ranked).toEqual([]);
     },
     TEST_TIMEOUT_MS,
   );
 
   test('no seed entities means no fan-out query at all', async () => {
-    const walked = await graphArm(sql, { entityIds: [], grant: PERSONAL, limit: 10 });
+    const walked = await graphArm(sql, {
+      entityIds: [],
+      grant: PERSONAL,
+      limit: 10,
+      ...NO_RELATION_PLAN,
+    });
     expect(walked.ranked).toEqual([]);
   });
 });
@@ -401,7 +423,12 @@ describe('the graph arm asks for a pool too, and walks two hops', () => {
         });
       }
 
-      const walked = await graphArm(sql, { entityIds: [hub], grant: PERSONAL, limit: 4 });
+      const walked = await graphArm(sql, {
+        entityIds: [hub],
+        grant: PERSONAL,
+        limit: 4,
+        ...NO_RELATION_PLAN,
+      });
       // With the pool arithmetic the arm asks for 100 and finds all 24; with a
       // bare limit it asks for 4 and RRF fuses a truncated universe.
       expect(walked.ranked.length).toBe(chunkIds.length);
@@ -476,12 +503,223 @@ describe('the graph arm asks for a pool too, and walks two hops', () => {
         createdAt: '2026-05-19',
       });
 
-      const walked = await graphArm(sql, { entityIds: [founder], grant: PERSONAL, limit: 10 });
+      const walked = await graphArm(sql, {
+        entityIds: [founder],
+        grant: PERSONAL,
+        limit: 10,
+        ...NO_RELATION_PLAN,
+      });
       // Reachable at all — this is the second hop.
       expect(walked.ranked).toContain(neighbourChunk!);
       // And ordered behind the seed's own statement despite being newer.
       expect(walked.ranked.indexOf(seedChunk!)).toBeLessThan(
         walked.ranked.indexOf(neighbourChunk!),
+      );
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The two ranking inputs the eval adapter implemented and the fleet did not.
+// ---------------------------------------------------------------------------
+
+/**
+ * **The blocking tier was grading a graph arm the fleet does not run.**
+ *
+ * `intent.ts` argues at length that `plan.relations` is load-bearing — "without
+ * this the graph arm ranks the neighbourhood by recency, and the most recently
+ * recorded relation wins whatever the question was" — and the same paragraph is
+ * true of the seed-first inversion an entity lookup wants. Both were implemented
+ * in `test/core/search/corpus-ranker.ts`, and neither reached `GraphArmRequest`,
+ * this SQL, or `read.ts`. That is the "stages exist twice" failure the module
+ * header of `arms.ts` claims the arms/post-retrieval split prevents, and every
+ * floor U7 published was measured against the version that only the eval ran.
+ *
+ * The two tests below are the arm's own guard for each term. Each one is a
+ * *comparison* rather than an assertion about the SQL text: the same walk is run
+ * twice, once with the term's input supplied and once without, and what is
+ * asserted is that the two orderings differ in the direction the term claims.
+ * Delete either `ORDER BY` term and the paired call collapses onto its control.
+ *
+ * **The relation term is keyed on the edge's endpoints, not on a fact→edge
+ * link.** The tenant schema has no such link — `entity_edge` carries no
+ * `fact_ids` column and there is no join table — so the eval adapter's original
+ * derivation (`edge.factIds`, a fixture-only field) had no SQL counterpart and
+ * could never have had one. What both substrates key on now is the property the
+ * database can actually answer: a fact that names *both* endpoints of an edge
+ * whose type the question asked about is evidence for that relation.
+ */
+describe('the graph arm ranks on the relation the question asked about', () => {
+  test(
+    'a fact evidencing the asked-for edge type outranks a newer fact about another edge',
+    async () => {
+      const person = await seedEntity(sql, {
+        slug: 'rel-analyst',
+        name: 'Ottoline Fairweather',
+        type: 'person',
+        origins: ['personal:files'],
+      });
+      const employer = await seedEntity(sql, {
+        slug: 'rel-employer',
+        name: 'Cobalt Meridian',
+        type: 'organization',
+        origins: ['personal:files'],
+      });
+      const investee = await seedEntity(sql, {
+        slug: 'rel-investee',
+        name: 'Pennyroyal Works',
+        type: 'organization',
+        origins: ['personal:files'],
+      });
+      await seedEdge(sql, {
+        subject: person,
+        type: 'works_at',
+        object: employer,
+        origins: ['personal:files'],
+      });
+      await seedEdge(sql, {
+        subject: person,
+        type: 'invested_in',
+        object: investee,
+        origins: ['personal:files'],
+      });
+
+      const [employmentChunk] = await seedPage(sql, {
+        id: 'p-rel-employment',
+        title: 'Team roster',
+        sourceType: 'note',
+        origin: 'personal:files',
+        createdAt: '2024-03-02',
+        paragraphs: ['Ottoline Fairweather works at Cobalt Meridian.'],
+      });
+      const [investmentChunk] = await seedPage(sql, {
+        id: 'p-rel-investment',
+        title: 'Cap table note',
+        sourceType: 'note',
+        origin: 'personal:files',
+        createdAt: '2026-07-30',
+        paragraphs: ['Ottoline Fairweather invested in Pennyroyal Works.'],
+      });
+      // The employment statement is the OLDER of the two, deliberately: with no
+      // relation term the ordering falls through to recency and the investment
+      // wins whatever was asked.
+      await seedFact(sql, {
+        statement: 'Ottoline Fairweather works at Cobalt Meridian.',
+        origins: ['personal:files'],
+        chunkIds: [employmentChunk!],
+        createdAt: '2024-03-02',
+      });
+      await seedFact(sql, {
+        statement: 'Ottoline Fairweather invested in Pennyroyal Works.',
+        origins: ['personal:files'],
+        chunkIds: [investmentChunk!],
+        createdAt: '2026-07-30',
+      });
+
+      // The control: no cue named a relation, so recency decides and the newest
+      // thing the neighbourhood asserted comes first.
+      const unasked = await graphArm(sql, {
+        entityIds: [person],
+        grant: PERSONAL,
+        limit: 10,
+        ...NO_RELATION_PLAN,
+      });
+      expect(unasked.ranked.indexOf(investmentChunk!)).toBeLessThan(
+        unasked.ranked.indexOf(employmentChunk!),
+      );
+
+      // "where does Ottoline work" — the cue table names `works_at`/`employs`,
+      // and the older statement that spans that edge is now the answer.
+      const asked = await graphArm(sql, {
+        entityIds: [person],
+        grant: PERSONAL,
+        limit: 10,
+        relations: ['works_at', 'employs'],
+        seedFirst: false,
+      });
+      expect(asked.ranked.indexOf(employmentChunk!)).toBeLessThan(
+        asked.ranked.indexOf(investmentChunk!),
+      );
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'seedFirst inverts the multi-entity ordering an entity lookup does not want',
+    async () => {
+      // "who is X" wants X's own statements; "who does X work with" wants the
+      // statement that spans the edge. Same fan-out, opposite priority — which is
+      // the intent plan doing work, and which the fleet could not express.
+      const subject = await seedEntity(sql, {
+        slug: 'sf-subject',
+        name: 'Perpetua Lindqvist',
+        type: 'person',
+        origins: ['personal:files'],
+      });
+      const other = await seedEntity(sql, {
+        slug: 'sf-other',
+        name: 'Halberd Foundry',
+        type: 'organization',
+        origins: ['personal:files'],
+      });
+      await seedEdge(sql, {
+        subject: subject,
+        type: 'works_at',
+        object: other,
+        origins: ['personal:files'],
+      });
+
+      const [aloneChunk] = await seedPage(sql, {
+        id: 'p-sf-alone',
+        title: 'Profile',
+        sourceType: 'note',
+        origin: 'personal:files',
+        createdAt: '2024-01-04',
+        paragraphs: ['Perpetua Lindqvist keeps bees on the roof.'],
+      });
+      const [spanChunk] = await seedPage(sql, {
+        id: 'p-sf-span',
+        title: 'Org note',
+        sourceType: 'note',
+        origin: 'personal:files',
+        createdAt: '2026-07-29',
+        paragraphs: ['Perpetua Lindqvist works at Halberd Foundry.'],
+      });
+      // The seed-only statement is the older one, so seed-first has to beat both
+      // the multi-entity key and recency for the assertion to mean anything.
+      await seedFact(sql, {
+        statement: 'Perpetua Lindqvist keeps bees on the roof.',
+        origins: ['personal:files'],
+        chunkIds: [aloneChunk!],
+        createdAt: '2024-01-04',
+      });
+      await seedFact(sql, {
+        statement: 'Perpetua Lindqvist works at Halberd Foundry.',
+        origins: ['personal:files'],
+        chunkIds: [spanChunk!],
+        createdAt: '2026-07-29',
+      });
+
+      const relational = await graphArm(sql, {
+        entityIds: [subject],
+        grant: PERSONAL,
+        limit: 10,
+        ...NO_RELATION_PLAN,
+      });
+      expect(relational.ranked.indexOf(spanChunk!)).toBeLessThan(
+        relational.ranked.indexOf(aloneChunk!),
+      );
+
+      const lookup = await graphArm(sql, {
+        entityIds: [subject],
+        grant: PERSONAL,
+        limit: 10,
+        relations: [],
+        seedFirst: true,
+      });
+      expect(lookup.ranked.indexOf(aloneChunk!)).toBeLessThan(
+        lookup.ranked.indexOf(spanChunk!),
       );
     },
     TEST_TIMEOUT_MS,

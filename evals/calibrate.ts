@@ -28,7 +28,8 @@
  */
 
 import { CORPUS, CORPUS_DIGEST, corpusTexts } from './corpus.ts';
-import { loadEmbeddings, SYNTHETIC_GENERATOR, SYNTHETIC_MODEL } from './embeddings.ts';
+import { loadEmbeddings, SYNTHETIC_GENERATOR, SYNTHETIC_MODEL, type EmbeddingIndex } from './embeddings.ts';
+import { probeReach } from './lexical-reach.ts';
 import { ruleCoverage } from './extraction.ts';
 import { QUESTION_TYPES } from './fixtures/types.ts';
 import {
@@ -52,7 +53,7 @@ export interface LowerBoundReceipt {
   readonly requirement: string;
   readonly corpus_digest: string;
   readonly embedding_manifest_digest: string;
-  readonly embedding_source: { readonly kind: string; readonly model: string; readonly generator: string };
+  readonly embedding_source: EmbeddingSource;
   readonly baselines: readonly { readonly name: string; readonly description: string }[];
   readonly rule: string;
   readonly rows: readonly CalibrationRow[];
@@ -63,7 +64,54 @@ export interface LowerBoundReceipt {
     readonly headroom: number;
     readonly finding: string;
   };
+  readonly semantic_reach: SemanticReach;
   readonly threats_to_validity: readonly string[];
+}
+
+/**
+ * What the vectors in the manifest actually are, **counted from its rows**.
+ *
+ * The previous shape of this field was the string `'synthetic'`, written into
+ * the receipt by hand. A hand-written claim about the fixture is a claim that
+ * keeps its value after it stops being true, and this one is load-bearing: the
+ * gate will only report a floor "not yet measurable" while the vectors really
+ * are a stand-in. So it is derived, here and in `evals/gates.ts`, from the same
+ * count.
+ */
+export interface EmbeddingSource {
+  readonly kind: 'synthetic' | 'provider' | 'mixed';
+  readonly synthetic: number;
+  readonly provider: number;
+  /** Present while any synthetic vector remains; they are reproducible from text. */
+  readonly model?: string;
+  readonly generator?: string;
+}
+
+/**
+ * Which gold answers this corpus offers **no keyed path** to, per all-or-nothing
+ * floor.
+ *
+ * A property of the fixture, not of any ranking: `evals/lexical-reach.ts` reads
+ * the corpus, the query and nothing else. It is recorded here so a reader can
+ * learn, without running anything, which of R6's floors this corpus can prove
+ * today and which of them are waiting on real embeddings — and so that a corpus
+ * edit which changes the answer has to change a committed receipt.
+ */
+export interface SemanticReach {
+  readonly note: string;
+  readonly rows: readonly {
+    readonly floorId: string;
+    readonly queryId: string;
+    readonly cutoff: number;
+    /** Answer chunks, or the chunks of a required duplicate group. */
+    readonly required: readonly string[];
+    /** Keys the query supplied that the answer's whole page cannot match. */
+    readonly uncovered: readonly string[];
+    /** How many other groups carry everything the answer carries. */
+    readonly dominators: number;
+  }[];
+  readonly blocked_probes: number;
+  readonly total_probes: number;
 }
 
 export interface UpperBoundReceipt {
@@ -97,6 +145,75 @@ export interface UpperBoundReceipt {
 
 function contextFor(manifest: string): RankerContext {
   return { corpus: CORPUS, embeddings: loadEmbeddings(manifest, corpusTexts(CORPUS)) };
+}
+
+function embeddingSourceOf(embeddings: EmbeddingIndex): EmbeddingSource {
+  const { synthetic, provider } = embeddings.sources;
+  const kind = provider === 0 ? 'synthetic' : synthetic === 0 ? 'provider' : 'mixed';
+  return {
+    kind,
+    synthetic,
+    provider,
+    ...(synthetic > 0 ? { model: SYNTHETIC_MODEL, generator: SYNTHETIC_GENERATOR } : {}),
+  };
+}
+
+/**
+ * The reach table: every probe of an all-or-nothing floor whose required answer
+ * the corpus offers no keyed path to.
+ *
+ * Hit floors ask about their answer chunks; the dilution floor asks about each
+ * required duplicate group separately, because a probe requiring two clusters
+ * can be blocked on one of them and trivially reachable on the other — which is
+ * exactly the shape of this corpus's pilot probes.
+ */
+function semanticReachOf(): SemanticReach {
+  const rows: Array<SemanticReach['rows'][number]> = [];
+  const blocked = new Set<string>();
+  let total = 0;
+
+  for (const query of CORPUS.queries) {
+    if (query.family === 'alias' || query.family === 'title_substring') {
+      total += 1;
+      const reach = probeReach(CORPUS, query, query.answers, 1);
+      if (!reach.semanticOnly) continue;
+      blocked.add(query.id);
+      rows.push({
+        floorId: `family.${query.family}.hit1`,
+        queryId: query.id,
+        cutoff: 1,
+        required: [...query.answers],
+        uncovered: reach.verdicts.flatMap((verdict) => [...verdict.uncovered]),
+        dominators: Math.min(...reach.verdicts.map((verdict) => verdict.dominators.length)),
+      });
+      continue;
+    }
+    if (query.family !== 'dilution') continue;
+    total += 1;
+    for (const group of query.requiredGroups ?? []) {
+      const chunks = [...CORPUS.chunks.keys()].filter((id) => CORPUS.groupOf(id) === group);
+      if (chunks.length === 0) continue;
+      const reach = probeReach(CORPUS, query, chunks, 3);
+      if (!reach.semanticOnly) continue;
+      blocked.add(query.id);
+      rows.push({
+        floorId: 'family.dilution.hit3',
+        queryId: query.id,
+        cutoff: 3,
+        required: chunks,
+        uncovered: reach.verdicts.flatMap((verdict) => [...verdict.uncovered]),
+        dominators: Math.min(...reach.verdicts.map((verdict) => verdict.dominators.length)),
+      });
+    }
+  }
+
+  return {
+    note:
+      "A probe is listed when the query supplied evidence the answer's whole page cannot match AND what the answer does carry is shared with at least as many other groups as the metric has slots. Under the committed synthetic vectors nothing can supply the missing half, so `evals/gates.ts` reports a floor these probes miss as `deferred` rather than met or failed. Regenerating the manifest from a real provider revokes every deferral automatically — the switch is the provider count in this receipt, not a constant anywhere.",
+    rows,
+    blocked_probes: blocked.size,
+    total_probes: total,
+  };
 }
 
 function valuesByFloor(report: EvalReport): Record<string, number> {
@@ -148,7 +265,7 @@ export function buildLowerBound(manifest: string): LowerBoundReceipt {
       'R6a: a naive single-arm baseline scores below each ranking floor by a committed numeric margin, so a later pass proves the stack rather than an easy corpus.',
     corpus_digest: CORPUS_DIGEST,
     embedding_manifest_digest: context.embeddings.manifestDigest,
-    embedding_source: { kind: 'synthetic', model: SYNTHETIC_MODEL, generator: SYNTHETIC_GENERATOR },
+    embedding_source: embeddingSourceOf(context.embeddings),
     baselines: NAIVE_BASELINES.map((ranker) => ({ name: ranker.name, description: ranker.description })),
     rule: 'For each floor, the STRONGEST value achieved by any naive arm must be <= (minimum - margin). Taking the strongest rather than a chosen arm removes the thumb from the scale.',
     rows,
@@ -161,12 +278,14 @@ export function buildLowerBound(manifest: string): LowerBoundReceipt {
       finding:
         'FLAGGED: the ceiling equals the floor exactly. R6 asks deterministic extraction for 0.8 recall and this corpus puts only 0.8 of its gold facts within reach of a rule, so U6\'s extractor would have to be perfect on every rule-reachable fact to clear the floor and one miss fails it. That is a knife edge, and it is a fixture property rather than an implementation one. Two ways out, both belonging to the gates half of this unit rather than to the corpus half: widen the deterministic rule families so more of the gold key is reachable, or re-scope the floor to recall-over-rule-reachable-facts, which is the quantity a deterministic extractor can actually be held to. Recorded rather than resolved here, because resolving it by reclassifying facts until the number looks comfortable is the exact failure R6a exists to prevent.',
     },
+    semantic_reach: semanticReachOf(),
     threats_to_validity: [
       'The committed vectors are synthetic (hashed lexical projections), so the vector-arm baseline is today a second lexical arm rather than an independent signal. When real embeddings land it will get stronger, the margin will narrow, and this receipt must be recomputed.',
       'A large share of the corpus\'s difficulty comes from a deliberate population of question-shaped chat and mail rows that lexically mirror the query set and answer nothing. That is a faithful property of conversational memory, but it means part of what the floors reward is telling a question from an answer (source-type priors, intent) rather than ranking alone.',
       'The dilution family draws ten queries from five duplicate clusters at two phrasings each. Two phrasings over one cluster is a weaker signal than two clusters would be.',
       'The corpus was authored to be hard for the naive arms measured here, which is what R6a asks for. It could not be tuned toward the ranking stack, because it was authored before U5 existed — that sequencing is the load-bearing part of U7\'s dependency line, not a convenience.',
       'The alias floor at 0.98 over 14 queries is arithmetically all-or-nothing; see the granularity note in evals/gates.ts.',
+      "The blocking tier's stand-in for the full-text arm scores every chunk sharing any query term, while production's `websearch_to_tsquery` ANDs its terms and recalls only chunks carrying all of them. The stand-in therefore recalls strictly more than the fleet does on multi-term queries, and these floors flatter production by that difference. Measured, not estimated: switching the stand-in to conjunctive recall moves the aggregate from 0.8269 to 0.7616 and takes the context-fenced floor below its bar. Closing it is stack work rather than fixture work and is not in this unit.",
     ],
   };
 }
@@ -249,7 +368,11 @@ function summaryMarkdown(lower: LowerBoundReceipt, upper: UpperBoundReceipt): st
   lines.push('');
   lines.push(`- corpus digest: \`${lower.corpus_digest}\``);
   lines.push(`- embedding manifest digest: \`${lower.embedding_manifest_digest}\``);
-  lines.push(`- embeddings: **${lower.embedding_source.kind}** (\`${lower.embedding_source.model}\`, generator \`${lower.embedding_source.generator}\`)`);
+  lines.push(
+    `- embeddings: **${lower.embedding_source.kind}** — ${lower.embedding_source.synthetic} synthetic` +
+      `${lower.embedding_source.generator === undefined ? '' : ` (\`${lower.embedding_source.model}\`, generator \`${lower.embedding_source.generator}\`)`}` +
+      `, ${lower.embedding_source.provider} from a provider. Counted from the manifest rows, not declared.`,
+  );
   lines.push('');
   lines.push('## Lower bound — the corpus is not trivial');
   lines.push('');
@@ -283,6 +406,30 @@ function summaryMarkdown(lower: LowerBoundReceipt, upper: UpperBoundReceipt): st
   lines.push('');
   lines.push(
     `Answerability audit: **${upper.answerability_audit.audited}/${upper.answerability_audit.total}** queries carry an evidence chain and at least one named stack mechanism.`,
+  );
+  lines.push('');
+  lines.push('## What these floors can prove today');
+  lines.push('');
+  lines.push(
+    `While the manifest is **${lower.embedding_source.kind}**, the vector arm carries lexical recall and nothing else. ` +
+      `${lower.semantic_reach.blocked_probes} of the ${lower.semantic_reach.total_probes} probes behind R6's three all-or-nothing floors ` +
+      'have a required answer this corpus offers no keyed path to: the query supplies evidence the answer\'s whole page ' +
+      'cannot match, and what the answer does carry is shared with at least as many other groups as the metric has slots. ' +
+      'A floor those probes miss is reported `deferred` by `evals/gates.ts` — neither met nor quietly excused — and the ' +
+      'suite prints the whole block on every run.',
+  );
+  lines.push('');
+  lines.push('| floor | probe | cutoff | query keys the answer cannot match | other groups carrying what it does |');
+  lines.push('|---|---|---|---|---|');
+  for (const row of lower.semantic_reach.rows) {
+    lines.push(
+      `| ${row.floorId} | \`${row.queryId}\` | ${row.cutoff} | ${row.uncovered.map((key) => `\`${key}\``).join(', ')} | ${row.dominators} |`,
+    );
+  }
+  lines.push('');
+  lines.push(
+    '**Regenerating the manifest from a real provider revokes every deferral**, automatically and without an edit: ' +
+      'the switch is the provider count above. Whatever the floors then read is what they read.',
   );
   lines.push('');
   lines.push('## Threats to validity');

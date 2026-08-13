@@ -131,6 +131,71 @@ describe('stage 6 — a run that is nothing but a resolved name is not a title m
   });
 });
 
+describe('stage 6 — a run that is nothing but the residual is not a title match either', () => {
+  // The mirror of the rule above, and the same double-count argument read from
+  // the other end. When the query resolved an entity, the name says *which
+  // subject* and the residual says *which of that subject's documents*. A
+  // partial run made only of the residual, on a page that does not name the
+  // subject at all, answers "which topic" — which both lexical arms already
+  // answered, out of the same tokens. See RESIDUAL_ONLY_RUN.
+  test('a topical title on a page that does not name the resolved entity earns no title credit', () => {
+    const topical = candidate('topical', {
+      title: 'Roast contract terms',
+      content: 'Green Harbour roasts the house blend weekly with a twelve month term.',
+    });
+    const answer = candidate('answer', {
+      title: 'Kettle and Quill supplier list',
+      content: 'Marcus Vandenberg renegotiates the roast contract every February.',
+      entityIds: ['marcus-vandenberg'],
+    });
+
+    const { order, scored } = scoreTwo('MV roast contract', topical, answer, {
+      resolvedEntityIds: ['marcus-vandenberg'],
+      resolvedNames: ['MV'],
+    });
+    expect(scored.find((s) => s.candidate.id === 'topical')?.boosts.title).toBe(0);
+    expect(order[0]).toBe('answer');
+  });
+
+  test('the same title on a page that DOES name the resolved entity still pays', () => {
+    // The confinement, and it is the whole rule: what is refused is a title run
+    // that matches the topic on a page with nothing to do with the subject asked
+    // about. A page about Marcus titled "Roast contract terms" is the document
+    // the user named.
+    const about = candidate('about', {
+      title: 'Roast contract terms',
+      content: 'Marcus Vandenberg signed the roast contract in February.',
+      entityIds: ['marcus-vandenberg'],
+    });
+    const other = candidate('other', { title: 'Something else', content: 'unrelated body' });
+    const { scored } = scoreTwo('MV roast contract', about, other, {
+      resolvedEntityIds: ['marcus-vandenberg'],
+      resolvedNames: ['MV'],
+    });
+    expect(scored.find((s) => s.candidate.id === 'about')?.boosts.title).toBeGreaterThan(0);
+  });
+
+  test('with nothing resolved the rule is inert — an ordinary title match still pays', () => {
+    const titled = candidate('titled', { title: 'Roast contract terms', content: 'body' });
+    const other = candidate('other', { title: 'Something else', content: 'body' });
+    const { scored } = scoreTwo('roast contract', titled, other);
+    expect(scored.find((s) => s.candidate.id === 'titled')?.boosts.title).toBeGreaterThan(0);
+  });
+
+  test('a title that IS the query is complete, and complete runs are untouched', () => {
+    // Same confinement as the resolved-name rule: a title that is the asked
+    // phrase is the user naming a document, whatever the phrase is made of and
+    // whoever the page is about.
+    const exact = candidate('exact', { title: 'MV roast contract', content: 'body' });
+    const other = candidate('other', { title: 'Something else', content: 'body' });
+    const { scored } = scoreTwo('MV roast contract', exact, other, {
+      resolvedEntityIds: ['marcus-vandenberg'],
+      resolvedNames: ['MV'],
+    });
+    expect(scored.find((s) => s.candidate.id === 'exact')?.boosts.title).toBeGreaterThan(0);
+  });
+});
+
 describe('stage 6 — the title-phrase boost', () => {
   test('an ordered phrase in the title beats a denser body decoy', () => {
     const titled = candidate('titled', {

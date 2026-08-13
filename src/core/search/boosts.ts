@@ -164,6 +164,38 @@ export const TITLE_FULL_PHRASE_BONUS = 0.5;
 export const RESOLVED_NAME_RUN = 'partial title runs made only of a resolved name earn no title credit';
 
 /**
+ * Why a **partial** title run made only of the *residual* earns nothing on a
+ * page that does not name the resolved entity.
+ *
+ * **The mirror of {@link RESOLVED_NAME_RUN}, and the same double-count read from
+ * the other end.** When the ladder resolves an entity, the query has two halves
+ * that do different jobs: the name says *which subject*, and the rest says
+ * *which of that subject's documents* — that split is already the ordering rule
+ * of two ladder rungs (`alias-hop.ts:rankByResidual`, `rankMentions`). A title
+ * run made only of the residual, on a page that names none of the resolved
+ * entities, matches the second half and contradicts the first. It is a *topic*
+ * match, and both lexical arms have already paid it out of exactly those tokens.
+ *
+ * Asked "MV roast contract", the corpus holds a document titled *Roast contract
+ * terms* about a supplier's schedule and never about Marcus, and a supplier list
+ * whose second paragraph states what Marcus does with that contract. The first
+ * takes a 107% envelope lift for matching two thirds of a query whose remaining
+ * third says the page is about somebody it never mentions.
+ *
+ * **Confined on both sides, and the confinement is the rule.** Complete runs are
+ * untouched — a title that *is* the asked phrase is the user naming a document,
+ * whoever it is about. And a page that *does* name a resolved entity keeps its
+ * credit in full: "Roast contract terms" on a page about Marcus is the document
+ * the user meant, and the title says so. What is refused is the fragment that
+ * matches the topic on a page with nothing to do with the subject.
+ *
+ * **It cannot fire when nothing resolved**, which is most queries: with no
+ * resolved entity there is no residual, no subject half, and no rule.
+ */
+export const RESIDUAL_ONLY_RUN =
+  'partial title runs carrying no resolved name earn no title credit on a page that names no resolved entity';
+
+/**
  * Function words a matched run may not consist *entirely* of.
  *
  * Without this the title boost fires on grammar: "who is Sam" against a page
@@ -334,6 +366,7 @@ function titleTerm(
   query: string,
   plan: RankingPlan,
   resolvedNameTokens: ReadonlySet<string>,
+  namesResolvedEntity: boolean,
 ): number {
   if (plan.exactMatchBoost === 0) return 0;
   const title = candidate.title;
@@ -364,6 +397,18 @@ function titleTerm(
     !complete &&
     resolvedNameTokens.size > 0 &&
     run.every((token) => resolvedNameTokens.has(token))
+  ) {
+    return 0;
+  }
+
+  // **And a run of pure residual is not a title match on a page that is not
+  // about the subject.** The other half of the same argument — see
+  // {@link RESIDUAL_ONLY_RUN}.
+  if (
+    !complete &&
+    resolvedNameTokens.size > 0 &&
+    !namesResolvedEntity &&
+    !run.some((token) => resolvedNameTokens.has(token))
   ) {
     return 0;
   }
@@ -475,16 +520,29 @@ export function applyBoosts(inputs: BoostInputs): ScoredCandidate[] {
   for (const [id, candidate] of inputs.candidates) {
     const fused = inputs.fused.get(id) ?? 0;
 
-    const title = titleTerm(candidate, inputs.query, inputs.plan, resolvedNameTokens);
+    // Two questions, one for each stage that asks one. The adjacency boost asks
+    // about the **chunk** — a paragraph naming nobody is evidence about nobody.
+    // The title rule asks about the **page**, because a title is the page's.
+    // See `types.ts:Candidate.pageEntityIds`.
+    const namesResolvedEntity =
+      resolved.size > 0 && candidate.entityIds.some((entityId) => resolved.has(entityId));
+    const pageNamesResolvedEntity =
+      resolved.size > 0 &&
+      (candidate.pageEntityIds ?? candidate.entityIds).some((entityId) => resolved.has(entityId));
+
+    const title = titleTerm(
+      candidate,
+      inputs.query,
+      inputs.plan,
+      resolvedNameTokens,
+      pageNamesResolvedEntity,
+    );
     const recency = recencyTerm(candidate, inputs.now, inputs.plan.recencyTilt);
     const sourceType = sourceTypeTerm(candidate, inputs.plan);
     const trust = trustTerm(candidate);
     const verdict = corroborationOf(candidate.attestations);
     const corroboration = verdict.corroborated ? corroborationBoost : 0;
-    const graph =
-      resolved.size > 0 && candidate.entityIds.some((entityId) => resolved.has(entityId))
-        ? graphAdjacencyBoost
-        : 0;
+    const graph = namesResolvedEntity ? graphAdjacencyBoost : 0;
     const restatement = restatementTerm(candidate, inputs.query, restatementPenalty);
 
     const envelope = Math.max(

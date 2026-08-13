@@ -32,7 +32,9 @@
  * what R6's last sentence says and what `evals/receipts/` carries.
  */
 
-import type { QueryFamily, QuestionType } from './corpus.ts';
+import type { Corpus, QueryFamily, QuestionType } from './corpus.ts';
+import type { EmbeddingIndex } from './embeddings.ts';
+import { probeReach, type ProbeReach } from './lexical-reach.ts';
 import type { EvalReport } from './run.ts';
 
 export type MetricId = 'ndcg@10' | 'hit@1' | 'hit@3' | 'dilution_hit@3';
@@ -188,7 +190,14 @@ export interface Measurement {
   readonly count: number;
 }
 
-export type ViolationKind = 'unmeasured' | 'insufficient_queries' | 'non_finite' | 'below_floor' | 'leak';
+export type ViolationKind =
+  | 'unmeasured'
+  | 'insufficient_queries'
+  | 'non_finite'
+  | 'below_floor'
+  | 'leak'
+  /** A floor marked not-yet-measurable that is now at or above its bar. */
+  | 'stale_deferral';
 
 export interface FloorViolation {
   readonly floorId: string;
@@ -325,6 +334,308 @@ export function checkFloors(
   }
 
   return { passed: violations.length === 0, violations, checked, measurements };
+}
+
+// ---------------------------------------------------------------------------
+// The third state: a floor that is neither met nor missed, because the fixture
+// cannot yet measure it.
+// ---------------------------------------------------------------------------
+
+/**
+ * **A gate that quietly excuses itself is worse than a red one**, so this is
+ * built to be impossible to abuse and impossible to forget.
+ *
+ * U7's committed vectors are synthetic (`evals/embeddings.ts`), so the vector
+ * arm carries lexical recall and nothing else. A probe whose answer the corpus
+ * offers no keyed path to is therefore not being measured — and saying so is
+ * honest exactly once and corrosive forever after. Five conditions keep it
+ * honest, and every one of them fails *toward enforcement*:
+ *
+ *   1. **Synthetic-only, counted from the manifest.** `EmbeddingIndex.sources`
+ *      counts the rows. One provider vector anywhere and nothing is deferred —
+ *      the deferral evaporates on its own the day real embeddings land, with
+ *      nobody remembering to remove anything.
+ *   2. **All-or-nothing floors only.** A mean has no probe responsible for it:
+ *      every query moves it, so "which probes caused the miss" has no answer and
+ *      the aggregate and per-type floors are always enforced. Only `hit@k` and
+ *      the dilution metric can be deferred.
+ *   3. **Every responsible probe must be eligible**, and eligibility is derived
+ *      by `evals/lexical-reach.ts` from the corpus — not from a list. One
+ *      isolable probe among the misses and the floor is MISSED, in full.
+ *   4. **A deferred floor that would pass is a violation** (`stale_deferral`).
+ *      A deferral nobody removed is how this becomes permanent, so the state is
+ *      only reachable while the measurement is genuinely below the bar.
+ *   5. **The evidence is carried, not asserted.** Every deferral names its
+ *      probes, the keys their gold could not match, and how many other things in
+ *      the corpus carry what it does. `test/core/search/floors.test.ts` prints
+ *      the whole block on every run and pins the exact set.
+ */
+export type FloorStatus = 'met' | 'missed' | 'deferred';
+
+export interface DeferredProbe {
+  readonly queryId: string;
+  /** Why this probe was on the hook: `hit@1` missed, or these groups crowded out. */
+  readonly detail: string;
+  readonly reach: ProbeReach;
+}
+
+export interface FloorOutcome {
+  readonly floorId: string;
+  readonly label: string;
+  readonly status: FloorStatus;
+  readonly value: number;
+  readonly minimum: number;
+  readonly count: number;
+  /** Populated only when `status` is `deferred`. */
+  readonly deferred?: {
+    readonly reason: string;
+    readonly probes: readonly DeferredProbe[];
+  };
+}
+
+export interface DeferralContext {
+  readonly corpus: Corpus;
+  readonly embeddings: EmbeddingIndex;
+}
+
+/**
+ * The rank a floor's metric reads, or `undefined` for the metrics that cannot be
+ * deferred at all.
+ *
+ * **Exported because condition 2 is otherwise only observable through a report
+ * that happens to exercise it.** A mutation making `ndcg@10` return a cutoff
+ * walks past any behavioural test whose blocked probes happen to be isolable at
+ * that cutoff; the structural claim — *a mean has no rank* — has to be assertable
+ * on its own.
+ */
+export function deferrableCutoffFor(metric: MetricId): number | undefined {
+  switch (metric) {
+    case 'hit@1':
+      return 1;
+    case 'hit@3':
+    case 'dilution_hit@3':
+      return 3;
+    case 'ndcg@10':
+      // A mean over every query. No probe is responsible for it — see condition
+      // 2 above — so it is never deferrable.
+      return undefined;
+  }
+}
+
+/** The queries a floor's measurement is taken over. */
+function probesFor(report: EvalReport, floor: RankingFloor): readonly EvalReport['perQuery'][number][] {
+  switch (floor.scope.kind) {
+    case 'aggregate':
+      return report.perQuery;
+    case 'type': {
+      const type = floor.scope.type;
+      return report.perQuery.filter((outcome) => outcome.type === type);
+    }
+    case 'family': {
+      const family = floor.scope.family;
+      return report.perQuery.filter((outcome) => outcome.family === family);
+    }
+  }
+}
+
+/**
+ * Classify one floor: met, missed, or not yet measurable.
+ *
+ * Returns `missed` for anything it cannot prove is deferrable, including every
+ * case where the report does not carry what it would need to decide. There is no
+ * branch here that reaches `deferred` by absence.
+ */
+export function classifyFloor(
+  report: EvalReport,
+  floor: RankingFloor,
+  context: DeferralContext,
+): FloorOutcome {
+  const measurement = measure(report, floor);
+  const base = {
+    floorId: floor.id,
+    label: floor.label,
+    value: measurement?.value ?? Number.NaN,
+    minimum: floor.minimum,
+    count: measurement?.count ?? 0,
+  };
+
+  if (
+    measurement === undefined ||
+    measurement.count < floor.minimumQueries ||
+    !Number.isFinite(measurement.value)
+  ) {
+    return { ...base, status: 'missed' };
+  }
+  if (measurement.value >= floor.minimum) return { ...base, status: 'met' };
+
+  // Condition 1. Counted from the manifest rows, never declared.
+  if (context.embeddings.sources.provider > 0) return { ...base, status: 'missed' };
+
+  // Condition 2.
+  const cutoff = deferrableCutoffFor(floor.metric);
+  if (cutoff === undefined) return { ...base, status: 'missed' };
+
+  // Condition 3. Every probe responsible for the miss must be one the corpus
+  // offers no keyed path to.
+  const responsible: DeferredProbe[] = [];
+  for (const outcome of probesFor(report, floor)) {
+    const query = context.corpus.queriesById.get(outcome.queryId);
+    if (query === undefined) return { ...base, status: 'missed' };
+
+    let required: readonly string[] = [];
+    let detail = '';
+    if (floor.metric === 'dilution_hit@3') {
+      if (outcome.dilutionHit3 !== 0) continue;
+      const chunks = outcome.missedGroups.flatMap((group) =>
+        [...context.corpus.chunks.keys()].filter((id) => context.corpus.groupOf(id) === group),
+      );
+      // A dilution miss with no named group is a metric that cannot say what it
+      // measured. Refuse rather than guess.
+      if (chunks.length === 0) return { ...base, status: 'missed' };
+      required = chunks;
+      detail = `required duplicate groups crowded out of the top 3: ${outcome.missedGroups.join(', ')}`;
+    } else {
+      const hit = floor.metric === 'hit@1' ? outcome.hit1 : outcome.hit3;
+      if (hit !== 0) continue;
+      required = query.answers;
+      detail = `no gold answer reached rank ${cutoff}`;
+    }
+
+    const reach = probeReach(context.corpus, query, required, cutoff);
+    if (!reach.semanticOnly) return { ...base, status: 'missed' };
+    responsible.push({ queryId: outcome.queryId, detail, reach });
+  }
+
+  // A floor below its bar with nothing responsible for it is arithmetic nobody
+  // understands. Enforce it.
+  if (responsible.length === 0) return { ...base, status: 'missed' };
+
+  return {
+    ...base,
+    status: 'deferred',
+    deferred: {
+      reason:
+        'the committed vectors are synthetic, so the vector arm carries lexical recall only; every probe below needs recall this corpus offers no keyed path to',
+      probes: responsible,
+    },
+  };
+}
+
+export interface ClassifiedGate {
+  readonly outcomes: readonly FloorOutcome[];
+  readonly deferrals: readonly FloorOutcome[];
+  readonly violations: readonly FloorViolation[];
+  readonly passed: boolean;
+}
+
+/**
+ * The whole gate, with the third state.
+ *
+ * A leak is still fatal on its own and still comes first: a stack that returned
+ * content the asking credential may not see has not scored badly, and no state
+ * of the fixture excuses it.
+ */
+export function classifyFloors(
+  report: EvalReport,
+  floors: readonly RankingFloor[] = RANKING_FLOORS,
+  context: DeferralContext,
+): ClassifiedGate {
+  if (floors.length === 0) {
+    throw new Error('classifyFloors was given no floors; an empty gate passes everything');
+  }
+
+  const violations: FloorViolation[] = [];
+  for (const violation of report.violations) {
+    violations.push({
+      floorId: 'visibility',
+      kind: 'leak',
+      detail: `${violation.queryId} returned ${violation.chunkId}: ${violation.detail}`,
+    });
+  }
+
+  const outcomes = floors.map((floor) => classifyFloor(report, floor, context));
+  violations.push(...violationsOf(outcomes));
+
+  return {
+    outcomes,
+    deferrals: outcomes.filter((outcome) => outcome.status === 'deferred'),
+    violations,
+    passed: violations.length === 0,
+  };
+}
+
+/**
+ * Turn classified outcomes into violations.
+ *
+ * Separated from {@link classifyFloors} for one reason: **condition 4 is
+ * otherwise unreachable and therefore untested.** `classifyFloor` only returns
+ * `deferred` below the bar, so a deferred-and-passing outcome cannot be produced
+ * through the public path — which is exactly why the check has to exist and
+ * exactly why it needs a seam a test can hand one to. An assertion nothing can
+ * trigger is an assertion nobody has shown to work.
+ */
+export function violationsOf(outcomes: readonly FloorOutcome[]): FloorViolation[] {
+  const violations: FloorViolation[] = [];
+  for (const outcome of outcomes) {
+    if (outcome.status === 'met') continue;
+    if (outcome.status === 'deferred') {
+      if (outcome.value >= outcome.minimum) {
+        violations.push({
+          floorId: outcome.floorId,
+          kind: 'stale_deferral',
+          detail: `${outcome.label} is ${outcome.value.toFixed(4)}, at or above its floor of ${outcome.minimum}, and is still deferred; remove the deferral`,
+          value: outcome.value,
+          minimum: outcome.minimum,
+        });
+      }
+      continue;
+    }
+    violations.push({
+      floorId: outcome.floorId,
+      kind: 'below_floor',
+      detail: `${outcome.label} is ${Number.isFinite(outcome.value) ? outcome.value.toFixed(4) : String(outcome.value)} over ${outcome.count} queries, below its floor of ${outcome.minimum}`,
+      value: outcome.value,
+      minimum: outcome.minimum,
+    });
+  }
+  return violations;
+}
+
+/** The deferral block, for the suite's output. One line per probe, every run. */
+export function renderDeferrals(gate: ClassifiedGate): string {
+  const lines: string[] = [];
+  const rule = '-'.repeat(78);
+  lines.push(rule);
+  if (gate.deferrals.length === 0) {
+    lines.push(' 0 floors deferred — every R6 floor below is being measured and enforced.');
+    lines.push(rule);
+    return lines.join('\n');
+  }
+
+  lines.push(
+    ` ${gate.deferrals.length} of ${gate.outcomes.length} R6 floors NOT YET MEASURABLE — the committed vectors are`,
+  );
+  lines.push(' synthetic (hashed lexical projections), so the vector arm is a second keyword');
+  lines.push(' arm. These floors are neither met nor enforced. Regenerate embeddings from a');
+  lines.push(' real provider and they enforce themselves again — see evals/README.md.');
+  for (const outcome of gate.deferrals) {
+    lines.push('');
+    lines.push(
+      ` [deferred] ${outcome.floorId}: ${outcome.value.toFixed(4)} against a floor of ${outcome.minimum}`,
+    );
+    for (const probe of outcome.deferred?.probes ?? []) {
+      lines.push(`   ${probe.queryId} — ${probe.detail}`);
+      for (const verdict of probe.reach.verdicts) {
+        lines.push(
+          `     ${verdict.chunkId}: query keys it cannot match [${verdict.uncovered.join(', ')}];` +
+            ` keys it carries [${verdict.carried.join(', ')}] are shared with ${verdict.dominators.length}` +
+            ` other group(s), against a cutoff of ${verdict.cutoff}`,
+        );
+      }
+    }
+  }
+  lines.push(rule);
+  return lines.join('\n');
 }
 
 export interface CalibrationRow {

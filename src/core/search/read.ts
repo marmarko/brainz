@@ -32,9 +32,11 @@ import { embedTexts, queryEncoding } from '../write/embed.ts';
 import { textArrayLiteral } from '../write/pg-values.ts';
 import {
   aliasLadderTiers,
+  mentionsIn,
   resolveEntities,
   type EntityRef,
   type LadderLookup,
+  type MentionKey,
   type PageRef,
 } from './alias-hop.ts';
 import { hydrate, readFtsLanguage, runArms } from './arms.ts';
@@ -130,7 +132,8 @@ export async function recall(request: RecallRequest): Promise<SearchResponse> {
 
 /** Everything up to the composition — the substrate half, for callers that need it. */
 export async function recallArms(request: RecallRequest): Promise<RecallOutcome> {
-  const lookup = await materialiseLadder(request.sql, request.query, request.grant);
+  const materialised = await materialiseLadder(request.sql, request.query, request.grant);
+  const { lookup } = materialised;
   const seeds = resolveEntities(request.query, lookup);
   const plan = refinePlan(
     planFor(classifyIntent(request.query)),
@@ -150,6 +153,11 @@ export async function recallArms(request: RecallRequest): Promise<RecallOutcome>
     ftsLanguage,
     entityIds: seeds.map((seed) => seed.entityId),
     useGraphArm: plan.useGraphArm,
+    // The plan's two graph-ranking inputs, carried rather than recomputed. Both
+    // reached U7's eval adapter and not this call for the whole of U5, which is
+    // how the blocking tier came to grade an arm the fleet does not run.
+    relations: plan.relations,
+    seedFirst: plan.intent === 'entity_lookup',
     queryVector: embedded.vector,
   });
 
@@ -165,6 +173,8 @@ export async function recallArms(request: RecallRequest): Promise<RecallOutcome>
       candidates.set(id, candidate);
     }
   }
+
+  attachAdjacency(candidates, materialised, seeds);
 
   return {
     plan,
@@ -187,6 +197,76 @@ export async function recallArms(request: RecallRequest): Promise<RecallOutcome>
   };
 }
 
+/**
+ * Attach the resolved entities each candidate is adjacent to.
+ *
+ * **Without this the graph-adjacency boost and the title boost's residual rule
+ * are inert on the fleet.** `arms.ts:toCandidate` defaults `entityIds` to `[]`
+ * and no production caller ever passed one, so two documented ranking terms read
+ * an empty array on every request while U7's eval adapter populated the field
+ * and graded them. That is the same defect as a ranking key that exists only in
+ * the eval, one stage further down the pipeline.
+ *
+ * **Three sets, because three stages ask three different questions.**
+ *
+ *   - `evidenceEntityIds` — this chunk is the source of a fact about the entity.
+ *     The strongest statement the stack has, and chunk-granular by nature.
+ *   - `entityIds` — this chunk names the entity, or evidences it. Chunk-granular
+ *     too: a paragraph that names nobody is evidence about nobody, and widening
+ *     it to the page lifts every paragraph of a profile above the row that
+ *     answers the question. Resolved **competitively**, over a dictionary of
+ *     every in-grant entity — `sam` is an alias of one person and the first
+ *     token of another's name, and a per-entity containment test attributes the
+ *     second one's sentence to the first (`alias-hop.ts:mentionsIn`).
+ *   - `pageEntityIds` — this chunk's *page* names the entity. Page-granular
+ *     because a title is the page's, and the title rule is the only stage that
+ *     reads it.
+ *
+ * Nothing here queries: every half comes off the already-materialised ladder
+ * lookup and the candidates' own text, so the derivations the rungs and the
+ * boosts share stay one derivation.
+ */
+function attachAdjacency(
+  candidates: Map<string, Candidate>,
+  materialised: MaterialisedLadder,
+  seeds: readonly EntityRef[],
+): void {
+  if (seeds.length === 0) return;
+  const { lookup, dictionary } = materialised;
+
+  const pageNamed = new Map<string, Set<string>>();
+  const evidenced = new Map<string, Set<string>>();
+  const add = (into: Map<string, Set<string>>, key: string, entityId: string): void => {
+    const set = into.get(key);
+    if (set === undefined) into.set(key, new Set([entityId]));
+    else set.add(entityId);
+  };
+
+  for (const seed of seeds) {
+    for (const page of lookup.pagesMentioning(seed.entityId)) {
+      add(pageNamed, page.pageId, seed.entityId);
+    }
+    for (const chunkId of lookup.evidenceFor(seed.entityId)) {
+      add(evidenced, chunkId, seed.entityId);
+    }
+  }
+
+  for (const [chunkId, candidate] of candidates) {
+    const mentioned = mentionsIn(candidate.content, dictionary);
+    const evidence = evidenced.get(chunkId) ?? new Set<string>();
+    const chunkLevel = new Set<string>([...evidence]);
+    for (const entityId of mentioned) chunkLevel.add(entityId);
+    const pageLevel = new Set<string>([...chunkLevel, ...(pageNamed.get(candidate.pageId) ?? [])]);
+
+    candidates.set(chunkId, {
+      ...candidate,
+      entityIds: [...chunkLevel],
+      evidenceEntityIds: [...evidence],
+      pageEntityIds: [...pageLevel],
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The ladder, over SQL.
 // ---------------------------------------------------------------------------
@@ -202,6 +282,18 @@ interface PageRow {
   readonly title: string | null;
   readonly chunk_ids: string[];
   readonly text: string;
+}
+
+/**
+ * The ladder's lookup plus the mention dictionary it was built from.
+ *
+ * The dictionary travels with the lookup because `attachAdjacency` needs the
+ * *same* one: a chunk's mentions and a rung's mentions answering to two
+ * dictionaries is the silent version of a routing bug.
+ */
+interface MaterialisedLadder {
+  readonly lookup: LadderLookup;
+  readonly dictionary: readonly MentionKey[];
 }
 
 /**
@@ -221,12 +313,18 @@ interface PageRow {
  * chunk the resolution then reaches is fenced on scalar membership. That split
  * is `fence.ts`'s, read back here rather than restated.
  */
-async function materialiseLadder(sql: SQL, query: string, grant: Grant): Promise<LadderLookup> {
+async function materialiseLadder(
+  sql: SQL,
+  query: string,
+  grant: Grant,
+): Promise<MaterialisedLadder> {
   const normalized = normalizeQuery(query);
   const queryTokens = tokens(query);
   const grantLiteral = textArrayLiteral(grant);
 
-  if (grant.length === 0 || queryTokens.length === 0) return EMPTY_LOOKUP;
+  if (grant.length === 0 || queryTokens.length === 0) {
+    return { lookup: EMPTY_LOOKUP, dictionary: [] };
+  }
 
   // Entities whose canonical name or any alias appears in the query, with the
   // name that matched travelling alongside — `intent.ts:resolutionOf` needs it.
@@ -287,7 +385,17 @@ async function materialiseLadder(sql: SQL, query: string, grant: Grant): Promise
     text: page.text,
   });
 
-  return {
+  // One dictionary over every in-grant entity's names, so a chunk's mentions
+  // resolve **competitively** rather than per entity. `sam` is a declared alias
+  // of one person and the first token of another's name; a per-entity check
+  // attributes the second one's sentence to the first. Same rule, same list, as
+  // the ladder's own — see `alias-hop.ts:mentionsIn`.
+  const dictionary: MentionKey[] = [];
+  for (const [entityId, entry] of byEntity) {
+    for (const key of entry.keys) dictionary.push({ key, entityId });
+  }
+
+  const lookup: LadderLookup = {
     pagesByTitle(key) {
       return pages.filter((page) => normalize(page.title ?? '') === key).map(refFor);
     },
@@ -323,6 +431,8 @@ async function materialiseLadder(sql: SQL, query: string, grant: Grant): Promise
       return pages.filter((page) => entityIdsByPage.get(page.page_id)?.has(entityId) === true).map(refFor);
     },
   };
+
+  return { lookup, dictionary };
 }
 
 /**

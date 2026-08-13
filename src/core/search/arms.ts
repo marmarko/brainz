@@ -356,6 +356,27 @@ export interface GraphArmRequest {
   readonly grant: Grant;
   readonly limit: number;
   readonly offset?: number;
+  /**
+   * The edge types the question asked about — `plan.relations`, verbatim.
+   *
+   * **Required, not optional, and that is the whole point of the field.** These
+   * two inputs existed in U7's eval adapter and nowhere else for the whole of
+   * U5: the blocking tier graded a graph arm that preferred the asked-for
+   * relation, and the fleet ran one that did not. An optional field with a
+   * silent default would let exactly that happen again, so a caller has to say
+   * what the plan said. Empty is the ordinary answer — most questions name no
+   * relation — and it is a statement rather than an absence.
+   */
+  readonly relations: readonly string[];
+  /**
+   * True when the question is an entity lookup ("who is Sam") rather than a
+   * relational one ("who does Sam work with").
+   *
+   * Same fan-out, opposite priority: a lookup wants the seed's *own* statements
+   * first, a relational question wants the statement that spans the edge. See
+   * the `ORDER BY` in {@link graphArm}.
+   */
+  readonly seedFirst: boolean;
 }
 
 /**
@@ -381,6 +402,24 @@ export interface GraphArmRequest {
  * would make the temporal probes unanswerable from this arm rather than merely
  * lower-ranked.
  *
+ * **Above both hops sits the relation the question asked about.** "Where does
+ * Sam work" and "who does Sam work with" resolve the same seed and fan out over
+ * the same neighbourhood; `works_at` versus `collaborates_with` is the only
+ * thing that separates them, and without it this arm ranks the neighbourhood by
+ * recency so the most recently recorded relation wins whatever was asked.
+ * `intent.ts` has argued that for as long as `plan.relations` has existed — and
+ * for as long as it existed, only U7's eval adapter implemented it. It is here
+ * now, keyed on the property the tenant schema can answer: **a fact that names
+ * both endpoints of an edge whose type the question asked about**. There is no
+ * fact→edge link in the schema (`entity_edge` carries no fact ids), so keying on
+ * one — which is what the adapter did, through a fixture-only field — is not a
+ * rule this database could ever have run.
+ *
+ * **{@link GraphArmRequest.seedFirst} inverts the multi-entity key**, because an
+ * entity lookup wants the opposite of what a relational question wants. Both
+ * spellings are one `CASE` in the `ORDER BY` rather than two statements, so the
+ * two orderings cannot drift apart.
+ *
  * **The fence is subset on facts and edges, scalar on chunks** — see
  * `fence.ts`. Entities resolve on intersect, which happens one stage earlier;
  * this arm never widens that.
@@ -397,12 +436,15 @@ export async function graphArm(
        SELECT unnest($2::bigint[]) AS entity_id
      ),
      neighbourhood AS (
-       SELECT e.subject_entity_id AS a, e.object_entity_id AS b
+       SELECT e.subject_entity_id AS a, e.object_entity_id AS b, e.edge_type
          FROM entity_edge e
         WHERE e.deleted_at IS NULL
           AND e.origin_contexts <@ $1::text[]
           AND (e.subject_entity_id IN (SELECT entity_id FROM seeds)
             OR e.object_entity_id IN (SELECT entity_id FROM seeds))
+     ),
+     asked AS (
+       SELECT n.a, n.b FROM neighbourhood n WHERE n.edge_type = ANY($4::text[])
      ),
      touched AS (
        SELECT entity_id FROM seeds
@@ -419,18 +461,36 @@ export async function graphArm(
            SELECT a.alias AS name FROM entity_alias a WHERE a.entity_id = t.entity_id
          ) n ON true
      ),
-     evidence AS (
-       SELECT f.fact_id,
-              f.created_at,
-              f.superseded_by,
-              max(CASE WHEN nm.entity_id IN (SELECT entity_id FROM seeds) THEN 1 ELSE 0 END) AS hits_seed,
-              count(DISTINCT nm.entity_id) AS entity_hits
+     -- One row per (fact, touched entity it names). Kept as rows rather than
+     -- collapsed straight to counts, because the relation key below has to ask
+     -- whether *two particular* entities are named by the same fact, which an
+     -- aggregate over names cannot answer.
+     matched AS (
+       SELECT f.fact_id, f.created_at, f.superseded_by, nm.entity_id
          FROM fact f
          JOIN names nm ON f.statement ILIKE '%' || nm.name || '%'
         WHERE f.deleted_at IS NULL
           AND f.quarantined_at IS NULL
           AND f.origin_contexts <@ $1::text[]
-        GROUP BY f.fact_id, f.created_at, f.superseded_by
+        GROUP BY f.fact_id, f.created_at, f.superseded_by, nm.entity_id
+     ),
+     evidence AS (
+       SELECT m.fact_id,
+              m.created_at,
+              m.superseded_by,
+              max(CASE WHEN m.entity_id IN (SELECT entity_id FROM seeds) THEN 1 ELSE 0 END) AS hits_seed,
+              count(*) AS entity_hits,
+              count(*) FILTER (WHERE m.entity_id IN (SELECT entity_id FROM seeds)) AS seed_hits,
+              max(CASE WHEN EXISTS (
+                    SELECT 1
+                      FROM asked k
+                     WHERE (k.a = m.entity_id
+                            AND k.b IN (SELECT o.entity_id FROM matched o WHERE o.fact_id = m.fact_id))
+                        OR (k.b = m.entity_id
+                            AND k.a IN (SELECT o.entity_id FROM matched o WHERE o.fact_id = m.fact_id))
+                  ) THEN 1 ELSE 0 END) AS asked_edge
+         FROM matched m
+        GROUP BY m.fact_id, m.created_at, m.superseded_by
      )
      SELECT ${CHUNK_COLUMNS}
        FROM evidence ev
@@ -438,8 +498,12 @@ export async function graphArm(
        JOIN chunk c ON c.chunk_id = fs.chunk_id
        LEFT JOIN page p ON p.page_id = c.page_id
       WHERE ${LIVE_AND_IN_GRANT}
-      ORDER BY (ev.hits_seed = 1) DESC,
-               (ev.entity_hits > 1) DESC,
+      ORDER BY (ev.asked_edge = 1) DESC,
+               (ev.hits_seed = 1) DESC,
+               CASE WHEN $5::boolean
+                    THEN (ev.entity_hits = ev.seed_hits)
+                    ELSE (ev.entity_hits > 1)
+               END DESC,
                (ev.superseded_by IS NULL) DESC,
                ev.created_at DESC,
                c.chunk_id
@@ -453,6 +517,8 @@ export async function graphArm(
       textArrayLiteral(request.grant),
       textArrayLiteral(request.entityIds),
       candidatePoolFor({ limit: request.limit, offset: request.offset ?? 0 }),
+      textArrayLiteral(request.relations),
+      request.seedFirst,
     ],
   )) as ChunkRow[];
 
@@ -479,6 +545,10 @@ export interface ArmDispatch {
   readonly ftsLanguage: string;
   readonly entityIds: readonly string[];
   readonly useGraphArm: boolean;
+  /** `plan.relations` — see {@link GraphArmRequest.relations}. */
+  readonly relations: readonly string[];
+  /** `plan.intent === 'entity_lookup'` — see {@link GraphArmRequest.seedFirst}. */
+  readonly seedFirst: boolean;
   /**
    * The query vector, or `null` when the embedding provider failed.
    *
@@ -552,6 +622,8 @@ export async function runArms(dispatch: ArmDispatch): Promise<ArmsOutcome> {
         grant: dispatch.grant,
         limit: dispatch.limit,
         ...(dispatch.offset === undefined ? {} : { offset: dispatch.offset }),
+        relations: dispatch.relations,
+        seedFirst: dispatch.seedFirst,
       }),
     );
   }

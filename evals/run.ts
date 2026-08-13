@@ -77,6 +77,34 @@ export interface Violation {
   readonly detail: string;
 }
 
+/**
+ * One query's outcome, kept alongside the means.
+ *
+ * **A mean cannot name the probe that missed**, and the gate has to: a floor is
+ * only ever "not yet measurable" when *every* probe responsible for the miss is
+ * one the corpus offers no keyed path to, which is a per-probe question. Carried
+ * for every ranker rather than only the stack's, so the baselines' receipts can
+ * be read the same way.
+ */
+export interface QueryOutcome {
+  readonly queryId: string;
+  readonly family: QueryFamily;
+  readonly type: QuestionType;
+  readonly ndcg10: number;
+  readonly hit1: number;
+  readonly hit3: number;
+  /** Only for the dilution family; `undefined` elsewhere, never a default. */
+  readonly dilutionHit3: number | undefined;
+  /**
+   * The required duplicate groups that had no member in the top 3.
+   *
+   * The dilution metric is all-or-nothing, so its 0 says nothing about *which*
+   * cluster was crowded out — and the deferral check needs exactly that, because
+   * eligibility is judged on the chunks of the groups that were actually missed.
+   */
+  readonly missedGroups: readonly string[];
+}
+
 export interface EvalReport {
   readonly ranker: string;
   readonly queryCount: number;
@@ -87,6 +115,8 @@ export interface EvalReport {
   readonly violations: readonly Violation[];
   /** Binds a report to the exact vectors it was produced against. */
   readonly embeddingManifestDigest: string;
+  /** Every query's own outcome, in corpus order. See {@link QueryOutcome}. */
+  readonly perQuery: readonly QueryOutcome[];
 }
 
 function mean(values: readonly number[]): number {
@@ -102,6 +132,7 @@ interface Scored {
   readonly hit3: number;
   readonly dilutionHit3: number | undefined;
   readonly duplicateOccupancy3: number;
+  readonly missedGroups: readonly string[];
 }
 
 /**
@@ -162,6 +193,20 @@ function scoreQuery(
   // empty map, so an unauthored gold key cannot become a silent zero.
   const relevance = corpus.relevanceFor(query.id);
 
+  // Which required clusters were crowded out. A leak forces the metric to zero
+  // below, and a leaked query has missed *every* required group by the same
+  // rule that zeroes its score — it did not answer the question it was asked.
+  const missedGroups =
+    query.family === 'dilution'
+      ? (query.requiredGroups ?? []).filter((group) => {
+          if (leaked) return true;
+          for (const chunkId of ranked.slice(0, 3)) {
+            if (corpus.groupOf(chunkId) === group) return false;
+          }
+          return true;
+        })
+      : [];
+
   if (leaked) {
     return {
       ndcg10: 0,
@@ -169,6 +214,7 @@ function scoreQuery(
       hit3: 0,
       dilutionHit3: query.family === 'dilution' ? 0 : undefined,
       duplicateOccupancy3: ranked.length === 0 ? 0 : duplicateOccupancyAt(ranked, (id) => corpus.groupOf(id), 3),
+      missedGroups,
     };
   }
 
@@ -183,6 +229,7 @@ function scoreQuery(
     hit3: hitAt(ranked, query.answers, 3),
     dilutionHit3: dilution,
     duplicateOccupancy3: ranked.length === 0 ? 0 : duplicateOccupancyAt(ranked, (id) => corpus.groupOf(id), 3),
+    missedGroups,
   };
 }
 
@@ -191,6 +238,7 @@ export function runEval(ranker: Ranker, context: RankerContext): EvalReport {
   const violations: Violation[] = [];
 
   const all: Scored[] = [];
+  const perQuery: QueryOutcome[] = [];
   const byType = new Map<QuestionType, Scored[]>();
   const byFamily = new Map<QueryFamily, Scored[]>();
   for (const type of QUESTION_TYPES) byType.set(type, []);
@@ -200,6 +248,16 @@ export function runEval(ranker: Ranker, context: RankerContext): EvalReport {
     const ranked = ranker.rank(query, context);
     const scored = scoreQuery(query, ranked, corpus, violations);
     all.push(scored);
+    perQuery.push({
+      queryId: query.id,
+      family: query.family,
+      type: query.type,
+      ndcg10: scored.ndcg10,
+      hit1: scored.hit1,
+      hit3: scored.hit3,
+      dilutionHit3: scored.dilutionHit3,
+      missedGroups: scored.missedGroups,
+    });
     byType.get(query.type)?.push(scored);
     byFamily.get(query.family)?.push(scored);
   }
@@ -245,5 +303,6 @@ export function runEval(ranker: Ranker, context: RankerContext): EvalReport {
     byFamily: familyReport,
     violations,
     embeddingManifestDigest: context.embeddings.manifestDigest,
+    perQuery,
   };
 }
