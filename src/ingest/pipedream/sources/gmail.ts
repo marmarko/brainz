@@ -37,6 +37,7 @@
  * the runner never mention Gmail.
  */
 
+import { normalizeAccountKey } from '../../cursor.ts';
 import type { JunkInput } from '../../junk.ts';
 import type { ProviderApi } from '../client.ts';
 import {
@@ -272,7 +273,7 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
     // Before the listing, always — see the header.
     let historyId = resume.deltaToken;
     // What the runner believes, until the profile says otherwise.
-    let accountKey = request.accountKey ?? null;
+    let accountKey = normalizeAccountKey(request.accountKey);
     if (historyId === null) {
       const profile = await api.request({
         app: APP,
@@ -286,7 +287,9 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
       historyId = asString(record?.historyId ?? null);
       // The same response already carries **which mailbox this is**. Dropping it
       // is what leaves a pulled message bound to nothing but a per-mailbox id.
-      accountKey = asString(record?.emailAddress ?? null) ?? accountKey;
+      // Normalised where it is observed, so one canonical spelling reaches the
+      // external ref, the connector state and the fence that compares them.
+      accountKey = normalizeAccountKey(asString(record?.emailAddress ?? null)) ?? accountKey;
     }
 
     const listed = await api.request({
@@ -335,7 +338,7 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
     const resume = readDeltaCursor(request.cursor);
     // A history walk does not re-observe the mailbox; it keys its refs by what
     // the first slice adopted, which is what the runner hands down here.
-    const accountKey = request.accountKey ?? null;
+    const accountKey = normalizeAccountKey(request.accountKey);
     const listed = await api.request({
       app: APP,
       method: 'GET',

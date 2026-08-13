@@ -734,6 +734,79 @@ describe('a page that could not be finished', () => {
     expect(dropped?.retryable).toBe(true);
   });
 
+  test('a pulled message is bound to the mailbox it came from', async () => {
+    // `users.getProfile` carries the address beside the history id, and this
+    // adapter used to read one and drop the other. Message ids are unique per
+    // *mailbox*: unbound, account B's colliding id arrives as an update to
+    // account A's page, under the same origin, where the tombstone fence
+    // cannot tell the two apart.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/users/me/profile', {
+      status: 200,
+      body: { historyId: '900', emailAddress: 'Owner@Example.test' },
+    });
+    transport.on('/users/me/messages?', { status: 200, body: { messages: [{ id: 'mb1' }] } });
+    transport.on('/messages/mb1', {
+      status: 200,
+      body: {
+        id: 'mb1',
+        internalDate: `${Date.UTC(2026, 6, 4)}`,
+        payload: { mimeType: 'text/plain', body: { data: base64url('a message in one mailbox') } },
+      },
+    });
+
+    const source = createGmailSource(client(transport));
+    const outcome = await source.list({
+      ...CONNECTION,
+      mode: 'backfill',
+      cursor: null,
+      since: SINCE,
+      maxItems: 10,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    // Normalised, because `Owner@` and `owner@` must not be two pages.
+    expect(outcome.page.accountKey).toBe('owner@example.test');
+    expect(outcome.page.items[0]?.externalRef).toBe(
+      externalRefFor('gmail', 'mb1', 'owner@example.test'),
+    );
+    expect(outcome.page.items[0]?.externalRef).not.toBe(externalRefFor('gmail', 'mb1'));
+  });
+
+  test('a delta keys its refs by the account the first slice adopted', async () => {
+    // A history walk does not re-observe the mailbox, so the runner hands the
+    // adopted identity down. Without it the delta writes unnamespaced refs and
+    // every update lands on a page the backfill never created.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/history?', {
+      status: 200,
+      body: {
+        historyId: '910',
+        history: [{ labelsAdded: [{ message: { id: 'md1' }, labelIds: ['TRASH'] }] }],
+      },
+    });
+
+    const source = createGmailSource(client(transport));
+    const outcome = await source.list({
+      ...CONNECTION,
+      accountKey: 'owner@example.test',
+      mode: 'delta',
+      cursor: '900',
+      since: null,
+      maxItems: 10,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.accountKey).toBe('owner@example.test');
+    expect(outcome.page.tombstones[0]?.externalRef).toBe(
+      externalRefFor('gmail', 'md1', 'owner@example.test'),
+    );
+  });
+
   test('a truncated drive change page is a delta cursor, and it replays against /changes', async () => {
     // A `backfill` kind here is read by `pullModeFor` as a first import, and the
     // backfill leg hands a changes-feed token to `/drive/v3/files` — a token the
