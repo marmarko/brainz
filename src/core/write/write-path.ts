@@ -176,21 +176,29 @@ interface ExistingPage {
   readonly pageId: string;
   readonly contentSha256: string;
   readonly chunkCount: number;
+  /** Whether the stored page is hidden. Half of the idempotency question. */
+  readonly quarantined: boolean;
 }
 
 async function livePageByRef(sql: SQL, externalRef: string): Promise<ExistingPage | null> {
   const rows = (await sql`
     SELECT p.page_id::text AS page_id, p.content_sha256,
+           (p.quarantined_at IS NOT NULL) AS quarantined,
            (SELECT count(*)::int FROM chunk c WHERE c.page_id = p.page_id AND c.deleted_at IS NULL) AS chunks
       FROM page p
      WHERE p.external_ref = ${externalRef} AND p.deleted_at IS NULL
      ORDER BY p.page_id DESC
      LIMIT 1
-  `) as Array<{ page_id: string; content_sha256: string; chunks: number }>;
+  `) as Array<{ page_id: string; content_sha256: string; quarantined: boolean; chunks: number }>;
   const row = rows[0];
   return row === undefined
     ? null
-    : { pageId: row.page_id, contentSha256: row.content_sha256, chunkCount: row.chunks };
+    : {
+        pageId: row.page_id,
+        contentSha256: row.content_sha256,
+        chunkCount: row.chunks,
+        quarantined: row.quarantined,
+      };
 }
 
 async function liveFactStatements(db: SQL, pageId: string): Promise<string[]> {
@@ -397,8 +405,18 @@ export async function ingestDocument(
   const digest = contentDigest(input.title, input.body);
   const externalRef = input.externalRef ?? null;
   const existing = externalRef === null ? null : await livePageByRef(ctx.sql, externalRef);
+  const quarantined = (input.quarantine ?? '').trim().length > 0;
 
-  if (existing !== null && existing.contentSha256 === digest) {
+  // **The digest is not the whole idempotency key; the verdict is the rest of
+  // it.** The junk verdict is reached from headers and labels, and the digest
+  // covers title and body — so a message re-classified between two pulls has an
+  // identical digest and a different visibility. Taking the unchanged shortcut
+  // on the digest alone makes the classification a one-way door: a page hidden
+  // once is hidden forever, its chunks never enter the embedding backlog, and
+  // the user's mail is unrecallable with no error anywhere. The reverse leaks
+  // just as quietly. A moved verdict therefore falls through and rewrites,
+  // which the receipt reports as `replaced`.
+  if (existing !== null && existing.contentSha256 === digest && existing.quarantined === quarantined) {
     // Idempotency, and it has to cost nothing: a poller re-reads the same items
     // on every cadence, and paying an embedding call for each is the whole
     // difference between a connector and a bill.
@@ -425,7 +443,6 @@ export async function ingestDocument(
   if (chunks.length === 0) return fail('empty_document');
 
   phases.enter('extract');
-  const quarantined = (input.quarantine ?? '').trim().length > 0;
   // A quarantined page contributes no facts, no entities and no edges: junk
   // that reaches the graph is junk every later phase reasons over.
   const facts = quarantined ? [] : extractFacts(chunks);
