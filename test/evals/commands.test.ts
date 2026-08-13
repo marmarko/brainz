@@ -20,13 +20,40 @@ import { describe, expect, test } from 'bun:test';
 
 const ROOT = new URL('../..', import.meta.url).pathname;
 
+/**
+ * The child's environment, with every gate variable stripped.
+ *
+ * **This is not tidiness.** `real-substrate.yml` runs `bun test` with
+ * `BRAINZ_REAL_SUBSTRATE=1` set, and two cases below assert that the scheduled
+ * tiers REFUSE without it. Inheriting the parent's environment would make those
+ * two assertions pass locally, pass in the PR job, and fail the moment the
+ * nightly workflow has a registered suite to run — a failure that arrives in a
+ * different job, weeks later, in the workflow whose whole purpose is to be
+ * believed. Stripping the credentials as well keeps the "no credentials in
+ * tests" constraint true for anything this file spawns, rather than true only
+ * for what it imports.
+ */
+function childEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  const stripped = new Set([
+    'BRAINZ_REAL_SUBSTRATE',
+    'BRAINZ_CANARY_TENANT',
+    'OPENAI_API_KEY',
+    'NEON_API_KEY',
+  ]);
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && !stripped.has(key)) env[key] = value;
+  }
+  return env;
+}
+
 async function run(script: string, args: readonly string[] = []) {
   const proc = Bun.spawn({
     cmd: ['bun', 'run', script, ...args],
     cwd: ROOT,
     stdout: 'pipe',
     stderr: 'pipe',
-    env: { ...process.env },
+    env: childEnv(),
   });
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -53,6 +80,7 @@ describe('a command still owned by a later unit stays loudly unimplemented', () 
       cwd: ROOT,
       stdout: 'pipe',
       stderr: 'pipe',
+      env: childEnv(),
     });
     const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     expect(exitCode).toBe(1);
@@ -60,7 +88,13 @@ describe('a command still owned by a later unit stays loudly unimplemented', () 
   });
 
   test('the router with no arguments is a usage error, not a pass', async () => {
-    const proc = Bun.spawn({ cmd: ['bun', 'run', 'scripts/not-yet.ts'], cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
+    const proc = Bun.spawn({
+      cmd: ['bun', 'run', 'scripts/not-yet.ts'],
+      cwd: ROOT,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: childEnv(),
+    });
     expect(await proc.exited).toBe(2);
   });
 });

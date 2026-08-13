@@ -309,8 +309,15 @@ describe('a delta that was never observed cannot certify anything', () => {
   });
 
   test('parseDelta requires a blocker on a blocked delta, and refuses one on an observed delta', () => {
+    // Asserted on the exact sentence, not on the word "blocker": the variable
+    // holding the raw value is called `blockerRaw`, so a TypeError from
+    // dereferencing it also contains the word, and a loose regex would let a
+    // deleted presence check pass while the parser crashed instead of refusing.
     const noBlocker = JSON.stringify({ ...blockedDelta(), blocker: undefined });
-    expect(() => parseDelta(noBlocker)).toThrow(/blocker/);
+    expect(() => parseDelta(noBlocker)).toThrow('a blocked delta must carry a blocker saying what stopped the run');
+
+    const notAnObject = JSON.stringify({ ...blockedDelta(), blocker: 'handshake' });
+    expect(() => parseDelta(notAnObject)).toThrow('a blocked delta must carry a blocker saying what stopped the run');
 
     const strayBlocker = JSON.stringify({
       ...delta([]),

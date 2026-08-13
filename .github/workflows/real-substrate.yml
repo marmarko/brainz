@@ -193,7 +193,9 @@ jobs:
         id: parity
         run: |
           set -euo pipefail
-          bun run eval:live-parity --preflight | tee -a "$GITHUB_OUTPUT"
+          # `--silent` so bun's own "$ bun run ..." banner can never land in
+          # GITHUB_OUTPUT, where a line that is not key=value fails the step.
+          bun run --silent eval:live-parity --preflight | tee -a "$GITHUB_OUTPUT"
 
       - name: Live-model parity
         if: steps.gate.outputs.ready == 'true' && steps.parity.outputs.samples != '0'
@@ -211,7 +213,7 @@ jobs:
         id: canary
         run: |
           set -euo pipefail
-          bun run eval:canary --preflight | tee -a "$GITHUB_OUTPUT"
+          bun run --silent eval:canary --preflight | tee -a "$GITHUB_OUTPUT"
 
       - name: Judged quality (canary tenant)
         # Non-blocking by contract — "nightly, non-blocking" in the Verification
