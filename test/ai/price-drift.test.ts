@@ -50,15 +50,52 @@ const CANONICAL_TABLE = 'src/ai/pricing.ts';
  * contains `rate`; `separator` nearly contains it; a substring match would
  * produce the kind of false positive that gets a guard deleted in a week.
  */
-const MONEY_WORDS: ReadonlySet<string> = new Set(['price', 'prices', 'cost', 'costs', 'usd', 'tariff', 'billing']);
+const MONEY_WORDS: ReadonlySet<string> = new Set([
+  'price',
+  'prices',
+  // `pricing` is not a form of `price` to a word-segment matcher, and it is the
+  // commonest way the second copy gets named: `flashPricing`, `pricingTable`.
+  'pricing',
+  'cost',
+  'costs',
+  'usd',
+  'tariff',
+  'billing',
+  // The words a contributor reaches for when they know `price` is spoken for.
+  'fee',
+  'fees',
+  'charge',
+  'charges',
+  'dollars',
+  'cents',
+  // `rate` is deliberately NOT here. A codebase has error rates, sample rates
+  // and hit rates, and a rule that fires on all of them is a rule someone
+  // deletes. It appears in {@link PRICE_CONTEXT} instead, where it only matters
+  // next to a number that is already a canonical price.
+]);
 
 /**
  * Vocabulary that says "this line is about money", used only for the value
  * rule. Deliberately narrower than {@link MONEY_WORDS}: `src/` is already full
  * of comments about cost and latency, and `0.5` is a plausible ranking weight,
  * so the value rule fires only next to an explicit unit.
+ *
+ * `MTok` is here because it is the unit the vendors' own pricing pages print,
+ * so it is the unit a copied price arrives wearing.
  */
-const PRICE_CONTEXT = /(price|usd|\$|per\s*million|\/\s*M\b)/i;
+const PRICE_CONTEXT = /(price|usd|\$|per\s*million|\/\s*M\b|m?tok(en)?s?\b|rate)/i;
+
+/**
+ * The context the *dollars-per-million* form needs, which is stricter than the
+ * micro-USD form's, because the two literals are not equally suspicious.
+ * `300_000` is a six-digit integer that happens to be a price; `0.5` is a price
+ * and also a threshold, a weight and half of everything. So the decimal form
+ * only counts next to an explicit unit — `$`, `per M`, `perMTok` — and never
+ * next to the looser words. Without this split, adding `rate` to the vocabulary
+ * above makes `const errorRate = 0.5` a price, and a guard that calls that a
+ * price does not survive its first week.
+ */
+const UNIT_CONTEXT = /(\$|per\s*_?m(illion|tok(en)?s?)?\b|\/\s*M\b)/i;
 
 /** Split an identifier into its camelCase / snake_case words. */
 export function identifierWords(identifier: string): string[] {
@@ -73,8 +110,15 @@ function namesMoney(identifier: string): boolean {
   return identifierWords(identifier).some((word) => MONEY_WORDS.has(word));
 }
 
-/** The unit a price is quoted in. Naming it is pricing. */
-const RATE_UNIT = /per_?million/i;
+/**
+ * The unit a price is quoted in. Naming it is pricing.
+ *
+ * Both spellings, because the vendors use one and this table uses the other:
+ * `perMillion` is what `pricing.ts` calls it, `perMTok` is what every pricing
+ * page prints, and a guard that knew only the first would watch a second copy
+ * be written in the vocabulary of the source it was copied from.
+ */
+const RATE_UNIT = /per_?m(illion|tok(en)?s?\b)/i;
 
 interface SourceFile {
   readonly path: string;
@@ -142,22 +186,33 @@ export function blankComments(source: string): string {
   return out.join('');
 }
 
-/** Every numeric literal the canonical table implies, in both quoted units. */
-export function canonicalPriceLiterals(): ReadonlySet<number> {
+/** The canonical prices as this table writes them: integer micro-USD. */
+function canonicalMicroLiterals(): ReadonlySet<number> {
   const values = new Set<number>();
   for (const price of CANONICAL_PRICING.values()) {
     for (const micro of [price.inputMicroUsdPerMillion, price.outputMicroUsdPerMillion]) {
-      if (micro === null) continue;
-      values.add(micro);
-      // The dollars-per-million form KTD13 prints, which is how a human copies
-      // a price out of the plan and into a constant.
-      values.add(micro / 1_000_000);
+      if (micro !== null) values.add(micro);
     }
   }
   // Zero and one are not prices in any useful sense; every file has them.
   values.delete(0);
   values.delete(1);
   return values;
+}
+
+/** The same prices in the dollars-per-million form KTD13 prints, which is how a
+ * human copies one out of the plan and into a constant. */
+function canonicalDollarLiterals(): ReadonlySet<number> {
+  const values = new Set<number>();
+  for (const micro of canonicalMicroLiterals()) values.add(micro / 1_000_000);
+  values.delete(0);
+  values.delete(1);
+  return values;
+}
+
+/** Every numeric literal the canonical table implies, in both quoted units. */
+export function canonicalPriceLiterals(): ReadonlySet<number> {
+  return new Set([...canonicalMicroLiterals(), ...canonicalDollarLiterals()]);
 }
 
 const ASSIGNMENT = /\b([A-Za-z_$][\w$]*)\s*[:=]\s*(-?\d[\d_]*(?:\.\d+)?)/g;
@@ -169,7 +224,8 @@ export function findPriceLiterals(
   exempt: readonly string[] = [CANONICAL_TABLE],
 ): Finding[] {
   const findings: Finding[] = [];
-  const canonical = canonicalPriceLiterals();
+  const micro = canonicalMicroLiterals();
+  const dollars = canonicalDollarLiterals();
 
   for (const file of files) {
     // Fail closed on binary first: every rule below is a text scan, and a scan
@@ -208,8 +264,10 @@ export function findPriceLiterals(
       for (const match of code.matchAll(ANY_NUMBER)) {
         const literal = match[0];
         const value = Number(literal.split('_').join(''));
-        if (!canonical.has(value)) continue;
-        if (!PRICE_CONTEXT.test(raw)) continue;
+        const matched = micro.has(value)
+          ? PRICE_CONTEXT.test(raw)
+          : dollars.has(value) && UNIT_CONTEXT.test(raw);
+        if (!matched) continue;
         findings.push({
           path: file.path,
           line,
@@ -324,6 +382,37 @@ describe('the drift guard goes red', () => {
   test('an ordinary timeout that happens to equal a price is not a finding', () => {
     const findings = findPriceLiterals(fixture('src/worker/jobs.ts', 'const TIMEOUT_MS = 3_000;\n'));
     expect(findings).toEqual([]);
+  });
+
+  test('every vocabulary a second copy plausibly wears is caught', () => {
+    // Each of these was written, run against the guard, and survived it. A
+    // guard is only worth what its evasions cost, and these cost one word.
+    const evasions: ReadonlyArray<readonly [string, string]> = [
+      ['the vendors\' own unit', 'export const EXTRACT_RATE_PER_MTOK = 300_000;\n'],
+      ['dollars in the vendors\' unit', 'export const FLASH_IN_PER_MTOK = 0.3;\n'],
+      ['a rate, by name', 'export const flashInputRate = 300_000;\n'],
+      ['pricing, which is not the word price', 'export const flashPricing = 300_001;\n'],
+      ['a fee', 'export const RERANK_FEE = 3_000;\n'],
+      ['a charge', 'export const EXTRACT_CHARGE = 299_999;\n'],
+      ['a re-declared rate unit', 'interface P { inputMicroUsdPerMTok: number }\n'],
+    ];
+    for (const [label, text] of evasions) {
+      const findings = findPriceLiterals(fixture('src/core/estimate.ts', text));
+      expect(findings.length, label).toBeGreaterThan(0);
+    }
+  });
+
+  test('the words that are not about money stay quiet', () => {
+    // `rate` earns its place in the vocabulary only if it does not fire on the
+    // half-dozen rates a codebase legitimately has.
+    for (const line of [
+      'const errorRate = 0.5;\n',
+      'const SAMPLE_RATE = 100;\n',
+      'let hitRate = 0;\n',
+      'const refreshIntervalMs = 300_000;\n',
+    ]) {
+      expect(findPriceLiterals(fixture('src/worker/jobs.ts', line)), line).toEqual([]);
+    }
   });
 
   test('the canonical table is exempt, and only the canonical table', () => {

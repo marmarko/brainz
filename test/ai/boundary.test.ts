@@ -82,15 +82,27 @@ const PROVIDER_SDKS: readonly string[] = [
 const ENDPOINT_MARKERS: readonly string[] = [
   'gateway.ai.cloudflare.com',
   'generativelanguage.googleapis.com',
+  'aiplatform.googleapis.com',
   'api.openai.com',
+  'openai.azure.com',
   'api.anthropic.com',
+  'bedrock-runtime.',
   'api.x.ai',
   'api.groq.com',
+  'api.deepseek.com',
+  'api.mistral.ai',
+  'api.fireworks.ai',
   'openrouter.ai',
   'api.together.xyz',
   '/ai/run/',
-  '/v1/chat/completions',
-  '/v1/embeddings',
+  // **Without the version segment**, which is the load-bearing detail. The
+  // gateway's own transport spells these paths exactly this way, and says why:
+  // the vendors disagree about where `/v1` sits, so the root is the part an
+  // operator configures. A marker that insisted on `/v1/` would therefore miss
+  // a bypass written in the style of the module it bypasses — the likeliest
+  // style there is, since that is the code a contributor copies from.
+  '/chat/completions',
+  '/embeddings',
   '/v1/messages',
   ':11434',
 ];
@@ -98,8 +110,17 @@ const ENDPOINT_MARKERS: readonly string[] = [
 /** A model id written at a call site. */
 const MODEL_ID_MARKER = '@cf/';
 
-/** The Workers AI binding: no import, no URL, still a model call. */
-const AI_BINDING = /\bAI\s*\.\s*run\s*\(/;
+/**
+ * The Workers AI binding: no import, no URL, still a model call. All the ways
+ * it is reached — `env.AI.run(…)`, `env['AI'].run(…)`, and the alias a
+ * destructure leaves behind (`const ai = env.AI`). The word boundary keeps it
+ * off `main.run(…)` and `openai.run(…)`, where the letters appear inside
+ * another identifier.
+ */
+const AI_BINDINGS: readonly RegExp[] = [
+  /\bAI\s*\.\s*run\s*\(/i,
+  /\[\s*['"]AI['"]\s*\]\s*\.\s*run\s*\(/i,
+];
 
 interface SourceFile {
   readonly path: string;
@@ -211,7 +232,7 @@ export function findProviderAccessOutsideGateway(files: readonly SourceFile[]): 
       );
     }
 
-    if (AI_BINDING.test(code)) {
+    if (AI_BINDINGS.some((pattern) => pattern.test(code))) {
       findings.push(
         `${file.path}: calls the platform AI binding directly — no routing, no price, no counter`,
       );
@@ -353,6 +374,40 @@ describe('the boundary guard goes red', () => {
     );
     expect(findings).toHaveLength(1);
     expect(findings[0]).toContain('platform AI binding');
+  });
+
+  test('every bypass written in the gateway\'s own style fails', () => {
+    // Each of these was written, run against the guard, and survived it. The
+    // first two are the ones that matter most: they are what a contributor
+    // produces by copying `gateway.ts`, which spells its paths without the
+    // version segment on purpose.
+    const evasions: ReadonlyArray<readonly [string, string]> = [
+      ['versionless chat path over a configured base', 'await fetch(`${base}/chat/completions`, init);\n'],
+      ['versionless embeddings path', "await fetch(base + '/embeddings', init);\n"],
+      ['the binding through an index', "await env['AI'].run(model, payload);\n"],
+      ['the binding through an alias', 'const ai = env.AI;\nawait ai.run(model, payload);\n'],
+      ['bedrock', "await fetch('https://bedrock-runtime.us-east-1.amazonaws.com/model/x/invoke', i);\n"],
+      ['azure openai', "await fetch('https://x.openai.azure.com/openai/deployments/y/chat', i);\n"],
+      ['vertex', "await fetch('https://us-central1-aiplatform.googleapis.com/v1/projects/x', i);\n"],
+      ['deepseek', "await fetch('https://api.deepseek.com/chat/completions', i);\n"],
+    ];
+    for (const [label, text] of evasions) {
+      const findings = findProviderAccessOutsideGateway(fixture('src/core/extract.ts', text));
+      expect(findings.length, label).toBeGreaterThan(0);
+    }
+  });
+
+  test('an ordinary route path is not a provider call', () => {
+    // The false positive the versionless markers could produce: this repo
+    // serves HTTP too, and `/messages` or `/embed` as a local route must not
+    // read as a model endpoint.
+    for (const line of [
+      "router.post('/messages', handler);\n",
+      "router.get('/embed', handler);\n",
+      "if (url.pathname === '/completions') return handler(request);\n",
+    ]) {
+      expect(findProviderAccessOutsideGateway(fixture('src/mcp/router.ts', line)), line).toEqual([]);
+    }
   });
 
   test('a file the scan cannot read as text fails, rather than being skipped', () => {

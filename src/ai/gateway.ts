@@ -10,14 +10,24 @@
  * false. Each is a guard that fails *open* unless it is built the other way
  * round, so each is stated as an ordering rule rather than a check:
  *
- *  1. **The cap is checked before the provider is called, never after.** A cap
- *     evaluated on the response is a receipt, not a limit. Both refusals that
- *     protect money — an unpriced model under an active cap, and an estimate
- *     that would exceed the remaining budget — return before the transport is
- *     touched, and the tests assert the transport was never reached.
+ *  1. **The estimate leaves the budget before the provider is called, and is
+ *     reconciled after.** Checking a counter and incrementing it later is not a
+ *     cap — it is a cap divided by the concurrency, because every call that
+ *     starts before the first one finishes reads the same empty budget. A phase
+ *     that fans out forty embeds overshoots forty-fold, and no sequential test
+ *     can see it. So a call takes a *reservation* out of the budget in one
+ *     synchronous step, before its first `await`, and settles it afterwards.
  *  2. **A missing signal is a failure, not a zero.** A provider that reports no
  *     usage is `usage_unreported`, never a free call. A model with no price is
  *     `price: unknown` with a `null` cost, never a cost of zero.
+ *  2a. **A call the provider ran but whose cost cannot be computed is charged at
+ *     its estimate.** This is rule 2 for the *ceiling* rather than the ledger,
+ *     and the two jobs pull opposite ways: the bill must never carry an invented
+ *     number, and the cap must never assume the cheapest one. A typed failure
+ *     that leaves the budget where it found it lets the same call be made
+ *     forever under a live cap — a provider whose usage block goes missing, or a
+ *     gateway returning 504 after the model ran, spends without limit and every
+ *     individual call looks like a well-handled error.
  *  3. **A metering write that fails takes the answer down with it.** Returning
  *     a completion whose cost was never recorded *is* the unmetered path. The
  *     completion is dropped instead; losing one answer is cheaper than losing
@@ -71,16 +81,52 @@ import {
 // Budgets.
 // ---------------------------------------------------------------------------
 
+/**
+ * Money taken out of a budget for a call that has not finished yet.
+ *
+ * The point of the type is that there is no way to spend without holding one,
+ * and no way to hold one without the cap having already been checked. A
+ * `wouldExceed()` followed later by a `commit()` reads correctly, tests
+ * correctly one call at a time, and lets N concurrent callers through a cap
+ * sized for one.
+ *
+ * Exactly one of the three closers runs; the rest are ignored, so a path that
+ * settles and then releases on the way out cannot double-count.
+ */
+export interface Reservation {
+  /** What was held. Zero when no price was available to estimate from. */
+  readonly estimateMicroUsd: number;
+  /** The call completed and cost this much. */
+  settle(actualMicroUsd: number): void;
+  /**
+   * The provider did the work and the cost cannot be computed. The estimate
+   * stands as the charge — see rule 2a: the ledger declines to invent a number,
+   * the ceiling declines to assume the cheapest one.
+   */
+  settleAtEstimate(): void;
+  /** The provider was never reached, or told us it did no work. */
+  release(): void;
+}
+
 export interface Budget {
   /** The phase this budget belongs to; carried into the typed failure. */
   readonly label: string;
   /** `null` means no cap. It does not mean "unlimited money" — it means the
    * caller has taken responsibility for the ceiling somewhere else. */
   readonly capMicroUsd: number | null;
+  /** Settled money: calls that finished. */
   spentMicroUsd(): number;
-  /** Would committing this much cross the cap? `false` when there is no cap. */
-  wouldExceed(estimateMicroUsd: number): boolean;
-  commit(microUsd: number): void;
+  /** Money held by calls in flight. Nonzero only while calls are outstanding. */
+  reservedMicroUsd(): number;
+  /**
+   * Take `estimateMicroUsd` out of what is left, or refuse. `null` is the
+   * refusal, and it is the only way this module learns a cap was reached.
+   *
+   * Synchronous on purpose, and called before the first `await` on the request
+   * path: that is what makes it atomic on a single-threaded runtime. An `async`
+   * reserve would reintroduce exactly the interleaving it exists to prevent.
+   */
+  reserve(estimateMicroUsd: number): Reservation | null;
 }
 
 export function createBudget(options: {
@@ -88,15 +134,38 @@ export function createBudget(options: {
   readonly capMicroUsd: number | null;
 }): Budget {
   let spent = 0;
+  let reserved = 0;
   const cap = options.capMicroUsd;
+
+  /** Negative or non-integer money is refused rather than trusted: it would
+   * otherwise be a way to give a budget back more than was taken from it. */
+  const countable = (amount: number): number =>
+    Number.isSafeInteger(amount) && amount > 0 ? amount : 0;
 
   return {
     label: options.label,
     capMicroUsd: cap,
     spentMicroUsd: () => spent,
-    wouldExceed: (estimate) => cap !== null && spent + estimate > cap,
-    commit: (microUsd) => {
-      spent += microUsd;
+    reservedMicroUsd: () => reserved,
+    reserve(estimateMicroUsd) {
+      const held = countable(estimateMicroUsd);
+      if (cap !== null && spent + reserved + held > cap) return null;
+      reserved += held;
+
+      let open = true;
+      const close = (charge: number): void => {
+        if (!open) return;
+        open = false;
+        reserved -= held;
+        spent += charge;
+      };
+
+      return {
+        estimateMicroUsd: held,
+        settle: (actual) => close(countable(actual)),
+        settleAtEstimate: () => close(held),
+        release: () => close(0),
+      };
     },
   };
 }
@@ -322,6 +391,9 @@ export type GatewayResult =
       readonly budgetLabel: string;
       readonly capMicroUsd: number;
       readonly spentMicroUsd: number;
+      /** Held by calls still in flight. A burst exhausts on this, not on spend,
+       * so a diagnosis that reads only `spentMicroUsd` sees a cap fire at zero. */
+      readonly reservedMicroUsd: number;
       readonly estimatedMicroUsd: number;
     }
   | { readonly ok: false; readonly reason: 'metering_unavailable'; readonly spentMicroUsd: number };
@@ -386,6 +458,26 @@ function estimateUsage(input: ModelInput, route: Route): TokenUsage {
   }
 }
 
+/**
+ * Did the provider tell us it did no work?
+ *
+ * The question is asked this way round on purpose. "Was it billed?" is
+ * unknowable from a status code, so the rule is conservative in the direction
+ * that protects money: a call is charged unless the provider said it never ran
+ * the model. A 4xx is that statement — a malformed request, a bad credential, a
+ * rate limit — with `408` excepted, because a request timeout is work that
+ * started. A 5xx, and a failure with no status at all (a socket that died, a
+ * fetch that hung, a bug in a transport), are all charged: none of them rules
+ * out a provider that accepted the request and metered it.
+ *
+ * The cost of being wrong is asymmetric and that is the whole argument. Charging
+ * for a call that was free stops a phase early. Releasing a call that was billed
+ * is an infinite loop with an invoice at the end of it.
+ */
+function providerRefusedBeforeWorking(status: number | null): boolean {
+  return status !== null && status >= 400 && status < 500 && status !== 408;
+}
+
 export function createModelGateway(options: ModelGatewayOptions): ModelGateway {
   const { profile, meter, keys, observer } = options;
   const now = options.now ?? Date.now;
@@ -441,18 +533,27 @@ export function createModelGateway(options: ModelGatewayOptions): ModelGateway {
         return { ok: false, reason: 'model_not_priced' };
       }
 
-      if (price !== undefined && budget.capMicroUsd !== null) {
-        const estimated = costMicroUsd(estimateUsage(input, route), price);
-        if (budget.wouldExceed(estimated)) {
-          return {
-            ok: false,
-            reason: 'budget_exhausted',
-            budgetLabel: budget.label,
-            capMicroUsd: budget.capMicroUsd,
-            spentMicroUsd: budget.spentMicroUsd(),
-            estimatedMicroUsd: estimated,
-          };
-        }
+      // The estimate is computed whether or not a cap is active: with no cap it
+      // has nothing to refuse, but it is still what an unknowable cost settles
+      // at, and a number that only exists when someone is watching is a number
+      // that rots.
+      const estimated = price === undefined ? 0 : costMicroUsd(estimateUsage(input, route), price);
+
+      // The last synchronous statement before the first `await`. Everything
+      // after this point can interleave with another call on the same budget;
+      // nothing before it can. That ordering is the cap.
+      const reservation = budget.reserve(estimated);
+      if (reservation === null) {
+        return {
+          ok: false,
+          reason: 'budget_exhausted',
+          budgetLabel: budget.label,
+          // Non-null by construction: `reserve` refuses only when a cap exists.
+          capMicroUsd: budget.capMicroUsd ?? 0,
+          spentMicroUsd: budget.spentMicroUsd(),
+          reservedMicroUsd: budget.reservedMicroUsd(),
+          estimatedMicroUsd: estimated,
+        };
       }
 
       const key = await resolveProviderKey({
@@ -464,10 +565,12 @@ export function createModelGateway(options: ModelGatewayOptions): ModelGateway {
         hosted: keys.hosted,
       });
       if (!key.ok) {
+        reservation.release();
         return { ok: false, reason: key.reason === 'scope_denied' ? 'scope_denied' : 'key_unavailable' };
       }
 
-      // --- From here the money is spent whatever happens next.
+      // --- From here the money is spent whatever happens next, so every exit
+      // below closes the reservation rather than dropping it.
 
       let response: TransportResponse;
       try {
@@ -483,13 +586,18 @@ export function createModelGateway(options: ModelGatewayOptions): ModelGateway {
           metadata: { op, tenantId, profile: profile.name, budgetLabel: budget.label },
         });
       } catch (error) {
+        const providerStatus = error instanceof TransportError ? error.status : null;
+        // A failed call is not a free call. A 504 arrives *after* the model ran
+        // and is billed; releasing its estimate turns a flapping provider into
+        // an unbounded retry loop under a live cap, with every individual
+        // attempt looking like a well-handled error. So the estimate stands
+        // unless the provider told us it did no work — which is what a 4xx
+        // says, 408 excepted, since a request timeout is work that started.
+        if (providerRefusedBeforeWorking(providerStatus)) reservation.release();
+        else reservation.settleAtEstimate();
         // The status, and nothing else. A provider that echoes the request in
         // its error body would otherwise write the user's words into a log.
-        return {
-          ok: false,
-          reason: 'transport_failed',
-          providerStatus: error instanceof TransportError ? error.status : null,
-        };
+        return { ok: false, reason: 'transport_failed', providerStatus };
       }
 
       let outcome: Exclude<
@@ -525,7 +633,11 @@ export function createModelGateway(options: ModelGatewayOptions): ModelGateway {
         if (wrong) outcome = 'embedding_dimension_mismatch';
       }
 
-      if (cost !== null) budget.commit(cost);
+      // Rule 2a. A cost we could compute is charged exactly; one we could not is
+      // charged at the estimate. The alternative — charging nothing — is what
+      // makes `usage_unreported` and `price_fault` repeatable without limit.
+      if (cost !== null) reservation.settle(cost);
+      else reservation.settleAtEstimate();
 
       const record: MeteringRecord = {
         tenantId,

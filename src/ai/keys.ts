@@ -276,9 +276,20 @@ export type KeyResolution =
  * credential would let it spend platform money on someone else's behalf. A
  * backend failure does not fall through either — it propagates, because "the
  * store is down" must never be flattened into "this tenant has no key".
+ *
+ * **The scope check is here, not only in the store.** Tier one is the one branch
+ * that never reaches the store, so a check that lived only inside
+ * {@link TenantProviderKeyStore.resolve} would leave the caller-supplied key as
+ * the single way to act as a tenant you do not serve: the call runs, and its
+ * cost is metered against that tenant's counter. Rule 1 of `secrets.ts` —
+ * "the scope check runs before the cache and before the backend" — is really
+ * "before anything", and a branch that skips the backend does not skip it.
  */
 export async function resolveProviderKey(request: ProviderKeyRequest): Promise<KeyResolution> {
   const { caller, tenantId, provider, explicitKey, store, hosted } = request;
+
+  if (!canResolve(caller, tenantId)) return { ok: false, reason: 'scope_denied' };
+  if (!isValidTenantId(tenantId)) return { ok: false, reason: 'invalid_tenant_id' };
 
   if (explicitKey !== undefined && explicitKey.length > 0) {
     return { ok: true, resolved: resolved(explicitKey, 'per-call') };
