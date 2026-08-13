@@ -361,3 +361,129 @@ describe('attestation classification (R12a input)', () => {
     TEST_TIMEOUT_MS,
   );
 });
+
+// ---------------------------------------------------------------------------
+// Guards a mutation run showed were missing.
+// ---------------------------------------------------------------------------
+
+describe('the graph arm asks for a pool too, and walks two hops', () => {
+  test(
+    'a fan-out returns more than the requested limit — it is a pool, not a page',
+    async () => {
+      // The mutation this kills: `candidatePoolFor({...})` -> `request.limit` in
+      // `graphArm`. The vector arm's identical mistake is guarded above; the
+      // graph arm's was not, and it had additionally been written out by hand as
+      // `max(limit * 5, 100)` — which silently dropped the offset, so page five
+      // of a fan-out was page one re-ranked. Every hazard guard stayed green.
+      const hub = await seedEntity(sql, {
+        slug: 'pool-hub',
+        name: 'Poolhub Industries',
+        type: 'organization',
+        origins: ['personal:files'],
+      });
+
+      const chunkIds: string[] = [];
+      for (let index = 0; index < 24; index += 1) {
+        const [chunkId] = await seedPage(sql, {
+          id: `p-pool-${index}`,
+          title: `Poolhub note ${index}`,
+          sourceType: 'note',
+          origin: 'personal:files',
+          createdAt: '2026-04-01',
+          paragraphs: [`Poolhub Industries note number ${index}.`],
+        });
+        chunkIds.push(chunkId!);
+        await seedFact(sql, {
+          statement: `Poolhub Industries recorded item ${index}.`,
+          origins: ['personal:files'],
+          chunkIds: [chunkId!],
+          createdAt: '2026-04-01',
+        });
+      }
+
+      const walked = await graphArm(sql, { entityIds: [hub], grant: PERSONAL, limit: 4 });
+      // With the pool arithmetic the arm asks for 100 and finds all 24; with a
+      // bare limit it asks for 4 and RRF fuses a truncated universe.
+      expect(walked.ranked.length).toBe(chunkIds.length);
+      expect(candidatePoolFor({ limit: 4 })).toBeGreaterThan(chunkIds.length);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a neighbour’s own fact is reachable, and still ranks below the seed’s',
+    async () => {
+      // Two properties in one walk, because they fail in opposite directions.
+      // Without the second hop the neighbour's chunk is unreachable — "Marc's
+      // shop location" is answered by a statement about the shop that never says
+      // his name. Without the seed-first ordering the newest thing the
+      // neighbourhood ever asserted outranks the seed's own statement, which is
+      // how a fan-out answers a question about a person with a stranger's job.
+      const founder = await seedEntity(sql, {
+        slug: 'hop-founder',
+        name: 'Hopfield Marchetti',
+        type: 'person',
+        origins: ['personal:files'],
+      });
+      const shop = await seedEntity(sql, {
+        slug: 'hop-shop',
+        name: 'Hopfield Provisions',
+        type: 'organization',
+        origins: ['personal:files'],
+      });
+      // A self-inverse type, because `edge_type_inverse_is_declared` is a
+      // foreign key onto the same table and a forward/inverse pair cannot be
+      // inserted without one of them dangling. Nothing in this walk depends on
+      // which type the edge carries — only that an edge exists.
+      await seedEdgeType(sql, 'affiliated_with', 'affiliated_with');
+      await seedEdge(sql, {
+        subject: founder,
+        type: 'affiliated_with',
+        object: shop,
+        origins: ['personal:files'],
+      });
+
+      const [seedChunk] = await seedPage(sql, {
+        id: 'p-hop-seed',
+        title: 'Hopfield Marchetti',
+        sourceType: 'note',
+        origin: 'personal:files',
+        createdAt: '2024-02-01',
+        paragraphs: ['Hopfield Marchetti keeps the ledgers himself.'],
+      });
+      const [neighbourChunk] = await seedPage(sql, {
+        id: 'p-hop-neighbour',
+        title: 'Relocation note',
+        sourceType: 'note',
+        origin: 'personal:files',
+        createdAt: '2026-05-19',
+        paragraphs: ['Hopfield Provisions is based in Bristol.'],
+      });
+
+      // The seed's own statement is the OLDER one, deliberately: with the
+      // seed-first key removed the ordering falls through to recency and the
+      // neighbour wins, which is exactly the mutation to catch.
+      await seedFact(sql, {
+        statement: 'Hopfield Marchetti keeps the ledgers.',
+        origins: ['personal:files'],
+        chunkIds: [seedChunk!],
+        createdAt: '2024-02-01',
+      });
+      await seedFact(sql, {
+        statement: 'Hopfield Provisions is based in Bristol.',
+        origins: ['personal:files'],
+        chunkIds: [neighbourChunk!],
+        createdAt: '2026-05-19',
+      });
+
+      const walked = await graphArm(sql, { entityIds: [founder], grant: PERSONAL, limit: 10 });
+      // Reachable at all — this is the second hop.
+      expect(walked.ranked).toContain(neighbourChunk!);
+      // And ordered behind the seed's own statement despite being newer.
+      expect(walked.ranked.indexOf(seedChunk!)).toBeLessThan(
+        walked.ranked.indexOf(neighbourChunk!),
+      );
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
