@@ -26,9 +26,11 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 
+import { HOSTED_PROFILE, IMAGE_INPUT_TOKENS } from '../../src/ai/routing.ts';
 import { acceptMedia, type AcceptMediaDeps } from '../../src/core/media/accept.ts';
 import { runTranscribePhase } from '../../src/core/media/ocr-phase.ts';
 import { runConsolidationCycle } from '../../src/worker/consolidate/cycle.ts';
+import { estimateCycle, measureWorkload } from '../../src/worker/consolidate/estimate.ts';
 import {
   CALLER,
   EMPTY_READER,
@@ -478,6 +480,77 @@ describe('what a stop leaves behind', () => {
       // brain.
       expect(harness.transport.callsFor('vision').length).toBe(1);
       expect(await ocrTextOf(attachmentId)).toBe('');
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe('the estimate knows there is work', () => {
+  test(
+    'the workload counts exactly what the phase would queue',
+    async () => {
+      const payloads = createPayloadStore();
+      await accept(payloads, {
+        mediaType: 'image/png',
+        bytes: screenshotBytes(),
+        externalId: 'estimate:pending',
+      });
+
+      const read = await accept(payloads, {
+        mediaType: 'image/png',
+        bytes: new Uint8Array([...screenshotBytes(), 1]),
+        externalId: 'estimate:already-read',
+      });
+      await tenant.sql`
+        UPDATE attachment SET ocr_text = 'done' WHERE attachment_id = ${read}::bigint
+      `;
+
+      const junk = await acceptMedia(acceptDeps(payloads), {
+        tenantId: TENANT,
+        caller: CALLER,
+        originContext: ORIGIN,
+        mediaType: 'image/png',
+        bytes: new Uint8Array([...screenshotBytes(), 2]),
+        externalId: 'estimate:junk',
+        quarantine: 'bulk',
+      });
+      if (!junk.ok) throw new Error('accept failed');
+
+      const workload = await measureWorkload(tenant.sql, { batch: 100 });
+      // One pending, and only one. A workload that counted the transcribed or
+      // the quarantined one would budget for calls the phase is forbidden to
+      // make — and the cap would look mysteriously generous rather than wrong.
+      expect(workload.transcribe?.items).toBe(1);
+      expect(workload.transcribe?.inputTokensPerItem).toBeGreaterThan(IMAGE_INPUT_TOKENS);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a brain with pending attachments budgets more for transcription than an empty one',
+    async () => {
+      const empty = estimateCycle({
+        profile: HOSTED_PROFILE,
+        workload: await measureWorkload(tenant.sql, { batch: 100 }),
+      });
+
+      const payloads = createPayloadStore();
+      await accept(payloads, {
+        mediaType: 'image/png',
+        bytes: screenshotBytes(),
+        externalId: 'estimate:budgeted',
+      });
+
+      const loaded = estimateCycle({
+        profile: HOSTED_PROFILE,
+        workload: await measureWorkload(tenant.sql, { batch: 100 }),
+      });
+
+      // Without this, a phase whose workload is never counted gets a cap of
+      // zero, refuses its first call, and reports `budget_exhausted` — which
+      // looks exactly like a tenant that ran out of money.
+      expect(loaded.perPhase.transcribe).toBeGreaterThan(empty.perPhase.transcribe);
+      expect(empty.perPhase.transcribe).toBe(0);
     },
     TEST_TIMEOUT_MS,
   );
