@@ -24,6 +24,17 @@
  *     searchable; {@link quarantineMarkerFor} returns `null` for them, which is
  *     the one line that keeps warned from collapsing into hidden.
  *
+ * **What `warned` does NOT get: a column.** U4's seam is one nullable marker
+ * whose only meaning is "quarantine this", and the tenant schema is U3's
+ * append-only ladder — a `junk_class` column is a rung, not a line here. So a
+ * warned item is stored exactly like ordinary mail (searchable, embedded) and
+ * the verdict survives in the pull's result and in the ingest-log disposition
+ * (`written`, with `items_quarantined` counting hidden items only). The
+ * consequence is stated rather than hidden: a caller cannot later ask the
+ * database "which pages were warned". Adding that is a rung whenever a surface
+ * needs it; inventing a marker that quarantines instead would trade a missing
+ * label for missing mail.
+ *
  * **The unknown reads clean, deliberately, and this is the one place in the
  * unit where the safe direction is *not* the closed one.** An item with no
  * headers — every calendar event, every Drive file, and any mail whose provider
