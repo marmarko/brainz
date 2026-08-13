@@ -356,6 +356,44 @@ describe('editing a page removes the edges it no longer states', () => {
     expect(await liveEdges()).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
+  test('it survives when the page that still states it typed the name differently', async () => {
+    // The test above states the claim with byte-identical typography on both
+    // pages, so it never exercises the question this module is built around:
+    // aliases are stored **normalized** and statements are stored **raw**, and
+    // "is this edge still implied" compares one against the other.
+    //
+    // Two pages, one claim, one keystroke apart — the first typed on a
+    // keyboard, the second arriving through a mail client that substitutes
+    // U+2019. `normalize` folds them to one key, which is the whole reason both
+    // resolve to a single entity rather than creating two. Reconciliation has to
+    // fold them the same way, or dropping the ASCII page silently deletes an
+    // edge the curly page still states, and "who does Ronan work with" answers
+    // with nothing the moment an unrelated page is edited.
+    await reset();
+    await write({
+      origin: 'personal',
+      ref: 'quote-1',
+      body: "Ronan O'Brien joined Verdant Systems.",
+    });
+    await write({
+      origin: 'work',
+      ref: 'quote-2',
+      body: 'Ronan O’Brien joined Verdant Systems.',
+    });
+    // One entity, one edge: the normalizer already did its job on the write side.
+    expect(await liveEdges()).toHaveLength(1);
+    expect((await liveEntities()).map((entity) => entity.name).sort()).toEqual([
+      "Ronan O'Brien",
+      'Verdant Systems',
+    ]);
+
+    await write({ origin: 'personal', ref: 'quote-1', body: 'A paragraph about nothing much.' });
+    expect(await liveEdges()).toHaveLength(1);
+
+    await write({ origin: 'work', ref: 'quote-2', body: 'Also a paragraph about nothing much.' });
+    expect(await liveEdges()).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
   test('leaving a job removes the employment edge without deleting the entities', async () => {
     await reset();
     await write({ origin: 'personal', ref: 'job-1', body: 'Dana Whitlock joined Northwind Labs.' });

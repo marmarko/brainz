@@ -45,7 +45,7 @@ import type { CallerIdentity } from '../../control/secrets.ts';
 import { EMBEDDING_DIMENSIONS } from '../../schema/vector-index.ts';
 import { CHUNKER_VERSION, chunkDocument, type Chunk } from './chunker.ts';
 import { classifyStatement, type DedupVerdict, type WriteStatus } from './dedup.ts';
-import { embedTexts, embeddingModelFor, vectorLiteral } from './embed.ts';
+import { embedTexts, knownEmbeddingModelFor, vectorLiteral } from './embed.ts';
 import { extractFacts, extractFromStatement, type ExtractedFact } from './extract.ts';
 import { NORMALIZER_VERSION } from './normalize.ts';
 import { textArrayLiteral } from './pg-values.ts';
@@ -80,7 +80,15 @@ export type WriteFailureReason =
   | 'unknown_source_type'
   | 'origin_missing'
   | 'tenant_not_configured'
-  | 'embed_failed';
+  | 'embed_failed'
+  /**
+   * Nothing was encoded — a document that stated no facts — and the gateway's
+   * profile is not one this process can look a model up by name. There is no
+   * honest value for `page.embedding_model`, and KTD8's fleet re-embed selects
+   * on exactly that column, so a guess would take a page out of the set that
+   * gets fixed. Typed, because every other refusal on this path is.
+   */
+  | 'embedding_model_unknown';
 
 export interface WriteFailure {
   readonly ok: false;
@@ -196,6 +204,30 @@ async function liveFactStatements(db: SQL, pageId: string): Promise<string[]> {
 
 function fail(reason: WriteFailureReason, detail?: string): WriteFailure {
   return detail === undefined ? { ok: false, reason } : { ok: false, reason, detail };
+}
+
+/**
+ * One item, on the run that fetched it. Every outcome an ingest run can have
+ * for an item passes through here, so "seen" cannot come to mean "written"
+ * again by a path that forgot to count itself.
+ *
+ * Outside the write transaction, deliberately: a counter is not worth holding
+ * a lock across, and a run whose count is one short is a smaller problem than a
+ * write that rolled back because its bookkeeping did.
+ */
+async function countIngestItem(
+  sql: SQL,
+  ingestId: string | null,
+  item: { readonly written: number; readonly quarantined: number },
+): Promise<void> {
+  if (ingestId === null) return;
+  await sql`
+    UPDATE ingest_log
+       SET items_seen = items_seen + 1,
+           items_written = items_written + ${item.written},
+           items_quarantined = items_quarantined + ${item.quarantined}
+     WHERE ingest_id = ${ingestId}::bigint
+  `;
 }
 
 interface CommitPlan {
@@ -370,6 +402,13 @@ export async function ingestDocument(
     // Idempotency, and it has to cost nothing: a poller re-reads the same items
     // on every cadence, and paying an embedding call for each is the whole
     // difference between a connector and a bill.
+    //
+    // It still counts as an item the run *saw*. That is the denominator an
+    // operator reads a connector's health out of, and this is a poller's most
+    // common outcome by a wide margin — so a counter that only advances when a
+    // row was written reports a run that saw nothing on the day it worked, and
+    // makes `items_seen` and `items_written` the same number forever.
+    await countIngestItem(ctx.sql, input.ingestId ?? null, { written: 0, quarantined: 0 });
     return {
       ok: true,
       status: 'unchanged',
@@ -419,6 +458,12 @@ export async function ingestDocument(
     );
   }
 
+  // What the gateway says it called, never a re-derivation from its profile's
+  // *name*: the two agree only for the shipped profiles, and the fallback is
+  // reached solely when nothing was encoded.
+  const modelId = embedded.modelId ?? knownEmbeddingModelFor(ctx.gateway.profileName);
+  if (modelId === null) return fail('embedding_model_unknown');
+
   const outcome = await commitWrite(
     ctx.sql,
     {
@@ -435,7 +480,7 @@ export async function ingestDocument(
       vectors: embedded.vectors,
       verdicts,
       settings,
-      modelId: embeddingModelFor(ctx.gateway.profileName),
+      modelId,
       replaces: existing === null ? null : existing.pageId,
     },
     phases,
@@ -444,15 +489,10 @@ export async function ingestDocument(
   phases.enter('commit');
   phases.assertComplete();
 
-  if (input.ingestId !== undefined && input.ingestId !== null) {
-    await ctx.sql`
-      UPDATE ingest_log
-         SET items_seen = items_seen + 1,
-             items_written = items_written + ${quarantined ? 0 : 1},
-             items_quarantined = items_quarantined + ${quarantined ? 1 : 0}
-       WHERE ingest_id = ${input.ingestId}::bigint
-    `;
-  }
+  await countIngestItem(ctx.sql, input.ingestId ?? null, {
+    written: quarantined ? 0 : 1,
+    quarantined: quarantined ? 1 : 0,
+  });
 
   return {
     ok: true,
@@ -549,6 +589,12 @@ export async function remember(
     };
   }
 
+  // `remember` always encodes exactly one text, so the gateway always has a
+  // record here and the by-name fallback is unreachable — but it is spelled the
+  // same way as ingestion's, because "unreachable" is a claim about today.
+  const modelId = embedded.modelId ?? knownEmbeddingModelFor(ctx.gateway.profileName);
+  if (modelId === null) return fail('embedding_model_unknown');
+
   const outcome = await commitWrite(
     ctx.sql,
     {
@@ -567,7 +613,7 @@ export async function remember(
       vectors: [vector],
       verdicts: [verdict],
       settings,
-      modelId: embeddingModelFor(ctx.gateway.profileName),
+      modelId,
       replaces: null,
     },
     phases,

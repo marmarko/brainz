@@ -337,52 +337,102 @@ function edgeKey(edge: { subjectId: string; objectId: string; edgeType: string }
   return `${subject}|${edge.edgeType}|${object}`;
 }
 
+/** How many live statements the reconciler reads before it stops asking and
+ * keeps the edge. See {@link stillImplied} for why the give-up answer is
+ * "keep". */
+export const RECONCILE_SCAN_LIMIT = 20_000;
+
+/** Rows per round trip on that scan. */
+const RECONCILE_SCAN_BATCH = 500;
+
 /**
  * Is this edge still asserted by some live fact?
  *
- * The candidate filter is a superset by construction: this extractor only
- * produces an edge between two names that both appear in the statement, so any
- * fact that could imply the edge must mention an alias of each endpoint. The
- * re-extraction then decides exactly, which is what keeps "an edge two pages
- * state survives one of them dropping it" from depending on string matching.
+ * **The filter is the normalizer, and it has to run where the normalizer
+ * lives.** The obvious implementation — probe the statements in SQL with
+ * `statement ILIKE '%' || alias || '%'` — reads as a harmless prefilter and is
+ * not one, because the two sides of that comparison are normalized differently:
+ * aliases are stored as {@link normalize} keys and statements are stored raw.
+ * The moment the surviving page spells a name the way a mail client does
+ * (`O’Brien`) and the alias holds the way a keyboard does (`o'brien`), the probe
+ * returns nothing, this function answers "no", and reconciliation **deletes an
+ * edge another live page still states**. It is silent — no error, no log, one
+ * fewer answer to "who does Ronan work with" — which is exactly the drift the
+ * normalizer's own docstring names as the failure with no symptom. A second
+ * normalizer written in SQL to close it would be that same failure one layer
+ * down, so the comparison is done here, in JavaScript, against the one module.
+ *
+ * **The scan is bounded, and running out is not a licence to delete.** Nothing
+ * links a fact to an edge — that is the schema's deliberate choice and the
+ * reason edges are recomputed rather than page-deleted — so the exact question
+ * is a scan over live statements. It stops at {@link RECONCILE_SCAN_LIMIT} and
+ * answers **true** when it does: an edge kept without proof is a stale answer
+ * the next edit reconsiders, and an edge deleted without proof is knowledge
+ * gone. The two are not symmetric, so the give-up branch takes the recoverable
+ * one.
  */
 async function stillImplied(db: SQL, edge: ResolvedEdge): Promise<boolean> {
-  const aliasesFor = async (entityId: string): Promise<string[]> => {
+  const keysFor = async (entityId: string): Promise<string[]> => {
     const rows = (await db`
       SELECT alias FROM entity_alias WHERE entity_id = ${entityId}::bigint
       UNION
       SELECT canonical_name FROM entity WHERE entity_id = ${entityId}::bigint
     `) as Array<{ alias: string }>;
-    return rows.map((row) => row.alias).filter((alias) => alias.trim().length > 0);
+    const keys = new Set<string>();
+    for (const row of rows) {
+      const key = normalize(row.alias);
+      if (key.length > 0) keys.add(key);
+    }
+    return [...keys];
   };
 
-  const subjectAliases = await aliasesFor(edge.subjectId);
-  const objectAliases = await aliasesFor(edge.objectId);
-  if (subjectAliases.length === 0 || objectAliases.length === 0) return false;
+  const subjectKeys = await keysFor(edge.subjectId);
+  const objectKeys = await keysFor(edge.objectId);
+  if (subjectKeys.length === 0 || objectKeys.length === 0) return false;
 
-  const candidates = (await db`
-    SELECT statement FROM fact
-     WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL
-       AND EXISTS (SELECT 1 FROM unnest(${textArrayLiteral(subjectAliases)}::text[]) a WHERE statement ILIKE '%' || a || '%')
-       AND EXISTS (SELECT 1 FROM unnest(${textArrayLiteral(objectAliases)}::text[]) b WHERE statement ILIKE '%' || b || '%')
-  `) as Array<{ statement: string }>;
+  const target = edgeKey(edge);
+  let after = '0';
+  let scanned = 0;
 
-  for (const candidate of candidates) {
-    const fact = extractFromStatement(candidate.statement);
-    if (fact === null) continue;
-    for (const implied of impliedEdges([fact])) {
-      const subject = await findEntityByName(db, implied.subject.name);
-      const object = await findEntityByName(db, implied.object.name);
-      if (subject === null || object === null) continue;
-      const key = edgeKey({
-        subjectId: subject.entityId,
-        objectId: object.entityId,
-        edgeType: implied.edgeType,
-      });
-      if (key === edgeKey(edge)) return true;
+  for (;;) {
+    const rows = (await db`
+      SELECT fact_id::text AS fact_id, statement FROM fact
+       WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL
+         AND fact_id > ${after}::bigint
+       ORDER BY fact_id
+       LIMIT ${RECONCILE_SCAN_BATCH}
+    `) as Array<{ fact_id: string; statement: string }>;
+    if (rows.length === 0) return false;
+
+    for (const row of rows) {
+      after = row.fact_id;
+      // The cheap half of the exact test: a statement that implies this edge
+      // must mention a name of each endpoint, and "mention" is a question about
+      // keys, not about bytes.
+      const key = normalize(row.statement);
+      if (!subjectKeys.some((name) => key.includes(name))) continue;
+      if (!objectKeys.some((name) => key.includes(name))) continue;
+
+      // Re-extraction is the decider, exactly as before: string overlap is a
+      // filter, never a verdict.
+      const fact = extractFromStatement(row.statement);
+      if (fact === null) continue;
+      for (const implied of impliedEdges([fact])) {
+        const subject = await findEntityByName(db, implied.subject.name);
+        const object = await findEntityByName(db, implied.object.name);
+        if (subject === null || object === null) continue;
+        const found = edgeKey({
+          subjectId: subject.entityId,
+          objectId: object.entityId,
+          edgeType: implied.edgeType,
+        });
+        if (found === target) return true;
+      }
     }
+
+    scanned += rows.length;
+    if (scanned >= RECONCILE_SCAN_LIMIT) return true;
   }
-  return false;
 }
 
 export interface ReconcileRequest {

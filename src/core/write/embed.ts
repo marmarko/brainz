@@ -34,7 +34,12 @@
  * shortly" is a statement someone can check. Quarantined and soft-deleted rows
  * are excluded, which is the junk gate's structural half (R16): a row the gate
  * marked never reaches the provider and never costs a call. The gate's
- * classifier is U9's.
+ * classifier is U9's — and because it runs *after* the write, and because R12's
+ * `forget` leg soft-deletes pages, the predicate reads **the page as well as the
+ * chunk**. Keying the gate on the chunk column alone makes it hold only while
+ * this module is the only writer: the day anything marks a page without also
+ * stamping every one of its chunks, the backfill hands the provider exactly the
+ * content the seam promises it never sees, and pays for it.
  */
 
 import type { SQL } from 'bun';
@@ -114,16 +119,34 @@ export function vectorLiteral(vector: readonly number[]): string {
 }
 
 /**
- * The model id the `embedding` op resolves to under a named profile — read from
- * the routing table rather than written down again, so `page.embedding_model`
- * cannot drift from what actually encoded the page. An unknown profile throws:
- * a default here would stamp every page with a model that never ran.
+ * The model id the `embedding` op resolves to under a **shipped** profile,
+ * looked up by name.
+ *
+ * This is a prediction, not a record, and the difference matters more than it
+ * looks. A gateway is constructed from a `NamedProfile`, not from a name — an
+ * operator serving embeddings from their own endpoint hands one in — so a
+ * profile *called* `hosted` need not route `embedding` where the shipped table
+ * routes it. Anything that can name what actually ran must therefore prefer
+ * {@link EmbedOutcome.modelId}, which the gateway reports from its own metering
+ * record. This function is the fallback for the one case that has no record: a
+ * document that stated no facts, so nothing was encoded at all.
+ *
+ * An unknown profile throws, because a default here would stamp every page with
+ * a model that never ran. {@link knownEmbeddingModelFor} is the non-throwing
+ * form, for the callers that have somewhere better to go than down.
  */
 export function embeddingModelFor(profileName: string): string {
-  const profile = PROFILES[profileName as RoutingProfileName];
-  if (profile === undefined) {
+  const modelId = knownEmbeddingModelFor(profileName);
+  if (modelId === null) {
     throw new Error(`no routing profile named '${profileName}'`);
   }
+  return modelId;
+}
+
+/** {@link embeddingModelFor}, answering `null` instead of throwing. */
+export function knownEmbeddingModelFor(profileName: string): string | null {
+  const profile = PROFILES[profileName as RoutingProfileName];
+  if (profile === undefined) return null;
   return routeFor(profile, EMBED_OP).id;
 }
 
@@ -136,7 +159,18 @@ export interface EmbedRequest {
 }
 
 export type EmbedOutcome =
-  | { readonly ok: true; readonly vectors: ReadonlyArray<readonly number[]>; readonly modelId: string }
+  | {
+      readonly ok: true;
+      readonly vectors: ReadonlyArray<readonly number[]>;
+      /**
+       * The model the gateway reports having called, from its own metering
+       * record — the only thing in this process that *knows* what encoded these
+       * vectors. Null when nothing was encoded, which is a document that stated
+       * no facts; a synthesized id there would be a provenance stamp for a call
+       * that never happened.
+       */
+      readonly modelId: string | null;
+    }
   | { readonly ok: false; readonly reason: string };
 
 /**
@@ -149,7 +183,7 @@ export type EmbedOutcome =
  */
 export async function embedTexts(request: EmbedRequest): Promise<EmbedOutcome> {
   if (request.texts.length === 0) {
-    return { ok: true, vectors: [], modelId: embeddingModelFor(request.gateway.profileName) };
+    return { ok: true, vectors: [], modelId: null };
   }
 
   const result = await request.gateway.call({
@@ -196,6 +230,7 @@ export async function pendingChunkEmbeddings(sql: SQL, limit: number): Promise<P
      WHERE c.embedding IS NULL
        AND c.deleted_at IS NULL
        AND c.quarantined_at IS NULL
+       AND (p.page_id IS NULL OR (p.deleted_at IS NULL AND p.quarantined_at IS NULL))
      ORDER BY c.chunk_id
      LIMIT ${Math.max(1, Math.trunc(limit))}
   `) as Array<{ chunk_id: string; content: string; title: string | null }>;
@@ -269,8 +304,10 @@ export async function runChunkEmbedBacklog(options: {
 export async function backlogSize(sql: SQL): Promise<number> {
   const rows = (await sql`
     SELECT count(*)::int AS pending
-      FROM chunk
-     WHERE embedding IS NULL AND deleted_at IS NULL AND quarantined_at IS NULL
+      FROM chunk c
+      LEFT JOIN page p ON p.page_id = c.page_id
+     WHERE c.embedding IS NULL AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
+       AND (p.page_id IS NULL OR (p.deleted_at IS NULL AND p.quarantined_at IS NULL))
   `) as Array<{ pending: number }>;
   return rows[0]?.pending ?? 0;
 }

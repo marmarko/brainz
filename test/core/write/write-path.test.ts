@@ -321,6 +321,67 @@ describe('the asynchronous half is resumable, not promised', () => {
     // gated before the provider call, which is the structural half U4 owns.
     expect(backfill.transport.calls).toHaveLength(0);
   }, TEST_TIMEOUT_MS);
+
+  test('a page quarantined after it was written takes its chunks with it', async () => {
+    // The test above quarantines at ingestion, when this module stamps the page
+    // **and** every chunk in one transaction — so it passes whether the backlog
+    // predicate reads the page or only the chunk. The gate that matters is the
+    // other one: U9's classifier runs *after* the write, and R12's `forget` leg
+    // soft-deletes pages. Either marks the page row. A backlog that keys on the
+    // chunk column alone then hands the provider exactly the content the seam
+    // promises it never sees — and being wrong here costs money and leaves junk
+    // vectors ranking, with nothing to point at.
+    await reset();
+    const harness = createGateway();
+    await ingestDocument(contextFor(harness), {
+      originContext: 'external',
+      sourceType: 'email',
+      title: 'Newsletter',
+      body: 'A paragraph with no extractable structure in it whatsoever.',
+    });
+    expect(await backlogSize(tenant.sql)).toBeGreaterThan(0);
+
+    await tenant.sql`UPDATE page SET quarantined_at = now()`;
+    expect(await backlogSize(tenant.sql)).toBe(0);
+    expect(await pendingChunkEmbeddings(tenant.sql, 100)).toHaveLength(0);
+
+    const backfill = createGateway();
+    const result = await runChunkEmbedBacklog({
+      sql: tenant.sql,
+      gateway: backfill.gateway,
+      tenantId: TENANT,
+      caller: CALLER,
+      budget: uncappedBudget('backfill'),
+    });
+    expect(result.embedded).toBe(0);
+    expect(backfill.transport.calls).toHaveLength(0);
+  }, TEST_TIMEOUT_MS);
+
+  test('a page soft-deleted after it was written takes its chunks with it', async () => {
+    await reset();
+    const harness = createGateway();
+    await ingestDocument(contextFor(harness), {
+      originContext: 'personal',
+      sourceType: 'note',
+      title: null,
+      body: 'A paragraph with no extractable structure in it whatsoever.',
+    });
+    expect(await backlogSize(tenant.sql)).toBeGreaterThan(0);
+
+    await tenant.sql`UPDATE page SET deleted_at = now()`;
+    expect(await backlogSize(tenant.sql)).toBe(0);
+
+    const backfill = createGateway();
+    const result = await runChunkEmbedBacklog({
+      sql: tenant.sql,
+      gateway: backfill.gateway,
+      tenantId: TENANT,
+      caller: CALLER,
+      budget: uncappedBudget('backfill'),
+    });
+    expect(result.embedded).toBe(0);
+    expect(backfill.transport.calls).toHaveLength(0);
+  }, TEST_TIMEOUT_MS);
 });
 
 describe('KTD8 end to end: a wrong-width provider writes nothing', () => {
@@ -466,6 +527,153 @@ describe('the provenance signature records what actually encoded the page', () =
     const used = new Set(harness.meter.records().map((record) => record.modelId));
     expect([...used]).toEqual([declared[0]?.embedding_model ?? '']);
   }, TEST_TIMEOUT_MS);
+
+  test('the page names the model that produced the vector, not the one a name lookup predicts', async () => {
+    // Both assertions above hold trivially under a shipped profile, where the
+    // gateway's own route and a lookup by profile *name* agree by construction.
+    // The gateway takes a `NamedProfile`, not a name — an operator serving
+    // embeddings from their own endpoint hands one in, and the two answers part
+    // company. The stamp is what KTD8's re-embed job selects on, so a stamp
+    // recovered by re-deriving from a name is a signature that identifies a
+    // model that never ran. The gateway already returns the one that did.
+    await reset();
+    const transport = createEmbeddingTransport();
+    const meter = createInMemorySpendMeter();
+    const gateway = createModelGateway({
+      profile: unpricedEmbeddingProfile(),
+      transport,
+      meter,
+      keys: {
+        store: createTenantProviderKeyStore({ backend: createInMemoryProviderKeyBackend() }),
+        hosted: createHostedKeyPool({
+          openai: 'k',
+          google: 'k',
+          cloudflare: 'k',
+          'self-host': 'k',
+        }),
+      },
+    });
+
+    const receipt = await ingestDocument(
+      {
+        sql: tenant.sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        budget: uncappedBudget('operator'),
+      },
+      {
+        originContext: 'personal',
+        sourceType: 'document',
+        title: 'Verdant Systems',
+        body: DOCUMENT,
+      },
+    );
+    expect(receipt.ok).toBe(true);
+
+    const used = new Set(meter.records().map((record) => record.modelId));
+    expect([...used]).toEqual(['self-host/embed-1']);
+
+    const rows = (await tenant.sql`SELECT embedding_model FROM page`) as Array<{
+      embedding_model: string;
+    }>;
+    expect(rows[0]?.embedding_model).toBe('self-host/embed-1');
+  }, TEST_TIMEOUT_MS);
+
+  test("an operator's own profile name does not take the write down after the provider was paid", async () => {
+    // The same re-derivation, in its louder form. `embeddingModelFor` throws on
+    // a name outside the two shipped profiles — and it is called *after* the
+    // embedding call has been made and metered, so the write dies with an
+    // untyped throw, having already spent the money, and the caller gets an
+    // exception where every other failure on this path is a typed result.
+    await reset();
+    const transport = createEmbeddingTransport();
+    const meter = createInMemorySpendMeter();
+    const gateway = createModelGateway({
+      profile: { ...unpricedEmbeddingProfile(), name: 'operator-a' },
+      transport,
+      meter,
+      keys: {
+        store: createTenantProviderKeyStore({ backend: createInMemoryProviderKeyBackend() }),
+        hosted: createHostedKeyPool({
+          openai: 'k',
+          google: 'k',
+          cloudflare: 'k',
+          'self-host': 'k',
+        }),
+      },
+    });
+
+    const receipt = await ingestDocument(
+      {
+        sql: tenant.sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        budget: uncappedBudget('operator'),
+      },
+      {
+        originContext: 'personal',
+        sourceType: 'document',
+        title: 'Verdant Systems',
+        body: DOCUMENT,
+      },
+    );
+
+    // The provider ran and was metered before the throw — the money is gone
+    // either way, so the only question is whether the write survives it.
+    expect(meter.records()).toHaveLength(1);
+    expect(receipt.ok).toBe(true);
+    expect(await countRows(tenant.sql, 'page')).toBe(1);
+
+    const rows = (await tenant.sql`SELECT embedding_model FROM page`) as Array<{
+      embedding_model: string;
+    }>;
+    expect(rows[0]?.embedding_model).toBe('self-host/embed-1');
+  }, TEST_TIMEOUT_MS);
+
+  test('a document that encoded nothing under an unknown profile refuses, typed', async () => {
+    // The one case with no record to fall back on: no fact was extracted, so no
+    // embedding call was made, so nothing in this process knows what will
+    // encode the chunks. Guessing would put a page in the wrong bucket of
+    // KTD8's re-embed selection, permanently and invisibly. So it refuses — as
+    // a typed result, like every other refusal on this path, not as a throw.
+    await reset();
+    const gateway = createModelGateway({
+      profile: { ...unpricedEmbeddingProfile(), name: 'operator-a' },
+      transport: createEmbeddingTransport(),
+      meter: createInMemorySpendMeter(),
+      keys: {
+        store: createTenantProviderKeyStore({ backend: createInMemoryProviderKeyBackend() }),
+        hosted: createHostedKeyPool({
+          openai: 'k',
+          google: 'k',
+          cloudflare: 'k',
+          'self-host': 'k',
+        }),
+      },
+    });
+
+    const receipt = await ingestDocument(
+      {
+        sql: tenant.sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        budget: uncappedBudget('operator'),
+      },
+      {
+        originContext: 'personal',
+        sourceType: 'note',
+        title: null,
+        body: 'A paragraph with no extractable structure in it whatsoever.',
+      },
+    );
+
+    expect(receipt.ok).toBe(false);
+    expect(receipt.ok === false && receipt.reason).toBe('embedding_model_unknown');
+    expect(await countRows(tenant.sql, 'page')).toBe(0);
+  }, TEST_TIMEOUT_MS);
 });
 
 describe('R16: ingestion is idempotent, and an edit reconciles rather than accumulates', () => {
@@ -544,6 +752,41 @@ describe('R16: ingestion is idempotent, and an edit reconciles rather than accum
       SELECT count(*)::int AS n FROM page WHERE ingest_id = ${ingestId}::bigint
     `) as Array<{ n: number }>;
     expect(linked[0]?.n).toBe(1);
+  }, TEST_TIMEOUT_MS);
+
+  test('an item a poller re-read and did not change is still an item seen', async () => {
+    // `items_seen` is the denominator an operator reads a connector's health
+    // out of, and the idempotent re-read is a poller's *most common* outcome by
+    // a wide margin — every cadence, every unchanged item. A counter that only
+    // advances when something was written says a run saw nothing on the day it
+    // worked perfectly, and makes "seen" and "written" the same number forever.
+    await reset();
+    const harness = createGateway();
+    const rows = (await tenant.sql`
+      INSERT INTO ingest_log (origin_context, source_type, external_ref)
+      VALUES ('external', 'email', 'run-2')
+      RETURNING ingest_id::text AS ingest_id
+    `) as Array<{ ingest_id: string }>;
+    const ingestId = rows[0]?.ingest_id ?? '';
+
+    const input = {
+      originContext: 'external' as const,
+      sourceType: 'email' as const,
+      title: 'Thread',
+      body: 'Marcus Fell founded Kettle Works.',
+      externalRef: 'gmail:thread-3',
+      ingestId,
+    };
+    const first = await ingestDocument(contextFor(harness), input);
+    expect(first.ok).toBe(true);
+    const second = await ingestDocument(contextFor(harness), input);
+    expect(second.ok && second.status).toBe('unchanged');
+
+    const counts = (await tenant.sql`
+      SELECT items_seen, items_written, items_quarantined
+        FROM ingest_log WHERE ingest_id = ${ingestId}::bigint
+    `) as Array<{ items_seen: number; items_written: number; items_quarantined: number }>;
+    expect(counts[0]).toEqual({ items_seen: 2, items_written: 1, items_quarantined: 0 });
   }, TEST_TIMEOUT_MS);
 });
 
