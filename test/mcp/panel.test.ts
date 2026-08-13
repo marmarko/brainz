@@ -297,11 +297,36 @@ describe('text-twin parity — a client that cannot render is not a client that 
     expect(twin.actions.length).toBe(MANAGE_ACTIONS.length);
   });
 
-  test('every text twin appears in the panel, so neither side can grow alone', () => {
+  test('every text twin appears in the panel as a rendered control, not just a mention', () => {
+    // The assertion is on the row's own markup rather than on the action name
+    // appearing anywhere in the document, because the panel embeds a JSON state
+    // blob that lists every action name. Mutation caught that: deleting a whole
+    // form row left the name in the blob and this test stayed green.
     const html = panelHtml(view, 'nonce-abc');
     for (const action of MANAGE_ACTIONS) {
-      expect(`${action.action} in panel: ${html.includes(action.action)}`).toBe(
-        `${action.action} in panel: true`,
+      // The per-row twin line, which only a rendered section produces — and it
+      // has to say the truth about *this* action: the one that is web-app-only
+      // on a chat connection must not advertise a tool call as its equivalent.
+      const twinLine = `manage(action: "${action.action}"`;
+      expect(`${action.action} twin line: ${html.includes(twinLine)}`).toBe(
+        `${action.action} twin line: true`,
+      );
+      const refusedInChat = html.includes(
+        `manage(action: "${action.action}", …)</code> is refused on a chat connection`,
+      );
+      expect(`${action.action} says it is refused in chat: ${refusedInChat}`).toBe(
+        `${action.action} says it is refused in chat: ${action.panelOnly}`,
+      );
+      // And the control the user actually operates: a button for an action that
+      // runs here, a link out for the one that does not.
+      const control = action.panelOnly
+        ? `href="${deepLinkFor(action.action, view.webAppBaseUrl).replace(/&/g, '&amp;')}"`
+        : `data-action="${action.action}"`;
+      expect(`${action.action} control: ${html.includes(control)}`).toBe(
+        `${action.action} control: true`,
+      );
+      expect(`${action.action} value field: ${html.includes(`data-value-for="${action.action}"`)}`).toBe(
+        `${action.action} value field: true`,
       );
     }
   });

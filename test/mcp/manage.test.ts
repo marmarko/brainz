@@ -17,7 +17,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 
 import { NO_CLIENT_CAPABILITIES } from '../../src/mcp/client-capabilities.ts';
 import { deepLinkFor, MANAGE_ACTIONS } from '../../src/mcp/panel.ts';
-import { PANEL_NONCE_TTL_MS } from '../../src/mcp/panel-token.ts';
+import { deriveSigningKey, hashToken } from '../../src/mcp/oauth.ts';
+import { PANEL_NONCE_TTL_MS, mintPanelToken } from '../../src/mcp/panel-token.ts';
 import { PANEL_RESOURCE_URI } from '../../src/mcp/panel.ts';
 import { readResource } from '../../src/mcp/resources.ts';
 import { createMcpFixture, type McpFixture } from './fixture.ts';
@@ -126,6 +127,73 @@ describe('the panel branch — a nonce, and nothing else', () => {
     expect(expired.ok).toBe(false);
     expect(expired.error?.code).toBe('invalid_params');
     expect((await stores()).paused.map((row) => row.source)).toEqual(['calendar']);
+  });
+
+  // The three bindings, separated.
+  //
+  // A nonce lifted from another brain differs in *three* ways at once — key,
+  // tenant id, connection id — so a test that only tries that one refuses for
+  // whichever check happens to run first, and stays green when the other two are
+  // deleted. Mutation showed exactly that: with the signature check and the
+  // tenant binding both removed, the composite test below still passed, held up
+  // by the connection binding alone. So each is isolated here, by minting a
+  // token that is correct in every respect except the one under test.
+  const realKey = (): string => deriveSigningKey(fixture.bearer);
+  const realCaller = (): string => `bearer:${hashToken(fixture.bearer).slice(0, 16)}`;
+
+  test('a nonce signed with another brain’s key is refused, and writes nothing', async () => {
+    const forged = mintPanelToken('a-key-this-brain-never-derived', {
+      purpose: 'panel',
+      tenantId: fixture.tenantId,
+      callerKey: realCaller(),
+      expiresAt: fixture.now() + PANEL_NONCE_TTL_MS,
+    });
+
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail', panel_nonce: forged },
+      { capabilities: PANEL_CLIENT },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe('invalid_params');
+    expect((await stores()).paused).toEqual([]);
+  });
+
+  test('a correctly signed nonce naming another brain is refused, and writes nothing', async () => {
+    const misaddressed = mintPanelToken(realKey(), {
+      purpose: 'panel',
+      tenantId: 't-some-other-brain',
+      callerKey: realCaller(),
+      expiresAt: fixture.now() + PANEL_NONCE_TTL_MS,
+    });
+
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail', panel_nonce: misaddressed },
+      { capabilities: PANEL_CLIENT },
+    );
+
+    expect(result.ok).toBe(false);
+    expect((await stores()).paused).toEqual([]);
+  });
+
+  test('a correctly signed nonce from another connection is refused, and writes nothing', async () => {
+    const otherConnection = mintPanelToken(realKey(), {
+      purpose: 'panel',
+      tenantId: fixture.tenantId,
+      callerKey: 'bearer:0000000000000000',
+      expiresAt: fixture.now() + PANEL_NONCE_TTL_MS,
+    });
+
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail', panel_nonce: otherConnection },
+      { capabilities: PANEL_CLIENT },
+    );
+
+    expect(result.ok).toBe(false);
+    expect((await stores()).paused).toEqual([]);
   });
 
   test('a nonce minted for another brain is refused, and writes nothing', async () => {
@@ -468,6 +536,35 @@ describe('R12a — the review queue has no close on this surface, by ruling', ()
     expect(rows[0]?.closed_by).toBeNull();
 
     await fixture.sql`DELETE FROM review_queue WHERE target_ref = 'entity:u14'`;
+  });
+
+  test('the pause table refuses an authority that would blur R12a’s line', async () => {
+    // Mutation found this one: weakening rung 7's CHECK to `length > 0` broke
+    // nothing, because the code only ever writes two of the three legal values
+    // and no test asked the database anything. The constraint's whole job is to
+    // stop a later writer recording a pause as something it was not — and
+    // `agent_mcp` is the name that matters, because it is the one
+    // `review_queue.closed_by` refuses one table over.
+    for (const authority of ['agent_mcp', 'user_out_of_band', 'whatever']) {
+      let sqlstate = 'none';
+      try {
+        await fixture.sql.unsafe(
+          `INSERT INTO source_pause (source, paused_by) VALUES ('drive', '${authority}')`,
+        );
+      } catch (error) {
+        sqlstate = String((error as { errno?: string }).errno ?? '');
+      }
+      expect(`${authority}: ${sqlstate}`).toBe(`${authority}: 23514`);
+    }
+
+    // And the legal ones are accepted, so the constraint is a closed set rather
+    // than a table that refuses every write.
+    for (const authority of ['panel', 'agent_confirmed', 'app']) {
+      await fixture.sql.unsafe(
+        `INSERT INTO source_pause (source, paused_by) VALUES ('drive', '${authority}')`,
+      );
+      await fixture.sql`DELETE FROM source_pause WHERE source = 'drive'`;
+    }
   });
 
   test('the schema still refuses agent_mcp, so the ruling is not the only thing holding', async () => {

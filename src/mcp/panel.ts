@@ -158,11 +158,20 @@ export function panelHtml(view: PanelView, nonce: string): string {
       ? `<a class="deep" href="${escape(deepLinkFor(def.action, view.webAppBaseUrl))}">Open in the web app</a>`
       : `<button data-action="${escape(def.action)}">Apply</button>`;
 
+    // The twin line names what a client without a panel would actually do —
+    // which for the one web-app-only action is the link, not a tool call. An
+    // earlier version printed a `manage(...)` line for every row, including
+    // that one, and it was advertising an equivalent that does not exist on the
+    // branch where anybody would need it.
+    const twin = def.panelOnly
+      ? `Without this panel: <a href="${escape(deepLinkFor(def.action, view.webAppBaseUrl))}">the web app</a> — <code>manage(action: "${escape(def.action)}", …)</code> is refused on a chat connection.`
+      : `Without this panel: <code>manage(action: "${escape(def.action)}", value: …)</code>, which asks you to confirm.`;
+
     return [
       '<section class="action">',
       `<h2>${escape(def.label)}</h2>`,
       `<p>${escape(def.summary)}</p>`,
-      `<p class="twin">Text equivalent: <code>manage(action: "${escape(def.action)}", value: …)</code></p>`,
+      `<p class="twin">${twin}</p>`,
       `<div class="row">${control}${button}</div>`,
       '</section>',
     ].join('');
