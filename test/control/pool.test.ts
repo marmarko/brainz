@@ -200,7 +200,7 @@ describe('the claim is a compare-and-set', () => {
       SELECT state::text AS state, claimed_by FROM control.pool_project`;
     expect(rows).toHaveLength(1);
     expect(rows[0]?.state).toBe('claimed');
-    expect(['alice', 'bob', 'carol']).toContain(rows[0]?.claimed_by);
+    expect(['alice', 'bob', 'carol']).toContain(rows[0]?.claimed_by ?? '');
   });
 
   test('an empty pool is a refusal, not a wait', async () => {

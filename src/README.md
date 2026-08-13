@@ -12,6 +12,7 @@ implementation units in the roadmap plan; the plan is the authority on scope.
 | `mcp/` | The MCP surface — tools, response envelope, OAuth grant lifecycle, shared dispatch | U6, U14 |
 | `worker/` | Typed job runner, locking, dead-lettering, the scheduled fleets | U10 |
 | `ingest/` | Chat-export and folder import, Pipedream connector substrate, first-import gate | U8, U9 |
+| `web/` | The web app — signup, sessions, subscription, connectors, spend, BYOK entry, the guided connect flow, and the `/admin` scope table. It holds the identity database, the control plane, and a **write-only** port for tenant provider keys; it holds no secret store, no tenant connection and no model gateway, because R11 is a claim about capability rather than intent. Filed here rather than under `apps/` because `tsconfig.json` covers `src`, `test` and `scripts`, and code that is neither typechecked nor scanned by the guards is worse than a differently-named directory. | U15 |
 
 **The tenant schema is a ladder, and rungs are append-only.** `schema/tenant.sql` is rung one
 and `schema/migrations/` holds the rest; `schema/migrations.ts` is the ordered list.
