@@ -1,0 +1,145 @@
+{
+  "generated_by": "src/upstream/hazard-sweep.ts",
+  "note": "Enumerated from the gbrain checkout at the pinned commit. The counts are measured, not inherited: `shell_guards` is the figure docs/porting-hazards.md quotes, `executable_guards` includes the TypeScript and JavaScript guards that figure omits, and `privacy_scanners` is a subset of the guards rather than an addition to them.",
+  "counts": {
+    "entries": 42,
+    "executable_guards": 41,
+    "shell_guards": 39,
+    "data_files": 1,
+    "privacy_scanners": 6,
+    "carded": 1,
+    "guarded": 8,
+    "not_applicable": 14,
+    "unported": 18
+  },
+  "guards": [
+    "scripts/check-admin-build.sh",
+    "scripts/check-admin-embedded.sh",
+    "scripts/check-admin-scope-drift.sh",
+    "scripts/check-batch-audit-site.sh",
+    "scripts/check-bun-test-timeout.sh",
+    "scripts/check-cli-executable.sh",
+    "scripts/check-engine-dynamic-import.sh",
+    "scripts/check-engine-dynamic-import.ts",
+    "scripts/check-eval-glossary-fresh.sh",
+    "scripts/check-exports-count.sh",
+    "scripts/check-fixture-privacy.sh",
+    "scripts/check-fuzz-purity.sh",
+    "scripts/check-gateway-routed-no-direct-anthropic.sh",
+    "scripts/check-image-decoders-embedded.sh",
+    "scripts/check-jsonb-params.mjs",
+    "scripts/check-jsonb-pattern.sh",
+    "scripts/check-key-files-current-state.sh",
+    "scripts/check-no-double-retry.sh",
+    "scripts/check-no-legacy-getconnection.sh",
+    "scripts/check-no-pii-in-agent-voice.sh",
+    "scripts/check-no-tracked-symlinks.sh",
+    "scripts/check-operations-filter-bypass.sh",
+    "scripts/check-pagetype-exhaustive.sh",
+    "scripts/check-pg-url-redaction.sh",
+    "scripts/check-privacy.sh",
+    "scripts/check-progress-to-stdout.sh",
+    "scripts/check-proposal-pii.sh",
+    "scripts/check-search-path.sh",
+    "scripts/check-skill-brain-first.sh",
+    "scripts/check-skills-manifest-fresh.sh",
+    "scripts/check-source-config-leak.sh",
+    "scripts/check-source-id-projection.sh",
+    "scripts/check-source-scope-onboard.sh",
+    "scripts/check-synthetic-corpus-privacy.sh",
+    "scripts/check-system-of-record.sh",
+    "scripts/check-test-isolation.allowlist",
+    "scripts/check-test-isolation.sh",
+    "scripts/check-test-real-names.sh",
+    "scripts/check-trailing-newline.sh",
+    "scripts/check-wasm-embedded.sh",
+    "scripts/check-worker-lock-renewal-shape.sh",
+    "scripts/check-worker-pool-atomicity.sh"
+  ],
+  "cards": [
+    {
+      "id": "H5",
+      "title": "A real person reaching a public artifact",
+      "sources": [
+        "scripts/check-fixture-privacy.sh",
+        "scripts/check-no-pii-in-agent-voice.sh",
+        "scripts/check-privacy.sh",
+        "scripts/check-proposal-pii.sh",
+        "scripts/check-synthetic-corpus-privacy.sh",
+        "scripts/check-test-real-names.sh"
+      ]
+    },
+    {
+      "id": "H6",
+      "title": "A trigger function resolving through the caller’s search_path",
+      "sources": [
+        "scripts/check-search-path.sh"
+      ]
+    },
+    {
+      "id": "H7",
+      "title": "A connection string or a secret leaving through a log line or a serializer",
+      "sources": [
+        "scripts/check-pg-url-redaction.sh",
+        "scripts/check-source-config-leak.sh"
+      ]
+    },
+    {
+      "id": "H8",
+      "title": "A structured value encoded twice on its way into the database",
+      "sources": [
+        "scripts/check-jsonb-params.mjs",
+        "scripts/check-jsonb-pattern.sh"
+      ]
+    },
+    {
+      "id": "H9",
+      "title": "A test hook that times out before the work it sets up can finish",
+      "sources": [
+        "scripts/check-bun-test-timeout.sh"
+      ]
+    },
+    {
+      "id": "H10",
+      "title": "Two retry ladders multiplying into one",
+      "sources": [
+        "scripts/check-no-double-retry.sh"
+      ]
+    },
+    {
+      "id": "H11",
+      "title": "Non-protocol bytes on the channel a client is parsing",
+      "sources": [
+        "scripts/check-progress-to-stdout.sh"
+      ]
+    },
+    {
+      "id": "H12",
+      "title": "Module-level state leaking between test files in one process",
+      "sources": [
+        "scripts/check-test-isolation.sh"
+      ]
+    },
+    {
+      "id": "H13",
+      "title": "A new union member falling through a switch nobody updated",
+      "sources": [
+        "scripts/check-pagetype-exhaustive.sh"
+      ]
+    },
+    {
+      "id": "H14",
+      "title": "A symlink in the repository pointing at one machine",
+      "sources": [
+        "scripts/check-no-tracked-symlinks.sh"
+      ]
+    },
+    {
+      "id": "H15",
+      "title": "A test that claims determinism and reaches the network anyway",
+      "sources": [
+        "scripts/check-fuzz-purity.sh"
+      ]
+    }
+  ]
+}

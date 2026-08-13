@@ -1,0 +1,56 @@
+{
+  "kind": "upstream-watch",
+  "mode": "weekly",
+  "run_on": "2026-08-13",
+  "pin": {
+    "tag": "v0.44.1.0",
+    "commit": "fc310db3ea152e821ddb245a800956f15b8ed4fb",
+    "compared_from": "0.44.1.0"
+  },
+  "upstream_ref": {
+    "ref": "HEAD",
+    "commit": "91382af30c21f37053e667f6bb54b914870e93b7",
+    "commits_ahead": 13
+  },
+  "delta": {
+    "releases": [],
+    "no_rows": [],
+    "rows": 0
+  },
+  "rows": [],
+  "unmapped_paths": [],
+  "out_of_scope": {},
+  "pin_recommendation": {
+    "advance": false,
+    "reason": "the checkout is 13 commit(s) past the pin but ships no new release — no CHANGELOG entry, nothing to classify. Advancing onto unreleased work would move the conformance target without moving the ledger. Leave the pin."
+  },
+  "sweep": {
+    "ok": true,
+    "undecided": [],
+    "stale": [],
+    "counts": {
+      "entries": 42,
+      "executable_guards": 41,
+      "shell_guards": 39,
+      "data_files": 1,
+      "privacy_scanners": 6,
+      "carded": 1,
+      "guarded": 8,
+      "not_applicable": 14,
+      "unported": 18
+    },
+    "cards": [
+      "H5 — A real person reaching a public artifact",
+      "H6 — A trigger function resolving through the caller’s search_path",
+      "H7 — A connection string or a secret leaving through a log line or a serializer",
+      "H8 — A structured value encoded twice on its way into the database",
+      "H9 — A test hook that times out before the work it sets up can finish",
+      "H10 — Two retry ladders multiplying into one",
+      "H11 — Non-protocol bytes on the channel a client is parsing",
+      "H12 — Module-level state leaking between test files in one process",
+      "H13 — A new union member falling through a switch nobody updated",
+      "H14 — A symlink in the repository pointing at one machine",
+      "H15 — A test that claims determinism and reaches the network anyway"
+    ]
+  }
+}

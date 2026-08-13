@@ -35,6 +35,39 @@ export const PRIORITIES = ["p0", "p1", "p2"] as const;
 
 export const DEFAULT_LEDGER_PATH = "upstream/concepts.jsonl";
 
+/** Confidence values a machine-written discovery may carry (U19). */
+export const CONFIDENCES = ["low", "medium", "high"] as const;
+
+/**
+ * Top-level directories a backticked string has to start with before this file
+ * will treat it as a claim about a file in this repo.
+ *
+ * Deliberately a fixed list. Without it, `websearch_to_tsquery`, a CLI flag, and
+ * a Postgres type name are all "paths that do not exist" and the evidence rule
+ * becomes noise a reviewer switches off.
+ */
+const REPO_ROOTS = ["src", "test", "tests", "scripts", "evals", "docs", "upstream", "deploy"];
+
+/**
+ * Repo paths a row's prose cites, with any `:symbol` suffix dropped.
+ *
+ * Exported because the rule built on it — *a `covered` row may not cite a file
+ * nobody wrote* — is only as good as what it recognises, and that deserves its
+ * own tests rather than being an implementation detail of the checker.
+ */
+export function citedRepoPaths(notes: string): string[] {
+  const pattern = new RegExp(
+    "`((?:" + REPO_ROOTS.join("|") + ")\\/[A-Za-z0-9_@./-]+?\\.[A-Za-z0-9]+)(?::[A-Za-z0-9_]+)?`",
+    "g",
+  );
+  const found: string[] = [];
+  for (const match of notes.matchAll(pattern)) {
+    const path = match[1];
+    if (path !== undefined && !found.includes(path)) found.push(path);
+  }
+  return found;
+}
+
 export interface LedgerFinding {
   /** 1-based line number in the JSONL file. */
   line: number;
@@ -54,6 +87,13 @@ export interface LedgerReport {
 export interface CheckOptions {
   /** Injected clock. Defaults to now. */
   today?: Date;
+  /**
+   * Injected filesystem, for the evidence rule. Defaults to a real check against
+   * the working directory. Injected for the same reason the clock is: a rule
+   * about what exists should be testable without the test depending on what
+   * happens to be on disk.
+   */
+  pathExists?: (path: string) => boolean;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -81,6 +121,7 @@ function isIsoDay(value: string): boolean {
 
 export function checkLedger(content: string, opts: CheckOptions = {}): LedgerReport {
   const today = toIsoDay(opts.today ?? new Date());
+  const exists = opts.pathExists ?? ((path: string): boolean => Bun.file(path).size > 0);
   const findings: LedgerFinding[] = [];
   const counts: Record<LedgerStatus, number> = { covered: 0, "not-yet": 0, omitted: 0 };
   const seenIds = new Map<string, number>();
@@ -163,10 +204,111 @@ export function checkLedger(content: string, opts: CheckOptions = {}): LedgerRep
 
     counts[status as LedgerStatus] += 1;
 
+    // -----------------------------------------------------------------------
+    // U19: rows a machine discovered.
+    //
+    // The watcher writes `not-yet` and cannot write anything else — that is a
+    // property of `src/upstream/classify.ts`, which has no code path to another
+    // status. This is the half that does not depend on trusting that module: a
+    // row carrying a discovery block and no human's `reviewed_by` is refused any
+    // status but `not-yet`, whatever wrote it.
+    //
+    // And it expires. A discovery is not a violation on the day it lands — a
+    // gate red on every PR trains people to ignore it, which is the reasoning
+    // `upstream/memory-verbs-v1-partial.json` already applies to its own CI job.
+    // It becomes one when its own `review_by` passes with nobody's name on it.
+    // -----------------------------------------------------------------------
+    const discovery = row["discovered_by"];
+    let discovered = false;
+
+    if (discovery !== undefined) {
+      if (!isPlainObject(discovery)) {
+        fail(id, '"discovered_by" must be an object naming the watcher, the run and the review deadline');
+      } else {
+        discovered = true;
+        const reviewedBy = discovery["reviewed_by"];
+        const reviewed = nonEmptyString(reviewedBy);
+
+        if (!nonEmptyString(discovery["watcher"])) {
+          fail(id, '"discovered_by.watcher" is missing — a machine-written row says which machine wrote it');
+        }
+
+        const confidence = discovery["confidence"];
+        if (
+          typeof confidence !== "string" ||
+          !(CONFIDENCES as readonly string[]).includes(confidence)
+        ) {
+          fail(
+            id,
+            `"discovered_by.confidence" must be one of ${CONFIDENCES.join(", ")}, got ` +
+              `${JSON.stringify(confidence)} — confidence orders a reviewer's queue and belongs in the row`,
+          );
+        }
+
+        const evidence = discovery["evidence"];
+        if (!Array.isArray(evidence) || evidence.length === 0) {
+          fail(
+            id,
+            '"discovered_by.evidence" must be a non-empty list of the upstream paths that produced this row — ' +
+              "a discovery nobody can check is not a discovery",
+          );
+        }
+
+        if (!reviewed) {
+          const reviewByRaw = discovery["review_by"];
+          if (typeof reviewByRaw !== "string" || !isIsoDay(reviewByRaw)) {
+            fail(
+              id,
+              '"discovered_by.review_by" must be an ISO calendar date (YYYY-MM-DD) — an undated discovery ' +
+                "is a row that never becomes anybody's problem",
+            );
+          } else if (reviewByRaw < today) {
+            fail(
+              id,
+              `"discovered_by.review_by" ${reviewByRaw} has passed (today is ${today}) and nobody has ` +
+                'reviewed it. Classify the row and record who did it in "discovered_by.reviewed_by".',
+            );
+          }
+
+          if (status !== "not-yet") {
+            fail(
+              id,
+              `an unreviewed discovery may only be "not-yet", not ${JSON.stringify(status)}. ` +
+                'A machine may say a capability exists upstream; only a human may say this repo covers it, ' +
+                'or declines it. Add "discovered_by.reviewed_by" when you have looked.',
+            );
+          }
+        }
+      }
+    }
+
     if (status === "covered") {
       if (!nonEmptyString(row["unit"])) {
         fail(id, 'status "covered" requires "unit" — name the implementation unit that covers it');
       }
+
+      // The evidence rule, repo-wide rather than watcher-only. `covered` retires
+      // a capability from every list an operator reads, so the one thing it must
+      // never be is a claim about a module nobody wrote.
+      const cited = citedRepoPaths(typeof row["notes"] === "string" ? row["notes"] : "");
+      for (const path of cited) {
+        if (!exists(path)) {
+          fail(
+            id,
+            `status "covered" cites \`${path}\`, which does not exist. A capability is not covered by a ` +
+              "file nobody wrote — either the path is stale or the coverage claim is.",
+          );
+        }
+      }
+
+      if (discovered && cited.length === 0) {
+        fail(
+          id,
+          'a reviewed discovery flipped to "covered" must cite at least one path in this repo in its ' +
+            '"notes". Saying "we have this" is the claim; the path is the evidence.',
+        );
+      }
+
       continue;
     }
 

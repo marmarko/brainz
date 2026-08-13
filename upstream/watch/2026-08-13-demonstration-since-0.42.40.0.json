@@ -1,0 +1,326 @@
+{
+  "kind": "upstream-watch",
+  "mode": "demonstration",
+  "run_on": "2026-08-13",
+  "pin": {
+    "tag": "v0.44.1.0",
+    "commit": "fc310db3ea152e821ddb245a800956f15b8ed4fb",
+    "compared_from": "0.42.40.0"
+  },
+  "upstream_ref": {
+    "ref": "HEAD",
+    "commit": "91382af30c21f37053e667f6bb54b914870e93b7",
+    "commits_ahead": 13
+  },
+  "delta": {
+    "releases": [
+      "0.44.1.0",
+      "0.44.0.0",
+      "0.43.0.0",
+      "0.42.76.0",
+      "0.42.75.0",
+      "0.42.74.0",
+      "0.42.73.2",
+      "0.42.73.1",
+      "0.42.73.0",
+      "0.42.72.1",
+      "0.42.72.0",
+      "0.42.71.0",
+      "0.42.70.0",
+      "0.42.69.0",
+      "0.42.68.1",
+      "0.42.67.0",
+      "0.42.66.1",
+      "0.42.66.0",
+      "0.42.65.0",
+      "0.42.64.0",
+      "0.42.63.0",
+      "0.42.62.0",
+      "0.42.61.0",
+      "0.42.60.0",
+      "0.42.59.0",
+      "0.42.58.0",
+      "0.42.57.0",
+      "0.42.56.0",
+      "0.42.55.0",
+      "0.42.53.0",
+      "0.42.52.0",
+      "0.42.51.0",
+      "0.42.50.0",
+      "0.42.49.0",
+      "0.42.48.0",
+      "0.42.47.0",
+      "0.42.46.0",
+      "0.42.45.0",
+      "0.42.44.0",
+      "0.42.43.0",
+      "0.42.42.0",
+      "0.42.41.0"
+    ],
+    "no_rows": [
+      {
+        "version": "0.44.0.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.43.0.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.76.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.75.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.74.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.73.2",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.73.1",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.73.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.72.1",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.72.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.71.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.70.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.69.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.68.1",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.67.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.66.1",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.66.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.65.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.64.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.63.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.62.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.61.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.60.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.59.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.58.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.57.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.56.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.55.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.53.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.52.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.51.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.50.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.48.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.47.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.46.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.45.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.44.0",
+        "reason": "all-out-of-scope"
+      },
+      {
+        "version": "0.42.43.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.42.0",
+        "reason": "no-paths"
+      },
+      {
+        "version": "0.42.41.0",
+        "reason": "no-paths"
+      }
+    ],
+    "rows": 3
+  },
+  "rows": [
+    {
+      "id": "up.0-44-1-0.ai-routing",
+      "capability": "Any current model works now. gbrain stops rejecting model ids it hasn't heard of. — the ai-routing part of gbrain 0.44.1.0",
+      "criticality": "important",
+      "status": "not-yet",
+      "priority": "p2",
+      "unit": "U19-review",
+      "source": "upstream-watcher",
+      "notes": "Discovered by the U19 upstream watcher from gbrain 0.44.1.0 (2026-08-11), taken against the pin at 0.42.40.0. Upstream touched: src/core/ai/model-resolver.ts, src/core/ai/gateway.ts. This row asserts only that upstream shipped something in this area — NOT that brainz lacks it and NOT that brainz has it. A reviewer decides which, adds `reviewed_by`, and cites a path in this repo when the answer is `covered`.",
+      "discovered_by": {
+        "watcher": "u19",
+        "run_on": "2026-08-13",
+        "gbrain_release": "0.44.1.0",
+        "gbrain_commit": "91382af30c21f37053e667f6bb54b914870e93b7",
+        "area": "ai-routing",
+        "confidence": "high",
+        "evidence": [
+          "src/core/ai/model-resolver.ts",
+          "src/core/ai/gateway.ts"
+        ],
+        "assigned": [
+          "criticality",
+          "priority",
+          "unit"
+        ],
+        "review_by": "2026-08-20"
+      }
+    },
+    {
+      "id": "up.0-44-1-0.worker",
+      "capability": "Any current model works now. gbrain stops rejecting model ids it hasn't heard of. — the worker part of gbrain 0.44.1.0",
+      "criticality": "important",
+      "status": "not-yet",
+      "priority": "p2",
+      "unit": "U19-review",
+      "source": "upstream-watcher",
+      "notes": "Discovered by the U19 upstream watcher from gbrain 0.44.1.0 (2026-08-11), taken against the pin at 0.42.40.0. Upstream touched: src/core/minions/handlers/contextual-reindex-per-chunk.ts. This row asserts only that upstream shipped something in this area — NOT that brainz lacks it and NOT that brainz has it. A reviewer decides which, adds `reviewed_by`, and cites a path in this repo when the answer is `covered`.",
+      "discovered_by": {
+        "watcher": "u19",
+        "run_on": "2026-08-13",
+        "gbrain_release": "0.44.1.0",
+        "gbrain_commit": "91382af30c21f37053e667f6bb54b914870e93b7",
+        "area": "worker",
+        "confidence": "medium",
+        "evidence": [
+          "src/core/minions/handlers/contextual-reindex-per-chunk.ts"
+        ],
+        "assigned": [
+          "criticality",
+          "priority",
+          "unit"
+        ],
+        "review_by": "2026-08-20"
+      }
+    },
+    {
+      "id": "up.0-42-49-0.unmapped",
+      "capability": "Big embed backfills and syncs now throttle themselves when the database gets busy, so clearing a backlog can't starve the job queue — no more external babysitter scripts. — the unmapped part of gbrain 0.42.49.0",
+      "criticality": "important",
+      "status": "not-yet",
+      "priority": "p2",
+      "unit": "U19-review",
+      "source": "upstream-watcher",
+      "notes": "Discovered by the U19 upstream watcher from gbrain 0.42.49.0 (2026-06-16), taken against the pin at 0.42.40.0. Upstream touched: src/core/db-pacer.ts, src/core/pace-mode.ts. This row asserts only that upstream shipped something in this area — NOT that brainz lacks it and NOT that brainz has it. A reviewer decides which, adds `reviewed_by`, and cites a path in this repo when the answer is `covered`.",
+      "discovered_by": {
+        "watcher": "u19",
+        "run_on": "2026-08-13",
+        "gbrain_release": "0.42.49.0",
+        "gbrain_commit": "91382af30c21f37053e667f6bb54b914870e93b7",
+        "area": "unmapped",
+        "confidence": "low",
+        "evidence": [
+          "src/core/db-pacer.ts",
+          "src/core/pace-mode.ts"
+        ],
+        "assigned": [
+          "criticality",
+          "priority",
+          "unit"
+        ],
+        "review_by": "2026-08-20"
+      }
+    }
+  ],
+  "unmapped_paths": [
+    "src/core/db-pacer.ts",
+    "src/core/pace-mode.ts"
+  ],
+  "out_of_scope": {
+    "a generative surface on top of memory is declined as `oos.generative-surface`": 1,
+    "upstream's own tests — the behaviour they pin is read from the source path instead": 3,
+    "upstream documentation": 8,
+    "upstream's own eval harness; brainz's lives in `evals/` and is graded by its own floors": 1,
+    "upstream's build and guard scripts — guards are swept separately by the hazard sweep": 5,
+    "no skillpack surface — declined as `oos.skillpacks`": 1,
+    "no CLI surface — brainz is served over MCP only, so a CLI command has no counterpart here": 1
+  },
+  "pin_recommendation": {
+    "advance": true,
+    "reason": "42 release(s) since the pin (0.44.1.0, 0.44.0.0, 0.43.0.0, 0.42.76.0, 0.42.75.0, 0.42.74.0, 0.42.73.2, 0.42.73.1, 0.42.73.0, 0.42.72.1, 0.42.72.0, 0.42.71.0, 0.42.70.0, 0.42.69.0, 0.42.68.1, 0.42.67.0, 0.42.66.1, 0.42.66.0, 0.42.65.0, 0.42.64.0, 0.42.63.0, 0.42.62.0, 0.42.61.0, 0.42.60.0, 0.42.59.0, 0.42.58.0, 0.42.57.0, 0.42.56.0, 0.42.55.0, 0.42.53.0, 0.42.52.0, 0.42.51.0, 0.42.50.0, 0.42.49.0, 0.42.48.0, 0.42.47.0, 0.42.46.0, 0.42.45.0, 0.42.44.0, 0.42.43.0, 0.42.42.0, 0.42.41.0). Advancing is a deliberate act with a conformance consequence: `upstream/memory-verbs-v1-partial.json` binds itself to the pinned commit, so the delta must be re-observed in the same change (`bun run conformance --raw`). This watcher does not advance it."
+  }
+}
