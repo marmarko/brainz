@@ -80,11 +80,25 @@ is only logged.
 > would be the whole gate, defeated.
 >
 > So the close has to arrive from a surface the connected agent cannot drive —
-> the in-chat panel (**U14**) or the web app (**U15**) — and neither exists
-> yet. `manage`, the tool those surfaces would dispatch through, does not
-> currently carry a review action in its enum at all; it accepts what it does
-> declare, validates it, and returns `applied: false`. Nothing your assistant
-> can do closes a review entry, and nothing in this alpha will.
+> the in-chat panel (**U14**) or the web app (**U15**). U14 has now shipped, and
+> it **deliberately did not add one**. `manage` gained four working settings and
+> carries no review action, for a reason worth reading rather than taking on
+> trust:
+>
+> - The panel is the surface that would qualify, and on the shipping clients it
+>   does not render for a connector you added yourself. A close that only the
+>   panel could reach would be a control nobody can exercise — which looks
+>   identical to a control that works, until you need it.
+> - The other route is your assistant asking you to confirm. That is a real
+>   control for reversible settings, and it is the wrong one here: your
+>   assistant issued the call, worded the context you read it in, and read the
+>   mail that prompted it. Approving inside that turn is not the independent
+>   decision the constraint is asking for.
+>
+> **So the close lands with the web app (U15), and until then nothing your
+> assistant can do closes a review entry.** That is the same sentence as before;
+> what changed is that it is now a decision with a named owner rather than a
+> gap.
 
 So for now: read the count, and write the entries down somewhere you control if
 they matter. A rising `pending_review` over the bake is a finding to report, not
@@ -107,6 +121,21 @@ that does not exist yet.
 Treat this count as a reading list. It tells you how much of what your brain
 believes came from other people. That is a useful number even before anything
 can be done with it.
+
+### What U14 did give you
+
+The `brain` tool now carries a `management` block: your spend cap, your reading
+posture, which connectors are paused, and the exact call for each thing you can
+change. Ask your assistant "what can I change about my brain" and it reads that.
+
+Three of the four changes run in chat, and every one of them asks you first —
+your client has to be able to put the question in front of you, and if it
+cannot, the call is refused with a link rather than made. The fourth, the
+reading posture, is web-app-only on a chat connection for the same reason the
+review close is: it is not a thing to be waved through inside a turn your
+assistant is driving.
+
+None of these touch the review queue.
 
 ### Contradictions (`contradictions`)
 
