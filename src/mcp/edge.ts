@@ -23,8 +23,46 @@
  * compute.
  */
 
+import { createHash } from 'node:crypto';
+
 import { tenantOfToken } from './oauth.ts';
 import type { EdgeLimiter } from './rate-limit.ts';
+
+/**
+ * The paths a connector reaches **before** it holds a credential.
+ *
+ * Discovery, registration and the token exchange all carry no bearer by
+ * construction — that is what they are for — so a tenant-derived routing rule
+ * has nothing to route them by, and answering them with the 401 that starts
+ * discovery makes discovery a loop. They go to one fixed instance instead.
+ */
+const PUBLIC_FLOW_PATHS: ReadonlySet<string> = new Set([
+  '/.well-known/oauth-protected-resource',
+  '/.well-known/oauth-authorization-server',
+  '/register',
+  '/authorize',
+  '/token',
+  // `/revoke` is deliberately NOT here. It requires the tenant's bearer, so it
+  // has a tenant to route by — and it must use it: the revocation list is the
+  // one piece of flow state `dispatch` reads, on the *tenant's* instance, on
+  // every call. Sent to the shared flow instance a revocation would be recorded
+  // somewhere no tool call ever looks, and the endpoint would answer 200 while
+  // the grant kept working.
+]);
+
+/**
+ * The instance every hop of the authorization flow lands on.
+ *
+ * `/authorize` carries the tenant's bearer and could be routed by tenant like
+ * everything else — and must not be. The registration, the single-use code and
+ * the refresh record are one store, and a flow whose three hops address three
+ * instances fails at the token endpoint as `invalid_grant`: a routing fault
+ * wearing a client error, which is the hardest kind to find from the outside.
+ * One name for the whole flow is what makes the store's locality a property
+ * rather than a coincidence. (It is also the seam a durable store replaces —
+ * when one exists, this constant is what stops mattering.)
+ */
+export const FLOW_INSTANCE = 'oauth-flow';
 
 /** The shape this file needs from a Durable Object namespace, and no more. */
 export interface FleetBinding<Id = unknown> {
@@ -44,6 +82,15 @@ export function resolveTenant(request: Request): string | null {
   const header = request.headers.get('authorization');
   if (header === null) return null;
   return tenantOfToken(header);
+}
+
+/** The request path, without throwing on a URL this Worker cannot parse. */
+function pathOf(request: Request): string {
+  try {
+    return new URL(request.url).pathname;
+  } catch {
+    return '';
+  }
 }
 
 /** The client address, as Cloudflare presents it. */
@@ -69,7 +116,16 @@ function callerIp(request: Request): string | null {
 function grantKey(request: Request): string | null {
   const header = request.headers.get('authorization');
   if (header === null || header.length === 0) return null;
-  return `presented:${Bun.hash(header).toString(16)}`;
+  // `node:crypto`, not the runtime's fast hash. This module is bundled into the
+  // Worker named in `wrangler.toml`, which runs in workerd — where `Bun` is not
+  // defined, so a `Bun.hash` here is a ReferenceError on the first production
+  // request, thrown from an argument expression *outside* the limiter's own
+  // try/catch and therefore not even reaching the fail-closed refusal. The suite
+  // could not see it because the suite runs in Bun.
+  //
+  // A cryptographic digest also keeps the bucket map from retaining a live
+  // credential: the map outlives the request by up to `idleEvictionMs`.
+  return `presented:${createHash('sha256').update(header).digest('hex').slice(0, 32)}`;
 }
 
 export async function handleFleetRequest<Id>(
@@ -91,7 +147,9 @@ export async function handleFleetRequest<Id>(
   }
 
   try {
-    if (tenantId === null) {
+    const flowPath = PUBLIC_FLOW_PATHS.has(pathOf(request));
+
+    if (tenantId === null && !flowPath) {
       return new Response(JSON.stringify({ error: 'unauthorized' }), {
         status: 401,
         headers: {
@@ -104,7 +162,12 @@ export async function handleFleetRequest<Id>(
 
     // The affinity rule, in one line: the DO id is derived from the tenant id,
     // so the same tenant reaches the same instance and its warm connections.
-    const id = deps.fleet.idFromName(tenantId);
+    // The authorization flow is the one exception, and it is an exception in
+    // both directions — its unauthenticated hops have no tenant to route by,
+    // and its one authenticated hop must not be routed by the tenant it does
+    // have, or the code it mints lands somewhere the token endpoint cannot
+    // reach.
+    const id = deps.fleet.idFromName(flowPath ? FLOW_INSTANCE : (tenantId as string));
     try {
       return await deps.fleet.get(id).fetch(request);
     } catch {

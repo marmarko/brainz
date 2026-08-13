@@ -37,6 +37,7 @@
 import type { SQL } from 'bun';
 
 import { fenceEntity, fenceRow, fenceScalar, type Grant } from '../core/search/fence.ts';
+import { textArrayLiteral } from '../core/write/pg-values.ts';
 import { formatId, type OpaqueId } from './ids.ts';
 
 /** R12's window, and U17's runbook inherits it. */
@@ -75,6 +76,7 @@ export async function forgetRecord(
   request: { readonly id: OpaqueId; readonly grant: Grant; readonly now: Date },
 ): Promise<ForgetOutcome> {
   const at = request.now.toISOString();
+  const grantLiteral = textArrayLiteral(request.grant);
   const permitted = await mayTouch(sql, request.grant, request.id);
   if (permitted !== 'ok') return { ok: false, reason: permitted };
 
@@ -94,10 +96,22 @@ export async function forgetRecord(
           'UPDATE page SET deleted_at = $2::timestamptz WHERE page_id = $1::bigint AND deleted_at IS NULL',
           [request.id.key, at],
         );
+        // The cascade carries the fence with it, and that is the whole of this
+        // block's security content. `mayTouch` above authorised **the page** —
+        // one scalar origin. Every row the cascade then reaches has an origin of
+        // its own: a passage may carry a different one, and a fact is a synthesis
+        // whose union the subset rule refuses to a credential holding only part
+        // of it. Without these two predicates a work-scoped grant retracts a
+        // cross-origin fact it is not permitted to *read*, by naming one of its
+        // sources — a read refusal converted into a write, which is strictly
+        // worse than the read it was refused.
         const chunks = await tombstone(
           tx,
-          'UPDATE chunk SET deleted_at = $2::timestamptz WHERE page_id = $1::bigint AND deleted_at IS NULL',
-          [request.id.key, at],
+          `UPDATE chunk SET deleted_at = $2::timestamptz
+            WHERE page_id = $1::bigint
+              AND deleted_at IS NULL
+              AND origin_context = ANY($3::text[])`,
+          [request.id.key, at, grantLiteral],
         );
         // Facts reach their page two ways — directly, and through the chunks
         // they were extracted from. Both, or a fact sourced from a retracted
@@ -106,11 +120,12 @@ export async function forgetRecord(
           tx,
           `UPDATE fact SET deleted_at = $2::timestamptz
             WHERE deleted_at IS NULL
+              AND origin_contexts <@ $3::text[]
               AND (page_id = $1::bigint
                    OR fact_id IN (SELECT fs.fact_id FROM fact_source fs
                                     JOIN chunk c ON c.chunk_id = fs.chunk_id
                                    WHERE c.page_id = $1::bigint))`,
-          [request.id.key, at],
+          [request.id.key, at, grantLiteral],
         );
         return { pages, chunks, facts, entities: 0 };
       }

@@ -323,7 +323,32 @@ async function handleToken(deps: ServerDeps, request: Request): Promise<Response
   return Response.json(tokens, { headers: { 'cache-control': 'no-store' } });
 }
 
+/**
+ * Revocation, behind the resource owner's credential.
+ *
+ * **It is a write, and it was reachable by anyone.** The version this replaced
+ * took a `grant_id` from an unauthenticated form post and retired it — so any
+ * caller holding a grant id, from a support transcript, a client log or a
+ * screen share, could close a stranger's connector. Revocation ids are
+ * unguessable, which bounds the exposure and does not make an open write
+ * endpoint on a public issuer acceptable.
+ *
+ * The residual, written down rather than discovered: the store's revocation
+ * list is keyed by grant id alone and holds no tenant, so an *authenticated*
+ * tenant presenting another tenant's grant id would still retire it. Closing
+ * that needs a tenant column on the revocation record, which belongs with the
+ * durable store U15 owns; this is the half that can be closed here.
+ */
 async function handleRevoke(deps: ServerDeps, request: Request): Promise<Response> {
+  const presented = stripBearer(request.headers.get('authorization') ?? '');
+  const tenantId = tenantOfToken(presented);
+  if (tenantId === null) return unauthorized(deps);
+
+  const resolved = await deps.secrets.resolve(fleetIdentity(tenantId), tenantId);
+  if (!resolved.ok || !verifyTenantBearer(presented, resolved.secret.bearerGrant)) {
+    return unauthorized(deps);
+  }
+
   const form = new URLSearchParams(await request.text());
   const grantId = form.get('grant_id') ?? '';
   if (grantId.length > 0) deps.store.revokeGrant(grantId);

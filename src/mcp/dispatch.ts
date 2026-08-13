@@ -75,6 +75,17 @@ import { isDispatchable, toolByName, type Endpoint } from './tools/index.ts';
  */
 export const DEFAULT_WRITE_ORIGIN = 'personal:agent';
 
+/**
+ * The one sentence every failure to authenticate answers with.
+ *
+ * Exported so a test can assert the surface has exactly one of these rather
+ * than asserting a string it copied. The rule it encodes: a refusal must not
+ * distinguish "no such tenant" from "wrong secret for a tenant that exists" —
+ * the second is an existence oracle over the fleet's tenant list, reachable
+ * with no credential at all and leaving no content in any log.
+ */
+export const UNAUTHORIZED_MESSAGE = 'That credential is not one this server issued.';
+
 export interface PanelNonces {
   verify(nonce: string, tenantId: string, nowMs: number): boolean;
 }
@@ -165,36 +176,49 @@ export async function dispatch(
 
   // ---- 1. The credential, before anything else touches a database. ---------
   const presented = request.authorization === null ? '' : stripBearer(request.authorization);
-  if (presented.length === 0) {
-    return refuse('unauthorized', 'This connection presented no credential.', 'unauthorized', anonymous);
-  }
+  const tenantId = presented.length === 0 ? null : tenantOfToken(presented);
 
-  const tenantId = tenantOfToken(presented);
-  if (tenantId === null) {
-    return refuse('unauthorized', 'That credential is not one this server issued.', 'unauthorized', anonymous);
-  }
+  // Every way of failing to authenticate leaves through **one** return, with one
+  // message. The version this replaced had three, and the third said something
+  // different — "not valid for this brain" once a tenant resolved, "not one this
+  // server issued" when it did not. That is a tenant-existence oracle: same
+  // credential shape, same alphabet, different sentence, and an unauthenticated
+  // caller enumerates which tenant ids the fleet serves without ever reading a
+  // row. Content-free is not the same as disclosure-free, which is exactly why
+  // this one survived a suite that checks every refusal is typed.
+  const resolved =
+    tenantId === null ? null : await deps.secrets.resolve(fleetIdentity(tenantId), tenantId);
 
-  const resolved = await deps.secrets.resolve(fleetIdentity(tenantId), tenantId);
-  if (!resolved.ok) {
-    return refuse('unauthorized', 'That credential is not one this server issued.', 'unauthorized', {
-      grantId: 'anonymous',
-      tenantId,
-    });
-  }
+  // An unresolvable tenant becomes an empty stored bearer rather than an early
+  // return, so the unknown-tenant path and the wrong-secret path run the same
+  // verification and produce the same refusal.
+  const claims =
+    tenantId === null
+      ? null
+      : verifyCredential(presented, resolved?.ok === true ? resolved.secret.bearerGrant : '', now.getTime(), {
+          tenantId,
+          endpoint: deps.endpoint,
+          writeOrigin,
+        });
 
-  const claims = verifyCredential(presented, resolved.secret.bearerGrant, now.getTime(), {
-    tenantId,
-    endpoint: deps.endpoint,
-    writeOrigin,
-  });
   if (claims === null) {
-    return refuse('unauthorized', 'That credential is not valid for this brain.', 'unauthorized', {
+    return refuse('unauthorized', UNAUTHORIZED_MESSAGE, 'unauthorized', {
       grantId: 'anonymous',
-      tenantId,
+      tenantId: tenantId ?? 'unknown',
     });
   }
+  if (resolved?.ok !== true) {
+    // Unreachable — a null `resolved` cannot produce claims — and kept so the
+    // narrowing below is a property of the code rather than of the reader.
+    return refuse('unauthorized', UNAUTHORIZED_MESSAGE, 'unauthorized', anonymous);
+  }
 
-  const actor = { grantId: claims.grantId, tenantId };
+  // From here down the tenant is the *authenticated* one — `verifyCredential`
+  // refuses an access token whose claims name a different tenant than the one
+  // its secret was resolved for, so these are the same string with one of them
+  // carrying a proof.
+  const authenticatedTenantId = claims.tenantId;
+  const actor = { grantId: claims.grantId, tenantId: authenticatedTenantId };
 
   // A self-contained token cannot be withdrawn by rewriting it, so revocation
   // is a list and it is consulted on every call — including the ones that would
@@ -219,7 +243,7 @@ export async function dispatch(
   if (def.requiresPanelNonce === true) {
     const supplied = typeof request.args.panel_nonce === 'string' ? request.args.panel_nonce : '';
     const accepted =
-      supplied.length > 0 && (deps.panelNonces?.verify(supplied, tenantId, now.getTime()) ?? false);
+      supplied.length > 0 && (deps.panelNonces?.verify(supplied, authenticatedTenantId, now.getTime()) ?? false);
     if (!accepted) {
       return refuse(
         'invalid_params',
@@ -231,7 +255,7 @@ export async function dispatch(
   }
 
   // ---- 3. The tenant's database, by an identity that reaches no other. -----
-  const opened = await deps.connections.open(tenantId);
+  const opened = await deps.connections.open(authenticatedTenantId);
   if (!opened.ok) {
     return refuse('unavailable', 'This brain could not be reached.', 'unavailable', actor);
   }
@@ -251,8 +275,8 @@ export async function dispatch(
     sql,
     grant,
     writeOrigin: claims.writeOrigin,
-    tenantId,
-    caller: fleetIdentity(tenantId),
+    tenantId: authenticatedTenantId,
+    caller: fleetIdentity(authenticatedTenantId),
     gateway: deps.gateway,
     now,
     nonce,
@@ -281,7 +305,7 @@ export async function dispatch(
   }
 
   const meta = {
-    'brainz.app/brain': attestation(tenantId),
+    'brainz.app/brain': attestation(authenticatedTenantId),
     'brainz.app/setup_url': 'https://app.brainz.test/connect',
   };
 

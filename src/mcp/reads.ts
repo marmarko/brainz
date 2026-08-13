@@ -140,13 +140,18 @@ export async function fetchRecord(sql: SQL, grant: Grant, id: OpaqueId): Promise
 
 async function fetchChunk(sql: SQL, grant: Grant, key: string): Promise<RecordOutcome> {
   const rows = (await sql.unsafe(
+    // The same fence on the join, in the other direction. A title is row
+    // content and a mail *subject* is attacker-authored — the one field the
+    // `/openai` shape can make the whole of what a model sees. Fencing the
+    // passage and then reading its parent's title hands a work-scoped grant a
+    // sentence a personal-origin sender wrote.
     `SELECT c.origin_context, c.content, c.created_at, p.title, p.source_type
        FROM chunk c
-       LEFT JOIN page p ON p.page_id = c.page_id
+       LEFT JOIN page p ON p.page_id = c.page_id AND p.origin_context = ANY($2::text[])
       WHERE c.chunk_id = $1::bigint
         AND c.deleted_at IS NULL
         AND c.quarantined_at IS NULL`,
-    [key],
+    [key, textArrayLiteral(grant)],
   )) as Array<{
     origin_context: string;
     content: string;
@@ -174,17 +179,24 @@ async function fetchChunk(sql: SQL, grant: Grant, key: string): Promise<RecordOu
 }
 
 async function fetchPage(sql: SQL, grant: Grant, key: string): Promise<RecordOutcome> {
+  // The join fences too, and it is not redundant with the page's own check.
+  // `chunk.origin_context` is its own credential-derived column — nothing in the
+  // schema ties it to its page's, which is why `indexState` counts chunks
+  // separately — so a page in grant can hang passages that are not. Fencing the
+  // parent and then aggregating the children is a cross-origin read wearing a
+  // document read.
   const rows = (await sql.unsafe(
     `SELECT p.origin_context, p.title, p.source_type, p.created_at,
             coalesce(string_agg(c.content, E'\\n\\n' ORDER BY c.ordinal, c.chunk_id), '') AS body
        FROM page p
        LEFT JOIN chunk c
          ON c.page_id = p.page_id AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
+        AND c.origin_context = ANY($2::text[])
       WHERE p.page_id = $1::bigint
         AND p.deleted_at IS NULL
         AND p.quarantined_at IS NULL
       GROUP BY p.page_id, p.origin_context, p.title, p.source_type, p.created_at`,
-    [key],
+    [key, textArrayLiteral(grant)],
   )) as Array<{
     origin_context: string;
     title: string | null;
@@ -294,6 +306,18 @@ export async function entityCard(sql: SQL, grant: Grant, name: string): Promise<
   if (needle.length === 0) return { status: 'not_found', suggestions: [] };
   const grantLiteral = textArrayLiteral(grant);
 
+  // In-grant matches first, then a stable tiebreak.
+  //
+  // The lookup is deliberately unfenced — an id-addressed or name-addressed read
+  // answers `scope_denied` rather than `not_found` when a row exists outside the
+  // grant, which is the disclosure this surface has undertaken to make so that
+  // "the fence held" and "there is nothing there" stay distinguishable. But an
+  // *unordered* unfenced match makes that disclosure decide the ordinary case
+  // too: two people share a name across a work and a personal mailbox — most of
+  // the interesting ones do — and the grant that holds one of them gets
+  // `scope_denied` on its own entity depending on which row the planner happened
+  // to return. Resolving in-grant first keeps the disclosure for the case it was
+  // meant for, which is the name this grant genuinely cannot reach.
   const rows = (await sql.unsafe(
     `SELECT e.entity_id::text AS entity_id, e.canonical_name, e.entity_type, e.origin_contexts
        FROM entity e
@@ -301,8 +325,9 @@ export async function entityCard(sql: SQL, grant: Grant, name: string): Promise<
       WHERE e.deleted_at IS NULL
         AND (lower(e.canonical_name) = $1 OR lower(a.alias) = $1)
       GROUP BY e.entity_id, e.canonical_name, e.entity_type, e.origin_contexts
+      ORDER BY (e.origin_contexts && $2::text[]) DESC, e.entity_id
       LIMIT 2`,
-    [needle],
+    [needle, grantLiteral],
   )) as Array<{ entity_id: string; canonical_name: string; entity_type: string; origin_contexts: string[] }>;
 
   const row = rows[0];
@@ -398,6 +423,7 @@ export async function briefingBundle(
             coalesce(substring(string_agg(c.content, ' ' ORDER BY c.ordinal) for 400), '') AS body
        FROM page p
        LEFT JOIN chunk c ON c.page_id = p.page_id AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
+         AND c.origin_context = ANY($1::text[])
       WHERE p.deleted_at IS NULL
         AND p.quarantined_at IS NULL
         AND p.origin_context = ANY($1::text[])
