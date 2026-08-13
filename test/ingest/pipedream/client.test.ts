@@ -539,6 +539,40 @@ describe('the rate budget bounds more than one pull', () => {
     expect(sharedRateBudget()).toBe(sharedRateBudget());
   });
 
+  test('only one caller per key waits on a timer at a time', async () => {
+    // With a shared budget the waiters on one key are the whole fleet, not one
+    // pull. Unserialized, every refill wakes all of them, one wins and the rest
+    // sleep again — O(waiters) wakeups per token, re-forming each round.
+    let clock = 0;
+    let sleeps = 0;
+    const pending: Array<() => void> = [];
+    const budget = createRateBudget({
+      qps: 1,
+      burst: 1,
+      now: () => clock,
+      sleep: () => {
+        sleeps += 1;
+        return new Promise<void>((resolve) => pending.push(resolve));
+      },
+    });
+
+    const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    await budget.take('gmail');
+    const waiting = [budget.take('gmail'), budget.take('gmail'), budget.take('gmail')];
+    await settle();
+
+    expect(sleeps).toBe(1);
+
+    // Drain, so nothing is left pending on the loop.
+    for (let round = 0; round < 16 && pending.length > 0; round += 1) {
+      clock += 1_000;
+      for (const resolve of pending.splice(0)) resolve();
+      await settle();
+    }
+    await Promise.all(waiting);
+  });
+
   test('waiters do not all proceed on one refill', async () => {
     // `take` slept and then decremented unconditionally, so N callers queued
     // behind one token all woke and all spent it. The bucket goes negative and
