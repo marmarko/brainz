@@ -437,3 +437,61 @@ describe('a setup capability does not survive a round trip through a transcript'
     expect(page.attachments[0]!.extractedContent).not.toContain('s3cr3t-token');
   });
 });
+
+describe('a claim URL in ordinary prose', () => {
+  /** The shape `mintClaimUrl` produces: a uuid path segment, the secret in the fragment. */
+  const CLAIM =
+    'https://brainz.example/connect/claim/6f1c2b3a-4d5e-4f60-8a1b-2c3d4e5f6071#Zm9vYmFyYmF6cXV1eDEyMzQ1Ng';
+
+  test('is redacted out of a transcript the fleet re-ingests', () => {
+    // The envelope's own key names are the structural signal, and they catch a
+    // capability that arrives *as* an envelope. They do not catch one an
+    // assistant simply typed into a sentence — and that one lands in the
+    // transcript, gets imported here, and is `recall`-able for its whole TTL:
+    // a live, single-use, tenant-bound capability sitting in the brain.
+    const prose = `Sure — open ${CLAIM} and pick the account you want.`;
+    const redacted = redactSetupCapabilities(prose);
+
+    expect(redacted).not.toContain(CLAIM);
+    expect(redacted).not.toContain('#Zm9vYmFyYmF6cXV1eDEyMzQ1Ng');
+    expect(redacted).toContain('open the account you want.'.slice(0, 4));
+  });
+
+  test('survives the parse, not just the helper', () => {
+    const parsed = parseChatExport([
+        {
+          uuid: 'conv-claim',
+          name: 'Connecting mail',
+          created_at: '2026-08-13T10:00:00Z',
+          chat_messages: [
+            {
+              uuid: 'm1',
+              sender: 'human',
+              created_at: '2026-08-13T10:00:00.000000Z',
+              text: 'connect my mail',
+              content: [{ type: 'text', text: 'connect my mail' }],
+              attachments: [],
+              files: [],
+            },
+            {
+              uuid: 'm2',
+              sender: 'assistant',
+              created_at: '2026-08-13T10:00:01.000000Z',
+              text: '',
+              content: [{ type: 'text', text: `Open ${CLAIM} to finish.` }],
+              attachments: [],
+              files: [],
+            },
+          ],
+        },
+    ]);
+    const body = parsed.conversations[0]?.body ?? '';
+    expect(body).toContain('to finish');
+    expect(body).not.toContain(CLAIM);
+  });
+
+  test('and an ordinary link is left alone', () => {
+    const prose = 'The deck is at https://widget-co.example/deck/2026-q3 if you want it.';
+    expect(redactSetupCapabilities(prose)).toBe(prose);
+  });
+});

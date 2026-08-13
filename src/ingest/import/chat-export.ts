@@ -43,11 +43,20 @@
  * this tenant. It travels in the MCP envelope's `setup` field and in the
  * `brainz.app/setup_url` meta key — which means it lands in the assistant's
  * transcript, which is the file this parser reads back in. Left alone, `recall`
- * could resurface a live capability months later. The redaction keys on the
- * envelope's own stable key names rather than on a URL shape, because the URL
- * shape is U9's to choose and does not exist yet — and a shape-based rule would
- * be a guard written against a value nobody has minted.
+ * could resurface a live capability months later.
+ *
+ * **Two rules, because they catch different things.** The structural one keys
+ * on the envelope's own stable key names, and it catches a capability that
+ * arrives *as* an envelope whatever the URL looks like. The shape rule is U9's
+ * own {@link redactClaimUrls}, imported rather than re-derived, and it catches
+ * the one the structural rule cannot see: a claim link an assistant simply
+ * typed into a sentence. That one is a live, single-use, tenant-bound
+ * capability sitting in the brain for the length of its TTL. When this file was
+ * written the URL shape did not exist yet and a shape rule would have been a
+ * guard against a value nobody had minted; it exists now.
  */
+
+import { redactClaimUrls } from '../pipedream/client.ts';
 
 /** Never a real URL, and not a value any parser will mistake for one. */
 export const REDACTED = '[redacted:setup-capability]';
@@ -190,7 +199,11 @@ function objectEnd(text: string, open: number): number {
  * a test has to be able to point at directly.
  */
 export function redactSetupCapabilities(text: string): string {
-  let output = text.replace(SETUP_URL_META, `$1"${REDACTED}"`);
+  // The shape rule first: it is a plain replace with no cursor to keep true,
+  // and running it before the structural pass means a claim URL inside a
+  // `setup` object is already gone by the time the object walk reaches it.
+  let output = redactClaimUrls(text);
+  output = output.replace(SETUP_URL_META, `$1"${REDACTED}"`);
 
   // A forward cursor, not a rescan from zero. Replacing inside a span shifts
   // every index after it, so a cached match list would redact the wrong bytes —
