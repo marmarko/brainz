@@ -142,12 +142,45 @@ describe('the per-cycle run record', () => {
   });
 });
 
+describe('R15 — a derived artifact cannot narrow its inputs’ origins', () => {
+  test('an entity card claiming less than the entity it describes is refused', async () => {
+    await sql.unsafe(`
+      INSERT INTO entity (canonical_name, entity_type, origin_contexts) VALUES
+        ('union-subject', 'person', ARRAY['personal:mail','work:files']),
+        ('union-subject-2', 'person', ARRAY['personal:mail','work:files'])
+    `);
+
+    // The covering case first, so the refusal below is a refusal of something
+    // and not of everything.
+    await sql.unsafe(`
+      INSERT INTO entity_card (entity_id, summary, trust_level, derivation, origin_contexts)
+      SELECT entity_id, 'covers both', 'model_inferred', 'model_derived',
+             ARRAY['personal:mail','work:files']
+        FROM entity WHERE canonical_name = 'union-subject'
+    `);
+
+    const state = await sqlstateOfFailure(
+      sql,
+      `INSERT INTO entity_card (entity_id, summary, trust_level, derivation, origin_contexts)
+       SELECT entity_id, 'narrows to one', 'model_inferred', 'model_derived', ARRAY['personal:mail']
+         FROM entity WHERE canonical_name = 'union-subject-2'`,
+    );
+    // BZ002: a derived row that does not carry an input's origin. KTD5 fences on
+    // origin alone, so this is a work relationship handed to a personal-fenced
+    // reader one derivation removed.
+    expect(state).toBe('BZ002');
+  });
+});
+
 describe('R12a — a review entry closes out of band or not at all', () => {
   test('a restatement over MCP cannot close a review entry', async () => {
     const state = await sqlstateOfFailure(
       sql,
-      `INSERT INTO review_queue (kind, target_ref, proposal, confidence, state, closed_by, origin_contexts)
-       VALUES ('entity_merge', 'entity:1', 'merge these two', 0.6, 'applied', 'agent_mcp', ARRAY['personal:mail'])`,
+      // `closed_at` is supplied deliberately: without it the row also violates
+      // the "a closed entry says who and when" CHECK, and the test would pass on
+      // a schema that had dropped the R12a rule entirely.
+      `INSERT INTO review_queue (kind, target_ref, proposal, confidence, state, closed_by, closed_at, origin_contexts)
+       VALUES ('entity_merge', 'entity:1', 'merge these two', 0.6, 'applied', 'agent_mcp', now(), ARRAY['personal:mail'])`,
     );
     expect(state).toBe('23514');
   });

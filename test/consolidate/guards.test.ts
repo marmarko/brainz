@@ -36,6 +36,7 @@ import {
   runContradictionPhase,
   runEnrichPhase,
   runExtractPhase,
+  runSynopsisPhase,
 } from '../../src/worker/consolidate/model-phases.ts';
 import { openRun } from '../../src/worker/consolidate/checkpoint.ts';
 import {
@@ -468,4 +469,101 @@ describe('4 — R12a', () => {
     // Exactly one opening marker: the wrapper's. The payload's copy is escaped.
     expect(prompt.user.split(openingMarker(nonce)).length - 1).toBe(1);
   });
+});
+
+describe('4b — R12a on the compiled-truth surface itself', () => {
+  test(
+    'a summary of external mail is not compiled truth; a summary of the user’s own note is',
+    async () => {
+      const { sql } = tenant;
+      await seedPage(sql, {
+        origin: 'personal:mail',
+        sourceType: 'email',
+        title: 'wire request',
+        body: `${INJECTION}\n${PLANTED}`,
+        externalRef: 'sender=attacker@evil.example',
+      });
+      await seedPage(sql, {
+        origin: 'personal:app',
+        sourceType: 'note',
+        title: 'my own note',
+        body: 'Ronan Whitfield joined Verdant Systems.',
+      });
+
+      const { gateway, transport } = createGateway({
+        chat: { synopsis: () => JSON.stringify({ summary: 'A short summary of the page.' }) },
+      });
+      const run = await openRun(sql, {
+        trigger: 'time_ceiling',
+        tier: 'paid',
+        now: new Date(),
+        estimateMicroUsd: 0,
+      });
+
+      const outcome = await runSynopsisPhase({
+        sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        runId: run.run.runId,
+        now: new Date(),
+        budget: uncappedBudget('synopsis'),
+      });
+
+      // Both were summarised, or the split below is a split of nothing.
+      expect(transport.callsFor('synopsis').length).toBe(2);
+      expect(outcome.applied).toBe(2);
+
+      const summaries = (await sql`
+        SELECT origin_context, derivation, compiled_truth FROM page
+         WHERE derivation = 'model_derived' ORDER BY origin_context
+      `) as Array<{ origin_context: string; derivation: string; compiled_truth: boolean }>;
+
+      expect(summaries.map((row) => [row.origin_context, row.compiled_truth])).toEqual([
+        // The user's own surface: an origin the sender cannot write.
+        ['personal:app', true],
+        // The mailbox: exactly the row a crafted message would want boosted.
+        ['personal:mail', false],
+      ]);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+});
+
+describe('5 — truncation degrades by importance, not by primary key', () => {
+  test(
+    'a bounded extraction pass spends its budget on the salient page first',
+    async () => {
+      const { sql } = tenant;
+      // Inserted dull-first, so an implementation that ordered by id would take
+      // the dull one and this test would pass by accident if it did not.
+      const dull = await seedPage(sql, {
+        origin: 'personal:mail',
+        sourceType: 'email',
+        title: 'lunch',
+        body: 'ok',
+      });
+      const salient = await seedPage(sql, {
+        origin: 'personal:mail',
+        sourceType: 'email',
+        title: 'Verdant thread',
+        body: 'Ronan Whitfield joined Verdant Systems.',
+      });
+      await sql`UPDATE page SET salience = 0.1, salience_source = 'deterministic' WHERE page_id = ${dull.pageId}::bigint`;
+      await sql`UPDATE page SET salience = 0.9, salience_source = 'deterministic' WHERE page_id = ${salient.pageId}::bigint`;
+
+      const first = await selectExtractionCandidates(sql, { limit: 1 });
+      expect(first.length).toBe(1);
+      expect(first[0]?.pageId).toBe(salient.pageId);
+
+      // And the bound is what left the other one out, not a filter: raise it and
+      // both appear, so the assertion above is about ordering rather than about
+      // one page being invisible.
+      const both = await selectExtractionCandidates(sql, { limit: 10 });
+      expect(both.map((candidate) => candidate.pageId).sort()).toEqual(
+        [dull.pageId, salient.pageId].sort(),
+      );
+    },
+    SETUP_TIMEOUT_MS,
+  );
 });

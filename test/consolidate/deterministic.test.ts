@@ -151,6 +151,42 @@ describe('link reconciliation', () => {
   );
 
   test(
+    'an edge this projection could not have produced is left alone',
+    async () => {
+      const { sql } = tenant;
+      await seedFact(sql, {
+        statement: 'Ronan Whitfield joined Verdant Systems.',
+        origins: ['personal:mail'],
+        confidence: 0.8,
+      });
+      // The shape U9 is about to add: an edge derived from connector metadata —
+      // an attendee join, a sender/recipient pair — that no deterministic
+      // statement implies. Whole-graph reconciliation is stronger than the write
+      // path's page-scoped one and would delete every one of these on the first
+      // cycle after they were written.
+      await sql.unsafe(`
+        INSERT INTO entity (canonical_name, entity_type, origin_contexts) VALUES
+          ('Dana Ilves', 'person', ARRAY['personal:mail']),
+          ('Trieste Roasters', 'organization', ARRAY['personal:mail']);
+        INSERT INTO entity_edge (subject_entity_id, edge_type, object_entity_id, origin_contexts, derivation)
+        SELECT (SELECT entity_id FROM entity WHERE canonical_name = 'Dana Ilves'),
+               'works_at',
+               (SELECT entity_id FROM entity WHERE canonical_name = 'Trieste Roasters'),
+               ARRAY['personal:mail'],
+               'ingested';
+      `);
+
+      const result = await reconcileAllEdges(sql, { taxonomyVersion: 1 });
+      // It still did its job on the edges it owns...
+      expect(result.added).toBe(1);
+      // ...and touched nothing it did not.
+      expect(result.removed).toBe(0);
+      expect(await countRows(sql, 'entity_edge', `deleted_at IS NULL AND derivation = 'ingested'`)).toBe(1);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
     'a superseded fact stops supporting its edge',
     async () => {
       const { sql } = tenant;
