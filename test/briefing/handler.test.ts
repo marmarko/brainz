@@ -17,6 +17,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
+import { collectBriefing } from '../../src/core/briefing/assemble.ts';
 import { DEBT_THRESHOLDS } from '../../src/core/briefing/prompt.ts';
 import { createMcpFixture, type McpFixture } from '../mcp/fixture.ts';
 import { CALENDAR, MAIL, seedBrain, warmLayer, type SeededBrain } from './fixture.ts';
@@ -139,12 +140,26 @@ describe('the upgrade prompt rides the advisory lane, bounded', () => {
     expect(second.envelope.notice).toBeUndefined();
   });
 
-  test('a brain with a fenced-out backlog is not prompted about it', async () => {
-    // The debt counter is fenced like everything else: pages this credential
-    // cannot read are not this credential's backlog.
-    const rows = (await fixture.sql`
-      SELECT count(*)::int AS n FROM page WHERE origin_context = ${CALENDAR}
-    `) as Array<{ n: number }>;
-    expect(rows[0]?.n ?? 0).toBeGreaterThan(0);
+  test('the debt counter is fenced: another origin\'s backlog is not yours', async () => {
+    // The whole seeded backlog is mail. A credential that can read only the
+    // calendar must not be told it owes for it — a debt counter that ignored
+    // the grant would prompt every narrow connection about work it cannot see,
+    // and would do it on the count of a brain it is not looking at.
+    const window = {
+      since: WINDOW.since,
+      until: WINDOW.until,
+      focus: null,
+      callerKey: 'bearer:fenced',
+      now: new Date(WINDOW.until),
+      budgetTokens: 4000,
+    };
+    const narrow = await collectBriefing(fixture.sql, [CALENDAR], window);
+    const wide = await collectBriefing(fixture.sql, [CALENDAR, MAIL], window);
+
+    expect(wide.counts.pendingDebt).toBeGreaterThanOrEqual(DEBT_THRESHOLDS[0]!);
+    expect(narrow.counts.pendingDebt).toBeLessThan(DEBT_THRESHOLDS[0]!);
+    // ...and it is not simply zero everywhere: the calendar's own live page is
+    // still this credential's backlog.
+    expect(narrow.counts.pendingDebt).toBeGreaterThan(0);
   });
 });
