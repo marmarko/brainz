@@ -114,11 +114,16 @@ describe.if(checkout !== undefined)('against the pinned gbrain build', () => {
   if (pinned === undefined) throw new Error('unreachable');
 
   test('every quoted rationale is still in the guard it was quoted from', () => {
-    const unported = Object.entries(GUARD_DISPOSITIONS).filter(([, entry]) => entry.kind === 'unported');
+    // `ported` carries a quote too, and it is the same claim: upstream's own
+    // words at the pin. A card that was closed here still quotes them, so it is
+    // held to the same freshness rule.
+    const unported = Object.entries(GUARD_DISPOSITIONS).filter(
+      ([, entry]) => entry.kind === 'unported' || entry.kind === 'ported',
+    );
     expect(unported.length).toBeGreaterThan(0);
 
     for (const [guard, disposition] of unported) {
-      if (disposition.kind !== 'unported') continue;
+      if (disposition.kind !== 'unported' && disposition.kind !== 'ported') continue;
       const source = pinned.readFile(guard);
       expect({ guard, quoted: source.includes(disposition.quote) }).toEqual({ guard, quoted: true });
     }

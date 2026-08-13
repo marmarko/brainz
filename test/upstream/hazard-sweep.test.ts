@@ -90,8 +90,22 @@ describe('cards are emitted only where nothing here would catch the mechanism', 
     for (const card of cards) {
       expect(card.sources.length).toBeGreaterThan(0);
       expect(card.id).toMatch(/^H\d+$/);
-      expect(card.status).toBe('unported');
+      expect(['unported', 'guarded']).toContain(card.status);
+      // A card that says `guarded` must name what closed it. The point of
+      // keeping a closed card is that its number survives; a closed card with
+      // no guard path would be a number surviving and nothing else.
+      if (card.status === 'guarded') expect(card.guarded_by ?? '').not.toBe('');
     }
+  });
+
+  test('a closed card keeps its number rather than vanishing', () => {
+    // Card ids are positional. Deleting `unpinned-search-path` when H6 was
+    // guarded would have renumbered H7…H15 under every reference to them in the
+    // tree, which is why `ported` is a disposition kind and not a deletion.
+    const closed = cards.find((card) => card.sources.includes('scripts/check-search-path.sh'));
+    expect(closed?.id).toBe('H6');
+    expect(closed?.status).toBe('guarded');
+    expect(cards.at(-1)?.id).toBe('H15');
   });
 
   test('card ids continue after the hand-written ones and never collide', () => {
@@ -120,7 +134,9 @@ describe('cards are emitted only where nothing here would catch the mechanism', 
     // disposition that closes a hazard by citing a file nobody wrote is the
     // whole failure this unit is against, in a different file.
     for (const [guard, disposition] of Object.entries(GUARD_DISPOSITIONS)) {
-      if (disposition.kind !== 'guarded') continue;
+      // `ported` is held to the same rule as `guarded`: it closes a hazard by
+      // naming a file, so the file has to be there.
+      if (disposition.kind !== 'guarded' && disposition.kind !== 'ported') continue;
       expect(
         { guard, exists: Bun.file(disposition.guard).size > 0 },
       ).toEqual({ guard, exists: true });
@@ -138,6 +154,7 @@ describe('rendered cards match the shape `docs/porting-hazards.md` already uses'
       expect(markdown).toContain(`## ${card.id} — ${card.title}`);
     }
     expect(markdown).toMatch(/\*\*Status:\*\* `unported`/);
+    expect(markdown).toMatch(/\*\*Status:\*\* `guarded`/);
   });
 
   test('each card carries the five fields the format declares', () => {

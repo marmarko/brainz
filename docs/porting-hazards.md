@@ -382,8 +382,8 @@ No brainz counterpart. Upstream source: `scripts/check-fixture-privacy.sh`, `scr
 
 ## H6 — A trigger function resolving through the caller’s search_path
 
-**Status:** `unported` — swept from gbrain's guard corpus by `src/upstream/hazard-sweep.ts`.
-No brainz counterpart. Upstream source: `scripts/check-search-path.sh`.
+**Status:** `guarded` — swept from gbrain's guard corpus by `src/upstream/hazard-sweep.ts`.
+brainz guard: `src/schema/search-path.ts`. Upstream source: `scripts/check-search-path.sh`.
 
 **Mechanism.** gbrain's own words, from the guard header at the pinned commit:
 
@@ -391,9 +391,9 @@ No brainz counterpart. Upstream source: `scripts/check-search-path.sh`.
 
 **What masked it.** Every test passes: in a database with one schema there is nothing to shadow, so an unqualified reference resolves to the object the author meant. The failure needs a second same-named object in a schema the caller can reach, which no fixture creates.
 
-**brainz analog.** Live and measurable. brainz’s tenant schema defines **eight** trigger functions across `src/schema/migrations/v2-knowledge-core.sql` and `v3-consolidation.sql`, and **none** of them declares `SET search_path`. They are not incidental functions: they are R15’s origin fence — `refuse_origin_change`, `assert_origin_union`, `assert_fact_page_origin`, `assert_edge_origin_union` and their siblings. A fence that resolves its own table references through whatever search_path the calling session set is a fence whose enforcement is a function of the caller.
+**brainz analog.** It fired. brainz’s tenant schema defined **eight** trigger functions across `src/schema/migrations/v2-knowledge-core.sql` and `v3-consolidation.sql` and pinned `search_path` on none of them, and seven of the eight are R15’s origin fence — `refuse_origin_change`, `assert_origin_union`, `assert_fact_page_origin`, `assert_edge_origin_union` and their siblings. None was `SECURITY DEFINER` (`prosecdef` false on all eight), so this was never the privilege-escalation form; it was a **working bypass of the fence**. A schema holding an empty table named `page`, placed in front of `public`, made `assert_fact_page_origin` inspect the wrong table and admit a `fact` claiming `{personal}` extracted from a `work` page — and KTD5 fences reads on origin alone, so that row then reads out to a personal-scoped grant. `refuse_origin_change` names no table and fell too, by listing `pg_catalog` *late* and shadowing `to_jsonb`. A fence that resolves its own references through the calling session is a fence whose enforcement is a function of the caller.
 
-**The guard.** A scan over every `CREATE FUNCTION` in `src/schema/**/*.sql` asserting a `SET search_path` clause, run at migration-definition time so a new trigger function cannot reintroduce the gap. Structural rather than behavioural: reproducing the shadowing needs a second schema the tenant role can create in, which is a separate question from whether the functions are pinned.
+**The guard.** Rung 8 (`src/schema/migrations/v8-search-path-pinned.sql`) pins `pg_catalog, public, pg_temp` — `pg_temp` named **last** because an unlisted one is searched first for relation names, which would leave every union check defeatable by a temp table. It expands rather than rewrites, because `ALTER FUNCTION` is not an expand-only statement: each function gets a pinned twin and each trigger a twin trigger, so the unpinned arm can be fooled and the pinned arm cannot. `src/schema/search-path.ts` guards it in two halves — a ladder scan so a ninth function cannot land unpinned, and a catalog scan that sees a twin dropped, disabled, or never written for a later table. The three bypasses above are replayed in `test/schema/search-path.test.ts`, because a structural guard that passes while the exploit works is this card’s own failure mode.
 
 **Related.** H4 — both are cases where the mechanism that enforces a property is itself unprotected.
 

@@ -29,6 +29,17 @@
  *   - `unported`   — applicable, nothing here would catch it. Emits a card, and
  *                    with it a skipped test whose reason string prints on every
  *                    run.
+ *   - `ported`     — it *was* `unported`, its card exists and keeps its number,
+ *                    and brainz has since written the guard. Emits the same card
+ *                    with `**Status:** \`guarded\`` and no skipped stub. This
+ *                    kind exists because card ids are positional: deleting a
+ *                    closed card would renumber every card after it, silently
+ *                    invalidating every reference to `H7`…`H15` in the tree. A
+ *                    hazard that was inherited and then closed is a different
+ *                    fact from a hazard that never applied, and it counts toward
+ *                    `guarded` rather than toward `unported` — the unguarded
+ *                    count is the number this unit exists to report, and a
+ *                    closed hazard still inside it is the count lying.
  *   - `data`       — not a guard: a fixture or allowlist the guard reads.
  *
  * Each `unported` entry carries a verbatim `quote` from the upstream guard's own
@@ -43,6 +54,13 @@ export type Disposition =
   | { readonly kind: 'guarded'; readonly guard: string; readonly note: string }
   | { readonly kind: 'not-applicable'; readonly note: string; readonly precondition?: string }
   | { readonly kind: 'unported'; readonly card: string; readonly quote: string }
+  | {
+      readonly kind: 'ported';
+      readonly card: string;
+      readonly quote: string;
+      /** The brainz guard that closed it. Checked to exist, like `guarded`. */
+      readonly guard: string;
+    }
   | { readonly kind: 'data'; readonly note: string };
 
 /**
@@ -93,17 +111,29 @@ export const SWEPT_CARDS: readonly SweptCardSpec[] = [
       'reference resolves to the object the author meant. The failure needs a second same-named object ' +
       'in a schema the caller can reach, which no fixture creates.',
     analog:
-      'Live and measurable. brainz’s tenant schema defines **eight** trigger functions across ' +
-      '`src/schema/migrations/v2-knowledge-core.sql` and `v3-consolidation.sql`, and **none** of them ' +
-      'declares `SET search_path`. They are not incidental functions: they are R15’s origin fence — ' +
-      '`refuse_origin_change`, `assert_origin_union`, `assert_fact_page_origin`, `assert_edge_origin_union` ' +
-      'and their siblings. A fence that resolves its own table references through whatever search_path ' +
-      'the calling session set is a fence whose enforcement is a function of the caller.',
+      'It fired. brainz’s tenant schema defined **eight** trigger functions across ' +
+      '`src/schema/migrations/v2-knowledge-core.sql` and `v3-consolidation.sql` and pinned `search_path` ' +
+      'on none of them, and seven of the eight are R15’s origin fence — `refuse_origin_change`, ' +
+      '`assert_origin_union`, `assert_fact_page_origin`, `assert_edge_origin_union` and their siblings. ' +
+      'None was `SECURITY DEFINER` (`prosecdef` false on all eight), so this was never the ' +
+      'privilege-escalation form; it was a **working bypass of the fence**. A schema holding an empty ' +
+      'table named `page`, placed in front of `public`, made `assert_fact_page_origin` inspect the wrong ' +
+      'table and admit a `fact` claiming `{personal}` extracted from a `work` page — and KTD5 fences ' +
+      'reads on origin alone, so that row then reads out to a personal-scoped grant. ' +
+      '`refuse_origin_change` names no table and fell too, by listing `pg_catalog` *late* and shadowing ' +
+      '`to_jsonb`. A fence that resolves its own references through the calling session is a fence whose ' +
+      'enforcement is a function of the caller.',
     guard:
-      'A scan over every `CREATE FUNCTION` in `src/schema/**/*.sql` asserting a `SET search_path` clause, ' +
-      'run at migration-definition time so a new trigger function cannot reintroduce the gap. Structural ' +
-      'rather than behavioural: reproducing the shadowing needs a second schema the tenant role can ' +
-      'create in, which is a separate question from whether the functions are pinned.',
+      'Rung 8 (`src/schema/migrations/v8-search-path-pinned.sql`) pins ' +
+      '`pg_catalog, public, pg_temp` — `pg_temp` named **last** because an unlisted one is searched ' +
+      'first for relation names, which would leave every union check defeatable by a temp table. It ' +
+      'expands rather than rewrites, because `ALTER FUNCTION` is not an expand-only statement: each ' +
+      'function gets a pinned twin and each trigger a twin trigger, so the unpinned arm can be fooled ' +
+      'and the pinned arm cannot. `src/schema/search-path.ts` guards it in two halves — a ladder scan ' +
+      'so a ninth function cannot land unpinned, and a catalog scan that sees a twin dropped, disabled, ' +
+      'or never written for a later table. The three bypasses above are replayed in ' +
+      '`test/schema/search-path.test.ts`, because a structural guard that passes while the exploit works ' +
+      'is this card’s own failure mode.',
     related: 'H4 — both are cases where the mechanism that enforces a property is itself unprotected.',
   },
   {
@@ -443,9 +473,10 @@ export const GUARD_DISPOSITIONS: Readonly<Record<string, Disposition>> = {
     quote: 'Tests are checked-in code distributed with every release and',
   },
   'scripts/check-search-path.sh': {
-    kind: 'unported',
+    kind: 'ported',
     card: 'unpinned-search-path',
     quote: 'every trigger function in the canonical schema base',
+    guard: 'src/schema/search-path.ts',
   },
   'scripts/check-pg-url-redaction.sh': {
     kind: 'unported',

@@ -8,9 +8,9 @@
     "data_files": 1,
     "privacy_scanners": 6,
     "carded": 1,
-    "guarded": 8,
+    "guarded": 9,
     "not_applicable": 14,
-    "unported": 18
+    "unported": 17
   },
   "guards": [
     "scripts/check-admin-build.sh",

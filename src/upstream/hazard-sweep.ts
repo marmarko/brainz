@@ -30,7 +30,9 @@ export const HAND_WRITTEN_CARDS = 4;
 export interface SweptCard extends SweptCardSpec {
   /** `H5`, `H6`, … — positional in {@link SWEPT_CARDS}, so re-rendering is a no-op. */
   readonly id: string;
-  readonly status: 'unported';
+  readonly status: 'unported' | 'guarded';
+  /** The brainz guard that closed it, when the card is `guarded`. */
+  readonly guarded_by?: string;
   /** The upstream guards this card answers for. */
   readonly sources: readonly string[];
   /** Upstream's own words, quoted from the guard headers at the pinned commit. */
@@ -94,7 +96,11 @@ export function sweep(upstreamFiles: readonly string[]): SweepReport {
       (entry) => entry.kind === 'unported' && entry.card === 'privacy-scanners',
     ).length,
     carded: dispositions.filter((entry) => entry.kind === 'carded').length,
-    guarded: dispositions.filter((entry) => entry.kind === 'guarded').length,
+    // `ported` counts here rather than under `unported`: it names a brainz guard
+    // that exists, which is what `guarded` means. The distinction the two kinds
+    // keep is whether a card was ever emitted, not whether a guard is written.
+    guarded: dispositions.filter((entry) => entry.kind === 'guarded' || entry.kind === 'ported')
+      .length,
     not_applicable: dispositions.filter((entry) => entry.kind === 'not-applicable').length,
     unported: dispositions.filter((entry) => entry.kind === 'unported').length,
   };
@@ -113,14 +119,24 @@ export function sweptCards(): SweptCard[] {
   const sourcesByCard = new Map<string, string[]>();
   const quotesByCard = new Map<string, string[]>();
 
+  // A card closed by a brainz guard keeps its sources, its quote and its number.
+  // Dropping it would renumber every card after it, which is why `ported` exists
+  // as a kind rather than as a deletion.
+  const guardsByCard = new Map<string, string[]>();
+
   for (const [guard, disposition] of Object.entries(GUARD_DISPOSITIONS)) {
-    if (disposition.kind !== 'unported') continue;
+    if (disposition.kind !== 'unported' && disposition.kind !== 'ported') continue;
     const sources = sourcesByCard.get(disposition.card) ?? [];
     sources.push(guard);
     sourcesByCard.set(disposition.card, sources.sort());
     const quotes = quotesByCard.get(disposition.card) ?? [];
     quotes.push(disposition.quote);
     quotesByCard.set(disposition.card, quotes);
+    if (disposition.kind === 'ported') {
+      const closed = guardsByCard.get(disposition.card) ?? [];
+      closed.push(disposition.guard);
+      guardsByCard.set(disposition.card, [...new Set(closed)].sort());
+    }
   }
 
   const cards: SweptCard[] = [];
@@ -129,10 +145,18 @@ export function sweptCards(): SweptCard[] {
   for (const spec of SWEPT_CARDS) {
     const sources = sourcesByCard.get(spec.key);
     if (sources === undefined || sources.length === 0) continue;
+    // Guarded only when EVERY upstream guard behind the card is ported. Six
+    // privacy scanners are one card; closing one of them closes no hazard, and a
+    // card that flipped on the first would be claiming coverage it does not have.
+    const closedBy = guardsByCard.get(spec.key) ?? [];
+    const guarded = closedBy.length > 0 && closedBy.length === countPortedFor(spec.key) &&
+      sources.length === countPortedFor(spec.key);
+
     cards.push({
       ...spec,
       id: `H${next}`,
-      status: 'unported',
+      status: guarded ? 'guarded' : 'unported',
+      ...(guarded ? { guarded_by: closedBy.join(', ') } : {}),
       sources,
       upstream_quote: (quotesByCard.get(spec.key) ?? []).join(' … '),
     });
@@ -140,6 +164,13 @@ export function sweptCards(): SweptCard[] {
   }
 
   return cards;
+}
+
+/** How many of a card's upstream guards carry a `ported` disposition. */
+function countPortedFor(card: string): number {
+  return Object.values(GUARD_DISPOSITIONS).filter(
+    (entry) => entry.kind === 'ported' && entry.card === card,
+  ).length;
 }
 
 /**
@@ -159,8 +190,10 @@ export function renderCards(cards: readonly SweptCard[]): string {
     return [
       `## ${card.id} — ${card.title}`,
       '',
-      `**Status:** \`unported\` — swept from gbrain's guard corpus by \`src/upstream/hazard-sweep.ts\`.`,
-      `No brainz counterpart. Upstream source: ${sources}.`,
+      `**Status:** \`${card.status}\` — swept from gbrain's guard corpus by \`src/upstream/hazard-sweep.ts\`.`,
+      card.status === 'guarded'
+        ? `brainz guard: \`${card.guarded_by}\`. Upstream source: ${sources}.`
+        : `No brainz counterpart. Upstream source: ${sources}.`,
       '',
       `**Mechanism.** gbrain's own words, from the guard header at the pinned commit:`,
       '',
@@ -207,7 +240,9 @@ export function renderStubs(cards: readonly SweptCard[]): string {
     '',
   ].join('\n');
 
-  const stubs = cards.map((card) => {
+  // A guarded card obliges no stub: `registry-consistency.test.ts` reads a stub
+  // with no `unported` row as a stale skip inflating the unguarded count.
+  const stubs = cards.filter((card) => card.status === 'unported').map((card) => {
     const sources = card.sources.join(', ');
     const reason = `${card.id} — ${card.title}: unported from ${sources}. ${card.guard.replace(/\s+/g, ' ')}`;
     return `test.skip(${JSON.stringify(reason)}, () => {});`;
