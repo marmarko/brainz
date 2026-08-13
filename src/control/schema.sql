@@ -276,3 +276,232 @@ CREATE INDEX tenant_due_for_consolidation
 CREATE INDEX tenant_stale_provisioning
   ON control.tenant (provisioning_started_at)
   WHERE state = 'provisioning'::control.tenant_state;
+
+-- ===========================================================================
+-- The typed job table (U10).
+--
+-- The header of this file predicted this table and predicted what it would want:
+-- a `jsonb` payload. It does not get one. Every job argument is a typed column
+-- — an enum where the value is one of a set written down here, a bounded
+-- alphabet-pinned domain where it is an identifier — because the control plane
+-- holds every tenant's scheduling state and none of their words. A payload
+-- column would carry a filename, a mailbox query, or a provider error body into
+-- the one database R10's register says has no content in it.
+--
+-- **How this table grows.** A later unit that needs a new argument adds a
+-- nullable, typed column and a CHECK tying it to the kind that uses it. That is
+-- an additive rung, and it is the only shape allowed: `import` will want to name
+-- the raw payload it reads, and the answer is a `varchar` domain over hex
+-- digits, never the filename.
+-- ===========================================================================
+
+-- What a job *is*. Five kinds, fixed at U10 because U8 and U9 consume `import`
+-- and `ingest_pull` in Phase 2 and a queue whose type set is still moving is a
+-- queue every consumer re-implements.
+CREATE TYPE control.job_kind AS ENUM (
+  'consolidate',
+  'ingest_pull',
+  'import',
+  'export',
+  're_embed'
+);
+
+-- What the job acts on, and the reason it is one NOT NULL enum rather than a
+-- nullable column per kind: it is half of the dedupe key, and a nullable column
+-- in a unique index is not a key at all — Postgres holds NULLs distinct, so
+-- every "one open job per tenant" claim would be silently false for the kinds
+-- that left it empty. `whole_brain` is the tenant's brain taken as a whole.
+CREATE TYPE control.job_target AS ENUM (
+  'whole_brain',
+  'gmail',
+  'calendar',
+  'drive',
+  'chat_export',
+  'folder'
+);
+
+-- `due` is claimable, `running` is leased, and the rest are terminal.
+--
+-- `dead` is the visible place an exhausted job lands: dead-lettering by deleting
+-- the row would make a poison job indistinguishable from a job that never
+-- existed, and the tenant's quarantine is read from these rows. `discarded` is
+-- an operator's answer to one — "this work is not to be done" — and it is a
+-- state rather than a `DELETE` for the same reason: the record of what was
+-- refused, and when, is the whole value of a dead letter.
+CREATE TYPE control.job_state AS ENUM ('due', 'running', 'done', 'dead', 'discarded');
+
+-- Which of KTD11's triggers put this job here. Recorded because the three
+-- triggers have different failure modes and "why did this tenant cycle" is
+-- otherwise unanswerable: a fleet cycling on the ceiling alone means the
+-- debounce is broken, and that looks exactly like a fleet that is working.
+CREATE TYPE control.job_trigger AS ENUM (
+  'debt_debounce',
+  'time_ceiling',
+  'user_request',
+  'connector_cadence'
+);
+
+-- Why the last attempt ended. A code, for the same reason
+-- `provisioning_failure` is a code: a handler's exception message is the
+-- ordinary way a user's filename or a connection string reaches this database.
+CREATE TYPE control.job_failure AS ENUM (
+  'handler_error',
+  'attempt_timed_out',
+  'lease_stolen',
+  'tenant_unavailable',
+  'cancelled'
+);
+
+-- Which worker process holds a lease. Observability only — **the fence is the
+-- token, not this column**. An identity string can be reused, guessed, or
+-- duplicated by a redeployed container; a monotonic counter cannot.
+CREATE DOMAIN control.worker_id AS varchar(64)
+  CONSTRAINT worker_id_is_an_opaque_handle
+  CHECK (VALUE ~ '^[a-z0-9][a-z0-9._-]{0,63}$');
+
+CREATE TABLE control.job (
+  job_id                uuid                    NOT NULL,
+  tenant_id             control.tenant_id       NOT NULL,
+  kind                  control.job_kind        NOT NULL,
+  target                control.job_target      NOT NULL,
+  state                 control.job_state       NOT NULL DEFAULT 'due',
+  trigger_reason        control.job_trigger     NOT NULL,
+
+  -- The retry ladder. `attempts` counts attempts *started*, so a worker that
+  -- dies without ever reporting still advances it — poison-job protection has
+  -- to cover the crash loop, not only the caught exception, or a handler that
+  -- kills its process is retried forever.
+  attempts              integer                 NOT NULL DEFAULT 0,
+  max_attempts          integer                 NOT NULL DEFAULT 5,
+
+  -- The debt this job was enqueued to work off. Completion subtracts *this*
+  -- rather than zeroing the counter, because U6 increments it concurrently and
+  -- a blind `= 0` silently discards everything that arrived mid-cycle.
+  debt_observed         integer                 NOT NULL DEFAULT 0,
+
+  -- When the job becomes claimable. Backoff moves it forward; it is never in
+  -- the past for a job that has just failed.
+  run_at                timestamptz             NOT NULL,
+
+  -- The lease. `lease_token` is the fencing token and the reason this table can
+  -- be trusted: every write a worker makes is conditional on the token it
+  -- believes it holds, so a worker whose lease was stolen is not *asked* to
+  -- stop — its writes are refused. U2 shipped this table's mistake first (a
+  -- blind patch keyed on the row id alone) and a straggling run banked `failed`
+  -- over a live tenant. The same shape here would let a zombie worker mark a
+  -- job done that another worker is still running.
+  lease_token           integer                 NOT NULL DEFAULT 0,
+  lease_owner           control.worker_id,
+  lease_expires_at      timestamptz,
+  heartbeat_at          timestamptz,
+
+  -- The stall backstop, and it is separate from the lease on purpose. The lease
+  -- is renewed by the runner, not by the handler, so a wedged handler on a
+  -- healthy worker heartbeats forever and holds its job forever: the liveness
+  -- signal is exactly what masks the stall. This is the wall-clock ceiling on a
+  -- single attempt, stamped at claim, and reclaim honours it whether or not the
+  -- lease still looks alive.
+  attempt_deadline_at   timestamptz,
+
+  created_at            timestamptz             NOT NULL,
+  updated_at            timestamptz             NOT NULL,
+  finished_at           timestamptz,
+  dead_lettered_at      timestamptz,
+  failure_code          control.job_failure,
+
+  CONSTRAINT job_pkey PRIMARY KEY (job_id),
+
+  -- A job outlives nothing. When U17 deletes a tenant its queue goes with it,
+  -- rather than becoming rows that name a tenant no connection string reaches.
+  CONSTRAINT job_belongs_to_a_tenant FOREIGN KEY (tenant_id)
+    REFERENCES control.tenant (tenant_id) ON DELETE CASCADE,
+
+  CONSTRAINT job_counters_are_non_negative CHECK (
+    attempts >= 0
+    AND debt_observed >= 0
+    AND lease_token >= 0
+    AND max_attempts >= 1
+  ),
+
+  -- The kind decides which targets are legal. Without this the enum is two
+  -- independent columns and `('consolidate', 'gmail')` is a storable job that
+  -- no handler will ever recognise.
+  CONSTRAINT job_target_suits_its_kind CHECK (
+    (kind = 'consolidate' AND target = 'whole_brain')
+    OR (kind = 'export' AND target = 'whole_brain')
+    OR (kind = 're_embed' AND target = 'whole_brain')
+    OR (kind = 'ingest_pull' AND target IN ('gmail', 'calendar', 'drive'))
+    OR (kind = 'import' AND target IN ('chat_export', 'folder'))
+  ),
+
+  -- A running job holds a real lease, with a token, an owner, an expiry and an
+  -- attempt deadline. The state and the lease cannot drift apart, so "running
+  -- but unleased" — the row a crashed claim would leave, and the row a reaper
+  -- would skip forever — is not storable.
+  CONSTRAINT running_jobs_hold_a_lease CHECK (
+    state <> 'running' OR (
+      lease_token > 0
+      AND lease_owner IS NOT NULL
+      AND lease_expires_at IS NOT NULL
+      AND attempt_deadline_at IS NOT NULL
+    )
+  ),
+
+  -- And the other direction: releasing a job clears its lease. A `due` row
+  -- still naming an owner reads as claimed to every human looking at it.
+  CONSTRAINT released_jobs_hold_no_lease CHECK (
+    state = 'running' OR (
+      lease_owner IS NULL
+      AND lease_expires_at IS NULL
+      AND attempt_deadline_at IS NULL
+    )
+  ),
+
+  CONSTRAINT dead_jobs_name_a_code_and_a_moment CHECK (
+    state <> 'dead' OR (failure_code IS NOT NULL AND dead_lettered_at IS NOT NULL)
+  ),
+
+  CONSTRAINT finished_jobs_carry_a_finished_at CHECK (
+    state <> 'done' OR finished_at IS NOT NULL
+  ),
+
+  -- The mirror of `only_served_tenants_carry_a_ready_at` above: a row that is
+  -- neither dead nor discarded cannot carry the moment it was dead-lettered.
+  -- Requeueing out of quarantine has to clear the evidence with it, or the next
+  -- reader sees a live job that still looks quarantined — and `enqueue` reads
+  -- exactly that to decide whether a tenant is quarantined.
+  CONSTRAINT only_dead_jobs_carry_a_dead_lettered_at CHECK (
+    dead_lettered_at IS NULL OR state IN ('dead', 'discarded')
+  )
+);
+
+-- **One open job per tenant, kind and target.** This is what makes "re-enqueued
+-- once, not duplicated" a property of the database rather than of the enqueue
+-- code being careful: a debounce that fires on every quiet tick, two schedulers
+-- running during a rolling deploy, and a retry racing a reclaim all collapse
+-- onto one row. Partial, because `done` and `dead` rows accumulate and must not
+-- block the next cycle.
+CREATE UNIQUE INDEX job_one_open_per_tenant_kind_target
+  ON control.job (tenant_id, kind, target)
+  WHERE state IN ('due', 'running');
+
+-- The claim query's access path.
+CREATE INDEX job_claimable
+  ON control.job (run_at)
+  WHERE state = 'due'::control.job_state;
+
+-- The reaper's. Both reclaim conditions — an expired lease and an overrun
+-- attempt deadline — are read from running rows only.
+CREATE INDEX job_reclaimable
+  ON control.job (lease_expires_at)
+  WHERE state = 'running'::control.job_state;
+
+-- The quarantine lookup. `enqueue` consults it on every insert, so it is on the
+-- write path, not only on an operator's dashboard. Keyed on the same triple as
+-- the dedupe index above, because **the unit of quarantine is the unit of
+-- scheduling**: a Gmail pull that poisons a worker must not stop that tenant's
+-- calendar, and a poisoned consolidation must stop the tenant's consolidation
+-- (its target is the whole brain, so it does).
+CREATE INDEX job_dead_letters
+  ON control.job (tenant_id, kind, target)
+  WHERE state = 'dead'::control.job_state;

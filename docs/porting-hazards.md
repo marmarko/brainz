@@ -295,6 +295,47 @@ misdiagnosis the plan's stop condition (c) is built to avoid.
 
 ---
 
+## H4 — Lease renewal starved by the connection it shares with the work
+
+**Status:** `guarded` — `test/worker/lease-renewal.test.ts`, against a real Postgres with a
+one-connection work pool. Remedy in `src/worker/locks.ts` (`assertDedicatedLeaseChannel`) and
+`src/worker/queue.ts` (`createLeaseChannel`).
+
+**Mechanism.** A long-held job lease is kept alive by a small renewal query on a timer. Route that
+query through the same pool the job's own work uses and it is not a timer at all — it is a request
+that waits its turn behind whatever the work is doing. Under a pooler that rotates connections, or
+simply under a pool the work has saturated, the renewal misses its window, the lease lapses while
+the worker is healthy and mid-job, and a reaper hands the job to somebody else. Production upstream
+lost roughly 39 worker processes a day to this exact sequence.
+
+**Why it is dangerous rather than merely wrong.** Every query in the sequence succeeds. The renewal
+eventually runs; the reaper is doing its job; the second worker completes normally. The only
+symptoms are a worker count that drifts down and a queue that quietly does some work twice — and
+the duplicate is expensive here, because a doubled consolidation cycle is doubled model spend
+against a per-tenant cap.
+
+**brainz analog.** Any long-held lease renewed over a shared pool: `control.job`'s
+`lease_expires_at`, and later any per-tenant connection LRU that puts the control plane and the
+tenant's own database behind one budget.
+
+**What masked it.** Pool contention. The wiring that fails is character-for-character the wiring
+that works, right up until the pool is busy — so it passes every test that runs one job at a time,
+which is every test anybody writes first.
+
+**The guard.** Behavioural, and in two halves. Saturate a one-connection work pool with a long
+query while a lease is held; assert the renewal on its own channel still lands, and that a reaper
+running at an instant which *would* otherwise have taken the lease takes nothing. Then the seeded
+regression: same clock, same reaper, renewal routed through the saturated pool — the lease is stolen
+from a live worker and the renewal that eventually runs is refused by the fencing token. The second
+half is what gives the first one meaning.
+
+**Related.** The fence rather than the lease is what makes the theft safe: `lease_token` is
+incremented by the steal, so the dispossessed worker's writes are rejected by the store instead of
+merely being discouraged. That is the same correction U2 made after shipping unfenced provisioning
+writes, and the reason a starved renewal is a lost job rather than a corrupted one.
+
+---
+
 ## Candidates for the next pass
 
 Not yet written up. From gbrain's guard corpus and incident log, in rough priority order:
@@ -310,6 +351,6 @@ Not yet written up. From gbrain's guard corpus and incident log, in rough priori
 - **Cost estimate diverging from actual by orders of magnitude** — the $50.71-against-$0.96 run.
   brainz analog: any LLM call whose fan-out is driven by data cardinality rather than a
   configured constant. Guard: estimate before running, refuse over budget, cap mid-run.
-- **Lock renewal starved by connection rotation** — production lost ~39 worker processes/day when
-  the pooler rotated connections mid-`renewLock`. brainz analog: any long-held lease renewed over
-  a pooled connection.
+- **Job progress that signals liveness as well as completion** — the difference between "still
+  working" and "wedged" on a 41,000-email import is a support ticket. U10 ships the wall-clock
+  attempt deadline as the backstop; per-item progress is still unported.
