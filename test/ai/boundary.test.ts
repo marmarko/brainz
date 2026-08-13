@@ -108,6 +108,24 @@ const ENDPOINT_MARKERS: readonly string[] = [
 ];
 
 /** A model id written at a call site. */
+/**
+ * The one file whose job is to NAME every model endpoint, and which therefore
+ * trips the endpoint rule by doing it correctly.
+ *
+ * R10's register (`src/register/components.ts`) publishes every party user
+ * content is transmitted to, hostname included, so an outsider can audit the
+ * blast radius. A guard that forbade the register from naming an endpoint would
+ * be forbidding the artifact whose purpose is to name them — it is this guard's
+ * ally, not its evader.
+ *
+ * **The exemption is only from the endpoint-marker rule.** The provider-SDK
+ * rule, the model-id rule and the Workers-AI binding rule all still apply, and
+ * `the declaration-only exemption cannot hide a call site` below asserts the
+ * exempted file makes no request of any kind. Naming a destination and reaching
+ * one are different acts; only the second is what this file exists to stop.
+ */
+const ENDPOINT_DECLARATION_ONLY: readonly string[] = ['src/register/components.ts'];
+
 const MODEL_ID_MARKER = '@cf/';
 
 /**
@@ -219,6 +237,7 @@ export function findProviderAccessOutsideGateway(files: readonly SourceFile[]): 
     }
 
     for (const marker of ENDPOINT_MARKERS) {
+      if (ENDPOINT_DECLARATION_ONLY.includes(file.path)) break;
       if (code.includes(marker)) {
         findings.push(
           `${file.path}: names the model endpoint '${marker}' — an unmetered call is a bill, not an error`,
@@ -267,6 +286,20 @@ describe('no model provider is reachable outside the gateway', () => {
 
   test('no source file outside src/ai reaches a provider', () => {
     expect(findProviderAccessOutsideGateway(SOURCES)).toEqual([]);
+  });
+
+  test('the declaration-only exemption cannot hide a call site', () => {
+    // An allowlist on a boundary guard is the way a boundary guard gets routed
+    // around, so the exempted file is held to a stricter rule than the one it is
+    // excused from: it may name an endpoint and it may not reach one.
+    for (const path of ENDPOINT_DECLARATION_ONLY) {
+      const file = SOURCES.find((entry) => entry.path === path);
+      expect({ path, present: file !== undefined }).toEqual({ path, present: true });
+      const code = stripComments(file?.text ?? '');
+      expect({ path, fetches: /\bfetch\s*\(/.test(code) }).toEqual({ path, fetches: false });
+      expect({ path, imports: bareImportSpecifiers(code) }).toEqual({ path, imports: [] });
+      expect({ path, modelId: code.includes(MODEL_ID_MARKER) }).toEqual({ path, modelId: false });
+    }
   });
 
   test('the markers match what the gateway actually writes — positive control', () => {

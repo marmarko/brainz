@@ -46,11 +46,25 @@ const SRC_DIR = `${REPO_ROOT}/src`;
 const ACCESSOR = 'src/control/storage.ts';
 
 /**
- * The module that *records* what the accessor derived. It writes
- * `storage_prefix` onto the control-plane row and never re-derives it — the
+ * The modules that *record* what the accessor derived, and never re-derive it.
+ *
+ * `provision.ts` writes `storage_prefix` onto the control-plane row — the
  * schema's own `storage_prefix_belongs_to_this_tenant` CHECK is what pins that.
+ * `dispatch.ts` and `attestation.ts` put it in U16's isolation receipt, which is
+ * a JSON document and therefore cannot carry a branded type across the wire; the
+ * prefix reaches them from `prefixFor` and is copied, never constructed.
+ *
+ * **The exemption is narrower than it looks, deliberately.** It is consulted
+ * *after* the cast rule and the `PREFIX_ROOT` literal rule, so a file on this
+ * list still cannot cast to `TenantPrefix` and still cannot spell the storage
+ * root. All it may do is read a value the accessor already produced — which is
+ * the difference between recording a derivation and performing one.
  */
-const PREFIX_RECORDERS: readonly string[] = ['src/control/provision.ts'];
+const PREFIX_RECORDERS: readonly string[] = [
+  'src/control/provision.ts',
+  'src/mcp/dispatch.ts',
+  'src/mcp/attestation.ts',
+];
 
 /** The root segment `storage.ts` keeps private, spelled out here on purpose. */
 const PREFIX_ROOT = 'tenants';

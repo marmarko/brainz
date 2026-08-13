@@ -30,7 +30,7 @@ So:
 - If you believe a secret was committed, say so immediately rather than quietly
   force-pushing — rotation matters more than the commit history looking clean.
 
-## Two ledgers CI enforces
+## Three ledgers CI enforces
 
 **`upstream/concepts.jsonl`** — every capability from the parity audit carries a
 classification: `covered`, `not-yet(priority)`, or `omitted(reason, revisit_by)`.
@@ -46,6 +46,38 @@ not yet guarded.
 If your change closes a hazard, replace its skipped stub with a real behavioural
 test and update the card's status. If your change introduces a capability the
 ledger lists as `not-yet`, flip its row in the same PR.
+
+**`docs/register.md`** — every component shared by more than one user, with its
+blast radius and its rotation owner (R10). It is generated from
+`src/register/components.ts` and checked for completeness against three things
+the register does not author: every `http(s)://` host named anywhere in `src/`,
+every model provider a routing profile can reach, and every binding
+`wrangler.toml` declares.
+
+### Register review — the PR checklist item
+
+> **Register (R10).** If this PR adds or changes a component shared by more than
+> one user — a vendor, a model provider, a fleet, a queue, a credential —
+> `docs/register.md` names it with its blast radius and rotation owner.
+
+`bun test test/register/` fails on a component the code names and the register
+does not, and on an entry claiming something the code no longer has. The human
+half of the review is the checklist line above: the machine can tell you a vendor
+is unnamed, and it cannot tell you whether the blast radius you wrote for it is
+true.
+
+**Adding a model provider is the case to slow down on.** KTD13 admits exactly two
+model-side processors, and every other content-touching op runs open weights on
+Cloudflare's own plane. A third provider is a register change *and* a
+subprocessor-list change, not a config edit — the register exists to make that
+cost visible before it is paid.
+
+After changing the register, regenerate the document:
+
+```bash
+bun -e 'import {REGISTER_DOC_PATH,renderRegister,spliceRegister} from "./src/register/render.ts"; \
+  await Bun.write(REGISTER_DOC_PATH, spliceRegister(await Bun.file(REGISTER_DOC_PATH).text(), renderRegister()))'
+```
 
 ## Tests
 
