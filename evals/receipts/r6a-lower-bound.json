@@ -1,0 +1,154 @@
+{
+  "receipt": "R6a lower bound (non-triviality)",
+  "requirement": "R6a: a naive single-arm baseline scores below each ranking floor by a committed numeric margin, so a later pass proves the stack rather than an easy corpus.",
+  "corpus_digest": "133c861fae5b48ada38247fa759a2fc58b3faea4a60ebda22e9ebdf4f877193a",
+  "embedding_manifest_digest": "fabb3db916ae4fff239cb6d4cd1d5ceb8b411c75badf4903f6bba72b767e592d",
+  "embedding_source": {
+    "kind": "synthetic",
+    "model": "synthetic-lexical-v1",
+    "generator": "lexical-hash-v1"
+  },
+  "baselines": [
+    {
+      "name": "naive-lexical-bm25",
+      "description": "Single arm: BM25 over chunk content. No titles, no aliases, no graph, no recency, no dedup."
+    },
+    {
+      "name": "naive-vector-cosine",
+      "description": "Single arm: cosine over the committed asymmetric vectors. No fusion, no boosts, no dedup."
+    }
+  ],
+  "rule": "For each floor, the STRONGEST value achieved by any naive arm must be <= (minimum - margin). Taking the strongest rather than a chosen arm removes the thumb from the scale.",
+  "rows": [
+    {
+      "floorId": "aggregate.ndcg10",
+      "label": "nDCG@10 over the whole query set",
+      "minimum": 0.65,
+      "margin": 0.1,
+      "ceiling": 0.55,
+      "naive": 0.48584700233613076,
+      "naiveBy": "naive-lexical-bm25",
+      "clears": true
+    },
+    {
+      "floorId": "family.title_substring.hit1",
+      "label": "title-substring Hit@1",
+      "minimum": 0.95,
+      "margin": 0.5,
+      "ceiling": 0.44999999999999996,
+      "naive": 0,
+      "naiveBy": "naive-lexical-bm25",
+      "clears": true
+    },
+    {
+      "floorId": "family.alias.hit1",
+      "label": "alias Hit@1",
+      "minimum": 0.98,
+      "margin": 0.5,
+      "ceiling": 0.48,
+      "naive": 0.14285714285714285,
+      "naiveBy": "naive-lexical-bm25",
+      "clears": true
+    },
+    {
+      "floorId": "family.dilution.hit3",
+      "label": "dilution Hit@3",
+      "minimum": 1,
+      "margin": 0.5,
+      "ceiling": 0.5,
+      "naive": 0.2,
+      "naiveBy": "naive-lexical-bm25",
+      "clears": true
+    },
+    {
+      "floorId": "type.relational.ndcg10",
+      "label": "relational nDCG@10",
+      "minimum": 0.65,
+      "margin": 0.1,
+      "ceiling": 0.55,
+      "naive": 0.48036065655902527,
+      "naiveBy": "naive-lexical-bm25",
+      "clears": true
+    },
+    {
+      "floorId": "type.named_entity.ndcg10",
+      "label": "named-entity nDCG@10",
+      "minimum": 0.65,
+      "margin": 0.1,
+      "ceiling": 0.55,
+      "naive": 0.48678318818936933,
+      "naiveBy": "naive-lexical-bm25",
+      "clears": true
+    },
+    {
+      "floorId": "type.temporal.ndcg10",
+      "label": "temporal nDCG@10",
+      "minimum": 0.65,
+      "margin": 0.1,
+      "ceiling": 0.55,
+      "naive": 0.5118507559870998,
+      "naiveBy": "naive-lexical-bm25",
+      "clears": true
+    },
+    {
+      "floorId": "type.context_fenced.ndcg10",
+      "label": "context-fenced nDCG@10",
+      "minimum": 0.65,
+      "margin": 0.1,
+      "ceiling": 0.55,
+      "naive": 0.4686992652175235,
+      "naiveBy": "naive-lexical-bm25",
+      "clears": true
+    }
+  ],
+  "clears": true,
+  "per_baseline": {
+    "naive-lexical-bm25": {
+      "aggregate.ndcg10": 0.48584700233613076,
+      "family.title_substring.hit1": 0,
+      "family.alias.hit1": 0.14285714285714285,
+      "family.dilution.hit3": 0.2,
+      "type.relational.ndcg10": 0.48036065655902527,
+      "type.named_entity.ndcg10": 0.48678318818936933,
+      "type.temporal.ndcg10": 0.5118507559870998,
+      "type.context_fenced.ndcg10": 0.4686992652175235
+    },
+    "naive-vector-cosine": {
+      "aggregate.ndcg10": 0.4171553908390306,
+      "family.title_substring.hit1": 0,
+      "family.alias.hit1": 0.07142857142857142,
+      "family.dilution.hit3": 0.2,
+      "type.relational.ndcg10": 0.40257700894085624,
+      "type.named_entity.ndcg10": 0.42357968037021815,
+      "type.temporal.ndcg10": 0.4403191499987566,
+      "type.context_fenced.ndcg10": 0.40293410490124953
+    }
+  },
+  "extraction_rule_coverage": {
+    "totalFacts": 25,
+    "reachable": 20,
+    "modelOnly": 5,
+    "coverage": 0.8,
+    "byFamily": {
+      "relation_verb_sentence": 4,
+      "role_copula_sentence": 6,
+      "location_sentence": 2,
+      "currency_amount_sentence": 4,
+      "dated_event_sentence": 2,
+      "versioned_defect_sentence": 2,
+      "model_only": 5
+    },
+    "floorIsAttainable": true,
+    "floor": 0.8,
+    "note": "R6a gives the deterministic-extraction floor a rule-coverage baseline instead of a retrieval one, because a rule-free extractor extracts nothing and produces no comparable score. Coverage is the CEILING on deterministic recall over this corpus: 20 of 25 gold facts are in reach of a declared rule family. R6's floor is 0.8.",
+    "headroom": 0,
+    "finding": "FLAGGED: the ceiling equals the floor exactly. R6 asks deterministic extraction for 0.8 recall and this corpus puts only 0.8 of its gold facts within reach of a rule, so U6's extractor would have to be perfect on every rule-reachable fact to clear the floor and one miss fails it. That is a knife edge, and it is a fixture property rather than an implementation one. Two ways out, both belonging to the gates half of this unit rather than to the corpus half: widen the deterministic rule families so more of the gold key is reachable, or re-scope the floor to recall-over-rule-reachable-facts, which is the quantity a deterministic extractor can actually be held to. Recorded rather than resolved here, because resolving it by reclassifying facts until the number looks comfortable is the exact failure R6a exists to prevent."
+  },
+  "threats_to_validity": [
+    "The committed vectors are synthetic (hashed lexical projections), so the vector-arm baseline is today a second lexical arm rather than an independent signal. When real embeddings land it will get stronger, the margin will narrow, and this receipt must be recomputed.",
+    "A large share of the corpus's difficulty comes from a deliberate population of question-shaped chat and mail rows that lexically mirror the query set and answer nothing. That is a faithful property of conversational memory, but it means part of what the floors reward is telling a question from an answer (source-type priors, intent) rather than ranking alone.",
+    "The dilution family draws ten queries from five duplicate clusters at two phrasings each. Two phrasings over one cluster is a weaker signal than two clusters would be.",
+    "The corpus was authored to be hard for the naive arms measured here, which is what R6a asks for. It could not be tuned toward the ranking stack, because it was authored before U5 existed — that sequencing is the load-bearing part of U7's dependency line, not a convenience.",
+    "The alias floor at 0.98 over 14 queries is arithmetically all-or-nothing; see the granularity note in evals/gates.ts."
+  ]
+}
