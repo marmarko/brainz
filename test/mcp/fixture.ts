@@ -32,6 +32,7 @@ import {
   type ControlSignals,
   type SignalSink,
 } from '../../src/mcp/control-signals.ts';
+import type { AttestationSigner } from '../../src/mcp/attestation.ts';
 import type { ClientCapabilities } from '../../src/mcp/client-capabilities.ts';
 import { dispatch, type DispatchDeps, type DispatchResult } from '../../src/mcp/dispatch.ts';
 import type { ResumeInput } from '../../src/mcp/manage-gate.ts';
@@ -96,6 +97,11 @@ export interface McpFixtureOptions {
   readonly schemaVersion?: number;
   /** Swap the signal sink to observe or to break it. */
   readonly sink?: (control: SQL) => SignalSink;
+  /**
+   * Who signs the isolation attestation (U16). Absent by default, because a
+   * fleet wired to no signer is a real state and the receipt has to say so.
+   */
+  readonly signer?: AttestationSigner;
 }
 
 const DEFAULT_START = Date.UTC(2026, 7, 13, 9, 0, 0);
@@ -151,6 +157,7 @@ export async function createMcpFixture(
     // database. A stub would let `manage` report `applied` for a write that
     // never landed, which is the one thing these tests exist to catch.
     settings: createSettingsBackend(controlSql),
+    ...(options.signer === undefined ? {} : { attestationSigner: options.signer }),
   };
 
   return {

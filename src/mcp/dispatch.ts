@@ -69,10 +69,19 @@ import {
   type AuthorizationStore,
   type GrantClaims,
 } from './oauth.ts';
+import {
+  attestationPayload,
+  boundaryFromConnectionString,
+  sealAttestation,
+  type AttestationSigner,
+  type TenantBoundaryFacts,
+} from './attestation.ts';
 import { brainOrigins, indexState } from './reads.ts';
 import type { TenantConnections } from './tenant-db.ts';
 import { briefing, entity, fetchOne, recall, search } from './tools/read.ts';
-import { attestation, brain, manage, synthesize } from './tools/meta.ts';
+import { brain, manage, synthesize } from './tools/meta.ts';
+import { INSTRUCTIONS_RELEASE } from './instructions.ts';
+import { definitionsDigest } from './tools/index.ts';
 import { forget, remember } from './tools/write.ts';
 import type { Handler, ToolContext } from './tools/context.ts';
 import { isDispatchable, toolByName, type Endpoint } from './tools/index.ts';
@@ -121,6 +130,40 @@ export interface DispatchDeps {
   /** The origin a web-app deep link points at. */
   readonly webAppBaseUrl?: string;
   readonly writeOrigin?: string;
+  /**
+   * Who signs the isolation attestation (U16).
+   *
+   * A capability, not a secret, and optional: a fleet wired to none stamps an
+   * `unsigned` receipt with a reason rather than signing with something it
+   * found locally. R10 puts the key outside this fleet's readable secret scope
+   * precisely so that one compromise of the process that parses attacker-
+   * controlled mail cannot mint valid receipts for a brain whose isolation has
+   * already gone — so `secrets` deliberately cannot produce it, and this is the
+   * only way it arrives.
+   */
+  readonly attestationSigner?: AttestationSigner;
+  /**
+   * The object-storage prefix source, for the attestation's storage half.
+   *
+   * Structurally `TenantStorage` from `src/control/storage.ts`, narrowed to the
+   * one method this needs: an accessor able to mint credentials has no business
+   * being reachable from a response builder.
+   */
+  readonly prefixSource?: {
+    prefixFor(
+      caller: ReturnType<typeof fleetIdentity>,
+      tenantId: string,
+    ): { readonly ok: true; readonly prefix: string } | { readonly ok: false };
+  };
+  /**
+   * The tenant's Neon project id, if this fleet has a way to know it.
+   *
+   * It is on the control-plane row, which the fleet identity holds no permission
+   * to read (R11, deliberately). Absent by default, and the attestation then
+   * reports `id: null, id_source: 'unresolved'` — never a string parsed out of
+   * the endpoint host, which is a different identifier that merely looks alike.
+   */
+  readonly tenantProjectId?: (tenantId: string) => string | null;
 }
 
 export interface DispatchRequest {
@@ -202,6 +245,16 @@ export interface AuthenticatedCaller {
    * refuses a handler that touches key material.
    */
   readonly signingKey: string;
+  /**
+   * What the tenant's own substrate is, as facts rather than as a credential.
+   *
+   * Derived here because this is where the DSN is, and the DSN is key material:
+   * `test/mcp/guards.test.ts` refuses a handler that touches any, so the seam
+   * where a connection string becomes a host and a database name has to be
+   * above the handlers. What travels down is this — no userinfo, no secret, and
+   * no field that could hold one.
+   */
+  readonly boundary: TenantBoundaryFacts;
 }
 
 export interface AuthenticationRefusal {
@@ -297,7 +350,32 @@ export async function authenticate(
 
   return {
     ok: true,
-    caller: { claims, actor, signingKey: deriveSigningKey(resolved.secret.bearerGrant) },
+    caller: {
+      claims,
+      actor,
+      signingKey: deriveSigningKey(resolved.secret.bearerGrant),
+      boundary: boundaryFactsFor(deps, claims.tenantId, resolved.secret.connectionString),
+    },
+  };
+}
+
+/** The DSN's two public facts, plus whatever else this fleet can honestly say. */
+function boundaryFactsFor(
+  deps: DispatchDeps,
+  tenantId: string,
+  connectionString: string,
+): TenantBoundaryFacts {
+  const { endpointHost, databaseName } = boundaryFromConnectionString(connectionString);
+  const projectId = deps.tenantProjectId?.(tenantId) ?? null;
+  const prefix = deps.prefixSource?.prefixFor(fleetIdentity(tenantId), tenantId);
+
+  return {
+    projectId,
+    projectIdSource: projectId === null ? 'unresolved' : 'control_plane',
+    endpointHost,
+    databaseName,
+    storagePrefix: prefix?.ok === true ? prefix.prefix : null,
+    storagePrefixSource: prefix?.ok === true ? 'derived' : 'unavailable',
   };
 }
 
@@ -345,8 +423,24 @@ export async function dispatch(
   // refuses an access token whose claims name a different tenant than the one
   // its secret was resolved for, so these are the same string with one of them
   // carrying a proof.
-  const { claims, actor, signingKey } = authenticated.caller;
+  const { claims, actor, signingKey, boundary } = authenticated.caller;
   const authenticatedTenantId = claims.tenantId;
+
+  // **The receipt is built once, above the handlers, and stamped in two places.**
+  // `brain` renders it and `_meta` carries it, and they are the same object
+  // rather than two builds of the same facts — two builders is how a tool and a
+  // stamp come to describe different worlds. It is sealed before any handler
+  // runs, so nothing a handler does can be inside what was signed.
+  const receipt = await sealAttestation(
+    attestationPayload({
+      tenantId: authenticatedTenantId,
+      issuedAt: now,
+      boundary,
+      definitionsDigest: definitionsDigest(),
+      instructionsRelease: INSTRUCTIONS_RELEASE,
+    }),
+    deps.attestationSigner,
+  );
 
   // ---- 2. The tool, and its gate, before the database is opened. -----------
   const def = toolByName(request.tool);
@@ -450,6 +544,7 @@ export async function dispatch(
     // pretending to have applied something.
     settings: deps.settings?.forTenant({ tenantId: authenticatedTenantId, sql }) ?? null,
     authority,
+    attestation: receipt,
     webAppBaseUrl: deps.webAppBaseUrl ?? DEFAULT_WEB_APP_BASE_URL,
     async indexState() {
       cachedState ??= await indexState(sql, grant);
@@ -474,7 +569,7 @@ export async function dispatch(
   }
 
   const meta = {
-    'brainz.app/brain': attestation(authenticatedTenantId),
+    'brainz.app/brain': receipt,
     'brainz.app/setup_url': 'https://app.brainz.test/connect',
   };
 

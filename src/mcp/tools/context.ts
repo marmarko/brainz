@@ -22,6 +22,7 @@ import type { Grant } from '../../core/search/fence.ts';
 import type { PauseAuthority } from '../../ingest/pause.ts';
 import type { ResultClass } from '../access-log.ts';
 import { demarcateIfExternal } from '../demarcation.ts';
+import type { SignedAttestation } from '../attestation.ts';
 import type { Degraded, IndexState, NextCall, SetupHint } from '../envelope.ts';
 import type { Record_ } from '../reads.ts';
 import type { SettingsPort } from '../settings.ts';
@@ -77,6 +78,16 @@ export interface ToolContext {
   readonly authority: PauseAuthority;
   /** The origin a web-app deep link points at. */
   readonly webAppBaseUrl: string;
+  /**
+   * This response's isolation receipt (U16), already sealed by dispatch.
+   *
+   * A value rather than a signer, and that distinction is the unit: a handler
+   * holding a signer could sign something else, and the handler that would do it
+   * is the one parsing attacker-controlled mail. What arrives here is the
+   * finished receipt — the same object `_meta` carries, so `brain` and the stamp
+   * cannot describe different worlds.
+   */
+  readonly attestation: SignedAttestation;
   /**
    * What the substrate holds, counted lazily and memoised per request.
    *

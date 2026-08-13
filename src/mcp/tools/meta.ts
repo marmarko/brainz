@@ -31,33 +31,6 @@ import { advertisedTools, definitionsDigest, ENDPOINTS, type Endpoint } from './
 import { INSTRUCTIONS_RELEASE, INSTRUCTIONS_RELEASED_ON } from '../instructions.ts';
 import { invalid, stringArg, type Handler } from './context.ts';
 
-/**
- * The attestation body, shared by the `brain` tool and the `_meta` stamp.
- *
- * **What it claims is scoped to what was verified.** The Neon boundary is
- * structural — one project, one database, one role per tenant, checkable from
- * the connection string. The object-storage boundary is structural *conditional
- * on correct prefix derivation*, because the platform matches prefixes literally
- * and enforces the string it was given rather than a boundary at the separator.
- * Reporting the second as unconditionally structural would be a receipt that
- * keeps verifying after the property stops holding.
- *
- * The signature is deliberately absent here: R10 puts the signing key outside
- * the fleet's readable secret scope, precisely so the process that parses
- * attacker-controlled mail cannot mint a valid receipt. U16 wires the sign-only
- * signer; until it does, this reports `unsigned` rather than self-signing.
- */
-export function attestation(tenantId: string): Record<string, unknown> {
-  return {
-    tenant_id: tenantId,
-    database_boundary: 'structural',
-    storage_boundary: 'structural_conditional_on_prefix_derivation',
-    signature: 'unsigned',
-    definitions_digest: definitionsDigest(),
-    instructions_release: INSTRUCTIONS_RELEASE,
-  };
-}
-
 export const brain: Handler = async (ctx) => {
   const counts = await inventory(ctx.sql, ctx.grant);
   const state = await ctx.indexState();
@@ -76,7 +49,16 @@ export const brain: Handler = async (ctx) => {
         chunks_pending_embedding: state.chunksPendingEmbedding,
         import_in_progress: state.importInProgress,
       },
-      attestation: attestation(ctx.tenantId),
+      // **The same object `_meta` carries, not a second build of the same
+      // facts.** `dispatch.ts` seals it once, above the handlers, from the
+      // resolved connection string — which is key material a handler may not
+      // touch. Two builders would be two renderings of one property, free to
+      // drift; one builder and two renderings cannot.
+      //
+      // The counts above sit BESIDE it rather than inside it: they change on
+      // every write, and a signature over a value that changes every write is
+      // one nobody can cache, compare between two responses, or replay-check.
+      attestation: ctx.attestation,
       definitions_digest: definitionsDigest(),
       instructions: { release: INSTRUCTIONS_RELEASE, released_on: INSTRUCTIONS_RELEASED_ON },
       // What this connection may read, as origin labels rather than as content.
