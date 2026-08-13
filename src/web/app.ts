@@ -411,7 +411,15 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
 
     async function handleSpend(session: Session): Promise<Response> {
       const tenantId = await tenantOf(session.accountId);
-      if (tenantId === null) return json({ ok: true, spend_micro_usd: 0, pending_debt: 0 });
+      // `null`, not zero. An account whose brain has not been provisioned has no
+      // spend to report, which is a different sentence from "you have spent
+      // nothing" — and a literal here would be a price named outside
+      // `src/ai/pricing.ts`, which `test/ai/price-drift.test.ts` refuses on
+      // sight. It is right to: the drift guard cannot tell a placeholder from a
+      // rate, and the discipline is only worth having if it has no exceptions.
+      if (tenantId === null) {
+        return json({ ok: true, spend_micro_usd: null, pending_debt: null, brain: null });
+      }
 
       const rows = await deps.controlSql<
         {
