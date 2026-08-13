@@ -38,6 +38,7 @@ import type { Budget, ModelGateway } from '../../ai/gateway.ts';
 import { PROFILES, type NamedProfile, type RoutingProfileName } from '../../ai/routing.ts';
 import type { CallerIdentity } from '../../control/secrets.ts';
 import { fleetIdentity } from '../../control/secrets.ts';
+import type { StoredPayloadReader } from '../../core/media/accept.ts';
 import type { JobContext, JobHandler } from '../runner.ts';
 import type { JobTrigger } from '../jobs.ts';
 import {
@@ -88,6 +89,15 @@ export interface CycleDeps {
    * table would then be an estimate of somebody else's costs.
    */
   readonly profile?: NamedProfile;
+  /**
+   * How U21's transcription phase reads a stored payload back.
+   *
+   * A port rather than an object-store client, for the reason every other
+   * boundary in this file is one: the cycle schedules work and does not resolve
+   * credentials. Absent on a fleet with no object store wired — the phase then
+   * reports the work it cannot do instead of reporting none.
+   */
+  readonly payloads?: StoredPayloadReader;
 }
 
 export interface CycleOptions {
@@ -258,6 +268,7 @@ export async function runConsolidationCycle(
       now: options.now,
       limit,
       ...(options.nonce === undefined ? {} : { nonce: options.nonce }),
+      ...(deps.payloads === undefined ? {} : { payloads: deps.payloads }),
     });
 
     spent += outcome.spentMicroUsd;
@@ -374,6 +385,8 @@ export interface TenantWorld {
   readonly gateway: ModelGateway;
   readonly tier: ConsolidationTier;
   readonly capMicroUsd: number | null;
+  /** U21's payload reader, scoped to this tenant by whoever opened the world. */
+  readonly payloads?: StoredPayloadReader;
   close(): Promise<void>;
 }
 
@@ -401,6 +414,7 @@ export function createConsolidateHandler(ports: ConsolidatePorts): JobHandler {
           gateway: world.gateway,
           tenantId: context.lease.tenantId,
           caller: fleetIdentity(context.lease.tenantId),
+          ...(world.payloads === undefined ? {} : { payloads: world.payloads }),
         },
         {
           trigger: jobTriggerOf(context),

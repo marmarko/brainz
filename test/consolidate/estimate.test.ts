@@ -17,7 +17,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { CANONICAL_PRICE_BOOK, costMicroUsd } from '../../src/ai/pricing.ts';
-import { HOSTED_PROFILE, routeFor } from '../../src/ai/routing.ts';
+import { HOSTED_PROFILE, IMAGE_INPUT_TOKENS, routeFor } from '../../src/ai/routing.ts';
 import { MODEL_PHASES, PHASE_OP } from '../../src/worker/consolidate/phases.ts';
 import {
   budgetsFor,
@@ -26,6 +26,11 @@ import {
 } from '../../src/worker/consolidate/estimate.ts';
 
 const WORKLOAD: Readonly<Record<string, PhaseWorkload>> = Object.freeze({
+  // U21's phase. An image is a short prompt and a large picture, so its
+  // per-item figure is the picture's — taken from the one place that number
+  // lives rather than restated, since a fixture that disagreed with the
+  // estimator would assert the estimator against itself.
+  transcribe: { items: 6, inputTokensPerItem: IMAGE_INPUT_TOKENS + 100 },
   extract: { items: 10, inputTokensPerItem: 400 },
   enrich: { items: 4, inputTokensPerItem: 800 },
   synopsis: { items: 10, inputTokensPerItem: 400 },

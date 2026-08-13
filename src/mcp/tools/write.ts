@@ -18,6 +18,7 @@
  */
 
 import { remember as writeRemember } from '../../core/write/write-path.ts';
+import { mediaPolicyForRemember, rememberMediaMessage } from '../../core/media/accept.ts';
 import { createBudget } from '../../ai/gateway.ts';
 import { parseId } from '../ids.ts';
 import { forgetRecord } from '../tombstone.ts';
@@ -35,6 +36,15 @@ const ALLOWED_SOURCE_TYPES = new Set(['note', 'document', 'file']);
 export const remember: Handler = async (ctx, args) => {
   const statement = stringArg(args, 'statement');
   if (statement === null) return invalid('remember needs a `statement`.');
+
+  // U21 step 4, and it runs *before* the write: a caller that declared a file
+  // gets an answer about the file, not a memory of the sentence describing it.
+  // Storing the prose and saying nothing about the attachment is the silent
+  // acceptance the whole media path is designed against.
+  const mediaType = stringArg(args, 'media_type');
+  if (mediaType !== null) {
+    return invalid(rememberMediaMessage(mediaPolicyForRemember(mediaType)));
+  }
 
   const declared = stringArg(args, 'source_type') ?? 'note';
   if (!ALLOWED_SOURCE_TYPES.has(declared)) {

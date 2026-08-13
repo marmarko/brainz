@@ -24,7 +24,7 @@ import type { SQL } from 'bun';
 
 import { createBudget, type Budget } from '../../ai/gateway.ts';
 import { CANONICAL_PRICE_BOOK, costMicroUsd, type PriceBook } from '../../ai/pricing.ts';
-import { routeFor, type NamedProfile } from '../../ai/routing.ts';
+import { IMAGE_INPUT_TOKENS, routeFor, type NamedProfile } from '../../ai/routing.ts';
 import { MODEL_PHASES, PHASE_OP, type ModelPhase } from './phases.ts';
 
 /** How much work a phase has, and how big one unit of it is. */
@@ -162,6 +162,12 @@ export function budgetsFor(
  * page's chunk list, a fact pair, a page's chunks — rounded up.
  */
 const TOKENS_PER_ITEM: Readonly<Record<ModelPhase, number>> = Object.freeze({
+  // An image is a short prompt and a large picture, and the picture is the whole
+  // of it. `IMAGE_INPUT_TOKENS` is the one place that figure lives, so the cap
+  // this module computes and the reservation `gateway.ts` takes cannot disagree
+  // — and they must not, because a phase budgeted below what its first call
+  // reserves stops before it starts.
+  transcribe: IMAGE_INPUT_TOKENS + 100,
   extract: 500,
   enrich: 1_000,
   synopsis: 500,
@@ -201,7 +207,15 @@ export async function measureWorkload(sql: SQL, limits: { readonly batch: number
     SELECT count(*)::int AS n FROM fact
      WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL`);
 
+  // The same predicate the phase itself queues on (`ocr-phase.ts`). An estimate
+  // that counted quarantined or already-read attachments would budget for calls
+  // the phase is forbidden to make, and the cap would look mysteriously generous.
+  const attachments = await scalar(sql`
+    SELECT count(*)::int AS n FROM attachment
+     WHERE ocr_text IS NULL AND deleted_at IS NULL AND quarantined_at IS NULL`);
+
   const workload: Record<ModelPhase, PhaseWorkload> = {
+    transcribe: { items: attachments, inputTokensPerItem: TOKENS_PER_ITEM.transcribe },
     extract: { items: chunks, inputTokensPerItem: TOKENS_PER_ITEM.extract },
     enrich: { items: entities, inputTokensPerItem: TOKENS_PER_ITEM.enrich },
     synopsis: { items: pages, inputTokensPerItem: TOKENS_PER_ITEM.synopsis },

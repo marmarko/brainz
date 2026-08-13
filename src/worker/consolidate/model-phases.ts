@@ -35,6 +35,8 @@ import type { SQL } from 'bun';
 
 import type { Budget, GatewayResult, ModelGateway } from '../../ai/gateway.ts';
 import type { CallerIdentity } from '../../control/secrets.ts';
+import type { StoredPayloadReader } from '../../core/media/accept.ts';
+import { runTranscribePhase } from '../../core/media/ocr-phase.ts';
 import { documentEncoding, embedTexts, vectorLiteral } from '../../core/write/embed.ts';
 import { textArrayLiteral } from '../../core/write/pg-values.ts';
 import {
@@ -97,6 +99,12 @@ export interface ModelPhaseDeps {
   readonly limit?: number;
   /** Injected in tests so a prompt is byte-comparable. Production mints one. */
   readonly nonce?: string;
+  /**
+   * U21's transcription phase reads the stored payload back through this port.
+   * Absent for a fleet with no object store wired: the phase then finds work it
+   * cannot do and says so, rather than reporting a brain with nothing to read.
+   */
+  readonly payloads?: StoredPayloadReader;
 }
 
 const DEFAULT_LIMIT = 200;
@@ -711,6 +719,11 @@ export async function runSalienceRefinePhase(deps: ModelPhaseDeps): Promise<Phas
 export const MODEL_PHASE_RUNNERS: Readonly<
   Record<ModelPhase, (deps: ModelPhaseDeps) => Promise<PhaseOutcome>>
 > = Object.freeze({
+  // U21's, and it lives in `src/core/media/` where the plan puts it: the module
+  // is about media, and the cycle is where it is scheduled. The import runs one
+  // way — this file pulls the runner in, and `ocr-phase.ts` takes only types
+  // back — so the graph has no cycle at runtime.
+  transcribe: runTranscribePhase,
   extract: runExtractPhase,
   enrich: runEnrichPhase,
   synopsis: runSynopsisPhase,

@@ -207,6 +207,18 @@ export const TOOLS: readonly ToolDef[] = [
         description: 'What kind of thing this is. Default `note`.',
         enum: ['note', 'document', 'file'],
       },
+      // U21 step 4. `remember` takes text, and a client holding a file has
+      // otherwise exactly two options: send its base64 as prose — which is
+      // stored and indexed as gibberish nobody can search for — or guess. This
+      // is the asking, and the answer is a typed refusal naming what this brain
+      // can and cannot read, and where the readable kinds do get in. Declaring
+      // it is what makes the policy reachable rather than a rule in a module.
+      media_type: {
+        type: 'string',
+        description:
+          'Content type of a file this is about, if any (e.g. `image/png`). Answers with what ' +
+          'can and cannot be read; the file itself is never sent through this tool.',
+      },
     },
     annotations: {
       title: 'remember (store one fact or note)',

@@ -78,8 +78,20 @@ describe('KTD13 — the model per phase is the table, not a choice made here', (
     }
   });
 
-  test('the ops are exactly the five U11 owes an exit-gate receipt for', () => {
-    const expected: ModelOp[] = ['extract', 'enrich', 'contradiction', 'salience', 'synopsis'];
+  test('the ops are exactly the ones U11 owes an exit-gate receipt for', () => {
+    // The plan's U11 verification names five "and U21's `image_to_text` when it
+    // lands". It has landed, as the `vision` op — KTD13's "Image / PDF → text"
+    // row, which is the table the decision says is the source of truth rather
+    // than the prose. So the exit gate owes six receipts, and this list is what
+    // says so.
+    const expected: ModelOp[] = [
+      'extract',
+      'enrich',
+      'contradiction',
+      'salience',
+      'synopsis',
+      'vision',
+    ];
     expect([...new Set(MODEL_PHASES.map((phase) => PHASE_OP[phase]))].sort()).toEqual(
       expected.sort(),
     );

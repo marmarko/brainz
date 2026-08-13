@@ -217,19 +217,19 @@ function dictionaryBefore(source: string, streamAt: number): string {
   return open === -1 ? source.slice(Math.max(0, streamAt - 512), streamAt) : source.slice(open, streamAt);
 }
 
-function decodeStream(dictionary: string, raw: Buffer): string | null {
+function decodeStream(dictionary: string, raw: Uint8Array): string | null {
   if (!/\/Filter\s*(\[[^\]]*)?\/FlateDecode/.test(dictionary)) {
     // Any other filter (DCT, JPX, LZW, RunLength, an encryption handler) is a
     // stream this module declines to read rather than one it reads badly.
     if (/\/Filter/.test(dictionary)) return null;
-    return raw.toString('latin1');
+    return latin1(raw);
   }
   try {
-    return inflateSync(raw).toString('latin1');
+    return latin1(inflateSync(raw));
   } catch {
     try {
       // Some producers write a raw deflate stream with no zlib header.
-      return inflateRawSync(raw).toString('latin1');
+      return latin1(inflateRawSync(raw));
     } catch {
       return null;
     }
@@ -283,7 +283,7 @@ export function extractPdfTextLayer(bytes: Uint8Array): string | null {
     // An image is bytes, not text. Reading one would produce a long run of
     // nothing, and occasionally a run that looks like something.
     if (!/\/Subtype\s*\/Image/.test(dictionary)) {
-      const decoded = decodeStream(dictionary, Buffer.from(bytes.subarray(start, end)));
+      const decoded = decodeStream(dictionary, bytes.subarray(start, end));
       if (decoded !== null) collected.push(showText(decoded));
     }
   }
