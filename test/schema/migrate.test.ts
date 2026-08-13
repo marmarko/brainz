@@ -21,12 +21,16 @@ import type { SQL } from 'bun';
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
 import {
+  DEFAULT_LOCK_TIMEOUT_MS,
   FLEET_CONTRACT,
   FLEET_SCHEMA_VERSION,
+  PartialMigrationError,
   SCHEMA_LOOKAHEAD,
+  TenantMigrationTimeoutError,
   TenantSchemaAheadError,
   TenantSchemaBehindError,
   assertServableSchema,
+  findExpandContractViolations,
   isServableSchema,
   migrateTenantSchema,
   readTenantSchemaVersion,
@@ -43,6 +47,7 @@ import {
   dropFixtureDatabase,
   provisionFixture,
   provisionLegacyV1,
+  sqlstateOf,
   type SchemaFixture,
 } from './fixture.ts';
 
@@ -207,10 +212,18 @@ describe('a rung that fails leaves nothing behind', () => {
       const fixture = track(await createEmptyDatabase('atomic'));
       const sql = open(fixture);
 
+      // The failure has to be a *runtime* one, and the second statement is an
+      // INSERT for that reason: the runner now refuses a rung the expand/contract
+      // scanner rejects, so a bare `SELECT 1/0` would throw before any DDL ran
+      // and this test would pass while proving nothing about transactionality.
       const broken = `
         CREATE TABLE chunk (chunk_id bigint GENERATED ALWAYS AS IDENTITY, origin_context text NOT NULL, content text NOT NULL, CONSTRAINT chunk_pkey PRIMARY KEY (chunk_id));
-        SELECT 1 / 0;
+        INSERT INTO chunk (origin_context, content) VALUES ('personal', 1 / 0);
       `;
+      // Stated as an assertion rather than as a comment: if this rung ever stops
+      // being accepted by the scanner, the test below stops measuring the thing
+      // it names.
+      expect(findExpandContractViolations(broken)).toEqual([]);
 
       await expect(
         migrateTenantSchema(sql, { ftsLanguage: FIXTURE_FTS_LANGUAGE, to: 1, baselineDdl: broken }),
@@ -248,6 +261,42 @@ describe('a rung that fails leaves nothing behind', () => {
   );
 
   test(
+    'a contracting rung is refused by the runner, not only by CI',
+    async () => {
+      // The asymmetry adversarial review found: `baselineDdl` lets a caller hand
+      // the runner arbitrary DDL, and that DDL used to get the HNSW dimension
+      // check and *not* the expand/contract check — whose only caller was a
+      // test over the committed ladder. So the rule held for the ladder in the
+      // tree and for nothing that actually executed.
+      const fixture = track(await createEmptyDatabase('contracting'));
+      const sql = open(fixture);
+
+      const laundered = `
+        CREATE TABLE chunk (chunk_id bigint GENERATED ALWAYS AS IDENTITY, origin_context text NOT NULL, content text NOT NULL, CONSTRAINT chunk_pkey PRIMARY KEY (chunk_id));
+        ALTER TABLE chunk ADD COLUMN ordinal integer, DROP COLUMN content;
+      `;
+
+      await expect(
+        migrateTenantSchema(sql, {
+          ftsLanguage: FIXTURE_FTS_LANGUAGE,
+          to: 1,
+          baselineDdl: laundered,
+        }),
+      ).rejects.toThrow(/not expand-only/);
+
+      // Refused before anything ran, which is the point: a contracting rung that
+      // is caught after it commits has already broken the live previous release.
+      expect(await readTenantSchemaVersion(sql)).toBe(0);
+      const tables = await sql<{ n: number }[]>`
+        SELECT count(*)::int AS n FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind = 'r' AND c.relname = 'chunk'
+      `;
+      expect(tables[0]?.n).toBe(0);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
     'a tenant indexed in one language is not migrated as another',
     async () => {
       const fixture = track(await provisionLegacyV1('drift'));
@@ -259,6 +308,131 @@ describe('a rung that fails leaves nothing behind', () => {
       await expect(migrateTenantSchema(sql, { ftsLanguage: 'english' })).rejects.toThrow(
         FtsLanguageDriftError,
       );
+
+      expect(await readTenantSchemaVersion(sql)).toBe(1);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe('a rung waits for its lock, but not forever', () => {
+  test(
+    'a rung queued behind an ordinary open read gives up instead of taking the tenant down',
+    async () => {
+      // Reproduced by adversarial review: rung two issues four `ALTER TABLE
+      // chunk ADD COLUMN`, which take ACCESS EXCLUSIVE. One ordinary open
+      // transaction holding ACCESS SHARE — a woken tenant mid-request — queues
+      // the rung, and every read arriving *after* the rung queues behind the
+      // exclusive request it cannot jump. So one long query plus one wake-time
+      // migration takes the tenant's whole read path down, and the migration
+      // waits forever.
+      const fixture = track(await provisionLegacyV1('lock_wait'));
+      const reader = open(fixture);
+      const migrator = open(fixture);
+
+      let releaseReader: () => void = () => {};
+      const readerDone = new Promise<void>((resolve) => {
+        releaseReader = resolve;
+      });
+      const holding = reader.begin(async (tx) => {
+        // ACCESS SHARE on chunk, held open for the length of the "request".
+        await tx.unsafe('SELECT count(*) FROM chunk');
+        await readerDone;
+        return { done: true };
+      });
+
+      try {
+        const blocked = await migrateTenantSchema(migrator, {
+          ftsLanguage: FIXTURE_FTS_LANGUAGE,
+          lockTimeoutMs: 500,
+        }).then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+
+        // A retryable failure with a code the caller can dispatch on, rather
+        // than an indefinite stall. 55P03 is lock_not_available.
+        expect(sqlstateOf(blocked)).toBe('55P03');
+
+        // And the tenant is untouched: the rung and its ledger row commit
+        // together or not at all, so a rung that could not get its lock leaves
+        // a tenant on the rung boundary it started from.
+        expect(await readTenantSchemaVersion(migrator)).toBe(1);
+      } finally {
+        releaseReader();
+        await holding;
+      }
+
+      // The next wake succeeds, which is what makes giving up the right answer:
+      // there is another wake along in a moment.
+      const after = await migrateTenantSchema(migrator, { ftsLanguage: FIXTURE_FTS_LANGUAGE });
+      expect(after.to).toBe(HEAD_SCHEMA_VERSION);
+      expect(after.applied).toEqual([2]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test('the default is a bound, not the absence of one', () => {
+    // A default of 0 would restore the reproduced outage for every caller that
+    // did not think to ask, which is every caller today.
+    expect(DEFAULT_LOCK_TIMEOUT_MS).toBeGreaterThan(0);
+  });
+});
+
+describe('a run that is cancelled stops on a rung boundary', () => {
+  test(
+    'the deadline is threaded into the migration rather than checked around it',
+    async () => {
+      const fixture = track(await createEmptyDatabase('cancelled'));
+      const sql = open(fixture);
+
+      const cancelled = new AbortController();
+      cancelled.abort();
+
+      await expect(
+        migrateTenantSchema(sql, { ftsLanguage: FIXTURE_FTS_LANGUAGE, signal: cancelled.signal }),
+      ).rejects.toThrow(/aborted/);
+      expect(await readTenantSchemaVersion(sql)).toBe(0);
+
+      // And a run cancelled after one rung leaves the tenant at that rung — not
+      // between two. This is the property per-rung transactions buy, and the
+      // reason a cancelled provisioning run is recoverable rather than a mess.
+      const first = await migrateTenantSchema(sql, { ftsLanguage: FIXTURE_FTS_LANGUAGE, to: 1 });
+      expect(first.to).toBe(1);
+
+      const stopped = new AbortController();
+      stopped.abort();
+      await expect(
+        migrateTenantSchema(sql, { ftsLanguage: FIXTURE_FTS_LANGUAGE, signal: stopped.signal }),
+      ).rejects.toThrow(/aborted/);
+      expect(await readTenantSchemaVersion(sql)).toBe(1);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe('a ladder that got part-way says so', () => {
+  test(
+    'the failure carries the version the tenant really reached',
+    async () => {
+      // A genuine partial ladder: rung one applies, rung two collides with a
+      // table that was already there. The tenant IS at v1 afterwards, and a
+      // bare throw would lose that — the sweep would report v0 and bank
+      // nothing, which is an outcome record the database disproves.
+      const fixture = track(await createEmptyDatabase('partial'));
+      const sql = open(fixture);
+      await sql.unsafe('CREATE TABLE page (page_id bigint)');
+
+      const failure = await migrateTenantSchema(sql, { ftsLanguage: FIXTURE_FTS_LANGUAGE }).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+
+      expect(failure).toBeInstanceOf(PartialMigrationError);
+      expect((failure as PartialMigrationError).result).toEqual({ from: 0, to: 1, applied: [1] });
+      // The original failure is carried, not swallowed: it is the thing an
+      // operator has to read to know what to do next.
+      expect(sqlstateOf((failure as PartialMigrationError).failure)).toBe('42P07');
 
       expect(await readTenantSchemaVersion(sql)).toBe(1);
     },
@@ -349,6 +523,92 @@ describe('the bounded sweep', () => {
     expect(outcomes.map((o) => o.status)).toEqual(['migrated', 'failed', 'migrated']);
     expect(outcomes[1]?.error).toBeInstanceOf(Error);
     expect(banked).toEqual(['alpha', 'charlie']);
+  });
+
+  test('one tenant that never finishes does not stall the whole sweep', async () => {
+    // The bound that was missing. `listBehind` bounds the sweep in count, which
+    // is what stops it waking the fleet — but a tenant whose rung is queued
+    // behind a long read never returns, and without a per-tenant budget every
+    // tenant behind it in the batch stays behind while the next sweep starts on
+    // the same one.
+    const banked: string[] = [];
+    const seen: { tenantId: string; aborted: boolean }[] = [];
+
+    const ports: SweepPorts = {
+      listBehind: () =>
+        Promise.resolve([candidate('alpha', 1), candidate('wedged', 1), candidate('charlie', 1)]),
+      migrate: (tenant, signal) =>
+        tenant.tenantId === 'wedged'
+          ? new Promise<never>((_resolve, reject) => {
+              // A port that honours the signal stops working as well as being
+              // stopped waiting for. This one records that it was told.
+              signal?.addEventListener('abort', () => {
+                seen.push({ tenantId: tenant.tenantId, aborted: true });
+                reject(new Error('the port gave up when it was told to'));
+              });
+            })
+          : Promise.resolve({ from: 1, to: HEAD_SCHEMA_VERSION, applied: [2] }),
+      recordSchemaVersion: (tenantId) => {
+        banked.push(tenantId);
+        return Promise.resolve();
+      },
+    };
+
+    const outcomes = await sweepTenantSchemas(ports, { limit: 10, perTenantTimeoutMs: 50 });
+
+    expect(outcomes.map((o) => o.status)).toEqual(['migrated', 'failed', 'migrated']);
+    expect(outcomes[1]?.error).toBeInstanceOf(TenantMigrationTimeoutError);
+    expect(banked).toEqual(['alpha', 'charlie']);
+    expect(seen).toEqual([{ tenantId: 'wedged', aborted: true }]);
+  });
+
+  test('a partly-migrated tenant is reported and banked where it actually is', async () => {
+    // Rungs commit one at a time, so a ladder that fails on its third rung has
+    // genuinely moved the tenant to its second. Reporting `from`/`to` as the
+    // version it started with tells an operator something the database can
+    // disprove — and banking nothing leaves the control-plane row lying until
+    // the next wake re-reads the tenant.
+    const banked: { tenantId: string; version: number }[] = [];
+    const ports: SweepPorts = {
+      listBehind: () => Promise.resolve([candidate('alpha', 1)]),
+      migrate: () =>
+        Promise.reject(
+          new PartialMigrationError({ from: 1, to: 2, applied: [2] }, new Error('rung 3 failed')),
+        ),
+      recordSchemaVersion: (tenantId, version) => {
+        banked.push({ tenantId, version });
+        return Promise.resolve();
+      },
+    };
+
+    const outcomes = await sweepTenantSchemas(ports, { limit: 10 });
+
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]?.status).toBe('failed');
+    expect(outcomes[0]?.from).toBe(1);
+    expect(outcomes[0]?.to).toBe(2);
+    expect(banked).toEqual([{ tenantId: 'alpha', version: 2 }]);
+  });
+
+  test('a cancelled sweep stops between tenants and reports what it did', async () => {
+    const cancelled = new AbortController();
+    const visited: string[] = [];
+    const ports: SweepPorts = {
+      listBehind: () => Promise.resolve([candidate('alpha', 1), candidate('bravo', 1)]),
+      migrate: (tenant) => {
+        visited.push(tenant.tenantId);
+        cancelled.abort();
+        return Promise.resolve({ from: 1, to: HEAD_SCHEMA_VERSION, applied: [2] });
+      },
+      recordSchemaVersion: () => Promise.resolve(),
+    };
+
+    const outcomes = await sweepTenantSchemas(ports, { limit: 10, signal: cancelled.signal });
+
+    // One visited, one not attempted — and no invented outcome for the tenant
+    // the sweep never touched.
+    expect(visited).toEqual(['alpha']);
+    expect(outcomes.map((o) => o.tenantId)).toEqual(['alpha']);
   });
 
   test('a tenant another instance already migrated is reported, not re-banked', async () => {

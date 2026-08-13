@@ -27,6 +27,11 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { HEAD_SCHEMA_VERSION } from '../../src/schema/migrations.ts';
 import {
+  OriginFenceError,
+  assertOriginFence,
+  findOriginFenceViolations,
+} from '../../src/schema/origin-fence.ts';
+import {
   CHUNK_EMBEDDING_COLUMN,
   CHUNK_TABLE,
   EMBEDDING_DIMENSIONS,
@@ -34,6 +39,8 @@ import {
   RESERVED_VECTOR_COLUMNS,
   assertHnswIndex,
   findIndexesOnColumn,
+  findVectorRegistryViolations,
+  listVectorColumns,
 } from '../../src/schema/vector-index.ts';
 import {
   generatedExpression,
@@ -300,49 +307,222 @@ describe('R15 — origin and subject, on every content row, enumerated', () => {
   );
 });
 
-describe('R15 — the database refuses to let an origin move', () => {
+/**
+ * One seeded row per origin-carrying table, and the tamper each one must refuse.
+ *
+ * Every table, not two of them. The previous version of this suite exercised the
+ * fence behaviourally on `chunk` and `fact` and left the other six to a catalog
+ * check — which meant a trigger disabled on `page`, `attachment`, `entity`,
+ * `entity_edge`, `ingest_log` or `contradiction_report` was seen by nothing that
+ * actually issues a write. The loop below is enumerated from the catalog and
+ * cross-checked against this map, so a future origin column has to arrive with a
+ * fixture or fail this file.
+ */
+const ORIGIN_FIXTURES: ReadonlyMap<string, { readonly where: string; readonly tamper: string }> =
+  new Map([
+    ['ingest_log', { where: `source_type = 'note'`, tamper: `origin_context = 'work'` }],
+    ['page', { where: `title = 'fence fixture'`, tamper: `origin_context = 'work'` }],
+    ['chunk', { where: `content = 'immutability fixture'`, tamper: `origin_context = 'work'` }],
+    [
+      'attachment',
+      { where: `object_key = 'fence/fixture.png'`, tamper: `origin_context = 'work'` },
+    ],
+    [
+      'fact',
+      {
+        where: `statement = 'derived fixture'`,
+        // Widening in place is the interesting shape: it is how an inference
+        // would silently grant a work-fenced reader a personal fact.
+        tamper: `origin_contexts = ARRAY['personal','work']`,
+      },
+    ],
+    [
+      'entity',
+      {
+        where: `canonical_name = 'fence-subject'`,
+        tamper: `origin_contexts = ARRAY['personal','work']`,
+      },
+    ],
+    [
+      'entity_edge',
+      { where: `edge_type = 'related_to'`, tamper: `origin_contexts = ARRAY['personal','work']` },
+    ],
+    [
+      'contradiction_report',
+      {
+        where: `kind = 'value_conflict'`,
+        tamper: `origin_contexts = ARRAY['personal','work']`,
+      },
+    ],
+  ]);
+
+describe('R15 — the database refuses to let an origin move, on every table that has one', () => {
   beforeAll(async () => {
+    const embedding = `('[1' || repeat(',0', ${EMBEDDING_DIMENSIONS - 1}) || ']')::vector(${EMBEDDING_DIMENSIONS})`;
     await sql.unsafe(`
+      INSERT INTO ingest_log (origin_context, source_type) VALUES ('personal', 'note');
+      INSERT INTO page (origin_context, source_type, title, embedding_model, embedding_dimensions,
+                        chunker_version, normalizer_version, content_sha256)
+      VALUES ('personal', 'note', 'fence fixture', 'text-embedding-3-small', ${EMBEDDING_DIMENSIONS}, 1, 1, repeat('b', 64));
       INSERT INTO chunk (origin_context, content) VALUES ('personal', 'immutability fixture');
+      INSERT INTO attachment (origin_context, media_type, object_key)
+      VALUES ('personal', 'image/png', 'fence/fixture.png');
       INSERT INTO fact (statement, embedding, origin_contexts)
-      VALUES ('derived fixture',
-              ('[1' || repeat(',0', ${EMBEDDING_DIMENSIONS - 1}) || ']')::vector(${EMBEDDING_DIMENSIONS}),
-              ARRAY['personal']);
+      VALUES ('derived fixture', ${embedding}, ARRAY['personal']),
+             ('derived fixture, the second', ${embedding}, ARRAY['personal']);
+      INSERT INTO entity (canonical_name, entity_type, origin_contexts)
+      VALUES ('fence-subject', 'person', ARRAY['personal']),
+             ('fence-object', 'organization', ARRAY['personal']);
+      INSERT INTO entity_edge (subject_entity_id, edge_type, object_entity_id, origin_contexts)
+      SELECT (SELECT entity_id FROM entity WHERE canonical_name = 'fence-subject'),
+             'related_to',
+             (SELECT entity_id FROM entity WHERE canonical_name = 'fence-object'),
+             ARRAY['personal'];
+      INSERT INTO contradiction_report (left_fact_id, right_fact_id, kind, origin_contexts)
+      SELECT (SELECT fact_id FROM fact WHERE statement = 'derived fixture'),
+             (SELECT fact_id FROM fact WHERE statement = 'derived fixture, the second'),
+             'value_conflict',
+             ARRAY['personal'];
     `);
   });
 
   test(
-    'an UPDATE that changes a scalar origin is rejected by the database',
+    'every origin column in the database refuses the write, and the fixture covers every one',
     async () => {
-      const state = await sqlstateOfFailure(
-        sql,
-        `UPDATE chunk SET origin_context = 'work' WHERE content = 'immutability fixture'`,
+      const columns = await listColumns(sql);
+      const originColumns = columns.filter(
+        (c) => c.column === 'origin_context' || c.column === 'origin_contexts',
       );
 
-      // The code, not the message: the write path has to be able to tell this
-      // apart from an ordinary constraint violation and answer `scope_denied`.
-      expect(state).toBe('BZ001');
+      // The half that makes the loop unable to go quiet: an origin column with
+      // no fixture is a table this test would otherwise skip in silence.
+      expect([...new Set(originColumns.map((c) => c.table))].sort()).toEqual(
+        [...ORIGIN_FIXTURES.keys()].sort(),
+      );
 
-      const rows = await sql<{ origin_context: string }[]>`
-        SELECT origin_context FROM chunk WHERE content = 'immutability fixture'
-      `;
-      expect(rows[0]?.origin_context).toBe('personal');
+      for (const column of originColumns) {
+        const fixture = ORIGIN_FIXTURES.get(column.table);
+        expect(fixture).toBeDefined();
+        if (fixture === undefined) continue;
+
+        // The row has to be there, or a refused UPDATE proves nothing: an UPDATE
+        // matching no rows also "fails to change the origin".
+        const before = await sql.unsafe<{ n: number }[]>(
+          `SELECT count(*)::int AS n FROM ${column.table} WHERE ${fixture.where}`,
+        );
+        expect(before[0]?.n).toBe(1);
+
+        const state = await sqlstateOfFailure(
+          sql,
+          `UPDATE ${column.table} SET ${fixture.tamper} WHERE ${fixture.where}`,
+        );
+
+        // The code, not the message: the write path has to be able to tell this
+        // apart from an ordinary constraint violation and answer `scope_denied`.
+        expect(`${column.table}: ${state}`).toBe(`${column.table}: BZ001`);
+      }
+
+      // And the fence is enforced as the runner checks it, on this same
+      // database — the catalog half and the behavioural probe both.
+      await expect(assertOriginFence(sql)).resolves.toBeUndefined();
+      expect(await findOriginFenceViolations(sql)).toEqual([]);
     },
     TEST_TIMEOUT_MS,
   );
 
   test(
-    'an UPDATE that changes a derived origin union is rejected too',
+    'the origin the tamper tried to move is still what it was',
     async () => {
-      const state = await sqlstateOfFailure(
-        sql,
-        `UPDATE fact SET origin_contexts = ARRAY['personal','work'] WHERE statement = 'derived fixture'`,
-      );
+      const rows = await sql<{ origin_context: string }[]>`
+        SELECT origin_context FROM chunk WHERE content = 'immutability fixture'
+      `;
+      expect(rows[0]?.origin_context).toBe('personal');
 
-      // Widening a derived row's origins in place is the interesting case: it is
-      // how an inference would silently grant a work-fenced reader a personal
-      // fact. A derived row whose inputs changed is rewritten, not mutated.
-      expect(state).toBe('BZ001');
+      const derived = await sql<{ origin_contexts: string[] }[]>`
+        SELECT origin_contexts FROM fact WHERE statement = 'derived fixture'
+      `;
+      expect(derived[0]?.origin_contexts).toEqual(['personal']);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a disabled trigger is a finding, even though its definition still reads correctly',
+    async () => {
+      // `ALTER TABLE … DISABLE TRIGGER` mutates the row permanently and leaves a
+      // clean catalog behind it: `pg_get_triggerdef` renders the trigger exactly
+      // as written, so a guard that reads definitions sees nothing. `tgenabled`
+      // is the column that tells the truth.
+      await sql.unsafe('ALTER TABLE page DISABLE TRIGGER page_origin_is_immutable');
+      try {
+        const findings = await findOriginFenceViolations(sql);
+        expect(findings).toHaveLength(1);
+        expect(findings[0]).toContain('page.origin_context');
+        await expect(assertOriginFence(sql)).rejects.toThrow(OriginFenceError);
+
+        // And the tamper it enables, which is the reason this matters: the row
+        // moves, and moves permanently.
+        await sql.unsafe(`UPDATE page SET origin_context = 'work' WHERE title = 'fence fixture'`);
+        const moved = await sql<{ origin_context: string }[]>`
+          SELECT origin_context FROM page WHERE title = 'fence fixture'
+        `;
+        expect(moved[0]?.origin_context).toBe('work');
+      } finally {
+        await sql.unsafe('ALTER TABLE page ENABLE TRIGGER page_origin_is_immutable');
+        await sql.unsafe(`DELETE FROM page WHERE title = 'fence fixture'`);
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a neutered shared function is a finding, which the catalog alone cannot see',
+    async () => {
+      // One statement, no DDL on any table, and every one of the seven origin
+      // triggers stops doing anything. This is the failure the behavioural probe
+      // exists for: the catalog half reports a clean sheet throughout.
+      const original = await sql<{ body: string }[]>`
+        SELECT pg_get_functiondef(oid) AS body FROM pg_proc WHERE proname = 'refuse_origin_change'
+      `;
+      const restore = original[0]?.body;
+      expect(restore).toBeDefined();
+
+      await sql.unsafe(
+        `CREATE OR REPLACE FUNCTION refuse_origin_change() RETURNS trigger
+         LANGUAGE plpgsql AS $neutered$ BEGIN RETURN NEW; END; $neutered$`,
+      );
+      try {
+        // Blind, and that is the point of having two halves.
+        expect(await findOriginFenceViolations(sql)).toEqual([]);
+
+        await expect(assertOriginFence(sql)).rejects.toThrow(/no longer refuses an origin change/);
+
+        // The fence really is gone while the catalog says otherwise.
+        expect(
+          await sqlstateOfFailure(
+            sql,
+            `UPDATE chunk SET origin_context = 'work' WHERE content = 'immutability fixture'`,
+          ),
+        ).toBeUndefined();
+      } finally {
+        // The row goes back BEFORE the function does. Once the fence is
+        // restored, moving this origin back is itself a change it refuses —
+        // which is the finding stated as a cleanup problem: a tamper window
+        // leaves rows the database will not let anyone put back.
+        await sql.unsafe(
+          `UPDATE chunk SET origin_context = 'personal' WHERE content = 'immutability fixture'`,
+        );
+        await sql.unsafe(restore ?? '');
+      }
+
+      // Restored: the fence is back, and it refuses again.
+      await expect(assertOriginFence(sql)).resolves.toBeUndefined();
+      expect(
+        await sqlstateOfFailure(
+          sql,
+          `UPDATE chunk SET origin_context = 'work' WHERE content = 'immutability fixture'`,
+        ),
+      ).toBe('BZ001');
     },
     TEST_TIMEOUT_MS,
   );
@@ -395,12 +575,16 @@ describe('KTD8 / H2 — every vector column is accounted for', () => {
   );
 
   test(
-    'every column registered as indexed really has a valid hnsw index',
+    'every column registered as indexed really has a valid hnsw index the arm can use',
     async () => {
       for (const column of INDEXED_VECTOR_COLUMNS) {
-        const index = await assertHnswIndex(sql, column.table, column.column);
+        const index = await assertHnswIndex(sql, column.table, column.column, column.operator);
         expect(index.method).toBe('hnsw');
         expect(index.valid).toBe(true);
+        // An hnsw index whose opclass cannot serve the operator the arm issues
+        // is an index the planner will not use, which is the missing index this
+        // guard exists to catch wearing a healthy catalog row.
+        expect(index.servesOperator).toBe(true);
       }
 
       // The one the hazard suite pins, named explicitly so a refactor that
@@ -415,15 +599,27 @@ describe('KTD8 / H2 — every vector column is accounted for', () => {
   );
 
   test(
-    'the reserved image column is reserved: no index, and inside the ceiling',
+    'the reserved image column is reserved: unfilled, unindexed, inside the ceiling',
     async () => {
+      const columns = await listColumns(sql);
+
       for (const column of RESERVED_VECTOR_COLUMNS) {
         const indexes = await findIndexesOnColumn(sql, column.table, column.column);
         // Reserved means nothing queries it. An index on an unqueried column is
         // a build cost and a promise the U21 model has not made yet — and the
         // moment something *does* query it, the registry entry has to move.
         expect(indexes).toEqual([]);
+
+        // And the property that makes "nothing queries it" checkable rather than
+        // asserted: nothing *fills* it either. A NOT NULL vector column means
+        // every insert must produce an embedding, and no write path pays an
+        // embedding call per row for a column no read ever touches — so a
+        // queried column quietly re-filed as reserved fails here.
+        const declared = columnsOf(columns, column.table).get(column.column);
+        expect(declared?.notNull).toBe(false);
       }
+
+      expect(findVectorRegistryViolations(await listVectorColumns(sql))).toEqual([]);
     },
     TEST_TIMEOUT_MS,
   );

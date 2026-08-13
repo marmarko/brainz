@@ -51,15 +51,43 @@ export const ADMIN_DSN =
 /** Deliberately not English: KTD9's silent-fallback failure must not pass. */
 export const FIXTURE_FTS_LANGUAGE = 'simple';
 
-export const NEAR_DECOY_CHUNKS = 100;
+/**
+ * The decoys, and the number that decides whether H3's guard can go red at all.
+ *
+ * Every decoy sits NEARER the query than every qualifying row, so without the
+ * iterative scan a pool of {@link CANDIDATE_POOL} spends this many candidates on
+ * rows the filter then discards: the arm yields `CANDIDATE_POOL - NEAR_DECOY_CHUNKS`.
+ * At 100 that arithmetic gave exactly 150 against a floor of 200 — a 50-row
+ * margin, which is to say the fixture was calibrated to the boundary of its own
+ * assertion, and weakening either number by one step made both headline
+ * assertions pass with the hazard live. At 150 the unremedied yield is 100
+ * against the same floor, and the margin is no longer a rounding error.
+ *
+ * The margin is not defended by this comment. `h3-post-filter-recall.test.ts`
+ * measures the unremedied yield directly and fails if it is not comfortably
+ * below the floor — a fixture that stops exhibiting the collapse fails the guard
+ * rather than quietly passing it.
+ */
+export const NEAR_DECOY_CHUNKS = 150;
 export const QUALIFYING_CHUNKS = 250;
-export const BACKGROUND_CHUNKS = 4650;
+export const BACKGROUND_CHUNKS = 4600;
 
 /** What the retrieval stack asks the vector arm for in `tokenmax`: 50 × 5. */
 export const CANDIDATE_POOL = 250;
 
 /** H1's and H3's assertion floor, straight from the ledger. */
 export const REQUIRED_YIELD = 200;
+
+/**
+ * How far below the floor the *unremedied* arm has to fall for the guard to be
+ * worth anything.
+ *
+ * A guard whose remedy-on and remedy-off measurements sit either side of the
+ * floor by one row is a guard that passes as soon as anything drifts. This is
+ * the headroom H3 asserts it still has, measured rather than computed — see
+ * {@link REQUIRED_YIELD} and the control arm in `h3-post-filter-recall.test.ts`.
+ */
+export const COLLAPSE_MARGIN = 50;
 
 /**
  * The query vector, as SQL. Built by repetition rather than written out so the

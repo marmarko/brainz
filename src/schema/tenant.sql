@@ -48,6 +48,12 @@ CREATE TABLE chunk (
   -- two. Immutability is enforced by the database from that rung on, not by
   -- convention: KTD5 fences access on origin alone, so a mutable origin is a
   -- privilege-escalation primitive rather than a data-quality nit.
+  --
+  -- Precisely: enforced against DML, and *attested* against DDL. The tenant role
+  -- owns these tables, so it can replace the trigger function or disable the
+  -- trigger — `src/schema/origin-fence.ts` is what makes either of those fail a
+  -- migration rather than pass unnoticed, and its docstring states what a single
+  -- owning role still leaves open.
   origin_context  text        NOT NULL,
 
   content         text        NOT NULL,

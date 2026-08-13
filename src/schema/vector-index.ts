@@ -8,7 +8,7 @@
  * the first real brain turns every query into a full table scan. There is no
  * error, no failing test, and no signal except a query plan nobody reads.
  *
- * Two assertions close it, and they close different halves:
+ * Three assertions close it, and they close different halves:
  *
  * 1. {@link assertHnswIndex} runs against a live tenant database, in
  *    provisioning (`src/schema/apply.ts`), not only in tests. Schema is applied
@@ -16,9 +16,21 @@
  *    produces a fleet where some brains have a vector index and some do not,
  *    with no aggregate signal — the slow ones just look like unlucky users. A
  *    tenant without this index is broken, not slow, and should fail provisioning
- *    loudly.
+ *    loudly. It requires an index whose **opclass serves the distance operator
+ *    the arm actually issues**, not merely an index of method `hnsw`: an HNSW
+ *    index built `vector_l2_ops` on a column queried with cosine `<=>` is an
+ *    index the planner cannot use, so the query falls back to a sequential scan
+ *    — H2's exact mechanism, reached by changing one token.
  *
- * 2. {@link findIndexableDimensionViolations} runs against schema *text*, at
+ * 2. {@link assertVectorColumns} compares the two registries below against the
+ *    vector columns the database actually has. Presence in a list is a claim;
+ *    this is what makes the claim checkable. Its load-bearing rule is that a
+ *    **reserved column may not be `NOT NULL`** — see
+ *    {@link findVectorRegistryViolations} for why that is the one property that
+ *    distinguishes "nothing reads this" from "something reads this and was
+ *    filed in the wrong list".
+ *
+ * 3. {@link findIndexableDimensionViolations} runs against schema *text*, at
  *    migration-definition time, with no database in sight. pgvector stores far
  *    more dimensions than it can index, and the gap is where a model swap dies:
  *    `vector` stores 16,000 and HNSW-indexes 2,000; `halfvec` stores 16,000 and
@@ -55,6 +67,20 @@ export type VectorTypeName = keyof typeof HNSW_INDEXABLE_DIMENSIONS;
 export const CHUNK_TABLE = 'chunk';
 export const CHUNK_EMBEDDING_COLUMN = 'embedding';
 
+/**
+ * The distance operators pgvector's vector-family opclasses provide, spelled the
+ * way a query spells them.
+ *
+ * The operator is registry *data* rather than an assumption baked into the
+ * catalog query, because the opclass that can serve one of these cannot serve
+ * the others: an index built `vector_l2_ops` is invisible to an `ORDER BY x <=>
+ * q`, and the planner's only remaining option is a sequential scan. Which is to
+ * say the operator a column is queried with is part of what "this column is
+ * indexed" means, and leaving it implicit is how a one-token edit turns the
+ * assertion into a formality.
+ */
+export type VectorDistanceOperator = '<=>' | '<->' | '<#>';
+
 export interface VectorColumn {
   readonly table: string;
   readonly column: string;
@@ -66,6 +92,15 @@ export interface VectorColumn {
   readonly since: number;
   /** Why it is on this list rather than the other one. */
   readonly why: string;
+}
+
+export interface IndexedVectorColumn extends VectorColumn {
+  /**
+   * The distance operator the arm that reads this column issues. Asserted
+   * against the index's opclass on every tenant, so "there is an hnsw index on
+   * it" cannot pass for "the planner can use it".
+   */
+  readonly operator: VectorDistanceOperator;
 }
 
 /**
@@ -82,17 +117,19 @@ export interface VectorColumn {
  * Ordered with `chunk.embedding` first: it is the column the whole retrieval
  * stack reads, so a tenant missing it should fail provisioning naming *that*.
  */
-export const INDEXED_VECTOR_COLUMNS: readonly VectorColumn[] = [
+export const INDEXED_VECTOR_COLUMNS: readonly IndexedVectorColumn[] = [
   {
     table: CHUNK_TABLE,
     column: CHUNK_EMBEDDING_COLUMN,
     since: 1,
+    operator: '<=>',
     why: "the vector arm of every read; H1 and H3's fixture measures this column",
   },
   {
     table: 'fact',
     column: 'embedding',
     since: 2,
+    operator: '<=>',
     why: 'facts are embedded on the write path and retrieved by similarity alongside chunks',
   },
 ];
@@ -107,6 +144,10 @@ export const INDEXED_VECTOR_COLUMNS: readonly VectorColumn[] = [
  * a placeholder, free to change while the column is empty, unindexed and
  * unqueried. The day U21 queries it, its entry moves to the list above and
  * provisioning starts asserting an index for it.
+ *
+ * Every entry here is checked against the database, not taken on trust — a
+ * reserved column must be nullable and must carry no index. See
+ * {@link findVectorRegistryViolations}.
  */
 export const RESERVED_VECTOR_COLUMNS: readonly VectorColumn[] = [
   {
@@ -192,6 +233,15 @@ export interface VectorIndexRecord {
   readonly method: string;
   /** A build that failed leaves an index the planner will not use. */
   readonly valid: boolean;
+  /** The operator class the index was built with, or `null` for none. */
+  readonly opclass: string | null;
+  /**
+   * Whether that opclass's family provides the distance operator this lookup
+   * asked about — read from `pg_amop`, not from a name the code recognises, so
+   * a `halfvec_cosine_ops` column added later is judged by what it can do
+   * rather than by whether anyone remembered to extend a map.
+   */
+  readonly servesOperator: boolean;
 }
 
 /**
@@ -204,21 +254,59 @@ export interface VectorIndexRecord {
 export class MissingVectorIndexError extends Error {
   readonly table: string;
   readonly column: string;
+  /** The operator the arm issues, which is what the index had to be able to serve. */
+  readonly operator: VectorDistanceOperator;
   /** What *was* found, so the message can distinguish absent from invalid. */
   readonly found: readonly VectorIndexRecord[];
 
-  constructor(table: string, column: string, found: readonly VectorIndexRecord[]) {
+  constructor(
+    table: string,
+    column: string,
+    operator: VectorDistanceOperator,
+    found: readonly VectorIndexRecord[],
+  ) {
+    const describe = (index: VectorIndexRecord): string => {
+      const faults: string[] = [];
+      if (!index.valid) faults.push('INVALID');
+      // Named rather than folded into "no usable index": a wrong opclass is the
+      // one failure here that looks completely healthy in `pg_indexes`.
+      if (index.method === 'hnsw' && !index.servesOperator) {
+        faults.push(`opclass ${index.opclass ?? 'unknown'} does not serve ${operator}`);
+      }
+      return `${index.indexName} (${[index.method, ...faults].join(', ')})`;
+    };
+
     const detail =
       found.length === 0
         ? 'no index of any method covers it'
-        : `found ${found.map((i) => `${i.indexName} (${i.method}${i.valid ? '' : ', INVALID'})`).join(', ')}`;
+        : `found ${found.map(describe).join(', ')}`;
     super(
-      `no valid hnsw index on ${table}.${column}: ${detail}. A tenant without one is broken, not slow — it answers by sequential scan, which is exact, so recall goes up and nothing errors while latency collapses at scale.`,
+      `no hnsw index on ${table}.${column} that can serve ${operator}: ${detail}. A tenant without one is broken, not slow — it answers by sequential scan, which is exact, so recall goes up and nothing errors while latency collapses at scale.`,
     );
     this.name = 'MissingVectorIndexError';
     this.table = table;
     this.column = column;
+    this.operator = operator;
     this.found = found;
+  }
+}
+
+/**
+ * Thrown when the vector-column registries in this file disagree with the vector
+ * columns the database has. Distinct from {@link MissingVectorIndexError}
+ * because the remedy differs: that one means a DDL step did not run on this
+ * tenant, this one means the source of truth in this file is wrong for every
+ * tenant.
+ */
+export class VectorColumnRegistryError extends Error {
+  readonly findings: readonly string[];
+
+  constructor(findings: readonly string[]) {
+    super(
+      `the vector-column registry does not match the database: ${findings.join('; ')}. Every vector column is either queried (indexed) or not (reserved); a column filed under the wrong one is H2 with a green guard over it.`,
+    );
+    this.name = 'VectorColumnRegistryError';
+    this.findings = findings;
   }
 }
 
@@ -235,16 +323,41 @@ export async function findIndexesOnColumn(
   sql: SQL,
   table: string,
   column: string,
+  operator: VectorDistanceOperator = '<=>',
 ): Promise<VectorIndexRecord[]> {
-  const rows = await sql<{ index_name: string; method: string; valid: boolean }[]>`
+  const rows = await sql<
+    { index_name: string; method: string; valid: boolean; opclass: string | null; serves: boolean }[]
+  >`
     SELECT i.relname   AS index_name,
            am.amname   AS method,
-           ix.indisvalid AND ix.indisready AS valid
+           ix.indisvalid AND ix.indisready AS valid,
+           oc.opcname  AS opclass,
+           -- Asked of pg_amop rather than matched against a list of opclass
+           -- names: the question is whether the planner can answer an ORDER BY
+           -- through this index, and that is a property of the operator family,
+           -- not of what the family happens to be called.
+           coalesce(
+             EXISTS (
+               SELECT 1
+               FROM pg_amop ao
+               JOIN pg_operator o ON o.oid = ao.amopopr
+               WHERE ao.amopfamily = oc.opcfamily
+                 AND ao.amoppurpose = 'o'
+                 AND o.oprname = ${operator}
+             ),
+             false
+           ) AS serves
     FROM pg_class t
     JOIN pg_index ix ON ix.indrelid = t.oid
     JOIN pg_class i  ON i.oid = ix.indexrelid
     JOIN pg_am am    ON am.oid = i.relam
     JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (ix.indkey)
+    -- indclass is position-matched to indkey, so the opclass is looked up at
+    -- this column's own position rather than at the first one. Today's vector
+    -- indexes are single-column; a composite one would otherwise be judged by
+    -- whatever its leading column happened to use.
+    LEFT JOIN pg_opclass oc
+      ON oc.oid = ix.indclass[array_position(string_to_array(ix.indkey::text, ' ')::int[], a.attnum::int) - 1]
     WHERE t.relname = ${table}
       AND a.attname = ${column}
       AND t.relkind = 'r'
@@ -256,6 +369,8 @@ export async function findIndexesOnColumn(
     indexName: row.index_name,
     method: row.method,
     valid: row.valid,
+    opclass: row.opclass,
+    servesOperator: row.serves,
   }));
 }
 
@@ -270,10 +385,16 @@ export async function assertHnswIndex(
   sql: SQL,
   table: string = CHUNK_TABLE,
   column: string = CHUNK_EMBEDDING_COLUMN,
+  operator: VectorDistanceOperator = '<=>',
 ): Promise<VectorIndexRecord> {
-  const found = await findIndexesOnColumn(sql, table, column);
-  const usable = found.find((index) => index.method === 'hnsw' && index.valid);
-  if (usable === undefined) throw new MissingVectorIndexError(table, column, found);
+  const found = await findIndexesOnColumn(sql, table, column, operator);
+  // All three conditions are the same condition asked three ways: can the
+  // planner answer this arm's ORDER BY through an index? A wrong opclass fails
+  // it exactly as completely as a missing index, and looks exactly as healthy.
+  const usable = found.find(
+    (index) => index.method === 'hnsw' && index.valid && index.servesOperator,
+  );
+  if (usable === undefined) throw new MissingVectorIndexError(table, column, operator, found);
   return usable;
 }
 
@@ -296,7 +417,140 @@ export async function assertIndexedVectorColumns(
   const accepted: VectorIndexRecord[] = [];
   for (const column of INDEXED_VECTOR_COLUMNS) {
     if (column.since > schemaVersion) continue;
-    accepted.push(await assertHnswIndex(sql, column.table, column.column));
+    accepted.push(await assertHnswIndex(sql, column.table, column.column, column.operator));
   }
   return accepted;
+}
+
+/** One vector column as the tenant's own catalog reports it. */
+export interface CatalogVectorColumn {
+  readonly table: string;
+  readonly column: string;
+  /** `format_type`, so it arrives spelled as declared: `vector(1536)`. */
+  readonly type: string;
+  readonly notNull: boolean;
+}
+
+/** Every vector-family column the tenant database actually has. */
+export async function listVectorColumns(sql: SQL): Promise<CatalogVectorColumn[]> {
+  const rows = await sql<
+    { table_name: string; column_name: string; type: string; not_null: boolean }[]
+  >`
+    SELECT c.relname AS table_name,
+           a.attname AS column_name,
+           format_type(a.atttypid, a.atttypmod) AS type,
+           a.attnotnull AS not_null
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid
+    JOIN pg_type ty ON ty.oid = a.atttypid
+    WHERE n.nspname = 'public'
+      AND c.relkind = 'r'
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND ty.typname IN ('vector', 'halfvec')
+    ORDER BY c.relname, a.attname
+  `;
+
+  return rows.map((row) => ({
+    table: row.table_name,
+    column: row.column_name,
+    type: row.type,
+    notNull: row.not_null,
+  }));
+}
+
+/**
+ * Where the two registries stop being prose.
+ *
+ * The lists above say which vector columns are queried and which are not, and
+ * that claim used to be carried entirely by their `why` strings. It is not
+ * checkable directly — nothing in the database knows what a future retrieval arm
+ * will read — so this checks the two properties that make the claim *survivable*
+ * when it is wrong in the one direction that matters:
+ *
+ *   * **Every vector column the database has is in exactly one list.** A column
+ *     in neither is H2 waiting to happen: it answers by sequential scan, exactly,
+ *     forever, and no guard is watching it. A column in both makes "which rule
+ *     applies" a question with two answers.
+ *
+ *   * **A reserved column may not be `NOT NULL`.** This is the rule that catches
+ *     the move a registry cannot otherwise see: taking a queried column *off* the
+ *     indexed list. `NOT NULL` on a vector column means the write path computes
+ *     an embedding for every row or the insert fails — and nothing pays an
+ *     embedding call per row for a column it never reads. So a `NOT NULL` vector
+ *     column is by construction on somebody's read path, and filing it as
+ *     reserved is a false statement the database can catch. (`fact.embedding` is
+ *     exactly this: synchronous on the write path, `NOT NULL` by design.)
+ *
+ * The residual is stated rather than hidden: a *nullable* queried column
+ * mis-filed as reserved is still invisible here. `chunk.embedding` is nullable
+ * and is caught instead by H1's and H3's plan-level assertions; a third such
+ * column would need its own. That is narrower than the hole this replaces, not
+ * the absence of one.
+ */
+export function findVectorRegistryViolations(
+  columns: readonly CatalogVectorColumn[],
+): string[] {
+  const findings: string[] = [];
+  const key = (c: { table: string; column: string }): string => `${c.table}.${c.column}`;
+  const indexed = new Set(INDEXED_VECTOR_COLUMNS.map(key));
+  const reserved = new Set(RESERVED_VECTOR_COLUMNS.map(key));
+
+  for (const name of indexed) {
+    if (reserved.has(name)) {
+      findings.push(`${name}: registered as BOTH indexed and reserved — it is one or the other`);
+    }
+  }
+
+  for (const column of columns) {
+    const name = key(column);
+    if (!indexed.has(name) && !reserved.has(name)) {
+      findings.push(
+        `${name} (${column.type}): a vector column in neither INDEXED_VECTOR_COLUMNS nor RESERVED_VECTOR_COLUMNS — an unregistered vector column is answered by sequential scan with nothing watching`,
+      );
+      continue;
+    }
+    if (reserved.has(name) && column.notNull) {
+      findings.push(
+        `${name}: registered as reserved but declared NOT NULL — the write path must produce a value for every row, so something computes this embedding, so something reads it. It belongs in INDEXED_VECTOR_COLUMNS with an index and an operator.`,
+      );
+    }
+  }
+
+  return findings;
+}
+
+/**
+ * The whole H2 assertion for one tenant, in the order the failures matter.
+ *
+ * Structure first, then indexes: a registry that disagrees with the database
+ * makes the index assertions meaningless (they are a loop over the registry), so
+ * reporting "no index on X" while X was never supposed to be on that list sends
+ * the reader to the wrong file.
+ */
+export async function assertVectorColumns(
+  sql: SQL,
+  schemaVersion: number,
+): Promise<VectorIndexRecord[]> {
+  const present = await listVectorColumns(sql);
+  const findings = findVectorRegistryViolations(present);
+
+  // Asked of the catalog rather than assumed from the list: "reserved" means an
+  // index was never built, and an index that appeared anyway is either a copied
+  // migration or a column that quietly became queried.
+  const here = new Set(present.map((c) => `${c.table}.${c.column}`));
+  for (const column of RESERVED_VECTOR_COLUMNS) {
+    if (!here.has(`${column.table}.${column.column}`)) continue;
+    const indexes = await findIndexesOnColumn(sql, column.table, column.column);
+    if (indexes.length > 0) {
+      findings.push(
+        `${column.table}.${column.column}: registered as reserved but carries ${indexes.map((i) => `${i.indexName} (${i.method})`).join(', ')} — a reserved column is one nothing reads, so an index on it is a build cost for no read, or a mis-registration`,
+      );
+    }
+  }
+
+  if (findings.length > 0) throw new VectorColumnRegistryError(findings);
+
+  return assertIndexedVectorColumns(sql, schemaVersion);
 }

@@ -155,6 +155,13 @@ export interface SurfaceFailure {
  * no longer do. Each exchange runs in its own transaction, so one failure does
  * not hide the rest — a report naming one broken statement out of nine sends
  * whoever reads it looking for one bug.
+ *
+ * **Known limit, deliberately not papered over:** a failure is recorded only
+ * when a statement *raises*. No result is compared, so a rung that changes what
+ * the previous release's queries *return* — a partial index that narrows a plan,
+ * a default that changes a count — is invisible here. Fixing it means freezing
+ * expected results alongside the statements, which is a second freeze with its
+ * own rot problem; it wants its own pass rather than a clause bolted on.
  */
 export async function runFleetSurface(
   sql: SQL,

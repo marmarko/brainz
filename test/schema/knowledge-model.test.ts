@@ -140,6 +140,144 @@ describe('R15 — a derived row cannot be narrower than the rows it came from', 
     },
     TEST_TIMEOUT_MS,
   );
+
+  test(
+    'the page a fact was extracted from is an input too',
+    async () => {
+      // `fact_source` is one derivation edge. `fact.page_id` is the other, on the
+      // same table — and for a while it was the one nothing checked, which is the
+      // shape of gap that survives review precisely because the neighbouring
+      // check is prominent.
+      const rows = await sql<{ page_id: string }[]>`
+        INSERT INTO page (origin_context, source_type, title, embedding_model,
+                          embedding_dimensions, chunker_version, normalizer_version, content_sha256)
+        VALUES ('work', 'document', 'a work document', 'text-embedding-3-small',
+                ${EMBEDDING_DIMENSIONS}, 1, 1, repeat('c', 64))
+        RETURNING page_id
+      `;
+      const workPage = Number(rows[0]?.page_id ?? 0);
+      expect(workPage).toBeGreaterThan(0);
+
+      expect(
+        await transactionFailure([
+          `INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+           VALUES ('extracted from a work page, claims personal', ${EMBEDDING}, ARRAY['personal'], ${workPage})`,
+        ]),
+      ).toBe('BZ002');
+
+      // And the honest write is accepted, which is what makes this a fence
+      // rather than a ban on deriving from pages.
+      expect(
+        await transactionFailure([
+          `INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+           VALUES ('extracted from a work page, says so', ${EMBEDDING}, ARRAY['work'], ${workPage})`,
+        ]),
+      ).toBeUndefined();
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'an edge cannot be narrower than the two entities it connects',
+    async () => {
+      const rows = await sql<{ entity_id: string }[]>`
+        INSERT INTO entity (canonical_name, entity_type, origin_contexts)
+        VALUES ('union-personal-entity', 'person', ARRAY['personal']),
+               ('union-work-entity', 'organization', ARRAY['work'])
+        RETURNING entity_id
+      `;
+      const [personal, work] = rows.map((row) => Number(row.entity_id));
+      expect(personal).toBeGreaterThan(0);
+      expect(work).toBeGreaterThan(0);
+
+      // A personal-fenced graph walk that follows this edge arrives at a
+      // work-fenced entity, and the fence it consulted said that was fine.
+      expect(
+        await transactionFailure([
+          `INSERT INTO entity_edge (subject_entity_id, edge_type, object_entity_id, origin_contexts)
+           VALUES (${personal}, 'related_to', ${work}, ARRAY['personal'])`,
+        ]),
+      ).toBe('BZ002');
+
+      expect(
+        await transactionFailure([
+          `INSERT INTO entity_edge (subject_entity_id, edge_type, object_entity_id, origin_contexts)
+           VALUES (${personal}, 'related_to', ${work}, ARRAY['personal','work'])`,
+        ]),
+      ).toBeUndefined();
+
+      // Removed again: the edge-registry test further down counts every stored
+      // edge to prove a relationship is stored once, and a fixture left lying
+      // around by this test would make that assertion mean something else.
+      await sql.unsafe(
+        `DELETE FROM entity_edge WHERE subject_entity_id = ${personal} AND object_entity_id = ${work}`,
+      );
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a contradiction report cannot be narrower than the two facts it quotes',
+    async () => {
+      const rows = await sql<{ fact_id: string }[]>`
+        INSERT INTO fact (statement, embedding, origin_contexts)
+        VALUES ('a personal claim', ${sql.unsafe(EMBEDDING)}, ARRAY['personal']),
+               ('a work claim that contradicts it', ${sql.unsafe(EMBEDDING)}, ARRAY['work'])
+        RETURNING fact_id
+      `;
+      const [personalFact, workFact] = rows.map((row) => Number(row.fact_id));
+      expect(personalFact).toBeGreaterThan(0);
+      expect(workFact).toBeGreaterThan(0);
+
+      // The report carries both facts' statements in what it reports on, so a
+      // narrow report is a work fact's content delivered to a personal reader.
+      expect(
+        await transactionFailure([
+          `INSERT INTO contradiction_report (left_fact_id, right_fact_id, kind, origin_contexts)
+           VALUES (${personalFact}, ${workFact}, 'value_conflict', ARRAY['personal'])`,
+        ]),
+      ).toBe('BZ002');
+
+      expect(
+        await transactionFailure([
+          `INSERT INTO contradiction_report (left_fact_id, right_fact_id, kind, origin_contexts)
+           VALUES (${personalFact}, ${workFact}, 'value_conflict', ARRAY['personal','work'])`,
+        ]),
+      ).toBeUndefined();
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'every derived table with recorded inputs has its union checked — enumerated',
+    async () => {
+      // The list this file used to encode by testing one of four. A derived
+      // table whose inputs are recorded in-row and unchecked is a fence that
+      // evaluates a claim rather than a fact, so the roster is asserted rather
+      // than trusted to be complete.
+      const rows = await sql<{ table_name: string; trigger_name: string }[]>`
+        SELECT c.relname AS table_name, t.tgname AS trigger_name
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        JOIN pg_proc p ON p.oid = t.tgfoid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND NOT t.tgisinternal
+          AND t.tgenabled <> 'D'
+          AND p.proname IN ('assert_origin_union', 'assert_fact_page_origin',
+                            'assert_edge_origin_union', 'assert_report_origin_union')
+        ORDER BY c.relname
+      `;
+
+      expect(rows.map((row) => row.table_name)).toEqual([
+        'contradiction_report',
+        'entity_edge',
+        'fact',
+        'fact_source',
+      ]);
+    },
+    TEST_TIMEOUT_MS,
+  );
 });
 
 describe('the two entity naming primitives are two primitives', () => {

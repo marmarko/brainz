@@ -21,9 +21,19 @@
  * **Measured on this substrate before it was written**, because a guard that
  * cannot go red is worse than none: pgvector 0.8.6 on PostgreSQL 17.10 ships
  * `hnsw.iterative_scan` defaulting to `off`, and at this fixture's shape a
- * 250-candidate request under the production predicates yields **150** rows
- * without it and 250 with it. The collapse is real here and now, not a hazard
+ * 250-candidate request under the production predicates yields **0** rows at
+ * pgvector's defaults, **100** with `ef_search` raised and the iterative scan
+ * still off, and 250 with it on. The collapse is real here and now, not a hazard
  * inherited on paper.
+ *
+ * **The middle number is asserted, not just quoted.** A guard that only measures
+ * the remedied arm passes on any fixture where the predicates stopped biting —
+ * including one somebody shrank. So the first test below is a control: the same
+ * query, the same forced index scan, `hnsw.iterative_scan` explicitly off, and
+ * an assertion that the yield is still *well* under the floor. That is what
+ * replaced an arithmetic tripwire over the fixture constants, which adversarial
+ * review found calibrated to its own boundary — one edit in either constant left
+ * both headline assertions green with the hazard live.
  */
 
 import { SQL } from 'bun';
@@ -35,6 +45,7 @@ import {
 } from '../../src/schema/vector-query.ts';
 import {
   CANDIDATE_POOL,
+  COLLAPSE_MARGIN,
   FORCE_INDEX_SCAN,
   NEAR_DECOY_CHUNKS,
   REQUIRED_YIELD,
@@ -78,9 +89,16 @@ describe('H3 — the pool survives the predicates every production read carries'
 
       // And the half that makes this test different from H1's. Every decoy sits
       // NEARER the query than every qualifying row, so a scan sized to the pool
-      // spends this many of its candidates on rows the filter will discard. If
-      // that headroom ever drops below the gap between the pool and the required
-      // yield, the collapse stops being observable and this guard goes quiet.
+      // spends this many of its candidates on rows the filter will discard.
+      //
+      // Whether that headroom is *enough* is not asserted here as arithmetic —
+      // the previous version of this file did exactly that, with
+      // `NEAR_DECOY_CHUNKS > CANDIDATE_POOL - REQUIRED_YIELD`, and adversarial
+      // review found it calibrated to the boundary: one step in either constant
+      // left both headline assertions green over a live hazard, with this
+      // inequality as the only red. The question "can this fixture still exhibit
+      // the collapse" is now answered by measuring the collapse, in the control
+      // arm below.
       const excludedRows = await sql.unsafe<{ n: number }[]>(
         `SELECT count(*)::int AS n
            FROM chunk
@@ -88,7 +106,6 @@ describe('H3 — the pool survives the predicates every production read carries'
             AND NOT (origin_context = 'personal' AND deleted_at IS NULL AND quarantined_at IS NULL)`,
       );
       expect(excludedRows[0]?.n).toBe(NEAR_DECOY_CHUNKS);
-      expect(NEAR_DECOY_CHUNKS).toBeGreaterThan(CANDIDATE_POOL - REQUIRED_YIELD);
 
       // All three exclusions are represented. A fixture that lost two of them
       // would still be "filtered", and would still be testing less than the
@@ -111,6 +128,50 @@ describe('H3 — the pool survives the predicates every production read carries'
       // same hazard one layer further down, and it is unguarded.
       const total = await sql.unsafe<{ n: number }[]>('SELECT count(*)::int AS n FROM chunk');
       expect(total[0]?.n).toBeLessThan(HNSW_MAX_SCAN_TUPLES_DEFAULT);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'the control arm: without the remedy this fixture still collapses, with room to spare',
+    async () => {
+      // **This is the assertion that makes the next one mean something.** The
+      // headline test says the arm yields ≥ REQUIRED_YIELD *with* the remedy. On
+      // its own that passes on any fixture where the predicates happen not to
+      // bite — including one someone shrank. So this runs the identical query
+      // with `hnsw.iterative_scan` explicitly off, which is pgvector 0.8.6's
+      // default and therefore the unremedied production configuration, and
+      // requires the collapse to still be there.
+      //
+      // Everything else is held identical to the headline test, deliberately:
+      // same pool, same predicates, same forced index scan, same plan
+      // assertions. `enable_seqscan = off` matters most — a sequential scan is
+      // exact, would return the full 250, and would fail this assertion for
+      // precisely the wrong reason.
+      const query = candidateQuery({ filtered: true, limit: CANDIDATE_POOL });
+
+      const { rows, plan } = await sql.begin(async (tx) => {
+        await tx.unsafe(FORCE_INDEX_SCAN);
+        await tx.unsafe(`SET LOCAL hnsw.ef_search = ${CANDIDATE_POOL}`);
+        await tx.unsafe('SET LOCAL hnsw.iterative_scan = off');
+        const explained = await explainLines(tx, query);
+        const found = await tx.unsafe<CandidateRow[]>(query);
+        return { rows: found, plan: explained };
+      });
+
+      expect(usesHnswIndexScan(plan)).toBe(true);
+      expect(plan.some((line) => line.trimStart().startsWith('Filter:'))).toBe(true);
+
+      // The hazard, measured: the scan spends its budget on rows the filter
+      // discards, so the arm returns far fewer qualifying rows than the pool it
+      // was asked for even though the corpus holds plenty.
+      expect(rows.length).toBeLessThan(REQUIRED_YIELD);
+
+      // And it is not a near miss. If this fails, the fixture no longer proves
+      // anything about the remedy below — shrink the decoys or raise the floor
+      // until it does, rather than trusting a guard whose red and green sit one
+      // row apart.
+      expect(rows.length).toBeLessThanOrEqual(REQUIRED_YIELD - COLLAPSE_MARGIN);
     },
     TEST_TIMEOUT_MS,
   );

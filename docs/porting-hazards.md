@@ -110,6 +110,15 @@ PostgreSQL 17.10, both of which would have left a green guard over a live hazard
    measures at roughly 50,000 chunks, far too slow for the PR-blocking tier, so the guard forces
    the plan and then asserts, via `EXPLAIN`, that the forcing took.
 
+**Scope, stated so `guarded` is not read as more than it is.** What is pinned is the *helper's*
+transaction mechanics — that both GUCs are in effect, at the values asked for, inside the query's
+own transaction, and that neither leaks past it. There is no production caller yet (U5 owns the
+retrieval arm), so nothing pins that request traffic reaches the helper, and nothing can: a U5 arm
+that passes a bare `limit` where the helper expects a *pool* sets `ef_search` to 10 and truncates
+below pgvector's own default with every guard here still green. `candidatePoolFor` in
+`src/schema/vector-query.ts` is the mitigation — the `offset + max(limit * 5, 100)` arithmetic as a
+named function the arm calls rather than a sentence the arm's author has to have read.
+
 ---
 
 ## H2 — The vector index that quietly isn't there
@@ -129,6 +138,28 @@ file; and `test/schema/tenant-schema.test.ts` enumerates the vector columns the 
 actually has and fails on any that appears in neither list. A reserved column carries no index
 on purpose — nothing queries it — and moving it to the indexed list is what turns provisioning's
 assertion on.
+
+**What a registry buys, and what it does not.** Adversarial review found the first version of that
+registry moved the fail-open rather than removing it: from *"a second column added later"* to *"a
+second column mis-registered later."* Two single-site edits were accepted with provisioning green
+and the hazard live, and both are now closed:
+
+- **A wrong opclass.** `USING hnsw (embedding vector_l2_ops)` on a column the arm reads with cosine
+  `<=>` is a valid, healthy-looking index the planner cannot use for that ordering — the plan is a
+  sequential scan *even under `enable_seqscan = off`*, because there is no alternative. Each indexed
+  column now declares the operator its arm issues, and the provisioning assertion requires an index
+  whose opclass family serves that operator (asked of `pg_amop`, not matched against a list of
+  opclass names, so a `halfvec` column added later is judged by what it can do).
+- **A demotion.** Moving a queried column to the reserved list and deleting its `CREATE INDEX` used
+  to satisfy everything, because the reserved rule *is* "carries no index". What catches it: a
+  reserved column may not be declared `NOT NULL`. Nothing computes an embedding for every row of a
+  column it never reads, so a `NOT NULL` vector column is on somebody's read path by construction.
+
+Plus a plan-level guard that loops over the registry and asserts, from `EXPLAIN`, that every indexed
+column can actually be `ORDER BY`-ed through its index. **The residual, stated rather than left to be
+found again:** a *nullable* queried column mis-filed as reserved is still invisible to the structural
+rule. `chunk.embedding` is nullable and is covered instead by H1's and H3's plan assertions;
+`fact.embedding` is covered by the `NOT NULL` rule; a third such column would need its own.
 
 **Mechanism.** pgvector caps *indexable* dimensions well below storable ones:
 
@@ -202,11 +233,26 @@ guard as specified would pass on a production-shaped query.
 
 **Confirmed to reproduce before the guard was written**, because a guard that cannot go red is
 worse than none. pgvector 0.8.6 ships `hnsw.iterative_scan` defaulting to `off`, so this is live
-and not already fixed upstream. On a 5,000-chunk fixture holding 250 qualifying rows behind 100
-nearer rows that the production predicates exclude, a 250-candidate request returns: **40** rows
-at pgvector's defaults, **250** unfiltered once `ef_search` is raised, **150** once the predicates
+and not already fixed upstream. On a 5,000-chunk fixture holding 250 qualifying rows behind 150
+nearer rows that the production predicates exclude, a 250-candidate request returns: **0** rows
+at pgvector's defaults, **250** unfiltered once `ef_search` is raised, **100** once the predicates
 are added — and 250 again with `iterative_scan` set. The collapse is exactly the arithmetic the
 mechanism predicts: the scan spends its whole budget on rows the filter then discards.
+
+**The unremedied number is asserted, not just quoted.** The guard's first test is a *control*: the
+same query, the same forced index scan, `hnsw.iterative_scan` explicitly off, and an assertion that
+the yield is still well below the floor. Without it, "the arm returns ≥200 with the remedy" passes
+on any fixture where the predicates stopped biting — including one somebody shrank. The first
+version of this guard defended that with an arithmetic tripwire over the fixture constants, and
+adversarial review found it calibrated exactly to its own boundary: one step in either constant left
+both headline assertions green with the hazard live, and the tripwire was the only red.
+
+**Scope limit, which the source comments carried and this card did not.** The remedy this guard pins
+is itself bounded by `hnsw.max_scan_tuples` (default 20,000) — how far an iterative scan will resume
+before giving up. What is proven here is that the scan *resumes*, not that it resumes far enough on
+a brain whose origin fence excludes most of a large corpus. That is the same hazard one layer
+further down; it is named in `src/schema/vector-query.ts` and it is unguarded. This card is
+`guarded` for the mechanism it describes, not for that one.
 
 **Mechanism.** pgvector applies a query's `WHERE` predicates **after** the HNSW scan returns its
 `ef_search` candidates. So the GUC sizes the *scan*, not the *qualifying yield*. Raising

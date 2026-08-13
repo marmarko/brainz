@@ -29,27 +29,54 @@
  * Presence-checking the `CREATE INDEX` text in the schema file would pass in
  * both halves while the fleet drifted, which is why neither test below reads the
  * schema file for reassurance.
+ *
+ * **Two ways an index-presence check stays green over a live hazard**, both
+ * found by adversarial review of the first version of this file and both closed
+ * below, because each is a single-token edit:
+ *
+ *   * **A wrong opclass.** `USING hnsw (embedding vector_l2_ops)` on a column
+ *     the arm reads with cosine `<=>` is a valid hnsw index the planner cannot
+ *     use for that ordering. The plan falls back to a sequential scan *even
+ *     under `enable_seqscan = off`*, because there is no alternative — exact
+ *     neighbours, recall up, nothing errors. Presence of an hnsw index is not
+ *     the property; being able to serve the operator the arm issues is.
+ *
+ *   * **A demotion.** Moving a queried column to `RESERVED_VECTOR_COLUMNS` and
+ *     deleting its `CREATE INDEX` used to be accepted by everything: the
+ *     registry checks were consistency checks *between the lists and the
+ *     database*, and a column in the reserved list is supposed to have no index.
+ *     What catches it is that a reserved column may not be `NOT NULL` — nothing
+ *     computes an embedding for every row of a column it never reads.
  */
 
 import { SQL } from 'bun';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { createTenantSchemaApplier, readTenantDdl } from '../../src/schema/apply.ts';
+import { HEAD_SCHEMA_VERSION } from '../../src/schema/migrations.ts';
 import {
   CHUNK_EMBEDDING_COLUMN,
   CHUNK_TABLE,
   EMBEDDING_DIMENSIONS,
   HNSW_INDEXABLE_DIMENSIONS,
+  INDEXED_VECTOR_COLUMNS,
   MissingVectorIndexError,
+  RESERVED_VECTOR_COLUMNS,
+  VectorColumnRegistryError,
   assertHnswIndex,
+  assertVectorColumns,
   findIndexableDimensionViolations,
   findIndexesOnColumn,
   findVectorDeclarations,
+  findVectorRegistryViolations,
+  listVectorColumns,
+  type CatalogVectorColumn,
 } from '../../src/schema/vector-index.ts';
 import {
   FIXTURE_FTS_LANGUAGE,
   createEmptyDatabase,
   dropFixtureDatabase,
+  explainLines,
   provisionFixtureDatabase,
   type TenantFixture,
 } from './fixture.ts';
@@ -235,7 +262,13 @@ describe('H2 — a tenant is not handed out without a usable vector index', () =
 
         const found = await findIndexesOnColumn(sql, CHUNK_TABLE, CHUNK_EMBEDDING_COLUMN);
         expect(found).toEqual([
-          { indexName: 'chunk_embedding_hnsw', method: 'hnsw', valid: false },
+          {
+            indexName: 'chunk_embedding_hnsw',
+            method: 'hnsw',
+            valid: false,
+            opclass: 'vector_cosine_ops',
+            servesOperator: true,
+          },
         ]);
 
         await expect(assertHnswIndex(sql, CHUNK_TABLE, CHUNK_EMBEDDING_COLUMN)).rejects.toThrow(
@@ -244,6 +277,213 @@ describe('H2 — a tenant is not handed out without a usable vector index', () =
       } finally {
         await sql.close();
         await dropFixtureDatabase(remnant);
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'every indexed column can actually be ORDER BY-ed through its index — asserted from the plan',
+    async () => {
+      // The assertion that grows with the registry rather than behind it. The
+      // catalog checks above ask whether an index exists and whether its opclass
+      // is right; this asks the planner, which is the only party whose opinion
+      // decides whether production does a sequential scan. `enable_seqscan` is
+      // off, so a plan that still says Seq Scan says the planner had no
+      // alternative — H2, exactly.
+      const columns = await listVectorColumns(healthySql);
+      const dimensionOf = new Map(columns.map((c) => [`${c.table}.${c.column}`, c.type]));
+      const checked: string[] = [];
+
+      for (const column of INDEXED_VECTOR_COLUMNS) {
+        if (column.since > HEAD_SCHEMA_VERSION) continue;
+        const declared = dimensionOf.get(`${column.table}.${column.column}`);
+        // The registry names a column the database does not have: a finding, not
+        // a skip. A `continue` here would make this loop vacuous the moment a
+        // table was renamed.
+        expect(declared).toBeDefined();
+        const dimensions = Number(/\((\d+)\)/.exec(declared ?? '')?.[1]);
+        expect(Number.isSafeInteger(dimensions)).toBe(true);
+
+        // Built from the column's own declared type, so this test does not carry
+        // a second copy of the dimension that could drift from the schema.
+        const probe = `('[1' || repeat(',0', ${dimensions - 1}) || ']')::${declared}`;
+        const accepted = await assertHnswIndex(
+          healthySql,
+          column.table,
+          column.column,
+          column.operator,
+        );
+
+        const plan = await healthySql.begin(async (tx) => {
+          await tx.unsafe('SET LOCAL enable_seqscan = off');
+          return {
+            value: await explainLines(
+              tx,
+              `SELECT 1 FROM ${column.table} ORDER BY ${column.column} ${column.operator} ${probe} LIMIT 10`,
+            ),
+          };
+        });
+
+        const lines = (plan as { value: string[] }).value;
+        expect(lines.some((line) => line.includes(`Index Scan using ${accepted.indexName}`))).toBe(
+          true,
+        );
+        checked.push(`${column.table}.${column.column}`);
+      }
+
+      // The loop must have run. A registry that emptied itself would otherwise
+      // report a clean sheet, which is the failure this whole file is about.
+      expect(checked).toEqual(INDEXED_VECTOR_COLUMNS.map((c) => `${c.table}.${c.column}`));
+      expect(checked.length).toBeGreaterThan(1);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'an hnsw index built for the wrong distance is refused — and the planner agrees',
+    async () => {
+      // One token: `vector_l2_ops` where the arm issues cosine `<=>`. Every
+      // presence-style check passes — the index is hnsw, valid, on the right
+      // column, and `pg_indexes` shows nothing odd.
+      const wrong = await provisionFixtureDatabase('h2_wrong_opclass');
+      const sql = new SQL(wrong.dsn, { max: 1 });
+      try {
+        await sql.unsafe('DROP INDEX chunk_embedding_hnsw');
+        await sql.unsafe(
+          'CREATE INDEX chunk_embedding_hnsw ON chunk USING hnsw (embedding vector_l2_ops)',
+        );
+
+        const found = await findIndexesOnColumn(sql, CHUNK_TABLE, CHUNK_EMBEDDING_COLUMN);
+        expect(found).toEqual([
+          {
+            indexName: 'chunk_embedding_hnsw',
+            method: 'hnsw',
+            valid: true,
+            opclass: 'vector_l2_ops',
+            servesOperator: false,
+          },
+        ]);
+
+        // The mechanism, measured rather than asserted: with the wrong opclass
+        // there is no index the planner can use for a cosine ordering, so it
+        // sequentially scans even when told not to.
+        const plan = await sql.begin(async (tx) => {
+          await tx.unsafe('SET LOCAL enable_seqscan = off');
+          return {
+            value: await explainLines(
+              tx,
+              `SELECT 1 FROM chunk ORDER BY embedding <=> ('[1' || repeat(',0', ${EMBEDDING_DIMENSIONS - 1}) || ']')::vector(${EMBEDDING_DIMENSIONS}) LIMIT 10`,
+            ),
+          };
+        });
+        const lines = (plan as { value: string[] }).value;
+        expect(lines.some((line) => line.includes('Seq Scan on chunk'))).toBe(true);
+        expect(lines.some((line) => line.includes('Index Scan using'))).toBe(false);
+
+        // And the same index IS usable for the distance it was built for, which
+        // is what makes this a wrong-operator finding rather than a broken index.
+        await expect(
+          assertHnswIndex(sql, CHUNK_TABLE, CHUNK_EMBEDDING_COLUMN, '<->'),
+        ).resolves.toMatchObject({ opclass: 'vector_l2_ops' });
+
+        await expect(assertHnswIndex(sql, CHUNK_TABLE, CHUNK_EMBEDDING_COLUMN)).rejects.toThrow(
+          MissingVectorIndexError,
+        );
+        await expect(assertVectorColumns(sql, HEAD_SCHEMA_VERSION)).rejects.toThrow(
+          MissingVectorIndexError,
+        );
+      } finally {
+        await sql.close();
+        await dropFixtureDatabase(wrong);
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe('H2 — the registry is checked against the database, not read as prose', () => {
+  const catalog = (
+    table: string,
+    column: string,
+    notNull: boolean,
+    type = 'vector(1536)',
+  ): CatalogVectorColumn => ({ table, column, type, notNull });
+
+  test('the shipped registry agrees with the shipped schema', () => {
+    // The control case. Every assertion below is about a registry that is wrong;
+    // this is the one that says the rule does not reject the right answer.
+    expect(
+      findVectorRegistryViolations([
+        ...INDEXED_VECTOR_COLUMNS.map((c) => catalog(c.table, c.column, false)),
+        ...RESERVED_VECTOR_COLUMNS.map((c) => catalog(c.table, c.column, false)),
+      ]),
+    ).toEqual([]);
+  });
+
+  test('a vector column in neither list is a finding', () => {
+    // The original H2 shape one level up: the guard covers the columns it was
+    // told about, and reports green for the fleet.
+    const findings = findVectorRegistryViolations([catalog('note', 'embedding', false)]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toContain('note.embedding');
+  });
+
+  test('a NOT NULL vector column cannot be filed as reserved', () => {
+    // The demotion, caught. `fact.embedding` is NOT NULL because a fact is
+    // embedded synchronously on the write path — which is a statement that
+    // something computes this vector for every row, and nothing pays that for a
+    // column it never reads.
+    const reserved = RESERVED_VECTOR_COLUMNS[0];
+    expect(reserved).toBeDefined();
+    const findings = findVectorRegistryViolations([
+      catalog(reserved?.table ?? '', reserved?.column ?? '', true),
+    ]);
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toContain('NOT NULL');
+
+    // And nullable is fine, which is what makes the rule usable: a reserved
+    // column is one nothing fills.
+    expect(
+      findVectorRegistryViolations([catalog(reserved?.table ?? '', reserved?.column ?? '', false)]),
+    ).toEqual([]);
+  });
+
+  test(
+    'provisioning runs this against the real catalog, and the shipped schema passes it',
+    async () => {
+      const healthy = await provisionFixtureDatabase('h2_registry');
+      const sql = new SQL(healthy.dsn, { max: 1 });
+      try {
+        const columns = await listVectorColumns(sql);
+        // Read from the catalog, so a column added to the DDL without being
+        // registered fails here rather than in whatever queries it next year.
+        expect(columns.map((c) => `${c.table}.${c.column}`).sort()).toEqual(
+          [
+            ...INDEXED_VECTOR_COLUMNS.map((c) => `${c.table}.${c.column}`),
+            ...RESERVED_VECTOR_COLUMNS.map((c) => `${c.table}.${c.column}`),
+          ].sort(),
+        );
+        expect(findVectorRegistryViolations(columns)).toEqual([]);
+        await expect(assertVectorColumns(sql, HEAD_SCHEMA_VERSION)).resolves.toHaveLength(
+          INDEXED_VECTOR_COLUMNS.length,
+        );
+
+        // An index appearing on a reserved column is the mirror failure: either
+        // a copied migration, or a column that became queried without its entry
+        // moving. Both are findings.
+        const reserved = RESERVED_VECTOR_COLUMNS[0];
+        expect(reserved).toBeDefined();
+        await sql.unsafe(
+          `CREATE INDEX reserved_probe_hnsw ON ${reserved?.table} USING hnsw (${reserved?.column} vector_cosine_ops)`,
+        );
+        await expect(assertVectorColumns(sql, HEAD_SCHEMA_VERSION)).rejects.toThrow(
+          VectorColumnRegistryError,
+        );
+      } finally {
+        await sql.close();
+        await dropFixtureDatabase(healthy);
       }
     },
     TEST_TIMEOUT_MS,

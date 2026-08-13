@@ -70,9 +70,44 @@ export interface VectorScanOptions {
   /**
    * How many candidates the caller wants back. Sized to the pool the retrieval
    * stack actually asked for, not to the final result count — the whole hazard
-   * is the gap between those two numbers.
+   * is the gap between those two numbers. {@link candidatePoolFor} is how a
+   * caller gets that number right.
    */
   readonly candidatePool: number;
+}
+
+/**
+ * The pool size the retrieval stack asks the vector arm for, as a function
+ * rather than as a sentence in a doc comment.
+ *
+ * **No production caller exists yet — U5 owns the retrieval arm — and that is
+ * exactly why this is here.** Every guard in `test/hazards/` calls
+ * {@link withVectorScan} directly, so what they pin is the helper's transaction
+ * mechanics: they cannot pin that the arm passes a *pool* rather than a final
+ * `limit`. A caller that writes `withVectorScan(sql, { candidatePool: limit },
+ * …)` with `limit = 10` sets `ef_search = 10`, truncates the pool below even
+ * pgvector's own default of 40, and leaves every hazard guard green — H1's
+ * mechanism reintroduced through the front door by code that looks correct.
+ *
+ * So the arithmetic gbrain paid for lives here, named, and the U5 arm calls this
+ * instead of doing the multiplication at the call site:
+ *
+ *     offset + max(limit * 5, 100)
+ *
+ * The floor matters as much as the multiplier: at `limit = 10` the multiplier
+ * alone gives 50, which is a pool barely above the default this whole module
+ * exists to raise.
+ */
+export function candidatePoolFor(request: {
+  readonly limit: number;
+  readonly offset?: number;
+}): number {
+  const limit = Math.max(Math.trunc(request.limit), 1);
+  const offset = Math.max(Math.trunc(request.offset ?? 0), 0);
+  if (!Number.isFinite(limit) || !Number.isFinite(offset)) {
+    throw new TypeError('limit and offset must be finite numbers');
+  }
+  return offset + Math.max(limit * 5, 100);
 }
 
 /**

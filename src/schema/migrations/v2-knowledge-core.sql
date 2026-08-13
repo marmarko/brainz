@@ -38,8 +38,35 @@
 -- or a page arrived through exactly one credential, so its origin is a scalar
 -- (and rung one already declared it that way). A fact, an entity, an edge or a
 -- contradiction is computed from other rows, so its origin is the set of its
--- inputs' origins — an array, checked against the actual inputs where the
--- inputs are recorded (`fact_source`), not merely asserted in prose.
+-- inputs' origins — an array, checked against the actual inputs **everywhere the
+-- inputs are recorded**, not merely asserted in prose. That is four derivation
+-- edges, and each one has its own trigger below because each one records its
+-- inputs differently:
+--
+--   * `fact_source`   → the chunks a fact was extracted from.
+--   * `fact.page_id`  → the page a fact was extracted from. A second edge on the
+--                       same table as the first, which is why it is easy to miss.
+--   * `entity_edge`   → its two endpoint entities.
+--   * `contradiction_report` → its two facts.
+--
+-- `entity` is the one derived table with no checkable inputs: nothing records
+-- which rows mentioned an entity, so its union is asserted by the write path and
+-- by nothing else. Stated here rather than left as an apparent oversight.
+--
+-- A derived row with narrower origins than its inputs is not a data-quality nit:
+-- KTD5 fences access on origin alone, so it is how a personal-fenced reader ends
+-- up holding a work document's content, one derivation removed.
+--
+-- **What none of this reaches: row identity reuse.** `DELETE FROM chunk WHERE
+-- chunk_id = 2` followed by an `OVERRIDING SYSTEM VALUE` insert of a new row at
+-- id 2 with a different origin fires no trigger, because no origin moved — a
+-- different row now answers to that id. Nothing here can prevent it: the tenant
+-- role owns the table, and an actor who can DELETE and override an identity can
+-- also drop the table. What the schema does buy is that the derivation edges are
+-- destroyed first (`fact_source` cascades from `chunk`), so existing derived rows
+-- are not retroactively re-pointed at the substituted row, and the union checks
+-- above catch the next derivation that names it. Citations and caches keyed on
+-- the bare id are the exposure, and they are U5's and U11's to reason about.
 --
 -- Each table declares which of those it is in its own `COMMENT ON TABLE`, in
 -- the vocabulary `test/schema/tenant-schema.test.ts` enumerates: a table that
@@ -387,6 +414,37 @@ CREATE TRIGGER fact_origin_is_immutable
   BEFORE UPDATE OF origin_contexts ON fact
   FOR EACH ROW EXECUTE FUNCTION refuse_origin_change('origin_contexts');
 
+-- `page_id` is a fact's *second* derivation edge, and the easier one to forget:
+-- the docstring above celebrates checking the union where the inputs are
+-- recorded, and for most of this file's life that meant `fact_source` only. A
+-- fact extracted from a work-fenced page while claiming `{personal}` leaks the
+-- same content as one extracted from a work-fenced chunk, on the same table.
+CREATE FUNCTION assert_fact_page_origin() RETURNS trigger
+LANGUAGE plpgsql AS $assert_fact_page_origin$
+DECLARE uncovered text;
+BEGIN
+  SELECT p.origin_context INTO uncovered
+  FROM page p
+  WHERE p.page_id = NEW.page_id
+    AND NOT (p.origin_context = ANY (NEW.origin_contexts))
+  LIMIT 1;
+
+  IF uncovered IS NOT NULL THEN
+    RAISE EXCEPTION
+      'fact % does not carry the origin % of the page it was extracted from (R15)', NEW.fact_id, uncovered
+      USING ERRCODE = 'BZ002',
+            HINT = 'a derived row inherits the union of its inputs'' origins; origin is immutable, so write the fact with the full union';
+  END IF;
+
+  RETURN NULL;
+END;
+$assert_fact_page_origin$;
+
+CREATE CONSTRAINT TRIGGER fact_page_origin_union
+  AFTER INSERT OR UPDATE ON fact
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION assert_fact_page_origin();
+
 
 -- ---------------------------------------------------------------------------
 -- fact_source — which chunks a fact was derived from, and the place R15's union
@@ -646,6 +704,40 @@ CREATE TRIGGER entity_edge_origin_is_immutable
   BEFORE UPDATE OF origin_contexts ON entity_edge
   FOR EACH ROW EXECUTE FUNCTION refuse_origin_change('origin_contexts');
 
+-- An edge's inputs are its two endpoints, and both are NOT NULL columns on the
+-- row itself — so the union is fully checkable in-row, which is exactly why
+-- leaving it unchecked is indefensible rather than merely unfortunate. An edge
+-- claiming `{personal}` between a personal entity and a work one tells a
+-- personal-fenced graph walk that the work entity is reachable.
+CREATE FUNCTION assert_edge_origin_union() RETURNS trigger
+LANGUAGE plpgsql AS $assert_edge_origin_union$
+DECLARE uncovered text;
+BEGIN
+  SELECT endpoint.origin INTO uncovered
+  FROM (
+    SELECT unnest(e.origin_contexts) AS origin
+    FROM entity e
+    WHERE e.entity_id IN (NEW.subject_entity_id, NEW.object_entity_id)
+  ) AS endpoint
+  WHERE NOT (endpoint.origin = ANY (NEW.origin_contexts))
+  LIMIT 1;
+
+  IF uncovered IS NOT NULL THEN
+    RAISE EXCEPTION
+      'edge % does not carry the origin % of one of the entities it connects (R15)', NEW.edge_id, uncovered
+      USING ERRCODE = 'BZ002',
+            HINT = 'a derived row inherits the union of its inputs'' origins; origin is immutable, so write the edge with the full union';
+  END IF;
+
+  RETURN NULL;
+END;
+$assert_edge_origin_union$;
+
+CREATE CONSTRAINT TRIGGER entity_edge_origin_union
+  AFTER INSERT OR UPDATE ON entity_edge
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION assert_edge_origin_union();
+
 
 -- ---------------------------------------------------------------------------
 -- contradiction_report — two facts that cannot both be true, and what was done
@@ -701,3 +793,36 @@ CREATE INDEX contradiction_open ON contradiction_report (detected_at DESC) WHERE
 CREATE TRIGGER contradiction_report_origin_is_immutable
   BEFORE UPDATE OF origin_contexts ON contradiction_report
   FOR EACH ROW EXECUTE FUNCTION refuse_origin_change('origin_contexts');
+
+-- Both sides are NOT NULL columns on the row, so this union is checkable in-row
+-- too. A report quotes the content of both facts it names; one claiming
+-- `{personal}` over a work fact hands a personal-fenced reader that fact's
+-- statement inside the report.
+CREATE FUNCTION assert_report_origin_union() RETURNS trigger
+LANGUAGE plpgsql AS $assert_report_origin_union$
+DECLARE uncovered text;
+BEGIN
+  SELECT side.origin INTO uncovered
+  FROM (
+    SELECT unnest(f.origin_contexts) AS origin
+    FROM fact f
+    WHERE f.fact_id IN (NEW.left_fact_id, NEW.right_fact_id)
+  ) AS side
+  WHERE NOT (side.origin = ANY (NEW.origin_contexts))
+  LIMIT 1;
+
+  IF uncovered IS NOT NULL THEN
+    RAISE EXCEPTION
+      'contradiction report % does not carry the origin % of one of the facts it quotes (R15)', NEW.report_id, uncovered
+      USING ERRCODE = 'BZ002',
+            HINT = 'a derived row inherits the union of its inputs'' origins; origin is immutable, so write the report with the full union';
+  END IF;
+
+  RETURN NULL;
+END;
+$assert_report_origin_union$;
+
+CREATE CONSTRAINT TRIGGER contradiction_report_origin_union
+  AFTER INSERT OR UPDATE ON contradiction_report
+  DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION assert_report_origin_union();

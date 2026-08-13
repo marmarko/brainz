@@ -34,7 +34,7 @@ import {
 } from '../control/provision.ts';
 import { assertTextSearchConfigExists } from './fts-language.ts';
 import { HEAD_SCHEMA_VERSION, MIGRATIONS, type TenantMigration } from './migrations.ts';
-import { assertIndexedVectorColumns } from './vector-index.ts';
+import { assertVectorColumns } from './vector-index.ts';
 
 export { FTS_LANGUAGE_PLACEHOLDER, applyFtsLanguage } from './fts-language.ts';
 
@@ -84,6 +84,14 @@ export function createTenantSchemaApplier(
 
         const result = await migrateTenantSchema(sql, {
           ftsLanguage: request.ftsLanguage,
+          // Threaded down rather than checked around the outside. The two
+          // `throwIfAborted` calls either side of this used to be the whole
+          // story, because `MigrateOptions` had nowhere to put a signal — which
+          // is the cooperative-deadline shape U2 already paid for: the deadline
+          // elapses, the call does not notice, and the lease becomes stealable
+          // while the transaction is still live. The migration observes it
+          // between rungs; `lockTimeoutMs` bounds the wait that actually blocks.
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
           ...(options.targetVersion === undefined ? {} : { to: options.targetVersion }),
           ...(options.ddl === undefined ? {} : { baselineDdl: options.ddl }),
         });
@@ -91,8 +99,11 @@ export function createTenantSchemaApplier(
 
         // The load-bearing line. Asks the catalog, not the DDL: presence of
         // `CREATE INDEX` in the text is what a grep would confirm, and a grep
-        // cannot see the tenant on which that statement did not run.
-        await assertIndexedVectorColumns(sql, result.to);
+        // cannot see the tenant on which that statement did not run. It checks
+        // the registry against the catalog before it checks the indexes, so a
+        // queried column quietly re-filed as reserved fails here rather than
+        // being skipped by a loop that no longer knows about it.
+        await assertVectorColumns(sql, result.to);
 
         return { schemaVersion: result.to };
       } finally {

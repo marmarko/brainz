@@ -38,6 +38,7 @@ import {
   HNSW_EF_SEARCH_DEFAULT,
   HNSW_EF_SEARCH_MAX,
   HNSW_ITERATIVE_SCAN_MODE,
+  candidatePoolFor,
   withVectorScan,
 } from '../../src/schema/vector-query.ts';
 import {
@@ -138,6 +139,29 @@ describe('H1 — the candidate pool the vector arm asked for is the pool it gets
 
       expect(settings?.ef).toBe(String(CANDIDATE_POOL));
       expect(settings?.iterative).toBe(HNSW_ITERATIVE_SCAN_MODE);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'the pool the arm asks for is a pool, not a limit',
+    () => {
+      // What this file cannot otherwise pin. Every test here calls the helper
+      // directly, so they measure the helper's transaction mechanics — not that
+      // the retrieval arm (U5) hands it `offset + max(limit * 5, 100)` rather
+      // than a bare `limit`. A caller passing `limit` sets `ef_search` to 10 or
+      // 25 and truncates the pool *below* pgvector's own default, with every
+      // guard in this file still green. Naming the arithmetic is what makes the
+      // wrong call a visible mistake rather than a plausible one.
+      expect(candidatePoolFor({ limit: 10 })).toBe(100); // conservative
+      expect(candidatePoolFor({ limit: 25 })).toBe(125); // balanced
+      expect(candidatePoolFor({ limit: 50 })).toBe(CANDIDATE_POOL); // tokenmax
+      expect(candidatePoolFor({ limit: 50, offset: 50 })).toBe(CANDIDATE_POOL + 50);
+
+      // The floor is the half that is easy to drop: at small limits the
+      // multiplier alone gives a pool barely above the default this module
+      // exists to raise.
+      expect(candidatePoolFor({ limit: 1 })).toBeGreaterThan(HNSW_EF_SEARCH_DEFAULT);
     },
     TEST_TIMEOUT_MS,
   );

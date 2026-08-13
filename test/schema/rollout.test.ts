@@ -93,6 +93,109 @@ describe('every rung is additive, statically', () => {
     expect(findExpandContractViolations('')).toHaveLength(1);
   });
 
+  test('a multi-action ALTER TABLE is judged action by action', () => {
+    // Every one of these was ACCEPTED by a scanner that matched on the statement
+    // head: Postgres allows several actions per `ALTER TABLE`, and `ADD COLUMN`
+    // at the front launders whatever follows it. The same three actions are
+    // rejected standalone, which is what made the gap invisible in review.
+    expect(
+      findExpandContractViolations('ALTER TABLE chunk ADD COLUMN x int, DROP COLUMN content;'),
+    ).toHaveLength(1);
+    expect(
+      findExpandContractViolations(
+        'ALTER TABLE chunk ADD COLUMN y int, ALTER COLUMN content TYPE varchar(80);',
+      ),
+    ).toHaveLength(1);
+    expect(
+      findExpandContractViolations('ALTER TABLE chunk ADD COLUMN z int, DROP CONSTRAINT chunk_pkey;'),
+    ).toHaveLength(1);
+
+    // And the NOT NULL rule is per action too. Statement-wide, this one reads as
+    // "there is a DEFAULT in here somewhere" — while `b` breaks every INSERT the
+    // previous release issues.
+    expect(
+      findExpandContractViolations('ALTER TABLE chunk ADD COLUMN a int DEFAULT 0, ADD COLUMN b int NOT NULL;'),
+    ).toHaveLength(1);
+
+    // The legitimate multi-action form still passes, or the rule is unusable.
+    expect(
+      findExpandContractViolations(
+        `ALTER TABLE chunk ADD COLUMN a int DEFAULT 0, ADD COLUMN b int NOT NULL DEFAULT 0,
+         ADD CONSTRAINT chunk_ab CHECK (a IN (0, 1) AND b >= 0);`,
+      ),
+    ).toEqual([]);
+    // Commas inside a parenthesised list are not action boundaries — a splitter
+    // that thought so would report a wall of false findings on real DDL, and a
+    // guard that cries wolf gets switched off.
+    expect(
+      findExpandContractViolations(
+        `ALTER TABLE chunk ADD CONSTRAINT chunk_page_fkey FOREIGN KEY (page_id, ordinal) REFERENCES page (page_id, ordinal);`,
+      ),
+    ).toEqual([]);
+  });
+
+  test('a uniqueness promise on a pre-existing table is a rollout break', () => {
+    // Reproduced by adversarial review as passing BOTH nets: the scanner (it is
+    // a `CREATE ... INDEX`, which is additive in shape) and the frozen fleet
+    // surface (whose two chunks happen to carry distinct content). It breaks the
+    // previous release on the first duplicate that release writes — on a schema
+    // it can neither understand nor retry past.
+    expect(
+      findExpandContractViolations('CREATE UNIQUE INDEX chunk_content_unique ON chunk (content);'),
+    ).toHaveLength(1);
+    expect(
+      findExpandContractViolations('ALTER TABLE chunk ADD CONSTRAINT chunk_content_unique UNIQUE (content);'),
+    ).toHaveLength(1);
+
+    // On a table the same rung creates, the promise is free: nothing else is
+    // writing to a table the previous release has never heard of. This is the
+    // shape the shipped ladder actually uses, three times.
+    expect(
+      findExpandContractViolations(
+        `CREATE TABLE note (note_id bigint GENERATED ALWAYS AS IDENTITY, slug text NOT NULL);
+         CREATE UNIQUE INDEX note_slug ON note (slug);`,
+      ),
+    ).toEqual([]);
+    // Order within the rung must not decide it.
+    expect(
+      findExpandContractViolations(
+        `CREATE UNIQUE INDEX note_slug ON public.note (slug);
+         CREATE TABLE note (note_id bigint GENERATED ALWAYS AS IDENTITY, slug text NOT NULL);`,
+      ),
+    ).toEqual([]);
+    // A non-unique index on an existing table stays fine: it promises nothing
+    // about what may be written.
+    expect(findExpandContractViolations('CREATE INDEX chunk_by_content ON chunk (content);')).toEqual([]);
+
+    // And the constraint form gets the same exemption on a table the rung
+    // creates. Without it the rule fires on correct DDL — create the table,
+    // then constrain it — which is how a guard earns a reputation for noise.
+    expect(
+      findExpandContractViolations(
+        `CREATE TABLE note (note_id bigint GENERATED ALWAYS AS IDENTITY, slug text NOT NULL);
+         ALTER TABLE note ADD CONSTRAINT note_slug_unique UNIQUE (slug);`,
+      ),
+    ).toEqual([]);
+  });
+
+  test('CREATE OR REPLACE FUNCTION is a change, not an addition', () => {
+    // The Q1/Q2 join, and the sharpest shape review found: an "additive" rung
+    // that replaces the shared origin-trigger function with one that returns NEW
+    // unconditionally disables R15 on every table at once. The scanner accepted
+    // it, the frozen surface ran it successfully, and every trigger definition
+    // still read correctly afterwards.
+    const neuter = `CREATE OR REPLACE FUNCTION refuse_origin_change() RETURNS trigger
+      LANGUAGE plpgsql AS $f$ BEGIN RETURN NEW; END; $f$;`;
+    expect(findExpandContractViolations(neuter)).toHaveLength(1);
+
+    // A NEW function is still additive — that is the migration path for a rung
+    // that needs different behaviour: add a function, point new triggers at it.
+    expect(
+      findExpandContractViolations(`CREATE FUNCTION refuse_origin_change_v2() RETURNS trigger
+        LANGUAGE plpgsql AS $f$ BEGIN RETURN NEW; END; $f$;`),
+    ).toEqual([]);
+  });
+
   test('the splitter understands dollar-quoted function bodies', () => {
     // Rung two ships three plpgsql functions. A splitter that broke on `;`
     // inside `$$ ... $$` would read each of them as a handful of malformed
