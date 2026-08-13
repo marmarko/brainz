@@ -56,7 +56,7 @@ import { IMAGE_INPUT_TOKENS } from '../../ai/routing.ts';
 import type { ModelPhaseDeps, PhaseOutcome, PhaseStop } from '../../worker/consolidate/model-phases.ts';
 import { PHASE_OP } from '../../worker/consolidate/phases.ts';
 import { ingestDocument } from '../write/write-path.ts';
-import { PDF_MEDIA_TYPE, normalizeMediaType } from './accept.ts';
+import { PDF_MEDIA_TYPE, normalizeMediaType, transcriptRefFor } from './accept.ts';
 import { extractPdfTextLayer } from './pdf-text.ts';
 
 /** How many attachments one pass considers, so a cycle stays bounded. */
@@ -233,9 +233,10 @@ async function materialiseTranscript(
       originContext: item.origin,
       sourceType: 'file',
       body: text,
-      // The idempotency key. A cycle that re-reads an attachment whose bytes did
-      // not change writes nothing and pays nothing.
-      externalRef: `attachment:${item.attachmentId}`,
+      // The idempotency key, and the handle the connector's deletion sweep
+      // reaches this page by. Spelled in `accept.ts` so the writer and the
+      // sweeper cannot drift.
+      externalRef: transcriptRefFor(item.attachmentId),
       subject:
         item.subjectContext === null || item.subjectConfidence === null
           ? null

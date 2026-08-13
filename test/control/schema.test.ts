@@ -1416,6 +1416,11 @@ const CONTENT_BEARING_SQL: readonly ContentBearingEntry[] = [
     because:
       "the event-time rung adds one column to the tenant's own `page` table, and what it holds is content: a `Date` header, a calendar start, a Drive `modifiedTime`, each asserted by whoever sent the item; it belongs to the same per-tenant database as the rungs above and nothing about it reaches the control plane",
   },
+  {
+    path: 'schema/migrations/v6-attachment-external-ref.sql',
+    because:
+      "the deletion-handle rung adds one column to the tenant's own `attachment` table, and a provider's id for a provider's object is content in the same sense `occurred_at` is: the sender chose it, it decides nothing about access, and it names a file inside one tenant's own database; the control plane holds ids, counters, timestamps, tier and connection-string references, and a Drive file id is none of those",
+  },
 ];
 
 const CONTROL_PREFIX = 'control/';

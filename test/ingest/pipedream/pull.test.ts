@@ -46,6 +46,7 @@ import {
   type PulledMedia,
 } from '../../../src/ingest/pipedream/sources/types.ts';
 import { selectPendingAttachments } from '../../../src/core/media/ocr-phase.ts';
+import { acceptMedia, transcriptRefFor } from '../../../src/core/media/accept.ts';
 import {
   CALLER,
   TENANT,
@@ -819,6 +820,177 @@ describe('the objects a listing carries', () => {
     expect(row?.outcome).toBe('ok');
     expect(row?.items_quarantined).toBe(1);
     expect(row?.items_written).toBe(0);
+  });
+
+  /**
+   * A file the user deleted upstream, and the two rows that outlive it.
+   *
+   * The sweep matched `page.external_ref` only, and an attachment is not a page:
+   * neither the attachment row nor the transcript page written from it —
+   * `attachment:{id}`, a different ref on a different table — was reachable by
+   * any deletion path. So a document a user deleted in Drive stayed searchable
+   * through its own transcribed text, indefinitely.
+   *
+   * **The transcript is asserted separately from the attachment row on
+   * purpose.** They are retired by different statements against different
+   * tables, and a sweep that retired only the attachment would leave the
+   * searchable half standing while every count in this test still read right.
+   */
+  async function attachmentIdIn(origin: string): Promise<string> {
+    const rows = (await fixture.tenantSql`
+      SELECT attachment_id::text AS id FROM attachment
+       WHERE origin_context = ${origin} AND deleted_at IS NULL
+       ORDER BY attachment_id DESC LIMIT 1
+    `) as Array<{ id: string }>;
+    const id = rows[0]?.id;
+    if (id === undefined) throw new Error(`no live attachment on ${origin}`);
+    return id;
+  }
+
+  /** The transcript the OCR phase writes, through the write path it writes it on. */
+  async function writeTranscript(attachmentId: string, origin: string, body: string) {
+    const receipt = await ingestDocument(
+      {
+        sql: fixture.tenantSql,
+        gateway: fixture.gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        budget: uncappedBudget(),
+      },
+      {
+        originContext: origin,
+        sourceType: 'file',
+        body,
+        externalRef: transcriptRefFor(attachmentId),
+      },
+    );
+    expect(receipt.ok).toBe(true);
+  }
+
+  test('A FILE DELETED UPSTREAM RETIRES ITS ATTACHMENT AND ITS TRANSCRIPT', async () => {
+    const ref = externalRefFor('drive', 'shot-gone');
+    const states = await storeWith(stateFor('drive'));
+    const source = createFakeSource('drive', 'document', [
+      page({ media: [mediaItem('shot-gone')], nextCursor: { kind: 'delta', value: 'd-gone-1' } }),
+      page({
+        tombstones: [{ externalRef: ref, reason: 'deleted' }],
+        nextCursor: { kind: 'delta', value: 'd-gone-2' },
+      }),
+    ]);
+
+    await pull(source, states, { window: 'all' });
+    const attachmentId = await attachmentIdIn(DRIVE_ORIGIN);
+    await writeTranscript(attachmentId, DRIVE_ORIGIN, mailBody('the wifi password is on this page'));
+
+    // Both halves live, or nothing below grades anything.
+    const transcriptRef = transcriptRefFor(attachmentId);
+    expect(await pageCount(transcriptRef)).toBe(1);
+    expect(
+      await countRows(fixture.tenantSql, 'attachment', `attachment_id = ${attachmentId} AND deleted_at IS NULL`),
+    ).toBe(1);
+
+    const second = await pull(source, states);
+    expect(second.counts.tombstoned).toBeGreaterThan(0);
+
+    // The row that says the object exists...
+    expect(
+      await countRows(fixture.tenantSql, 'attachment', `attachment_id = ${attachmentId} AND deleted_at IS NULL`),
+    ).toBe(0);
+    // ...and the searchable text derived from it, which is the half a user
+    // would actually notice: a deleted file still answering a query.
+    expect(await pageCount(transcriptRef)).toBe(0);
+    expect(
+      await countRows(
+        fixture.tenantSql,
+        'chunk c',
+        `c.deleted_at IS NULL AND c.page_id IN (SELECT page_id FROM page WHERE external_ref = '${transcriptRef}')`,
+      ),
+    ).toBe(0);
+    // The deletion is on the record, so an operator can see it happened.
+    expect((await itemRow(ref))?.outcome).toBe('ok');
+  });
+
+  test('an attachment cannot be retired from another origin', async () => {
+    // R15 at the deletion end, on the lane this change added. A Drive pull that
+    // swept attachments by ref alone would retire a mail attachment that
+    // happens to carry the same provider id.
+    const shared = externalRefFor('drive', 'shared-object-id');
+    const mailOrigin = originContextFor('gmail');
+    const accepted = await acceptMedia(
+      { sql: fixture.tenantSql, storage: fixture.storage, store: fixture.rawStore },
+      {
+        tenantId: TENANT,
+        caller: CALLER,
+        originContext: mailOrigin,
+        mediaType: 'image/png',
+        bytes: screenshotBytes(),
+        externalId: shared,
+      },
+    );
+    expect(accepted.ok).toBe(true);
+
+    const states = await storeWith(stateFor('drive'));
+    const source = createFakeSource('drive', 'document', [
+      page({
+        tombstones: [{ externalRef: shared, reason: 'deleted' }],
+        nextCursor: { kind: 'delta', value: 'd-shared' },
+      }),
+    ]);
+    await pull(source, states);
+
+    expect(
+      await countRows(
+        fixture.tenantSql,
+        'attachment',
+        `origin_context = '${mailOrigin}' AND deleted_at IS NULL`,
+      ),
+    ).toBe(1);
+  });
+
+  test('a deleted message takes its attachments and their transcripts with it', async () => {
+    // The other way an attachment is orphaned: the *page* it hangs off is
+    // tombstoned by its own ref, and the attachment is named by nothing at all.
+    // Without this the mail is gone and the picture that arrived on it is still
+    // in the brain, with its transcript still answering queries.
+    const mailOrigin = originContextFor('gmail');
+    const ref = externalRefFor('gmail', 'm-with-shot');
+    const states = await storeWith(stateFor('gmail'));
+    const source = createFakeSource('gmail', 'email', [
+      page({ items: [item('gmail', 'm-with-shot', mailBody('see attached'))], nextCursor: { kind: 'delta', value: 'm-1' } }),
+      page({ tombstones: [{ externalRef: ref, reason: 'deleted' }], nextCursor: { kind: 'delta', value: 'm-2' } }),
+    ]);
+
+    await pull(source, states, { window: 'all' });
+    const pageRows = (await fixture.tenantSql`
+      SELECT page_id::text AS id FROM page WHERE external_ref = ${ref} AND deleted_at IS NULL
+    `) as Array<{ id: string }>;
+    const pageId = pageRows[0]?.id ?? '';
+    expect(pageId.length).toBeGreaterThan(0);
+
+    const accepted = await acceptMedia(
+      { sql: fixture.tenantSql, storage: fixture.storage, store: fixture.rawStore },
+      {
+        tenantId: TENANT,
+        caller: CALLER,
+        originContext: mailOrigin,
+        mediaType: 'image/png',
+        bytes: screenshotBytes(),
+        externalId: externalRefFor('gmail', 'm-with-shot-part-2'),
+        pageId,
+      },
+    );
+    expect(accepted.ok).toBe(true);
+    const attachmentId = (accepted as { attachmentId: string }).attachmentId;
+    await writeTranscript(attachmentId, mailOrigin, mailBody('the agenda, photographed'));
+    const transcriptRef = transcriptRefFor(attachmentId);
+    expect(await pageCount(transcriptRef)).toBe(1);
+
+    await pull(source, states);
+
+    expect(
+      await countRows(fixture.tenantSql, 'attachment', `attachment_id = ${attachmentId} AND deleted_at IS NULL`),
+    ).toBe(0);
+    expect(await pageCount(transcriptRef)).toBe(0);
   });
 });
 

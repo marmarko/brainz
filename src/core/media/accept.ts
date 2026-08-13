@@ -45,6 +45,19 @@ import type { RawObject, RawStore } from '../../ingest/import/raw.ts';
 export const MEDIA_COLLECTION = 'media';
 
 /**
+ * The external ref a transcript page is keyed on.
+ *
+ * Spelled once, and that is not tidiness: three places have to agree on it — the
+ * OCR phase writes it, the connector's deletion sweep has to *find* it, and the
+ * tests assert against it. Two of those three did not exist when the phase chose
+ * the string, which is how a transcript came to be unreachable by every deletion
+ * path in the system.
+ */
+export function transcriptRefFor(attachmentId: string): string {
+  return `attachment:${attachmentId}`;
+}
+
+/**
  * The images U21 is built for. A screenshot is the dominant consumer image and
  * it is mostly text; interpreting photographs is explicitly not the goal, so the
  * list is the formats a screenshot actually arrives in rather than everything a
@@ -323,6 +336,30 @@ async function liveAttachmentByKey(sql: SQL, objectKey: string): Promise<Existin
 }
 
 /**
+ * Record which provider object this row is, if the row does not say yet.
+ *
+ * **Rung 6's backfill, and it is an observation rather than a migration.** Every
+ * attachment written before that rung carries `external_ref IS NULL`, which
+ * makes it unreachable by the connector's deletion sweep — and the id cannot be
+ * recovered from the key, because the accessor hashes it (R9). What can be
+ * recovered is the caller in front of us right now, who has just been handed
+ * this exact object under this exact id by the provider. So the value is
+ * written from a sighting, on whichever path the sighting arrives — including
+ * `unchanged`, which is a poller's most common outcome and therefore the one
+ * that heals the most rows.
+ *
+ * `WHERE external_ref IS NULL` is the whole safety rule: an observed value is
+ * never replaced by a later, different claim.
+ */
+async function noteExternalRef(sql: SQL, attachmentId: string, externalRef: string): Promise<void> {
+  if (externalRef.length === 0) return;
+  await sql`
+    UPDATE attachment SET external_ref = ${externalRef}
+     WHERE attachment_id = ${attachmentId}::bigint AND external_ref IS NULL
+  `;
+}
+
+/**
  * Store one object and record it. Nothing is read, decoded or transcribed.
  *
  * Idempotent on (object key, digest, junk verdict) — the same triple the write
@@ -357,6 +394,7 @@ export async function acceptMedia(
 
   const contentSha256 = digestOf(input.bytes);
   const quarantined = (input.quarantine ?? '').trim().length > 0;
+  const externalRef = input.externalId.trim();
   const existing = await liveAttachmentByKey(deps.sql, key.key);
 
   if (
@@ -364,6 +402,10 @@ export async function acceptMedia(
     existing.contentSha256 === contentSha256 &&
     existing.quarantined === quarantined
   ) {
+    // Nothing about the object changed, so nothing about the object is written
+    // — except the one thing this sighting is evidence of, and only if the row
+    // does not already know it. See `noteExternalRef`.
+    await noteExternalRef(deps.sql, existing.attachmentId, externalRef);
     return {
       ok: true,
       status: 'unchanged',
@@ -396,6 +438,7 @@ export async function acceptMedia(
          SET media_type = ${verdict.mediaType},
              byte_size = ${input.bytes.length},
              content_sha256 = ${contentSha256},
+             external_ref = coalesce(external_ref, ${externalRef}),
              ocr_text = NULL,
              quarantined_at = ${quarantined ? new Date() : null}
        WHERE attachment_id = ${existing.attachmentId}::bigint
@@ -414,10 +457,13 @@ export async function acceptMedia(
 
   const rows = (await deps.sql`
     INSERT INTO attachment (page_id, origin_context, subject_context, subject_confidence,
-                            media_type, object_key, byte_size, content_sha256, quarantined_at)
+                            media_type, object_key, byte_size, content_sha256, external_ref,
+                            quarantined_at)
     VALUES (${input.pageId ?? null}, ${origin}, ${input.subject?.context ?? null},
             ${input.subject?.confidence ?? null}, ${verdict.mediaType}, ${key.key},
-            ${input.bytes.length}, ${contentSha256}, ${quarantined ? new Date() : null})
+            ${input.bytes.length}, ${contentSha256},
+            ${externalRef.length === 0 ? null : externalRef},
+            ${quarantined ? new Date() : null})
     RETURNING attachment_id::text AS attachment_id
   `) as Array<{ attachment_id: string }>;
   const attachmentId = rows[0]?.attachment_id;
