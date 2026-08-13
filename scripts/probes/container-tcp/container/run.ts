@@ -180,10 +180,37 @@ function attest(options: RunOptions): OriginAttestation {
     if (options.colo === null || options.colo === '') {
       missing.push('cloudflare_colo — no colo was stamped on this run');
     }
-    if (options.workerRayColo === null) {
+    // NOT required: a `cf-ray` on the request the Worker received.
+    //
+    // That was required here and it produced a false negative on the first real
+    // deployed run — a genuine container in colo LAX, with `request.cf` present
+    // and eight CLOUDFLARE_* placement markers in its environment, was refused.
+    // Cloudflare emits `cf-ray` as a RESPONSE header; a Worker does not reliably
+    // see one inbound. The inbound signal is `request.cf`, checked above, and the
+    // response-side `cf-ray` is checked by the driver, which is the better place
+    // for it anyway: the driver observes it on a response it received itself,
+    // rather than believing something the run under test reported about itself.
+    //
+    // Dropping it does not reopen the false positive this gate exists for. A
+    // `wrangler dev` run on a laptop still fails the driver's half — scheme is
+    // `http:` not `https:`, host shape is loopback not public, and no `cf-ray`
+    // comes back at all because no Cloudflare edge is involved.
+    //
+    // What replaces it is stronger than what it asserted: when both sides report
+    // a colo, they must AGREE. The Worker's `cf.colo` is observed inside
+    // Cloudflare; the driver's `cf-ray` colo is observed from outside. Two
+    // independent vantage points naming the same colo is corroboration; a
+    // fabricated report cannot produce it without also controlling the response
+    // header the driver reads.
+    if (
+      options.workerRayColo !== null &&
+      options.colo !== null &&
+      options.workerRayColo !== options.colo
+    ) {
       missing.push(
-        'worker_cf_ray — the request that reached the Worker carried no `cf-ray` header, so it ' +
-          "did not arrive through Cloudflare's edge",
+        `colo_disagreement — the Worker's cf object reported colo ${options.colo} but the ` +
+          `inbound ray reported ${options.workerRayColo}; a single run cannot have happened in two ` +
+          'places, so one of these did not come from Cloudflare',
       );
     }
   }
