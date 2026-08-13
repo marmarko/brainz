@@ -537,6 +537,34 @@ The checklist text for `.github/pull_request_template.md`, for whoever owns it:
 
 ---
 
+## 7a. What execution changed about this plan
+
+Recorded here rather than by editing the sections above, so the plan stays a
+plan and the corrections stay attributable.
+
+1. **The canary needs two database URLs, not one** (§4). `control.job` is in the
+   control plane, and KTD1 gives every tenant a database of its own — so the
+   queue check takes `--control-database-url` and the tenant checks take
+   `--database-url`. `docs/register.md` carries the current invocation.
+2. **The `ef_search` check was aimed at the wrong property.** The plan inherited
+   "is it raised above 40" from H1's card. brainz never relies on the default —
+   `withVectorScan` sets it per transaction — so what can silently be wrong is
+   whether the setting is *registered*, since Postgres accepts any prefixed
+   custom GUC and a `SET LOCAL` on an unloaded pgvector succeeds and does
+   nothing.
+3. **Two boundary guards fired on the new code and both were right** (not
+   anticipated in §5's mutation table): the storage accessor's de-branding rule
+   and the gateway's endpoint-marker rule. Both now carry narrowed exemptions
+   with reasons, and the gateway exemption is held to a stricter rule than the
+   one it is excused from — the register may name an endpoint and a test asserts
+   it cannot reach one.
+4. **The `pg_catalog`-demotion mutation initially survived** (§5), because the
+   first version of that test put its shadow in a schema the pin excluded. With
+   a pin in place the only reachable shadow is `public`, which the tenant role
+   owns — so that is the adversary the test now uses.
+5. **The hazard-ledger flip was made** (§1.8), and needed the `ported`
+   disposition kind described there.
+
 ## 8. Order of work
 
 1. This document.
