@@ -286,8 +286,21 @@ export const TOOLS: readonly ToolDef[] = [
   },
   {
     name: 'manage',
+    // **This description has to serve both branches, and the version it
+    // replaced served neither.** It read "Not for models" and marked
+    // `panel_nonce` required, which was honest while the tool was unadvertised
+    // — and became false the moment U14's fallback made it the eighth
+    // model-visible name on a client without the MCP Apps extension. A model
+    // told not to call it will refuse before the confirm gate ever runs, and a
+    // required nonce it cannot obtain (minting is ui-gated, deliberately) is a
+    // schema the client fails or the model fabricates a value for. The
+    // replacement control would have existed and been unreachable through the
+    // front door this unit opened.
     description:
-      'Panel control plane. Reversible settings only, and only from a panel view holding a short-TTL nonce. Not for models.',
+      'Change one reversible setting on this brain: its model-spend cap, or whether a connected source is being polled. ' +
+      'Every change needs the person present to approve it — this call asks first and applies nothing until they answer, ' +
+      'and if this client cannot put the question in front of them it is refused with a link to the web app. ' +
+      'Some settings are web-app-only from a chat connection and say so.',
     params: {
       action: {
         type: 'string',
@@ -296,10 +309,17 @@ export const TOOLS: readonly ToolDef[] = [
         enum: ['set_context_policy', 'set_spend_cap', 'pause_source', 'resume_source'],
       },
       value: { type: 'string', description: 'The new value for the action.' },
-      panel_nonce: { type: 'string', description: 'The nonce minted into the panel at resources/read.', required: true },
+      // Not required, and the gate rather than the schema is why. A panel view
+      // holds one; a model has no way to obtain one and must not be asked for
+      // it. Declared so the panel's own call validates against this schema.
+      panel_nonce: {
+        type: 'string',
+        description:
+          'Only sent by a panel view, which is minted one. Leave it out; you will be asked to confirm instead.',
+      },
     },
     annotations: {
-      title: 'manage (panel settings)',
+      title: 'manage (one reversible setting)',
       readOnlyHint: false,
       // Every action is reversible by construction. Disconnect, delete, export
       // and sharing deep-link to the web app instead of living here, which is

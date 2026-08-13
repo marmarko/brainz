@@ -33,7 +33,7 @@ import {
   verifyPanelToken,
 } from '../../src/mcp/panel-token.ts';
 import { listResources, readResource } from '../../src/mcp/resources.ts';
-import { listedTools } from '../../src/mcp/tools/index.ts';
+import { inputSchemaFor, listedTools } from '../../src/mcp/tools/index.ts';
 import { createMcpFixture, type McpFixture } from './fixture.ts';
 
 const KEY = 'a-derived-signing-key';
@@ -262,6 +262,31 @@ describe('what tools/list says, per client', () => {
     expect(manage).toBeDefined();
     expect(manage?.meta).toBeUndefined();
     expect(listed.length).toBe(8);
+  });
+
+  test('the model-visible manage is a definition a model can actually satisfy', () => {
+    // The fallback's replacement control is the confirmation, and a model has to
+    // reach the call for the confirmation to happen. Two ways that silently
+    // fails, both of which the pre-U14 definition had:
+    //
+    //   * a description telling models not to call it, so the model refuses
+    //     before the gate runs and the user gets nothing;
+    //   * a required `panel_nonce`, which is mintable only on a ui-capable
+    //     `resources/read` — so the schema demands a value this branch cannot
+    //     produce, and the client fails validation or the model invents one.
+    const manage = listedTools('mcp', NO_CLIENT_CAPABILITIES).find(
+      (entry) => entry.def.name === 'manage',
+    )?.def;
+    expect(manage).toBeDefined();
+    expect(manage?.description.toLowerCase()).not.toContain('not for models');
+    expect(manage?.params.panel_nonce?.required).not.toBe(true);
+
+    const schema = inputSchemaFor(manage!) as { required?: string[] };
+    expect(schema.required).toEqual(['action']);
+
+    // And it says the thing that makes the fallback safe rather than merely
+    // reachable: this call asks before it acts.
+    expect(manage?.description).toMatch(/approve|confirm/i);
   });
 
   test('the ChatGPT surface never lists manage', () => {
