@@ -125,8 +125,28 @@ export interface SourceStaleness {
   readonly staleSeconds: number | null;
   readonly itemsWritten: number;
   readonly itemsSeen: number;
-  /** The most recent run-level failure, so a stalled source says why. */
+  /**
+   * Why the source is unhappy **now** — the failure code of its most recent
+   * terminal run, and `null` when that run succeeded.
+   *
+   * Not "the most recent failure ever". One cursor expiry writes one failed run
+   * row, and a view that reaches past every later success to find it answers
+   * "provider_error" for the rest of the brain's life. A staleness display
+   * nobody can clear is a staleness display nobody reads.
+   */
   readonly lastFailureCode: IngestFailureCode | null;
+  /**
+   * Items this source could not import, counted from the item rows.
+   *
+   * The run rows cannot say this: a pull that lost forty messages to a rate
+   * limit and imported the rest still closes `ok`, and the whole loss lives in
+   * rows a run-row-only view filters out by construction. This is the number
+   * that separates "nothing happened this week" from "your mail stopped
+   * syncing".
+   */
+  readonly itemsFailed: number;
+  /** The most recent item-level failure code. Null when no item ever failed. */
+  readonly lastItemFailureCode: IngestFailureCode | null;
   readonly runInProgress: boolean;
 }
 
@@ -282,10 +302,15 @@ export async function recordItem(sql: SQL, request: RecordItemRequest): Promise<
  * Per-source staleness, for the panel's display and `search_degraded`'s
  * statement of what is not indexed yet.
  *
- * **Aggregated over run rows only.** The item rows describe the same items a
- * run already counted, so summing both would double every number — and a
- * staleness display that reports twice the traffic is a display nobody trusts
- * the second time they check it.
+ * **The counters aggregate run rows only; the failures aggregate item rows
+ * too.** The two halves are separated by `FILTER` rather than by a `WHERE`,
+ * because they answer different questions and only one of them double-counts.
+ * Summing `items_seen` across both row kinds reports twice the traffic — a
+ * display nobody trusts the second time they check it. But *excluding* item
+ * rows from the view entirely, which is what a `WHERE external_ref IS NULL`
+ * does, hides every item-level loss there is: a pull that lost forty messages
+ * to a rate limit and imported the rest closes its run row `ok`, and the brain
+ * then reports itself healthy while a slice of the mailbox is missing.
  */
 export async function sourceStaleness(
   sql: SQL,
@@ -295,14 +320,27 @@ export async function sourceStaleness(
     SELECT origin_context,
            source_type,
            max(coalesce(finished_at, started_at))                        AS last_checked_at,
-           max(finished_at) FILTER (WHERE items_written > 0)             AS last_write_at,
-           coalesce(sum(items_seen), 0)::int                             AS items_seen,
-           coalesce(sum(items_written), 0)::int                          AS items_written,
-           count(*) FILTER (WHERE outcome = 'running')::int              AS running,
-           (array_agg(failure_code ORDER BY coalesce(finished_at, started_at) DESC)
-              FILTER (WHERE outcome = 'failed'))[1]                      AS last_failure_code
+           max(finished_at) FILTER (
+             WHERE external_ref IS NULL AND items_written > 0)           AS last_write_at,
+           coalesce(sum(items_seen)    FILTER (WHERE external_ref IS NULL), 0)::int
+                                                                         AS items_seen,
+           coalesce(sum(items_written) FILTER (WHERE external_ref IS NULL), 0)::int
+                                                                         AS items_written,
+           count(*) FILTER (
+             WHERE external_ref IS NULL AND outcome = 'running')::int    AS running,
+           -- The most recent *terminal run*, whatever it said. A later success
+           -- therefore clears the code instead of being reached past.
+           (array_agg(failure_code
+                        ORDER BY coalesce(finished_at, started_at) DESC, ingest_id DESC)
+              FILTER (WHERE external_ref IS NULL AND outcome <> 'running'))[1]
+                                                                         AS last_failure_code,
+           count(*) FILTER (
+             WHERE external_ref IS NOT NULL AND outcome = 'failed')::int AS items_failed,
+           (array_agg(failure_code
+                        ORDER BY coalesce(finished_at, started_at) DESC, ingest_id DESC)
+              FILTER (WHERE external_ref IS NOT NULL AND outcome = 'failed'))[1]
+                                                                         AS last_item_failure_code
       FROM ingest_log
-     WHERE external_ref IS NULL
      GROUP BY origin_context, source_type
      ORDER BY origin_context, source_type
   `) as Array<{
@@ -314,6 +352,8 @@ export async function sourceStaleness(
     items_written: number;
     running: number;
     last_failure_code: string | null;
+    items_failed: number;
+    last_item_failure_code: string | null;
   }>;
 
   return rows.map((row) => ({
@@ -331,6 +371,8 @@ export async function sourceStaleness(
     itemsSeen: row.items_seen,
     itemsWritten: row.items_written,
     lastFailureCode: (row.last_failure_code as IngestFailureCode | null) ?? null,
+    itemsFailed: row.items_failed,
+    lastItemFailureCode: (row.last_item_failure_code as IngestFailureCode | null) ?? null,
     runInProgress: row.running > 0,
   }));
 }

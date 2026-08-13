@@ -269,6 +269,50 @@ describe('staleness is derived from the log, per source', () => {
     expect(source!.lastFailureCode).toBe('budget_exhausted');
   });
 
+  test('an item nobody could import is visible, not filtered out of the view', async () => {
+    // The run row says the run succeeded; the loss is entirely in the item
+    // rows. A staleness view keyed on `external_ref IS NULL` cannot see it, so
+    // the brain reports itself healthy while a slice of the mailbox is missing.
+    await reset();
+    const run = await openRun(fixture.tenantSql, { originContext: ORIGIN, sourceType: 'chat' });
+    await countRunItem(fixture.tenantSql, run.ingestId, { written: 0, quarantined: 0 });
+    await recordItem(fixture.tenantSql, {
+      originContext: ORIGIN,
+      sourceType: 'chat',
+      externalRef: 'claude:conv-lost',
+      disposition: 'failed',
+      failureCode: 'rate_limited',
+    });
+    await finishRun(fixture.tenantSql, run.ingestId, { outcome: 'ok' });
+
+    const [source] = await sourceStaleness(fixture.tenantSql, { now });
+    expect(source!.itemsFailed).toBe(1);
+    expect(source!.lastItemFailureCode).toBe('rate_limited');
+  });
+
+  test('a later success clears the last failure code', async () => {
+    // One cursor expiry writes a failed run row. Reading "the most recent
+    // failure ever" rather than "the most recent outcome" makes that row the
+    // permanent answer to `why is this source unhappy`, months after it healed.
+    await reset();
+    const failed = await openRun(fixture.tenantSql, { originContext: ORIGIN, sourceType: 'chat' });
+    await finishRun(fixture.tenantSql, failed.ingestId, {
+      outcome: 'failed',
+      failureCode: 'provider_error',
+    });
+    let [source] = await sourceStaleness(fixture.tenantSql, { now });
+    expect(source!.lastFailureCode).toBe('provider_error');
+
+    const recovered = await openRun(fixture.tenantSql, {
+      originContext: ORIGIN,
+      sourceType: 'chat',
+    });
+    await finishRun(fixture.tenantSql, recovered.ingestId, { outcome: 'ok' });
+
+    [source] = await sourceStaleness(fixture.tenantSql, { now });
+    expect(source!.lastFailureCode).toBeNull();
+  });
+
   test('item rows and run rows are not double counted', async () => {
     await reset();
     const run = await openRun(fixture.tenantSql, { originContext: ORIGIN, sourceType: 'chat' });
