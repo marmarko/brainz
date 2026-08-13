@@ -16,6 +16,7 @@
 
 import { describe, expect, test } from 'bun:test';
 
+import { main } from '../../evals/blocking.ts';
 import { BRIEFING_CASES, runBriefingLeg, type BriefingCase } from '../../evals/briefing.ts';
 import {
   buildReceipt,
@@ -52,6 +53,25 @@ describe('the briefing leg', () => {
   test('an empty leg is refused, not passed', () => {
     expect(() => runBriefingLeg([])).toThrow(/empty leg/);
   });
+
+  test('A FAILING BRIEFING CASE FAILS THE COMMAND — the leg is in the verdict', async () => {
+    // On the shipped cases this leg is clean, so its contribution to the exit
+    // code has no reachable failing branch and `&& briefing.passed` could be
+    // deleted with the suite still green. A mutation run proved exactly that,
+    // which is why `main` takes the cases as an injectable dependency.
+    const broken: BriefingCase = {
+      id: 'fixture.always_fails',
+      what: 'a case that is always in violation',
+      run: () => [{ check: 'fixture.always_fails', detail: 'by construction' }],
+    };
+    expect(await main(['--json'], { briefingCases: [...BRIEFING_CASES, broken] })).toBe(1);
+    // ...and the same command with the shipped cases exits zero, so the
+    // assertion above is about the leg rather than about the tier.
+    expect(await main(['--json'])).toBe(0);
+    // Two full commands, and each one grades the corpus four times over (two
+    // legs, two runs apiece, for the determinism digest). The default 5s
+    // deadline is a limit on this test's honesty rather than on the tier's.
+  }, 120_000);
 
   test('every case reports at least one check when it runs', () => {
     // A case whose `run` returns `[]` for every input is indistinguishable from

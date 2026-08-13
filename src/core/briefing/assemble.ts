@@ -69,6 +69,7 @@
 
 import type { SQL } from 'bun';
 
+import { FIRST_PARTY_SURFACES } from '../../mcp/demarcation.ts';
 import type { Grant } from '../search/fence.ts';
 import { textArrayLiteral } from '../write/pg-values.ts';
 import { bandOf, upgradePrompt, type PromptState, type UpgradePrompt } from './prompt.ts';
@@ -96,9 +97,14 @@ function estimateTokens(text: string): number {
 }
 
 // ---------------------------------------------------------------------------
-// The shapes. Deliberately free of any `src/mcp/` import: the surface layer
-// formats ids and applies R2a's demarcation, and a core module that reached up
-// into it would invert the one layering the guards enforce.
+// The shapes. Ids are raw and text is unwrapped: the surface layer formats
+// opaque ids and applies R2a's demarcation, and a core module that rendered
+// either would be a second place those rules live.
+//
+// The one thing reached for upward is `FIRST_PARTY_SURFACES` — a constant, not
+// a renderer. R12a's question is "could an outside sender have written this
+// origin", and there must be exactly one answer to it; `materialize.ts` reaches
+// for the same module for the same reason.
 // ---------------------------------------------------------------------------
 
 export interface BriefingRecord {
@@ -597,6 +603,17 @@ async function readParticipants(
  * **`contradictions` is a count and it goes nowhere near the prompt.** It is in
  * the bundle because a user wants to know; it is not in `PromptInput` because
  * the free tier cannot produce one (R8).
+ *
+ * **`uncorroborated` counts facts, and that is R8's rule applied a second
+ * time.** The obvious reading is `commitment WHERE NOT compiled_truth` — and a
+ * commitment is a model-phase artifact, so on the free tier that count is
+ * permanently zero and R12a's "here is something you could corroborate" line
+ * renders empty for exactly the tier the prompt exists to convert. That is the
+ * contradiction-count mistake wearing different clothes. So the count is over
+ * **facts whose origin union is entirely external** — which the deterministic
+ * extractor produces on both tiers — using the same first-party surface list
+ * `demarcation.ts` uses, rather than a second opinion about which origins an
+ * outsider can write.
  */
 async function readCounts(
   sql: SQL,
@@ -619,11 +636,15 @@ async function readCounts(
        (SELECT count(*) FROM review_queue
          WHERE state = 'open' AND kind <> 'contradiction' AND origin_contexts <@ $1::text[])::int
          AS pending_review,
-       (SELECT count(*) FROM commitment
-         WHERE deleted_at IS NULL AND state = 'open' AND NOT compiled_truth
-           AND origin_contexts <@ $1::text[])::int
+       (SELECT count(*) FROM fact f
+         WHERE f.deleted_at IS NULL AND f.quarantined_at IS NULL AND f.superseded_by IS NULL
+           AND f.origin_contexts <@ $1::text[]
+           AND NOT EXISTS (
+             SELECT 1 FROM unnest(f.origin_contexts) AS o
+              WHERE split_part(o, ':', 2) = ANY($3::text[])
+           ))::int
          AS uncorroborated`,
-    [grantLiteral, lastCycleAt],
+    [grantLiteral, lastCycleAt, textArrayLiteral([...FIRST_PARTY_SURFACES])],
   )) as Array<{
     contradictions: number;
     pending_debt: number;

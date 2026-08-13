@@ -39,7 +39,12 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { renderBriefingLeg, runBriefingLeg, type BriefingLegResult } from './briefing.ts';
+import {
+  renderBriefingLeg,
+  runBriefingLeg,
+  type BriefingCase,
+  type BriefingLegResult,
+} from './briefing.ts';
 import { CORPUS, corpusTexts, type Corpus } from './corpus.ts';
 import { loadEmbeddings, type EmbeddingIndex } from './embeddings.ts';
 import {
@@ -415,6 +420,13 @@ export async function main(
     readonly ranker?: Ranker;
     readonly context?: TierContext;
     readonly scores?: RerankScoreIndex;
+    /**
+     * Injected for the same reason `ranker` is: on the shipped cases the
+     * briefing leg is clean, so its contribution to the exit code has no
+     * reachable failing branch and `&& briefing.passed` could be deleted with
+     * the suite still green. A mutation run proved exactly that.
+     */
+    readonly briefingCases?: readonly BriefingCase[];
   },
 ): Promise<number> {
   const { stackRanker, rerankedStackRanker } = await import('../test/core/search/corpus-ranker.ts');
@@ -430,7 +442,7 @@ export async function main(
   // U12's third leg: the briefing's assembly, over fixtures. Fully enforced —
   // participant-card completeness and delta correctness are properties of the
   // pure function and depend on no model, no database and no committed score.
-  const briefing: BriefingLegResult = runBriefingLeg();
+  const briefing: BriefingLegResult = runBriefingLeg(deps?.briefingCases);
 
   const passed = result.passed && leg.binding.length === 0 && briefing.passed;
 

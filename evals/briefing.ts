@@ -341,7 +341,9 @@ export interface BriefingLegResult {
  * Run every case. Deterministic, no database, no model, no clock — `now` is a
  * fixture value like every other input.
  */
-export function runBriefingLeg(cases: readonly BriefingCase[] = BRIEFING_CASES): BriefingLegResult {
+export function runBriefingLeg(cases: readonly BriefingCase[] | undefined = BRIEFING_CASES): BriefingLegResult {
+  // `undefined` is the shipped set, not an empty one: an optional dependency
+  // that defaulted to `[]` would turn an omitted argument into a passing leg.
   if (cases.length === 0) {
     throw new Error('the briefing leg was given no cases; an empty leg passes everything');
   }

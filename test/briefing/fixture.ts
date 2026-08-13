@@ -121,6 +121,19 @@ export async function seedBrain(sql: SQL, at: string): Promise<SeededBrain> {
     createdAt: at,
   });
 
+  // A meeting behind the same fence. Separate from the mail above because the
+  // meetings lane has its own statement with its own grant predicate, and a
+  // fixture whose only out-of-grant row is an email cannot tell whether that
+  // predicate is there — dropping it leaks a calendar page and every other
+  // assertion stays green.
+  await insertPage(sql, {
+    origin: WORK,
+    sourceType: 'calendar',
+    title: 'Board session',
+    body: 'Board session\nAttendees: priya@example.com',
+    createdAt: at,
+  });
+
   const fact = (await sql`
     INSERT INTO fact (statement, embedding, origin_contexts, created_at, derivation, trust_level)
     VALUES ('Priya Raghavan confirmed the renewal lands in October.',

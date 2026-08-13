@@ -39,6 +39,7 @@ import {
   syntheticScoreVector,
   type RerankScoreRow,
 } from '../../evals/rerank-scores.ts';
+import type { Ranker } from '../../evals/run.ts';
 import { rerankedStackRanker, stackRanker } from '../core/search/corpus-ranker.ts';
 
 const corpus = scoreCorpus();
@@ -214,16 +215,37 @@ describe('the rerank leg, and the switch that enforces it', () => {
     expect(leg.binding.filter((violation) => violation.kind === 'floor').length).toBeGreaterThan(0);
   });
 
-  test('determinism and leaks bind whatever the scores are', () => {
+  test('the shipped stack leaks nothing and is deterministic, so nothing binds', () => {
     const leg = runRerankLeg({ ranker: rerankedStackRanker(scores), context, scores });
-    // No leak and no non-determinism on the shipped stack, which is what makes
-    // the binding list empty rather than the filter being inert: the kinds it
-    // would carry are exactly the ones it does not filter out.
     expect(leg.binding).toEqual([]);
     expect(leg.result.egress).toEqual([]);
-    for (const kind of ['leak', 'nondeterministic', 'network_egress', 'empty_query_set'] as const) {
-      expect(leg.binding.some((violation) => violation.kind === kind)).toBe(false);
-    }
+  });
+
+  test('A LEAK BINDS EVEN WHILE THE FLOORS DO NOT — the filter is not inert', () => {
+    // The half the assertion above cannot make. On a clean run the binding list
+    // is empty whether the filter keeps leaks or drops everything, so replacing
+    // it with `[]` is invisible — a mutation run proved exactly that. This leg
+    // is fed a ranker that returns a chunk outside the query's grant, which is a
+    // `leak` violation, and asserts it survives the hold-back.
+    const leaking: Ranker = {
+      name: 'leaking-stack',
+      description: 'the shipped stack with the fence removed from one result',
+      rank(query, rankerContext) {
+        const ranked = [...rerankedStackRanker(scores).rank(query, rankerContext)];
+        const outside = rankerContext.corpus.chunkIds.find((id) => {
+          const chunk = rankerContext.corpus.chunks.get(id);
+          return chunk !== undefined && chunk.live && !query.grant.includes(chunk.origin);
+        });
+        return outside === undefined || ranked.includes(outside) ? ranked : [outside, ...ranked.slice(0, 19)];
+      },
+    };
+
+    const leg = runRerankLeg({ ranker: leaking, context, scores });
+    expect(leg.enforced).toBe(false);
+    expect(leg.binding.some((violation) => violation.kind === 'leak')).toBe(true);
+    // ...and the floor violations are still held back, so the hold-back is a
+    // filter on one kind rather than a switch on all of them.
+    expect(leg.binding.every((violation) => violation.kind !== 'floor')).toBe(true);
   });
 
   test('the baseline leg still carries the enforced floors', () => {

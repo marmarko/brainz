@@ -98,6 +98,19 @@ describe('a cold materialised layer', () => {
     expect(everything).not.toContain(WORK);
     expect(brain.fencedPageId.length).toBeGreaterThan(0);
   });
+
+  test('the meetings lane carries its own fence', async () => {
+    // Its own statement, its own grant predicate. The assertion above passes
+    // with that predicate deleted, because its out-of-grant row is an email.
+    const bundle = await assembleOverSql(fixture.sql, GRANT, request({ callerKey: 'bearer:cold-5' }));
+    expect(bundle.meetings.map((meeting) => meeting.title)).not.toContain('Board session');
+    // ...and the in-grant meeting IS there, so this is a fence rather than an
+    // empty lane.
+    expect(bundle.meetings.map((meeting) => meeting.title)).toContain('Roadmap review');
+
+    const wide = await assembleOverSql(fixture.sql, [...GRANT, WORK], request({ callerKey: 'bearer:cold-6' }));
+    expect(wide.meetings.map((meeting) => meeting.title)).toContain('Board session');
+  });
 });
 
 describe('a warm materialised layer — the same brain, consolidated', () => {
@@ -140,6 +153,30 @@ describe('a warm materialised layer — the same brain, consolidated', () => {
     const stale = bundle.stale.find((entry) => entry.title === 'Cancelled offsite');
     expect(stale).toBeDefined();
     expect(stale?.relevance).toBeCloseTo(0.9, 5);
+  });
+
+  test('pending debt is anchored on the last completed cycle', async () => {
+    // Without the anchor this is a count of every page the brain has ever held,
+    // which grows forever and crosses every prompt threshold on a brain that is
+    // fully consolidated. The completed run in `warmLayer` sits at AT, so a page
+    // written before it is already accounted for and one written after is not.
+    await fixture.sql`
+      INSERT INTO page (origin_context, source_type, title, created_at,
+                        embedding_model, embedding_dimensions, chunker_version, normalizer_version, content_sha256)
+      VALUES (${MAIL}, 'email', 'Before the cycle', '2026-08-13T07:00:00Z'::timestamptz,
+              'fixture-model', 1536, 1, 1, ${'0'.repeat(64)})
+    `;
+    const settled = await assembleOverSql(fixture.sql, GRANT, request({ callerKey: 'bearer:warm-debt-1' }));
+    expect(settled.counts.pendingDebt).toBe(0);
+
+    await fixture.sql`
+      INSERT INTO page (origin_context, source_type, title, created_at,
+                        embedding_model, embedding_dimensions, chunker_version, normalizer_version, content_sha256)
+      VALUES (${MAIL}, 'email', 'After the cycle', '2026-08-13T11:00:00Z'::timestamptz,
+              'fixture-model', 1536, 1, 1, ${'0'.repeat(64)})
+    `;
+    const owed = await assembleOverSql(fixture.sql, GRANT, request({ callerKey: 'bearer:warm-debt-2' }));
+    expect(owed.counts.pendingDebt).toBe(1);
   });
 
   test('the contradiction count is a count and nothing more', async () => {
