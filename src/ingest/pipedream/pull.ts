@@ -18,6 +18,16 @@
  *      door marked "routine poll". So an invalidation discards the cursor,
  *      writes a staleness event, and re-enters through the gate with a bounded
  *      window.
+ *   2a. **The window bounds a first import and nothing else.** A delta feed is
+ *      already bounded by what changed, so windowing it buys no ceiling and
+ *      costs the update: the item is dropped *and* the cursor advances past it,
+ *      so the provider never offers that change again. An item's `occurredAt`
+ *      is when it happened, not when it was edited — a meeting held in March
+ *      and annotated in August arrives dated March — and every window is
+ *      measured from `now`, so a row drifts out of one just by the calendar
+ *      moving. {@link windowFor} is the single place that decides, and a
+ *      cursor-expiry re-list picks the window back up because it *is* a first
+ *      import wearing a poller's clothes.
  *   3. **A junk gate in front of the meter.** Hidden items are handed to U4's
  *      `quarantine` seam, which contributes no facts and keeps their chunks out
  *      of the embedding backlog — and, because their characters are zeroed
@@ -29,6 +39,20 @@
  * kind and target on the way through and changes nothing else. It is a seam,
  * and it is stated rather than hidden: when U8's `GateRequest.target` is next
  * widened to `JobTarget`, this adapter deletes.
+ *
+ * **Deletions run in front of the gate, not behind it.** A tombstone costs no
+ * provider call, so no ceiling has an opinion on it — and a pull the gate
+ * refused that skipped the sweep would keep a cancelled meeting answering
+ * queries until the tenant's thirty-day spend window rolls. Worse than late: if
+ * the sync cursor expires meanwhile, the recovery re-list carries no tombstones
+ * at all (a backfill enumerates what exists, never what is gone) and the
+ * deletion is lost for good. That is the stale row U11 reports against its
+ * replacement as a genuine contradiction, manufactured by the spend gate.
+ *
+ * **A banked approval is re-clamped, not re-gated.** Deferring spends nothing,
+ * so the counter the gate read has not moved by the time the background job
+ * runs; `clampApproval` trims the banked figure to the headroom still there.
+ * Without it every deferred lane carries its own full copy of the ceiling.
  *
  * **Two callers, two ceilings.** An interactive caller (the web app's "connect
  * Gmail") gets U8's default inline ceilings, so a large first import defers to
@@ -75,6 +99,8 @@ import {
   type PullMode,
 } from '../cursor.ts';
 import {
+  DEFAULT_WINDOW_DAYS,
+  clampApproval,
   estimateImport,
   gateFirstImport,
   selectWindow,
@@ -220,6 +246,11 @@ function writeCodeFor(reason: WriteFailureReason): IngestFailureCode {
  * because "why is this job here" is recorded rather than inferred and a user's
  * connect request is not a cadence tick. Everything else delegates, so this
  * wrapper cannot drift from the queue it wraps.
+ *
+ * What stops the placeholder target becoming a job nobody handles is the
+ * database's own `job_target_suits_its_kind`, which admits only a connector
+ * source for `ingest_pull` — not a check here, which would be a second copy of
+ * a constraint that already exists.
  */
 export function connectorGateQueue(
   queue: JobQueue,
@@ -272,15 +303,35 @@ export async function enqueuePullIfDue(
   });
 }
 
-function windowBoundary(window: ImportWindow | undefined, now: Date): Date | null {
-  if (window === 'all') return null;
-  const days = window?.days ?? 90;
-  return new Date(now.getTime() - Math.max(0, days) * 24 * 60 * 60 * 1000);
+/**
+ * The window this pull runs under.
+ *
+ * **A delta feed is not windowed, and that is the whole point of asking.** The
+ * bounded window exists to cap a *first import* — a mailbox nobody has read
+ * yet. A delta feed is already bounded by how much actually changed, so
+ * windowing it buys no ceiling and costs the one thing a poller cannot recover:
+ * the update is dropped **and** the cursor advances past it, so the provider
+ * never offers that change again. The row is stale for good, and U11 then reads
+ * it against its live replacement and reports a contradiction that never
+ * happened.
+ *
+ * Widening does not rescue it either, because the item's timestamp is not the
+ * edit's: a meeting held in March and annotated in August arrives dated March,
+ * and every window is measured from `now`, so an item drifts out of one just by
+ * the calendar moving.
+ */
+function windowFor(mode: PullMode, window: ImportWindow | undefined): ImportWindow {
+  if (mode === 'delta') return 'all';
+  return window ?? { days: DEFAULT_WINDOW_DAYS };
 }
 
-function windowDaysOf(window: ImportWindow | undefined): number | null {
+function windowBoundary(window: ImportWindow, now: Date): Date | null {
   if (window === 'all') return null;
-  return window?.days ?? 90;
+  return new Date(now.getTime() - Math.max(0, window.days) * 24 * 60 * 60 * 1000);
+}
+
+function windowDaysOf(window: ImportWindow): number | null {
+  return window === 'all' ? null : window.days;
 }
 
 export async function runPull(request: PullRequest): Promise<PullResult> {
@@ -295,7 +346,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
   let cursorInvalidated = false;
   let widen: PullResult['widen'] = {
     excludedItems: 0,
-    windowDays: windowDaysOf(request.window),
+    windowDays: windowDaysOf(windowFor('backfill', request.window)),
     outsideWindow: null,
   };
 
@@ -377,10 +428,11 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     // ------------------------------------------------------------------
     // 1. List, and treat an expired cursor as a first-class path.
     // ------------------------------------------------------------------
+    let window = windowFor(mode, request.window);
     let listing = await source.list({
       mode,
       cursor: state.cursor?.value ?? null,
-      since: mode === 'delta' ? null : windowBoundary(request.window, request.now),
+      since: windowBoundary(window, request.now),
       maxItems,
       now: request.now,
       externalUserId: state.externalUserId,
@@ -394,12 +446,15 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
       await logStalenessEvent('provider_error');
 
       mode = 'backfill';
+      // The recovery is a first import wearing a poller's clothes, so it picks
+      // the window back up — including when the pull that expired was a delta.
+      window = windowFor(mode, request.window);
       listing = await source.list({
         mode,
         // The whole point: recovery re-enters as a *bounded, gated* backfill,
         // not as a free re-list of the mailbox.
         cursor: null,
-        since: windowBoundary(request.window, request.now),
+        since: windowBoundary(window, request.now),
         maxItems,
         now: request.now,
         externalUserId: state.externalUserId,
@@ -435,10 +490,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     // 3. One item set: the estimate's and the loop's. Two walks is how a gate
     //    approves 1,200 items and imports 40,000.
     // ------------------------------------------------------------------
-    const selection = selectWindow(candidates, {
-      now: request.now,
-      ...(request.window === undefined ? {} : { window: request.window }),
-    });
+    const selection = selectWindow(candidates, { now: request.now, window });
     widen = {
       excludedItems: selection.excluded.length,
       windowDays: selection.windowDays,
@@ -449,16 +501,70 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     const items = classified.filter((entry) => selected.has(entry.item.externalRef));
 
     // ------------------------------------------------------------------
-    // 4. The gate. Skipped only when this run carries an approval the gate
-    //    already made — re-gating a resumed job would re-read a counter the
-    //    first pass already moved.
+    // 4. Deletions, **before the gate**.
+    //
+    // A tombstone costs no provider call, so nothing about the ceiling has an
+    // opinion on it — and a refused pull that skipped the sweep would leave a
+    // cancelled meeting answering queries until the tenant's thirty-day spend
+    // window rolls. Worse than late: if the sync cursor expires in the
+    // meantime, the recovery re-list carries no tombstones at all (a backfill
+    // enumerates what exists, never what is gone) and that deletion is lost
+    // permanently. It is the stale row U11 reports against its replacement as
+    // a genuine contradiction, produced by the spend gate.
+    // ------------------------------------------------------------------
+    if (listed.tombstones.length > 0) {
+      const swept = await tombstoneRefs(tenant.sql, {
+        originContext,
+        externalRefs: listed.tombstones.map((tombstone) => tombstone.externalRef),
+      });
+      counts.tombstoned = swept.tombstoned;
+      for (const externalRef of swept.externalRefs) {
+        await countRunItem(tenant.sql, run.ingestId, { written: 0, quarantined: 0 });
+        await recordItem(tenant.sql, {
+          originContext,
+          sourceType,
+          externalRef,
+          disposition: 'tombstoned',
+        });
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // 5. The gate. Skipped only when this run carries an approval the gate
+    //    already made — but the *amount* is re-read, because a deferral
+    //    reserved nothing and the cap may have gone elsewhere since.
     // ------------------------------------------------------------------
     let decision: GateDecision | null = null;
     let estimate: ImportEstimate | null = null;
     let approvedMicroUsd: number;
 
     if (request.approvedMicroUsd !== undefined) {
-      approvedMicroUsd = request.approvedMicroUsd;
+      const clamp = await clampApproval({
+        control: request.control,
+        tenantId: tenant.tenantId,
+        approvedMicroUsd: request.approvedMicroUsd,
+        now: request.now,
+      });
+      if (!clamp.ok) {
+        await finishRun(tenant.sql, run.ingestId, {
+          outcome: 'failed',
+          failureCode: clamp.reason === 'cap_exhausted' ? 'budget_exhausted' : 'cancelled',
+        });
+        await saveState(null);
+        return {
+          outcome: 'refused',
+          mode,
+          runId: run.ingestId,
+          decision: { proceed: 'refused', reason: clamp.reason, headroom: clamp.headroom },
+          estimate,
+          counts,
+          widen,
+          attemptedItems,
+          cursorAdvanced: false,
+          cursorInvalidated,
+        };
+      }
+      approvedMicroUsd = clamp.approvedMicroUsd;
     } else {
       const estimated = await estimateImport({
         sql: tenant.sql,
@@ -532,7 +638,12 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
           backfill: {
             jobId: decision.jobId,
             approvedMicroUsd: decision.approvedMicroUsd,
-            windowDays: selection.windowDays,
+            // What a *backfill* would use, not what this pull used. A delta
+            // pull runs unwindowed, and banking that as `null` would hand the
+            // resumed job an all-time window — which becomes an unbounded
+            // re-list the moment its cursor expires, through the one door this
+            // whole module exists to keep shut.
+            windowDays: windowDaysOf(windowFor('backfill', request.window)),
           },
         };
         await states.write(state);
@@ -555,7 +666,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     }
 
     // ------------------------------------------------------------------
-    // 5. **One** budget, from the approved amount, for the whole run. This
+    // 6. **One** budget, from the approved amount, for the whole run. This
     //    line is the gate; a fresh budget per item makes every ceiling above
     //    it decoration.
     // ------------------------------------------------------------------
@@ -565,7 +676,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     });
 
     // ------------------------------------------------------------------
-    // 6. What the provider offered but could not be turned into an item. U4's
+    // 7. What the provider offered but could not be turned into an item. U4's
     //    counter only advances for what it accepted, so these are counted here
     //    or a run that half-read a mailbox reports a clean pull.
     // ------------------------------------------------------------------
@@ -584,7 +695,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     }
 
     // ------------------------------------------------------------------
-    // 7. The items.
+    // 8. The items.
     // ------------------------------------------------------------------
     let stopReason: PullStopReason | undefined;
 
@@ -657,7 +768,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     }
 
     // ------------------------------------------------------------------
-    // 8. The chunk pass the estimate priced. U4 defers it by design, so a
+    // 9. The chunk pass the estimate priced. U4 defers it by design, so a
     //    runner that only writes pages leaves the gate bounding work that
     //    never happens. Quarantined chunks are not in this backlog — which is
     //    the structural half of "the junk gate runs before the meter".
@@ -671,28 +782,6 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
         budget,
       });
       if (backlog.failure === 'budget_exhausted') stopReason = 'budget_exhausted';
-    }
-
-    // ------------------------------------------------------------------
-    // 9. Deletions. Runs whether or not the budget held: it costs no provider
-    //    call, and a brain that stopped importing should still stop answering
-    //    with meetings that were cancelled.
-    // ------------------------------------------------------------------
-    if (listed.tombstones.length > 0) {
-      const swept = await tombstoneRefs(tenant.sql, {
-        originContext,
-        externalRefs: listed.tombstones.map((tombstone) => tombstone.externalRef),
-      });
-      counts.tombstoned = swept.tombstoned;
-      for (const externalRef of swept.externalRefs) {
-        await countRunItem(tenant.sql, run.ingestId, { written: 0, quarantined: 0 });
-        await recordItem(tenant.sql, {
-          originContext,
-          sourceType,
-          externalRef,
-          disposition: 'tombstoned',
-        });
-      }
     }
 
     // ------------------------------------------------------------------

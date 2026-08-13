@@ -18,6 +18,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { HOSTED_PROFILE } from '../../../src/ai/routing.ts';
+import { ingestDocument } from '../../../src/core/write/write-path.ts';
 import {
   connectSource,
   createInMemoryConnectorStore,
@@ -30,12 +31,15 @@ import {
   runPull,
 } from '../../../src/ingest/pipedream/pull.ts';
 import { externalRefFor } from '../../../src/ingest/pipedream/sources/types.ts';
+import { DEFAULT_WINDOW_DAYS } from '../../../src/ingest/first-import.ts';
 import type { JobLease } from '../../../src/worker/jobs.ts';
 import {
+  CALLER,
   TENANT,
   countRows,
   createIngestFixture,
   setSpend,
+  uncappedBudget,
   type IngestFixture,
 } from '../fixture.ts';
 import { createFakeSource, mailBody, page } from './fixture.ts';
@@ -53,10 +57,29 @@ afterAll(async () => {
   await fixture.close();
 });
 
-function stateFor(overrides: Partial<ConnectorState> = {}): ConnectorState {
+function stateFor(
+  overrides: Partial<ConnectorState> = {},
+  source: 'gmail' | 'calendar' | 'drive' = 'gmail',
+): ConnectorState {
   return {
-    ...connectSource({ source: 'gmail', externalUserId: TENANT, accountId: 'apn_1', now: NOW }),
+    ...connectSource({ source, externalUserId: TENANT, accountId: 'apn_1', now: NOW }),
     ...overrides,
+  };
+}
+
+function leaseFor(jobId: string): JobLease {
+  return {
+    jobId,
+    tenantId: TENANT,
+    kind: 'ingest_pull',
+    target: 'gmail',
+    leaseToken: 1,
+    owner: 'worker-1',
+    expiresAt: new Date(NOW.getTime() + 60_000),
+    attemptDeadlineAt: new Date(NOW.getTime() + 600_000),
+    attempts: 1,
+    maxAttempts: 5,
+    debtObserved: 0,
   };
 }
 
@@ -112,6 +135,43 @@ describe('a first import too big for one pass', () => {
     expect(state?.backfill?.jobId).toBe(jobId);
     expect(state?.backfill?.approvedMicroUsd).toBeGreaterThan(0);
     expect(state?.cursor).toBeNull();
+  });
+
+  test('a deferral from a delta pull banks a bounded window, never an all-time one', async () => {
+    // A delta pull runs unwindowed, because a delta feed is already bounded by
+    // what changed. Its *deferral* is a different animal: the job that redeems
+    // it may find the cursor expired and fall back to a re-list, and a banked
+    // `windowDays: null` would make that re-list all-time — the unbounded first
+    // import, arriving through the one door this module exists to keep shut.
+    // Drive, because the gmail lane already holds an open job from the test
+    // above and the queue's unique index would refuse a second one.
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 0, capMicroUsd: null });
+    const states = await storeWith(
+      stateFor({ cursor: { kind: 'delta', value: 'p-live', issuedAt: NOW.toISOString() } }, 'drive'),
+    );
+    const items = Array.from({ length: 600 }, (_, index) => ({
+      externalRef: externalRefFor('drive', `delta-defer-${index}`),
+      title: `doc ${index}`,
+      body: mailBody(`delta-defer-${index}`, 1),
+      occurredAt: NOW,
+    }));
+    const source = createFakeSource('drive', 'document', [
+      page({ items, nextCursor: { kind: 'delta', value: 'p-next' } }),
+    ]);
+
+    const result = await runPull({
+      tenant: fixture.runtime,
+      control: fixture.controlSql,
+      profile: HOSTED_PROFILE,
+      source,
+      states,
+      now: NOW,
+      queue: fixture.queue,
+    });
+
+    expect(result.mode).toBe('delta');
+    expect(result.outcome).toBe('deferred');
+    expect((await states.read('drive'))?.backfill?.windowDays).toBe(DEFAULT_WINDOW_DAYS);
   });
 
   test('the deferred job resumes under the approved cap without re-gating', async () => {
@@ -261,6 +321,146 @@ describe('the ceiling actually holds', () => {
     ).toBe(1);
     // And the cursor did not move over items nobody imported.
     expect((await states.read('gmail'))?.cursor).toBeNull();
+  });
+
+  test('a banked approval is re-clamped to the headroom that is actually left', async () => {
+    // The deferral **reserved nothing**: `control.tenant` moved by zero when the
+    // job was enqueued, because a deferral spends no money. So an approval sat
+    // on a connector state is a claim on headroom nobody is holding. A resumed
+    // job that spends it without asking again gives every deferred lane its own
+    // full copy of the cap — three connectors and a chat-export deferral is four
+    // times the ceiling, and each one looks correct on its own.
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 900, capMicroUsd: 900 });
+    const states = await storeWith(
+      stateFor({ backfill: { jobId: 'job-spent', approvedMicroUsd: 4_000_000, windowDays: 90 } }),
+    );
+    const source = createFakeSource('gmail', 'email', [
+      page({ items: mailbox(2, 'spent'), nextCursor: { kind: 'delta', value: 'h-8' } }),
+    ]);
+
+    const handler = createIngestPullHandler({
+      control: fixture.controlSql,
+      profile: HOSTED_PROFILE,
+      openTenant: () => Promise.resolve(fixture.runtime),
+      openSource: () => Promise.resolve({ source, states }),
+    });
+    await handler({ lease: leaseFor('job-spent'), signal: new AbortController().signal, now: NOW });
+
+    // Nothing imported, because there was nothing left to import it with.
+    expect(
+      await countRows(
+        fixture.tenantSql,
+        'page',
+        `external_ref = '${externalRefFor('gmail', 'spent-0')}'`,
+      ),
+    ).toBe(0);
+    // And the cursor did not move over work nobody paid for.
+    expect((await states.read('gmail'))?.cursor).toBeNull();
+  });
+
+  test('a banked approval larger than the headroom spends the headroom, not the approval', async () => {
+    // The refusal at zero headroom is the easy half. The half that fails
+    // *open* is a tenant with a little left: clamp the approval to nothing and
+    // the run refuses loudly, forget to clamp at all and it quietly spends the
+    // whole banked figure. Both look identical from the outside unless the
+    // budget is what actually bounds the writes.
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 899, capMicroUsd: 900 });
+    const states = await storeWith(stateFor({}, 'drive'));
+    const names = ['Alice Example', 'Bella Example', 'Carla Example'];
+    const items = names.map((name, index) => ({
+      externalRef: externalRefFor('drive', `clamped-${index}`),
+      title: `doc ${index}`,
+      body: `${name} is a partner at Widget Co. ${mailBody(`clamped-${index}`, 1)}`,
+      occurredAt: NOW,
+    }));
+    const source = createFakeSource('drive', 'document', [
+      page({ items, nextCursor: { kind: 'delta', value: 'p-clamped' } }),
+    ]);
+
+    const result = await runPull({
+      tenant: fixture.runtime,
+      control: fixture.controlSql,
+      profile: HOSTED_PROFILE,
+      source,
+      states,
+      now: NOW,
+      interactive: false,
+      approvedMicroUsd: 4_000_000,
+    });
+
+    expect(result.outcome).toBe('stopped');
+    expect(result.stopReason).toBe('budget_exhausted');
+    expect(result.counts.written).toBe(0);
+    expect(
+      await countRows(
+        fixture.tenantSql,
+        'page',
+        `external_ref = '${externalRefFor('drive', 'clamped-0')}'`,
+      ),
+    ).toBe(0);
+    expect(result.cursorAdvanced).toBe(false);
+  });
+
+  test('a refused pull still stops answering with what the provider says is gone', async () => {
+    // Deletions cost no provider call, which is why the runner applies them
+    // whether or not the budget held. A refusal must obey the same rule: a
+    // tenant at its cap that keeps a cancelled meeting live is the stale row
+    // U11 reports against its replacement as a genuine contradiction — and the
+    // cap is a thirty-day rolling window, so "until next month" is how long
+    // that lasts. Worse, if the sync cursor expires in the meantime the
+    // recovery re-list carries no tombstones at all and the deletion is lost
+    // for good.
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 0, capMicroUsd: null });
+    const ref = externalRefFor('calendar', 'e-capped');
+    const written = await ingestDocument(
+      {
+        sql: fixture.runtime.sql,
+        gateway: fixture.runtime.gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        budget: uncappedBudget(),
+      },
+      {
+        originContext: originContextFor('calendar'),
+        sourceType: 'calendar',
+        title: 'standup',
+        body: mailBody('standup that was later cancelled'),
+        externalRef: ref,
+      },
+    );
+    expect(written.ok).toBe(true);
+
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 900, capMicroUsd: 900 });
+    const states = await storeWith(stateFor({}, 'calendar'));
+    const source = createFakeSource('calendar', 'calendar', [
+      page({
+        items: [
+          {
+            externalRef: externalRefFor('calendar', 'e-live'),
+            title: 'a new event',
+            body: mailBody('a new event'),
+            occurredAt: NOW,
+          },
+        ],
+        tombstones: [{ externalRef: ref, reason: 'cancelled' }],
+        nextCursor: { kind: 'delta', value: 'sync-capped' },
+      }),
+    ]);
+
+    const result = await runPull({
+      tenant: fixture.runtime,
+      control: fixture.controlSql,
+      profile: HOSTED_PROFILE,
+      source,
+      states,
+      now: NOW,
+    });
+
+    expect(result.outcome).toBe('refused');
+    expect(result.counts.tombstoned).toBe(1);
+    expect(
+      await countRows(fixture.tenantSql, 'page', `external_ref = '${ref}' AND deleted_at IS NULL`),
+    ).toBe(0);
   });
 
   test('a run that exhausts its budget mid-pull stops and leaves the cursor alone', async () => {

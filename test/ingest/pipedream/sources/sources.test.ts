@@ -168,6 +168,132 @@ describe('gmail', () => {
     expect(transport.requests.some((request) => request.url.includes('/messages/m5'))).toBe(false);
   });
 
+  test('a message untrashed upstream comes back, rather than staying tombstoned for good', async () => {
+    // `messagesAdded` fires once, when the message first arrives. A message
+    // that was only ever *trashed* is still in the mailbox, so nothing will
+    // ever re-add it — `labelsRemoved: [TRASH]` is the only event that says it
+    // is back. Read as nothing, the page stays soft-deleted and the message is
+    // unrecallable permanently, while the user can see it in Gmail.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/history?', {
+      status: 200,
+      body: {
+        historyId: '5800',
+        history: [{ labelsRemoved: [{ message: { id: 'm7' }, labelIds: ['TRASH'] }] }],
+      },
+    });
+    transport.on('/messages/m7', {
+      status: 200,
+      body: {
+        id: 'm7',
+        internalDate: `${Date.UTC(2026, 6, 1)}`,
+        labelIds: ['INBOX'],
+        payload: {
+          mimeType: 'text/plain',
+          headers: [{ name: 'Subject', value: 'back from the bin' }],
+          body: { data: base64url('the message the user restored') },
+        },
+      },
+    });
+
+    const source = createGmailSource(client(transport));
+    const outcome = await source.list({
+      ...CONNECTION,
+      mode: 'delta',
+      cursor: '5700',
+      since: null,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.items.map((entry) => entry.externalRef)).toEqual([
+      externalRefFor('gmail', 'm7'),
+    ]);
+    expect(outcome.page.tombstones).toEqual([]);
+  });
+
+  test('within one history page the last event wins, in both directions', async () => {
+    // Trashed-then-untrashed is live; untrashed-then-trashed is gone. A rule
+    // that answers "gone" whenever a trash event appears anywhere in the page
+    // gets the first one wrong, and one that answers "live" whenever an
+    // untrash appears gets the second one wrong. Only order settles it.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/history?', {
+      status: 200,
+      body: {
+        historyId: '5900',
+        history: [
+          { labelsAdded: [{ message: { id: 'm8' }, labelIds: ['TRASH'] }] },
+          { labelsRemoved: [{ message: { id: 'm8' }, labelIds: ['TRASH'] }] },
+          { messagesAdded: [{ message: { id: 'm9' } }] },
+          { labelsAdded: [{ message: { id: 'm9' }, labelIds: ['TRASH'] }] },
+        ],
+      },
+    });
+    transport.on('/messages/m8', {
+      status: 200,
+      body: {
+        id: 'm8',
+        internalDate: `${Date.UTC(2026, 6, 2)}`,
+        labelIds: ['INBOX'],
+        payload: {
+          mimeType: 'text/plain',
+          headers: [{ name: 'Subject', value: 'restored' }],
+          body: { data: base64url('restored body') },
+        },
+      },
+    });
+
+    const source = createGmailSource(client(transport));
+    const outcome = await source.list({
+      ...CONNECTION,
+      mode: 'delta',
+      cursor: '5800',
+      since: null,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.items.map((entry) => entry.externalRef)).toEqual([
+      externalRefFor('gmail', 'm8'),
+    ]);
+    expect(outcome.page.tombstones.map((tombstone) => tombstone.externalRef)).toEqual([
+      externalRefFor('gmail', 'm9'),
+    ]);
+  });
+
+  test('a label change that is not a trash change fetches nothing', async () => {
+    // Marking a message read must not cost a message fetch on every poll.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/history?', {
+      status: 200,
+      body: {
+        historyId: '6000',
+        history: [{ labelsRemoved: [{ message: { id: 'm10' }, labelIds: ['UNREAD'] }] }],
+      },
+    });
+
+    const source = createGmailSource(client(transport));
+    const outcome = await source.list({
+      ...CONNECTION,
+      mode: 'delta',
+      cursor: '5900',
+      since: null,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.items.length).toBe(0);
+    expect(outcome.page.tombstones.length).toBe(0);
+    expect(transport.requests.some((request) => request.url.includes('/messages/m10'))).toBe(false);
+  });
+
   test('an expired history window is a cursor invalidation, not a provider error', async () => {
     const transport = withToken(createScriptedTransport());
     transport.on('/history?', { status: 404, body: { error: { message: 'startHistoryId not found' } } });

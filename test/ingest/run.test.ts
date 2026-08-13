@@ -414,6 +414,54 @@ describe('a large import defers, and the deferral carries its own ceiling', () =
   });
 });
 
+describe('a banked approval is not a reservation', () => {
+  test('a resumed deferral is re-clamped to the headroom that is left', async () => {
+    // Deferring spends nothing, so `control.tenant` has not moved by the time
+    // the job runs. An approval redeemed without asking again gives every
+    // deferred lane its own full copy of the ceiling — chat-export, folder and
+    // three connectors is five times the cap, and each spends "its own"
+    // approval correctly.
+    await resetBrain();
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 5_000_000, capMicroUsd: 5_000_000 });
+
+    const result = await runImport({
+      ...baseRequest(materialFrom(exportDocument(2))),
+      approvedMicroUsd: 4_000_000,
+      jobId: 'job-banked',
+    });
+
+    expect(result.outcome).toBe('refused');
+    if (result.decision?.proceed === 'refused') {
+      expect(result.decision.reason).toBe('cap_exhausted');
+    }
+    expect(await countRows(fixture.tenantSql, 'page')).toBe(0);
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 0, capMicroUsd: null });
+  });
+
+  test('a headroom smaller than the approval is what the run may spend', async () => {
+    // Refusing at zero headroom is the easy half, and a clamp that only ever
+    // fires there is a guard that fails open: a tenant with a micro-dollar left
+    // would still have the whole banked approval spent against it, and the run
+    // would look perfectly well-behaved doing it.
+    await resetBrain();
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 4_999_999, capMicroUsd: 5_000_000 });
+
+    const result = await runImport({
+      ...baseRequest(materialFrom(exportDocument(3))),
+      approvedMicroUsd: 4_000_000,
+      jobId: 'job-banked-2',
+    });
+
+    expect(result.outcome).toBe('stopped');
+    expect(result.stopReason).toBe('budget_exhausted');
+    // The chunk pass is where a micro-dollar runs out, and the rows it could
+    // not pay for stay in the backlog. Under the unclamped approval this run
+    // would have completed and drained it.
+    expect(await backlogSize(fixture.tenantSql)).toBeGreaterThan(0);
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 0, capMicroUsd: null });
+  });
+});
+
 describe('a manifest that is not a manifest is refused', () => {
   test('a resumed import with no usable ceiling does not run', async () => {
     await resetBrain();
@@ -533,6 +581,50 @@ describe('folder material carries update and tombstone semantics', () => {
     expect(await countRows(fixture.tenantSql, 'page', 'deleted_at IS NULL')).toBe(1);
     const rows = await ingestLogRows(fixture.tenantSql);
     expect(rows.some((row) => row.external_ref === externalRefFor(ROOT, 'b.md'))).toBe(true);
+  });
+
+  test('a refused import still reconciles the deletion it observed', async () => {
+    // A deleted file costs no provider call to tombstone, so no ceiling has an
+    // opinion on it. Skipping the sweep because the gate said no leaves the
+    // file answering queries until the tenant's thirty-day spend window rolls
+    // — the stale row U11 later reports against its replacement as a genuine
+    // contradiction, manufactured by the spend gate itself.
+    await resetBrain();
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 0, capMicroUsd: null });
+    await runImport(
+      folderRequest({
+        items: [
+          itemFrom(externalRefFor(ROOT, 'gone.md'), proseOf('gone', 4), null, 'gone.md'),
+        ],
+        failures: [],
+        tombstone: {
+          rootId: ROOT,
+          originContext: FOLDER_ORIGIN,
+          seenRefs: [externalRefFor(ROOT, 'gone.md')],
+          complete: true,
+        },
+      }),
+    );
+    expect(await countRows(fixture.tenantSql, 'page', 'deleted_at IS NULL')).toBe(1);
+
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 5_000_000, capMicroUsd: 5_000_000 });
+    const refused = await runImport(
+      folderRequest({
+        items: [itemFrom(externalRefFor(ROOT, 'new.md'), proseOf('new', 4), null, 'new.md')],
+        failures: [],
+        tombstone: {
+          rootId: ROOT,
+          originContext: FOLDER_ORIGIN,
+          seenRefs: [externalRefFor(ROOT, 'new.md')],
+          complete: true,
+        },
+      }),
+    );
+
+    expect(refused.outcome).toBe('refused');
+    expect(refused.tombstone?.tombstoned).toBe(1);
+    expect(await countRows(fixture.tenantSql, 'page', 'deleted_at IS NULL')).toBe(0);
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 0, capMicroUsd: null });
   });
 
   test('an incomplete scan imports what it saw and reconciles no deletions', async () => {

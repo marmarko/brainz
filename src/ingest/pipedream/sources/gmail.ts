@@ -8,6 +8,15 @@
  * is not an error path, it is *the* path (U9 approach 2a), and it arrives here
  * as `cursor_invalid` so the runner can discard the cursor and re-gate.
  *
+ * **The delta is a fold over events in order, not a scan for keywords.** A
+ * message can be trashed and restored inside one history page, so the last
+ * event for an id is the only thing that says where it ended up. The event that
+ * is easy to leave out is `labelsRemoved: [TRASH]` — `messagesAdded` fires once
+ * when the mail first arrives and will never fire again for a message that was
+ * merely binned, so an untrash read as nothing leaves the page soft-deleted
+ * while the user can plainly see the message in Gmail, permanently and with
+ * nothing left to correct it.
+ *
  * **The history id is captured before the listing, not after.** A message that
  * arrives while the backfill is running would otherwise fall in the gap between
  * "what the list returned" and "where the delta starts", and be invisible
@@ -45,13 +54,33 @@ import {
   type PulledFailure,
   type PulledItem,
   type PulledTombstone,
+  type TombstoneReason,
 } from './types.ts';
 
 const APP = 'gmail' as const;
 const PAGE_SIZE = 100;
 
-/** Labels that mean "this message is gone from the mailbox the user sees". */
+/**
+ * Labels that mean "this message is gone from the mailbox the user sees".
+ *
+ * The same set answers both directions: adding one takes the message away,
+ * removing one brings it back. Keeping one set is what stops the two halves
+ * from disagreeing about what "gone" is.
+ */
 const REMOVING_LABELS = new Set(['TRASH', 'SPAM']);
+
+/** The message id inside a `messagesAdded` / `labelsRemoved` / … change. */
+function messageIdOf(change: unknown): string | null {
+  return asString(asRecord(asRecord(change)?.message ?? null)?.id ?? null);
+}
+
+/** Does this label change mention a label that hides a message? */
+function touchesRemovingLabel(change: unknown): boolean {
+  return asArray(asRecord(change)?.labelIds).some((label) => {
+    const name = asString(label);
+    return name !== null && REMOVING_LABELS.has(name);
+  });
+}
 
 /** `after:YYYY/MM/DD` — Gmail's own query syntax, in UTC. */
 function afterQuery(since: Date): string {
@@ -261,48 +290,69 @@ export function createGmailSource(api: ProviderApi): ProviderSource {
     if (!listed.ok) return { ok: false, reason: listed.reason };
 
     const body = asRecord(listed.value);
-    const added = new Set<string>();
-    const tombstones = new Map<string, PulledTombstone>();
+    /**
+     * Where each id ended up, **in event order**.
+     *
+     * History entries arrive oldest-first, so the last event for a message is
+     * the current truth and this is a fold rather than a set of predicates. The
+     * shape matters in both directions: a rule that answers "gone" whenever a
+     * trash event appears anywhere in the page loses a message the user
+     * restored, and one that answers "live" whenever an untrash appears
+     * resurrects one they threw away.
+     */
+    const settled = new Map<string, { readonly live: boolean; readonly reason: TombstoneReason }>();
+    const gone = (id: string, reason: TombstoneReason) => settled.set(id, { live: false, reason });
+    const back = (id: string) => settled.set(id, { live: true, reason: 'deleted' });
 
     for (const entry of asArray(body?.history)) {
       const record = asRecord(entry);
       if (record === null) continue;
 
       for (const change of asArray(record.messagesAdded)) {
-        const id = asString(asRecord(asRecord(change)?.message ?? null)?.id ?? null);
-        if (id !== null) added.add(id);
+        const id = messageIdOf(change);
+        if (id !== null) back(id);
       }
 
       for (const change of asArray(record.messagesDeleted)) {
-        const id = asString(asRecord(asRecord(change)?.message ?? null)?.id ?? null);
-        if (id !== null) {
-          tombstones.set(id, { externalRef: externalRefFor('gmail', id), reason: 'deleted' });
-        }
+        const id = messageIdOf(change);
+        if (id !== null) gone(id, 'deleted');
       }
 
       for (const change of asArray(record.labelsAdded)) {
-        const labelChange = asRecord(change);
-        const id = asString(asRecord(labelChange?.message ?? null)?.id ?? null);
-        const labels = asArray(labelChange?.labelIds).map((label) => asString(label));
-        if (id !== null && labels.some((label) => label !== null && REMOVING_LABELS.has(label))) {
-          tombstones.set(id, { externalRef: externalRefFor('gmail', id), reason: 'trashed' });
-        }
+        const id = messageIdOf(change);
+        if (id !== null && touchesRemovingLabel(change)) gone(id, 'trashed');
+      }
+
+      // **The event that says a message is back.** `messagesAdded` fires once,
+      // when the message first arrives, so nothing will ever re-add a message
+      // that was merely trashed — this is the only signal there is. Read as
+      // nothing, the page stays soft-deleted while the user can plainly see the
+      // mail in Gmail, and no later pull will ever correct it.
+      //
+      // Only a TRASH/SPAM removal counts: every other label change (read,
+      // starred, moved) leaves the content alone, and treating it as news would
+      // re-fetch the whole mailbox every time somebody clears their unreads.
+      for (const change of asArray(record.labelsRemoved)) {
+        const id = messageIdOf(change);
+        if (id !== null && touchesRemovingLabel(change)) back(id);
       }
     }
 
-    // A message that was added and then trashed inside one history page is
-    // gone, not new: fetching and writing it would leave a page the next pull
-    // has no event left to tombstone.
-    for (const id of tombstones.keys()) added.delete(id);
+    const live: string[] = [];
+    const tombstones: PulledTombstone[] = [];
+    for (const [id, state] of settled) {
+      if (state.live) live.push(id);
+      else tombstones.push({ externalRef: externalRefFor('gmail', id), reason: state.reason });
+    }
 
-    const { items, failures } = await collect(request, [...added].slice(0, request.maxItems));
+    const { items, failures } = await collect(request, live.slice(0, request.maxItems));
     const historyId = asString(body?.historyId ?? null);
 
     return {
       ok: true,
       page: {
         items,
-        tombstones: [...tombstones.values()],
+        tombstones,
         failures,
         nextCursor: historyId === null ? null : { kind: 'delta', value: historyId },
         outsideWindow: null,

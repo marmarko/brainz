@@ -42,6 +42,7 @@ import { externalRefFor } from '../../../src/ingest/pipedream/sources/types.ts';
 import {
   CALLER,
   TENANT,
+  contentDigest,
   countRows,
   createIngestFixture,
   ingestLogRows,
@@ -246,6 +247,53 @@ describe('update and tombstone semantics', () => {
     );
     expect(liveFacts).toBe(0);
     expect(liveChunks).toBe(0);
+  });
+
+  test('a delta pull corrects an item older than the window rather than advancing past it', async () => {
+    // The bounded window exists to cap a FIRST import. A delta feed is already
+    // bounded — it carries only what changed — so windowing it buys nothing and
+    // costs the one thing a poller cannot recover: the edit is dropped AND the
+    // cursor advances past it, so the provider never offers that change again.
+    // The row is then stale for good, which is precisely the row U11 reads
+    // against its live replacement and reports as a genuine contradiction.
+    //
+    // Calendar makes it concrete because `occurredAt` is the event's start, not
+    // the edit's timestamp: a meeting held seven months ago whose notes are
+    // added today arrives with a seven-month-old date.
+    const ref = externalRefFor('calendar', 'e-old');
+    const longAgo = new Date(NOW.getTime() - 200 * 24 * 60 * 60 * 1000);
+    const asBooked = `${mailBody('agenda as booked')} The room is Oak.`;
+    const corrected = `${mailBody('agenda as booked')} The room is Birch.`;
+    const states = await storeWith(stateFor('calendar'));
+    const source = createFakeSource('calendar', 'calendar', [
+      page({
+        items: [item('calendar', 'e-old', asBooked, longAgo)],
+        nextCursor: { kind: 'delta', value: 'sync-old-1' },
+      }),
+      page({
+        items: [item('calendar', 'e-old', corrected, longAgo)],
+        nextCursor: { kind: 'delta', value: 'sync-old-2' },
+      }),
+    ]);
+
+    // The first pull is a backfill, widened so the old event lands at all.
+    const first = await pull(source, states, { window: 'all' });
+    expect(first.counts.written).toBe(1);
+
+    // The second rides the delta cursor, carrying the default window a cadence
+    // tick carries.
+    const second = await pull(source, states);
+    expect(second.mode).toBe('delta');
+    expect(second.attemptedItems).toBe(1);
+    expect(second.counts.written).toBe(1);
+    // Nothing was left out, so nothing is reported as left out.
+    expect(second.widen.excludedItems).toBe(0);
+
+    const live = (await fixture.tenantSql`
+      SELECT content_sha256 FROM page WHERE external_ref = ${ref} AND deleted_at IS NULL
+    `) as Array<{ content_sha256: string }>;
+    expect(live.length).toBe(1);
+    expect(live[0]?.content_sha256).toBe(contentDigest('subject e-old', corrected));
   });
 
   test('a tombstone for an item this brain never held is not an error', async () => {

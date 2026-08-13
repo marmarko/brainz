@@ -41,6 +41,13 @@
  * was five weeks ago still carries last month's total, and charging them for it
  * is a wrong refusal rather than a safety property.
  *
+ * **5. An approval is not a reservation, so a deferred one is re-clamped when it
+ * is redeemed.** Deferring spends nothing, which means the counter this gate
+ * read has not moved by the time the background job runs — and every deferred
+ * lane would otherwise carry its own full copy of the ceiling. {@link
+ * clampApproval} trims a banked amount to the headroom that is still there,
+ * without re-estimating or re-deferring.
+ *
  * The decision itself is inert. It approves an amount; **`run.ts` is what turns
  * that amount into a `Budget` and threads it through every write**, and without
  * that the approval is decoration.
@@ -424,6 +431,64 @@ export async function readHeadroom(
 
 function refusal(reason: GateRefusal, headroom: GateHeadroom | null): GateDecision {
   return { proceed: 'refused', reason, headroom };
+}
+
+/** What {@link clampApproval} can refuse with. A deferred run cannot be deferred
+ * again, so the queue-shaped refusals are not reachable from here. */
+export type ClampRefusal = Extract<
+  GateRefusal,
+  'tenant_unknown' | 'tenant_not_ready' | 'cap_exhausted'
+>;
+
+export type ClampOutcome =
+  | {
+      readonly ok: true;
+      readonly approvedMicroUsd: number;
+      readonly clamped: boolean;
+      readonly headroom: GateHeadroom;
+    }
+  | { readonly ok: false; readonly reason: ClampRefusal; readonly headroom: GateHeadroom | null };
+
+/**
+ * What an approval made *earlier* may still spend.
+ *
+ * **A deferral reserves nothing.** `control.tenant.spend_micro_usd` moves only
+ * when U20's meter writes, and deciding to defer makes no call — so the number
+ * banked on a manifest or a connector state is a claim on headroom that nobody
+ * is holding. Between the deferral and the job that redeems it, anything else
+ * may have spent the cap: the other two connectors, a chat-export import, a
+ * consolidation cycle. A resumed run that spends its banked figure without
+ * asking again gives **every deferred lane its own full copy of the ceiling**,
+ * and each one looks correct in isolation.
+ *
+ * This is deliberately *not* re-gating. The estimate is not recomputed, the
+ * inline ceilings are not re-applied and nothing is re-deferred — re-deferring
+ * would come back `already_open` against the very job asking. Only the amount
+ * is trimmed to what is left, which is the one number that can have gone stale.
+ */
+export async function clampApproval(request: {
+  readonly control: SQL;
+  readonly tenantId: string;
+  readonly approvedMicroUsd: number;
+  readonly now: Date;
+  readonly windowSeconds?: number;
+}): Promise<ClampOutcome> {
+  const read = await readHeadroom(request.control, {
+    tenantId: request.tenantId,
+    now: request.now,
+    ...(request.windowSeconds === undefined ? {} : { windowSeconds: request.windowSeconds }),
+  });
+  if (!read.ok) return { ok: false, reason: 'tenant_unknown', headroom: null };
+  if (read.state !== 'ready') return { ok: false, reason: 'tenant_not_ready', headroom: read.headroom };
+
+  const headroom = read.headroom;
+  if (headroom.headroomMicroUsd <= 0) return { ok: false, reason: 'cap_exhausted', headroom };
+
+  const banked = Number.isSafeInteger(request.approvedMicroUsd)
+    ? Math.max(0, request.approvedMicroUsd)
+    : 0;
+  const approvedMicroUsd = Math.min(banked, headroom.headroomMicroUsd);
+  return { ok: true, approvedMicroUsd, clamped: approvedMicroUsd < banked, headroom };
 }
 
 /**

@@ -17,7 +17,14 @@
  * out. That is the property that makes a hard stop the right behaviour instead
  * of a partial-credit heuristic.
  *
- * **Order matters in two places.**
+ * **A banked approval is re-clamped when it is redeemed.** A deferral spends
+ * nothing, so `control.tenant` has not moved by the time the background job
+ * runs — the figure on the manifest is a claim on headroom nobody was holding.
+ * `clampApproval` trims it to what is left. Not re-gating: the estimate stands,
+ * the deferral stands, only the amount can have gone stale. Without it every
+ * deferred lane carries its own full copy of the ceiling.
+ *
+ * **Order matters in three places.**
  *
  *   1. **The run row opens first.** It is what `page.ingest_id` references and
  *      what U4's own counter advances, and opening it first means a refusal is
@@ -28,6 +35,12 @@
  *      user's export file may be gone; if the bytes were not banked up front,
  *      the deferral is a promise the fleet cannot keep. A failed preservation is
  *      a typed stop (R16) — never a warning that lets unre-derivable pages land.
+ *   3. **Deletions reconcile before the gate too**, because a tombstone costs no
+ *      provider call and no ceiling has an opinion on it. An import the gate
+ *      refused that skipped the sweep leaves a deleted file answering queries
+ *      until the tenant's rolling spend window rolls — the stale row U11 later
+ *      reports against its live replacement as a genuine contradiction, produced
+ *      by the spend gate rather than by anything the user did.
  *
  * **Every item leaves a row, including the ones the write path never sees.**
  * U4's `countIngestItem` advances `items_seen` for everything it accepts; a
@@ -54,6 +67,7 @@ import type { JobLease, JobQueue } from '../../worker/jobs.ts';
 import type { JobContext } from '../../worker/runner.ts';
 import {
   DEFAULT_WINDOW_DAYS,
+  clampApproval,
   estimateImport,
   gateFirstImport,
   isImportTarget,
@@ -236,6 +250,8 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
     excludedItems: 0,
     windowDays: null,
   };
+  /** Reconciled before the gate, so every exit below reports what it did. */
+  let tombstone: TombstoneResult | null = null;
 
   const stop = async (
     stopReason: ImportStopReason,
@@ -253,7 +269,7 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
       counts: { ...counts },
       attemptedItems,
       stopReason,
-      tombstone: null,
+      tombstone,
     };
   };
 
@@ -296,16 +312,62 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
     const items = material.items.filter((item) => selected.has(item.externalRef));
 
     // ------------------------------------------------------------------
-    // 3. The gate — unless this run is a resumed deferral, which was gated
-    //    when it was enqueued. Re-gating would re-read a counter the first
-    //    pass already moved.
+    // 3. Deletion reconciliation, **before the gate**.
+    //
+    // It costs no provider call, so no ceiling has an opinion on it — and a
+    // refused import that skipped the sweep leaves a deleted file answering
+    // queries until the tenant's rolling spend window rolls. That is the stale
+    // row U11 later reports against its live replacement as a genuine
+    // contradiction, manufactured by the spend gate.
+    // ------------------------------------------------------------------
+    if (material.tombstone != null) {
+      tombstone = await tombstoneMissing(tenant.sql, material.tombstone);
+      counts.tombstoned = tombstone.tombstoned;
+      for (const externalRef of tombstone.externalRefs) {
+        await countRunItem(tenant.sql, run.ingestId, { written: 0, quarantined: 0 });
+        await recordItem(tenant.sql, {
+          originContext: request.originContext,
+          sourceType: request.sourceType,
+          externalRef,
+          disposition: 'tombstoned',
+        });
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // 4. The gate — unless this run is a resumed deferral, which was gated
+    //    when it was enqueued. The decision is not remade; only the *amount*
+    //    is re-read, because deferring reserved nothing and the cap may have
+    //    gone somewhere else in the hours since.
     // ------------------------------------------------------------------
     let decision: GateDecision | null = null;
     let estimate: ImportEstimate | null = null;
     let approvedMicroUsd: number;
 
     if (request.approvedMicroUsd !== undefined) {
-      approvedMicroUsd = request.approvedMicroUsd;
+      const clamp = await clampApproval({
+        control: request.control,
+        tenantId: tenant.tenantId,
+        approvedMicroUsd: request.approvedMicroUsd,
+        now: request.now,
+      });
+      if (!clamp.ok) {
+        await finishRun(tenant.sql, run.ingestId, {
+          outcome: 'failed',
+          failureCode: clamp.reason === 'cap_exhausted' ? 'budget_exhausted' : 'cancelled',
+        });
+        return {
+          outcome: 'refused',
+          runId: run.ingestId,
+          decision: { proceed: 'refused', reason: clamp.reason, headroom: clamp.headroom },
+          estimate,
+          widen,
+          counts: { ...counts },
+          attemptedItems,
+          tombstone,
+        };
+      }
+      approvedMicroUsd = clamp.approvedMicroUsd;
     } else {
       const outcome = await estimateImport({
         sql: tenant.sql,
@@ -347,7 +409,7 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
           widen,
           counts: { ...counts },
           attemptedItems,
-          tombstone: null,
+          tombstone,
         };
       }
 
@@ -380,7 +442,7 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
           widen,
           counts: { ...counts },
           attemptedItems,
-          tombstone: null,
+          tombstone,
         };
       }
 
@@ -388,7 +450,7 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
     }
 
     // ------------------------------------------------------------------
-    // 4. **One** budget, from the approved amount, for the whole run.
+    // 5. **One** budget, from the approved amount, for the whole run.
     //
     // This line is the gate. A fresh budget per item, or an uncapped one, and
     // every assertion about the ceiling above becomes decoration.
@@ -399,7 +461,7 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
     });
 
     // ------------------------------------------------------------------
-    // 5. What the source could not produce. Counted on the run row, because
+    // 6. What the source could not produce. Counted on the run row, because
     //    nothing else will: U4's counter only advances for what it accepted.
     //
     //    A failure with no id gets no item row. `external_ref IS NULL` is what
@@ -421,7 +483,7 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
     }
 
     // ------------------------------------------------------------------
-    // 6. The items.
+    // 7. The items.
     // ------------------------------------------------------------------
     let stopReason: ImportStopReason | undefined;
 
@@ -479,7 +541,7 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
     }
 
     // ------------------------------------------------------------------
-    // 7. The chunk pass — the one the estimate priced.
+    // 8. The chunk pass — the one the estimate priced.
     //
     // U4 defers chunk embedding by design, so a runner that only writes pages
     // spends almost nothing and the gate would be bounding a pass that never
@@ -500,26 +562,6 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
         budget,
       });
       if (backlog.failure === 'budget_exhausted') stopReason = 'budget_exhausted';
-    }
-
-    // ------------------------------------------------------------------
-    // 8. Deletion reconciliation. Runs whether or not the budget held: it
-    //    costs no provider call, and a corpus that stopped importing should
-    //    still stop answering with files that are gone.
-    // ------------------------------------------------------------------
-    let tombstone: TombstoneResult | null = null;
-    if (material.tombstone != null) {
-      tombstone = await tombstoneMissing(tenant.sql, material.tombstone);
-      counts.tombstoned = tombstone.tombstoned;
-      for (const externalRef of tombstone.externalRefs) {
-        await countRunItem(tenant.sql, run.ingestId, { written: 0, quarantined: 0 });
-        await recordItem(tenant.sql, {
-          originContext: request.originContext,
-          sourceType: request.sourceType,
-          externalRef,
-          disposition: 'tombstoned',
-        });
-      }
     }
 
     if (stopReason !== undefined) {
