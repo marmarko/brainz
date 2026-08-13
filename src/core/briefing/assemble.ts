@@ -57,9 +57,31 @@
  * cursor advances monotonically — a retried scheduled task with a stale clock
  * must not rewind and replay a week.
  *
+ * **But an explicitly-asked-for window beats the bookmark, and does not move
+ * it.** `since` used to be overridden by the cursor whenever one existed, which
+ * made `briefing(since = 7 days ago)` mean "since your last call" — and since
+ * *every* call banked a new bookmark, the two recipes this repo ships consumed
+ * each other's delta over one credential. Two rules replace it, and they are one
+ * decision seen from both ends:
+ *
+ *   * a caller who names a window gets that window (`basis: 'window'`), and
+ *   * a **query is not a bookmark advance**, so that call banks nothing.
+ *
+ * A caller who names no window is asking the bookmark ("what is new since I last
+ * looked"), gets it (`basis: 'cursor'`), and moves it. So the daily task and the
+ * weekly review coexist on one connection: the daily owns the bookmark, and the
+ * weekly reads across it without disturbing it.
+ *
+ * **The prompt bound is banked either way.** `last_read_at` is the only column
+ * an explicit window leaves alone; the upgrade prompt's own bookkeeping still
+ * lands, because a bound that only recorded itself on cursor reads would let a
+ * client that always names a window see the prompt every single morning — which
+ * is the daily sales pitch U12 step 3 exists to forbid.
+ *
  * **`firstRead` is a stored fact, not an inference.** An empty delta and a
  * never-read cursor produce the same list, and they are opposite situations to a
- * reader.
+ * reader. It reports the stored bookmark in both bases, so a windowed read never
+ * claims a bookmark the connection does not have.
  *
  * The split below — {@link collectBriefing} does the SQL, {@link assembleBriefing}
  * is pure — exists so the blocking tier can grade the assembly (participant-card
@@ -126,6 +148,19 @@ export interface BriefingParticipant {
 }
 
 export interface BriefingMeeting extends BriefingRecord {
+  /**
+   * When the meeting *is*, already coalesced — `occurred_at` when the provider
+   * asserted one and arrival when it did not, which is the same expression the
+   * lane windows and sorts on.
+   *
+   * It sits beside `createdAt` rather than replacing it because the surface's
+   * projection is shared with every other lane: a meetings record that dropped
+   * arrival would be a different shape from a delta record for no reason a
+   * reader could see. Coalesced rather than nullable because the *sort* is
+   * coalesced, and a bundle whose printed times cannot reproduce its own order
+   * is the defect this field exists to close.
+   */
+  readonly occurredAt: string;
   readonly participants: readonly BriefingParticipant[];
 }
 
@@ -178,13 +213,60 @@ export interface BriefingSource {
 }
 
 export interface BriefingOptions {
-  readonly since: string;
+  /**
+   * The window the caller asked for, or `null` when they asked for none.
+   *
+   * Nullable rather than pre-defaulted, and that is the whole fix: "the caller
+   * named a window" and "the caller named a window that happens to equal the
+   * default" have to be distinguishable, because the first one beats the
+   * bookmark and leaves it where it was. A resolved string plus a parallel
+   * `explicit` flag would be the same information in a shape where the two can
+   * disagree.
+   */
+  readonly since: string | null;
   readonly until: string;
   readonly focus: string | null;
   /** The grant id `mcp/dispatch.ts` derived. Never a request parameter. */
   readonly callerKey: string;
   readonly now: Date;
   readonly budgetTokens: number;
+}
+
+/** How far back a briefing looks when the caller does not say. */
+export const DEFAULT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The window every non-delta lane runs on: what the caller asked for, or the
+ * default day ending at `now`.
+ *
+ * One function because three lanes read it and the reported `window` is a fourth
+ * — a default applied at one of those and not the others is a bundle whose
+ * header disagrees with its body.
+ */
+export function briefingWindow(options: BriefingOptions): { readonly since: string; readonly until: string } {
+  return {
+    since:
+      options.since ?? new Date(options.now.getTime() - DEFAULT_WINDOW_MS).toISOString(),
+    until: options.until,
+  };
+}
+
+/** Where the delta starts, and which of the two rules put it there. */
+export interface DeltaBasis {
+  readonly since: string;
+  readonly basis: 'cursor' | 'window';
+}
+
+/**
+ * The one place the delta's start is decided.
+ *
+ * Called by both halves — the SQL half needs it to bound its statements and the
+ * pure half needs it to report what it did — and a second copy is how a bundle
+ * comes to say `since: X` over rows fetched from `Y`.
+ */
+export function deltaBasisFor(options: BriefingOptions, lastReadAt: string | null): DeltaBasis {
+  if (options.since !== null) return { since: options.since, basis: 'window' };
+  return { since: lastReadAt ?? briefingWindow(options).since, basis: 'cursor' };
 }
 
 export interface Briefing {
@@ -196,6 +278,8 @@ export interface Briefing {
   readonly commitments: readonly BriefingCommitment[];
   readonly delta: {
     readonly since: string;
+    /** Which rule put the delta where it starts. Reported, never inferred. */
+    readonly basis: 'cursor' | 'window';
     readonly firstRead: boolean;
     readonly changed: readonly BriefingRecord[];
     readonly stated: readonly BriefingRecord[];
@@ -222,9 +306,11 @@ export interface Briefing {
  *      card": R8 says participant cards are not part of the free briefing, and a
  *      list of bare names would be the silently-thinner shape the requirement
  *      exists to forbid.
- *   2. *The delta window starts at the cursor.* On a first read there is no
- *      cursor, so it starts at the requested window — which is the only reading
- *      under which a brand-new connection's first briefing is not empty.
+ *   2. *The delta window starts at the cursor, unless the caller named one.* A
+ *      named window wins and banks nothing; an unnamed one reads the bookmark
+ *      and moves it. On a first read there is no bookmark, so it falls back to
+ *      the default window — the only reading under which a brand-new
+ *      connection's first briefing is not empty.
  *   3. *The budget drops whole rows from the tail.* Never a truncated one: a
  *      half-quoted external message is a demarcated region with no closing
  *      marker once the surface wraps it, which is the one shape R2a's wrapper
@@ -233,7 +319,8 @@ export interface Briefing {
 export function assembleBriefing(source: BriefingSource, options: BriefingOptions): Briefing {
   const materialized = source.layer.dreamt;
   const firstRead = source.cursor.lastReadAt === null;
-  const deltaSince = source.cursor.lastReadAt ?? options.since;
+  const delta = deltaBasisFor(options, source.cursor.lastReadAt);
+  const window = briefingWindow(options);
 
   const meetings = source.meetings.map((meeting) => ({
     ...meeting,
@@ -262,11 +349,11 @@ export function assembleBriefing(source: BriefingSource, options: BriefingOption
   return {
     coverage: materialized ? 'materialized' : 'cold',
     tier: source.layer.tier,
-    window: { since: options.since, until: options.until },
+    window,
     focus: options.focus,
     meetings,
     commitments: materialized ? source.commitments : [],
-    delta: { since: deltaSince, firstRead, changed, stated },
+    delta: { since: delta.since, basis: delta.basis, firstRead, changed, stated },
     stale: source.stale,
     counts: source.counts,
     notIncluded: materialized ? [] : BRIEFING_NOT_INCLUDED,
@@ -313,9 +400,15 @@ const OCCURRED_AT = 'coalesce(p.occurred_at, p.created_at)';
  * since you last looked" is a question about arrival, and re-keying it onto
  * occurrence would hide a meeting minuted this morning for a call held in March.
  * Only this lane asks "what is happening now".
+ *
+ * It **selects** the occurrence as well as filtering on it, because the surface
+ * has to be able to print the time it sorted by. It rendered arrival for one
+ * rung, so a briefing ordered by when a call happens listed the moment a poller
+ * heard about it — a bundle whose own reader cannot reproduce its order.
  */
 export const MEETINGS_STATEMENT = `
     SELECT p.page_id::text AS page_id, p.title, p.source_type, p.origin_context, p.created_at,
+           ${OCCURRED_AT} AS occurred_at,
            coalesce(substring(string_agg(c.content, ' ' ORDER BY c.ordinal) for 600), '') AS body
       FROM page p
       LEFT JOIN chunk c ON c.page_id = p.page_id AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
@@ -339,6 +432,11 @@ interface PageRow {
   readonly origin_context: string;
   readonly created_at: string;
   readonly body: string;
+}
+
+/** A meetings row: a page row plus the coalesced occurrence it sorted on. */
+interface MeetingRow extends PageRow {
+  readonly occurred_at: string | Date;
 }
 
 function isoOf(value: string | Date | null): string {
@@ -366,6 +464,7 @@ export async function collectBriefing(
 ): Promise<BriefingSource> {
   const grantLiteral = textArrayLiteral(grant);
   const focus = focusOf(options.focus);
+  const window = briefingWindow(options);
 
   const cursorRows = (await sql.unsafe(
     `SELECT last_read_at, prompt_last_shown_at, prompt_last_debt
@@ -402,10 +501,10 @@ export async function collectBriefing(
 
   const meetingRows = (await sql.unsafe(MEETINGS_STATEMENT, [
     grantLiteral,
-    options.since,
-    options.until,
+    window.since,
+    window.until,
     focus,
-  ])) as PageRow[];
+  ])) as MeetingRow[];
 
   const participants = await readParticipants(
     sql,
@@ -433,9 +532,10 @@ export async function collectBriefing(
     compiled_truth: boolean;
   }>;
 
-  // The delta: from this caller's cursor, not from the window's opening. On a
-  // first read there is no cursor and the window is the honest fallback.
-  const deltaSince = lastReadAt ?? options.since;
+  // The delta: from this caller's bookmark when they asked for none, and from
+  // the window they named when they did. One helper, shared with the assembly,
+  // so the reported `since` and the fetched rows cannot disagree.
+  const deltaSince = deltaBasisFor(options, lastReadAt).since;
 
   const changedRows = (await sql.unsafe(
     `SELECT p.page_id::text AS page_id, p.title, p.source_type, p.origin_context, p.created_at,
@@ -452,7 +552,7 @@ export async function collectBriefing(
       GROUP BY p.page_id, p.title, p.source_type, p.origin_context, p.created_at
       ORDER BY p.created_at DESC
       LIMIT ${SECTION_LIMIT}`,
-    [grantLiteral, deltaSince, options.until, focus],
+    [grantLiteral, deltaSince, window.until, focus],
   )) as PageRow[];
 
   const statedRows = (await sql.unsafe(
@@ -467,23 +567,34 @@ export async function collectBriefing(
         AND ($4::text IS NULL OR statement ILIKE '%' || $4 || '%')
       ORDER BY created_at DESC
       LIMIT ${SECTION_LIMIT}`,
-    [grantLiteral, deltaSince, options.until, focus],
+    [grantLiteral, deltaSince, window.until, focus],
   )) as Array<{ fact_id: string; statement: string; origin_contexts: string[]; created_at: string | Date }>;
 
   // Stale *with relevance*: a cancelled meeting or a superseded document that
   // still matters. Ordered by salience so the flag is a short list of things
   // worth knowing are wrong rather than an inventory of everything that rotted.
+  //
+  // **It went stale inside the window, and that is not a detail.** This lane
+  // took a window and ignored it: top 20 by salience at any age, so a briefing
+  // asked for today re-flagged a document superseded in April every morning
+  // forever, and the seven-day review and the daily read returned an identical
+  // list. It also made the header's claim false in both directions — the sort
+  // ran over every stale page the tenant owns, which is the corpus-scaling
+  // fan-out this whole file is built to avoid. An item ages out of the briefing
+  // once the window passes it; a wider `since` is what brings it back.
   const staleRows = (await sql.unsafe(
     `SELECT p.page_id::text AS page_id, p.title, p.stale_at, p.salience, p.origin_context
        FROM page p
       WHERE p.deleted_at IS NULL
         AND p.quarantined_at IS NULL
         AND p.stale_at IS NOT NULL
+        AND p.stale_at >= $3::timestamptz
+        AND p.stale_at < $4::timestamptz
         AND p.origin_context = ANY($1::text[])
         AND ($2::text IS NULL OR p.title ILIKE '%' || $2 || '%')
       ORDER BY p.salience DESC NULLS LAST, p.stale_at DESC
       LIMIT ${SECTION_LIMIT}`,
-    [grantLiteral, focus],
+    [grantLiteral, focus, window.since, window.until],
   )) as Array<{
     page_id: string;
     title: string | null;
@@ -504,6 +615,7 @@ export async function collectBriefing(
     },
     meetings: meetingRows.map((row) => ({
       ...recordOfPage(row),
+      occurredAt: isoOf(row.occurred_at),
       participants: participants.get(row.page_id) ?? [],
     })),
     commitments: commitmentRows.map((row) => ({
@@ -705,22 +817,38 @@ async function readCounts(
  * The read mark is `least(until, now)`: a caller may ask for a window that ends
  * in the future, and banking that would skip everything written between now and
  * then, permanently.
+ *
+ * **A windowed read passes `null` and moves no bookmark.** It is the same
+ * statement rather than a second one because the *prompt* columns still have to
+ * bank: the bound on the upgrade notice is per credential, not per basis, and a
+ * client that always names a window would otherwise see the prompt every
+ * morning. `NULL` here means "leave `last_read_at` where it is" — which on a
+ * first call inserts the row with no bookmark at all, so `firstRead` stays the
+ * stored fact it claims to be.
  */
 export async function advanceBriefingCursor(
   sql: SQL,
   options: BriefingOptions,
   prompt: UpgradePrompt | null,
+  banks: boolean,
 ): Promise<void> {
   const requested = Date.parse(options.until);
-  const mark = new Date(
-    Math.min(Number.isFinite(requested) ? requested : options.now.getTime(), options.now.getTime()),
-  ).toISOString();
+  const mark = !banks
+    ? null
+    : new Date(
+        Math.min(
+          Number.isFinite(requested) ? requested : options.now.getTime(),
+          options.now.getTime(),
+        ),
+      ).toISOString();
 
   await sql.unsafe(
     `INSERT INTO briefing_cursor (caller_key, last_read_at, prompt_last_shown_at, prompt_last_debt)
      VALUES ($1, $2::timestamptz, $3::timestamptz, $4)
      ON CONFLICT (caller_key) DO UPDATE
-        SET last_read_at = GREATEST(COALESCE(briefing_cursor.last_read_at, to_timestamp(0)), EXCLUDED.last_read_at),
+        SET last_read_at =
+              CASE WHEN EXCLUDED.last_read_at IS NULL THEN briefing_cursor.last_read_at
+                   ELSE GREATEST(COALESCE(briefing_cursor.last_read_at, to_timestamp(0)), EXCLUDED.last_read_at) END,
             prompt_last_shown_at =
               CASE WHEN EXCLUDED.prompt_last_shown_at IS NULL THEN briefing_cursor.prompt_last_shown_at
                    ELSE EXCLUDED.prompt_last_shown_at END,
@@ -745,6 +873,8 @@ export async function briefing(
 ): Promise<Briefing> {
   const source = await collectBriefing(sql, grant, options);
   const bundle = assembleBriefing(source, options);
-  await advanceBriefingCursor(sql, options, bundle.prompt);
+  // The bundle's own basis decides, rather than a second reading of `options`:
+  // whatever the delta was built from is what the bookmark answers to.
+  await advanceBriefingCursor(sql, options, bundle.prompt, bundle.delta.basis === 'cursor');
   return bundle;
 }

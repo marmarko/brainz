@@ -182,6 +182,36 @@ export async function seedMeeting(
   });
 }
 
+/**
+ * One page that has gone stale, with its staleness time set independently.
+ *
+ * Separate from {@link seedBrain}'s stale page for the same reason
+ * {@link seedMeeting} is separate from its meeting: a fixture whose every stale
+ * row went stale inside the window cannot tell a windowed lane from one that
+ * ignores the window, and the lane ignored it for exactly as long as nobody had
+ * a row outside.
+ */
+export async function seedStale(
+  sql: SQL,
+  input: {
+    readonly origin: string;
+    readonly title: string;
+    readonly createdAt: string;
+    readonly staleAt: string;
+    readonly salience?: number;
+  },
+): Promise<string> {
+  return insertPage(sql, {
+    origin: input.origin,
+    sourceType: 'email',
+    title: input.title,
+    body: `${input.title} — superseded.`,
+    createdAt: input.createdAt,
+    staleAt: input.staleAt,
+    salience: input.salience ?? 0.5,
+  });
+}
+
 export interface WarmOptions {
   /** A contradiction the free tier could never have produced. Default 0. */
   readonly contradictions?: number;

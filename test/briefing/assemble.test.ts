@@ -38,6 +38,7 @@ import {
   recordRun,
   seedBrain,
   seedMeeting,
+  seedStale,
   warmLayer,
   type SeededBrain,
 } from './fixture.ts';
@@ -202,6 +203,15 @@ describe('the per-caller read cursor', () => {
   let fixture: McpFixture;
   let brain: SeededBrain;
 
+  /**
+   * Every read in this block asks for no window, because that is what a cursor
+   * read *is* now. Passing a `since` here would exercise the windowed lane and
+   * assert nothing about the bookmark — which is how the two recipes came to
+   * consume each other with this block green.
+   */
+  const cursorRead = (overrides: Record<string, unknown> = {}) =>
+    request({ since: null, ...overrides });
+
   beforeAll(async () => {
     fixture = await createMcpFixture('u12_cursor');
     brain = await seedBrain(fixture.sql, AT);
@@ -212,7 +222,7 @@ describe('the per-caller read cursor', () => {
   });
 
   test('first read is a first read, and its delta is not empty', async () => {
-    const first = await assembleOverSql(fixture.sql, GRANT, request({ callerKey: 'bearer:alice' }));
+    const first = await assembleOverSql(fixture.sql, GRANT, cursorRead({ callerKey: 'bearer:alice' }));
     expect(first.delta.firstRead).toBe(true);
     // The assertion the empty-second-delta test is worthless without.
     expect(first.delta.changed.length).toBeGreaterThan(0);
@@ -222,7 +232,7 @@ describe('the per-caller read cursor', () => {
     const second = await assembleOverSql(
       fixture.sql,
       GRANT,
-      request({ callerKey: 'bearer:alice', now: new Date('2026-08-14T09:00:00.000Z') }),
+      cursorRead({ callerKey: 'bearer:alice', now: new Date('2026-08-14T09:00:00.000Z') }),
     );
     expect(second.delta.firstRead).toBe(false);
     expect(second.delta.changed).toEqual([]);
@@ -239,9 +249,8 @@ describe('the per-caller read cursor', () => {
     const third = await assembleOverSql(
       fixture.sql,
       GRANT,
-      request({
+      cursorRead({
         callerKey: 'bearer:alice',
-        since: '2026-08-14T00:00:00.000Z',
         until: '2026-08-15T00:00:00.000Z',
         now: new Date('2026-08-15T00:00:00.000Z'),
       }),
@@ -253,7 +262,11 @@ describe('the per-caller read cursor', () => {
     const other = await assembleOverSql(
       fixture.sql,
       GRANT,
-      request({ callerKey: 'bearer:bob', now: new Date('2026-08-15T00:00:00.000Z') }),
+      cursorRead({
+        callerKey: 'bearer:bob',
+        until: '2026-08-15T00:00:00.000Z',
+        now: new Date('2026-08-15T00:00:00.000Z'),
+      }),
     );
     expect(other.delta.firstRead).toBe(true);
     expect(other.delta.changed.length).toBeGreaterThan(0);
@@ -267,9 +280,8 @@ describe('the per-caller read cursor', () => {
     await assembleOverSql(
       fixture.sql,
       GRANT,
-      request({
+      cursorRead({
         callerKey: 'bearer:alice',
-        since: '2026-01-01T00:00:00.000Z',
         until: '2026-01-02T00:00:00.000Z',
         now: new Date('2026-01-02T00:00:00.000Z'),
       }),
@@ -284,6 +296,184 @@ describe('the per-caller read cursor', () => {
     const before = await contentCensus(fixture.sql);
     await assembleOverSql(fixture.sql, GRANT, request({ callerKey: 'bearer:census' }));
     expect(await contentCensus(fixture.sql)).toEqual(before);
+  });
+});
+
+/**
+ * The window the caller asked for, against the bookmark the connection keeps.
+ *
+ * **Both recipes this repo ships run over one credential**, and before this
+ * block they consumed each other: `deltaSince` was `lastReadAt ?? since`, so a
+ * weekly review that asked for seven days was handed "since your last call" —
+ * which the daily briefing had just moved to this morning — and then advanced
+ * the bookmark again on its way out.
+ *
+ * Every test here is written against the trivial pass. A single call proves
+ * nothing: the cursor has to have been advanced by a *previous* call on the
+ * *same* credential before an explicit window can be shown to beat it.
+ */
+describe('an explicit window is the caller’s; the bookmark is the connection’s', () => {
+  const WEEK_AGO = '2026-08-07T00:00:00.000Z';
+  let fixture: McpFixture;
+
+  beforeAll(async () => {
+    fixture = await createMcpFixture('u12_window');
+    const brain = await seedBrain(fixture.sql, AT);
+    await warmLayer(fixture.sql, brain, AT);
+  });
+  afterAll(async () => {
+    await fixture.close();
+  });
+
+  test('THE WEEKLY REVIEW STILL GETS A WEEK AFTER THE DAILY RAN — same credential', async () => {
+    const key = 'bearer:one-connection';
+
+    // The daily task. No window asked for, so the bookmark governs and moves.
+    const daily = await assembleOverSql(
+      fixture.sql,
+      GRANT,
+      request({ callerKey: key, since: null, now: new Date(UNTIL) }),
+    );
+    expect(daily.delta.basis).toBe('cursor');
+    // The half without which everything below passes on an empty brain.
+    expect(daily.delta.changed.length).toBeGreaterThan(0);
+
+    // The weekly review, on the same connection, asking for seven days.
+    const weekly = await assembleOverSql(
+      fixture.sql,
+      GRANT,
+      request({ callerKey: key, since: WEEK_AGO, now: new Date(UNTIL) }),
+    );
+    expect(weekly.delta.basis).toBe('window');
+    expect(weekly.delta.since).toBe(WEEK_AGO);
+    expect(weekly.delta.changed.map((entry) => entry.title)).toContain('Renewal terms');
+  });
+
+  test('a windowed read is not a bookmark advance', async () => {
+    const key = 'bearer:no-advance';
+    await assembleOverSql(
+      fixture.sql,
+      GRANT,
+      request({ callerKey: key, since: null, now: new Date(UNTIL) }),
+    );
+    const banked = await readCursor(fixture, key);
+    expect(banked).not.toBeNull();
+
+    await assembleOverSql(
+      fixture.sql,
+      GRANT,
+      request({
+        callerKey: key,
+        since: WEEK_AGO,
+        until: '2026-08-20T00:00:00.000Z',
+        now: new Date('2026-08-20T00:00:00.000Z'),
+      }),
+    );
+    // A query is not a bookmark advance. The far `until` above is what a cursor
+    // read would have banked, so an unchanged value here is the whole assertion.
+    expect(await readCursor(fixture, key)).toBe(banked);
+  });
+
+  test('and the daily still gets its own delta when the weekly ran first', async () => {
+    const key = 'bearer:weekly-first';
+    const weekly = await assembleOverSql(
+      fixture.sql,
+      GRANT,
+      request({ callerKey: key, since: WEEK_AGO, now: new Date(UNTIL) }),
+    );
+    expect(weekly.delta.changed.length).toBeGreaterThan(0);
+
+    const daily = await assembleOverSql(
+      fixture.sql,
+      GRANT,
+      request({ callerKey: key, since: null, now: new Date(UNTIL) }),
+    );
+    expect(daily.delta.basis).toBe('cursor');
+    expect(daily.delta.firstRead).toBe(true);
+    expect(daily.delta.changed.length).toBeGreaterThan(0);
+  });
+
+  test('the bookmark still governs when no window is asked for', async () => {
+    const key = 'bearer:still-a-cursor';
+    const first = await assembleOverSql(
+      fixture.sql,
+      GRANT,
+      request({ callerKey: key, since: null, now: new Date(UNTIL) }),
+    );
+    expect(first.delta.changed.length).toBeGreaterThan(0);
+
+    const second = await assembleOverSql(
+      fixture.sql,
+      GRANT,
+      request({ callerKey: key, since: null, now: new Date(UNTIL) }),
+    );
+    expect(second.delta.firstRead).toBe(false);
+    expect(second.delta.changed).toEqual([]);
+  });
+});
+
+/**
+ * The stale lane's window.
+ *
+ * `briefing` accepts a window and the stale lane ignored it entirely: top 20 by
+ * salience at any age. Two rows are seeded on either side of the window because
+ * one is not a test — a lane that ignores the window returns both, and a fixture
+ * with only the inside row returns the same list either way.
+ */
+describe('stale honours the window it was given', () => {
+  const SINCE_WEEK = '2026-08-07T00:00:00.000Z';
+  let fixture: McpFixture;
+
+  beforeAll(async () => {
+    fixture = await createMcpFixture('u12_stale');
+    await seedStale(fixture.sql, {
+      origin: MAIL,
+      title: 'Superseded this week',
+      createdAt: '2026-08-01T09:00:00.000Z',
+      staleAt: '2026-08-09T09:00:00.000Z',
+      salience: 0.3,
+    });
+    await seedStale(fixture.sql, {
+      origin: MAIL,
+      title: 'Superseded in April',
+      createdAt: '2026-04-01T09:00:00.000Z',
+      staleAt: '2026-04-02T09:00:00.000Z',
+      // Higher salience than the recent one, so an unwindowed lane orders it
+      // first rather than dropping it off the end of the LIMIT.
+      salience: 0.99,
+    });
+  });
+  afterAll(async () => {
+    await fixture.close();
+  });
+
+  test('a page that went stale inside the window is flagged', async () => {
+    const bundle = await assembleOverSql(
+      fixture.sql,
+      GRANT,
+      request({ since: SINCE_WEEK, callerKey: 'bearer:stale-in' }),
+    );
+    expect(bundle.stale.map((entry) => entry.title)).toContain('Superseded this week');
+  });
+
+  test('ONE THAT WENT STALE IN APRIL IS NOT', async () => {
+    const bundle = await assembleOverSql(
+      fixture.sql,
+      GRANT,
+      request({ since: SINCE_WEEK, callerKey: 'bearer:stale-out' }),
+    );
+    expect(bundle.stale.map((entry) => entry.title)).not.toContain('Superseded in April');
+  });
+
+  test('and a window wide enough to hold it brings it back', async () => {
+    // The half that keeps the assertion above from passing on a lane that
+    // returns nothing at all.
+    const bundle = await assembleOverSql(
+      fixture.sql,
+      GRANT,
+      request({ since: '2026-01-01T00:00:00.000Z', callerKey: 'bearer:stale-wide' }),
+    );
+    expect(bundle.stale.map((entry) => entry.title)).toContain('Superseded in April');
   });
 });
 

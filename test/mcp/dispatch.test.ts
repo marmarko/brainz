@@ -495,18 +495,21 @@ describe('untrusted-content demarcation', () => {
         until: '2026-07-01',
         focus: 'platform team',
       });
-      // The delta is cursor-relative (U12), and the test above already read
-      // this exact window through this exact credential — so it is empty, and
-      // that is the cursor doing its job rather than the focus failing.
-      const first = focused.content as { focus?: string; delta: { changed: { text: string }[] } };
+      // A window the caller named is the window they get, and the test above
+      // read this exact window through this exact credential — so this one
+      // returns the same rows rather than an empty delta. A query is not a
+      // bookmark advance; the connection's bookmark is somewhere else entirely.
+      const first = focused.content as {
+        focus?: string;
+        delta: { basis: string; changed: { text: string }[] };
+      };
       expect(first.focus).toBe('platform team');
-      expect(first.delta.changed).toEqual([]);
+      expect(first.delta.basis).toBe('window');
+      expect(first.delta.changed.length).toBeGreaterThan(0);
 
-      // Rewind this caller's bookmark to ask the parameter question on a first
-      // read. Nothing in the product does this; it is the only way to test a
-      // window twice from one credential.
-      await fixture.sql`DELETE FROM briefing_cursor`;
-
+      // ...and again, unchanged. This is the weekly review's whole requirement:
+      // it can run beside a daily task on one credential without either one
+      // consuming the other.
       const fresh = await fixture.call('briefing', {
         since: '2026-05-01',
         until: '2026-07-01',
@@ -514,7 +517,13 @@ describe('untrusted-content demarcation', () => {
       });
       const bundle = fresh.content as { focus?: string; delta: { changed: { text: string }[] } };
       expect(bundle.focus).toBe('platform team');
-      expect(bundle.delta.changed.length).toBeGreaterThan(0);
+      // Compared with the demarcation stripped: the delimiter is a fresh nonce
+      // per response, so the wrapped strings differ by design even when the
+      // rows inside them are the same rows.
+      const inner = (rows: { text: string }[]): string[] =>
+        rows.map((row) => row.text.replaceAll(/<<<\/?UNTRUSTED-CONTENT [0-9a-f]+>>>/g, '').trim());
+      expect(inner(bundle.delta.changed)).toEqual(inner(first.delta.changed));
+      expect(inner(bundle.delta.changed).length).toBeGreaterThan(0);
       for (const row of bundle.delta.changed) {
         expect(row.text.toLowerCase()).toContain('platform team');
       }

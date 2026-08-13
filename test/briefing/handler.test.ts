@@ -20,7 +20,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { collectBriefing } from '../../src/core/briefing/assemble.ts';
 import { DEBT_THRESHOLDS } from '../../src/core/briefing/prompt.ts';
 import { createMcpFixture, type McpFixture } from '../mcp/fixture.ts';
-import { CALENDAR, MAIL, seedBrain, warmLayer, type SeededBrain } from './fixture.ts';
+import { CALENDAR, MAIL, seedBrain, seedMeeting, warmLayer, type SeededBrain } from './fixture.ts';
 
 const AT = '2026-08-13T09:00:00.000Z';
 const WINDOW = { since: '2026-08-12T00:00:00.000Z', until: '2026-08-14T00:00:00.000Z' };
@@ -98,6 +98,96 @@ describe('the envelope tells the truth in both directions', () => {
     ]);
     for (const commitment of content.commitments) expect(commitment.id).toMatch(/^fact:/);
     for (const entry of content.stale) expect(entry.id).toMatch(/^doc:/);
+  });
+});
+
+/**
+ * What the envelope says a meeting's time is.
+ *
+ * The lane keys and sorts on `coalesce(occurred_at, created_at)` — when the call
+ * *is* — and the envelope rendered `created_at`, when the poller heard about it.
+ * A briefing that sorts by one time and prints the other is a bundle whose order
+ * its own reader cannot reproduce, and the gap is exactly one overnight sync.
+ *
+ * The fixture sets the two times to different instants for the same reason the
+ * assembler's does: with `occurred_at == created_at` the two renderings are
+ * indistinguishable, which is how this survived the rung that introduced it.
+ */
+describe('a meeting is rendered at the time it happens', () => {
+  const OCCURRED = '2026-08-13T14:00:00.000Z';
+  const ARRIVED = '2026-08-12T02:30:00.000Z';
+  let fixture: McpFixture;
+
+  beforeAll(async () => {
+    fixture = await createMcpFixture('u12_occurred', {
+      startAt: Date.parse('2026-08-13T18:00:00.000Z'),
+    });
+    await seedMeeting(fixture.sql, {
+      origin: CALENDAR,
+      title: 'Roadmap review',
+      body: 'Roadmap review\nAttendees: priya@example.com',
+      createdAt: ARRIVED,
+      occurredAt: OCCURRED,
+    });
+    // A page the provider asserted no time for: the fallback has to render as
+    // arrival rather than as null, the same way the lane windows it.
+    await seedMeeting(fixture.sql, {
+      origin: CALENDAR,
+      title: 'Undated sync',
+      body: 'Undated sync\nAttendees: nobody',
+      createdAt: '2026-08-13T11:00:00.000Z',
+      occurredAt: null,
+    });
+  });
+  afterAll(async () => {
+    await fixture.close();
+  });
+
+  test('the envelope carries the occurrence, not the arrival', async () => {
+    const result = await fixture.call('briefing', {
+      since: '2026-08-13T00:00:00.000Z',
+      until: '2026-08-14T00:00:00.000Z',
+    });
+    const content = result.content as {
+      meetings: Array<{ title: string; occurred_at: string; created_at: string }>;
+    };
+    const review = content.meetings.find((meeting) => meeting.title.includes('Roadmap review'));
+    expect(review).toBeDefined();
+    expect(review?.occurred_at).toBe(OCCURRED);
+    // Arrival stays, under its own name. It is the projection's field and every
+    // other lane renders it; dropping it here would make one lane's records a
+    // different shape from the rest.
+    expect(review?.created_at).toBe(ARRIVED);
+  });
+
+  test('a meeting the provider gave no time for falls back to arrival', async () => {
+    const result = await fixture.call('briefing', {
+      since: '2026-08-13T00:00:00.000Z',
+      until: '2026-08-14T00:00:00.000Z',
+    });
+    const content = result.content as {
+      meetings: Array<{ title: string; occurred_at: string; created_at: string }>;
+    };
+    const undated = content.meetings.find((meeting) => meeting.title.includes('Undated sync'));
+    expect(undated?.occurred_at).toBe('2026-08-13T11:00:00.000Z');
+    expect(undated?.occurred_at).toBe(undated?.created_at ?? '');
+  });
+
+  test('and the order the bundle prints is the order it sorted', async () => {
+    // The 14:00 call arrived before the 11:00 one. Sorted by occurrence it is
+    // first; sorted by arrival it is last, and a reader sorting the printed
+    // `occurred_at` themselves would disagree with the server.
+    const result = await fixture.call('briefing', {
+      since: '2026-08-13T00:00:00.000Z',
+      until: '2026-08-14T00:00:00.000Z',
+    });
+    const content = result.content as { meetings: Array<{ occurred_at: string }> };
+    const printed = content.meetings.map((meeting) => meeting.occurred_at);
+    // Without this the whole assertion passes on a list of `undefined`, which
+    // is precisely the state the field is missing in.
+    expect(printed.length).toBe(2);
+    for (const at of printed) expect(Number.isNaN(Date.parse(at))).toBe(false);
+    expect(printed).toEqual([...printed].sort().reverse());
   });
 });
 

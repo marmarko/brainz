@@ -14,9 +14,13 @@
  *     the free briefing names what the paid tier would add instead of being
  *     silently thinner, and a nameless-card list is precisely the silently
  *     thinner shape.
- *   - **delta correctness** — the delta window opens at the caller's cursor, not
- *     at the requested window, and a caller who is caught up sees an empty one.
- *     A briefing whose delta ignores the cursor is a dashboard.
+ *   - **delta correctness** — a caller who asks for no window gets one that
+ *     opens at their cursor, and a caller who is caught up sees an empty one. A
+ *     briefing whose delta ignores the cursor is a dashboard. A caller who *does*
+ *     ask for a window gets the window they asked for: this leg pinned the
+ *     opposite for one release, which is how the shipped daily and weekly
+ *     recipes came to consume each other's delta over one credential with a
+ *     green blocking tier.
  *
  * **The fixtures are built in pairs.** Every cold case has a warm twin over the
  * *same* rows and every caught-up case has a first-read twin, because a check
@@ -70,6 +74,9 @@ function source(overrides: Partial<BriefingSource> = {}): BriefingSource {
       {
         ...record('m1', 'Roadmap review', 'Attendees: priya@example.com'),
         sourceType: 'calendar',
+        // When the call *is*, distinct from when the row arrived — the pair the
+        // surface renders and the lane sorts on.
+        occurredAt: '2026-08-13T14:00:00.000Z',
         participants: [
           { entityId: 'e1', name: 'Priya Raghavan', card: 'Runs the renewal.', origins: ['personal:mail'] },
           { entityId: 'e2', name: 'Tomas Berg', card: 'Owns the pilot.', origins: ['personal:mail'] },
@@ -192,9 +199,14 @@ export const BRIEFING_CASES: readonly BriefingCase[] = [
   },
   {
     id: 'delta.first_read_opens_at_the_window',
-    what: 'a caller with no cursor gets the requested window, marked as a first read',
+    what: 'a caller with no cursor gets a window either way, marked as a first read',
     run() {
       const bundle = warm();
+      // The other half of "no cursor": no window asked for either, so the
+      // fallback is the default day rather than nothing at all. A brand-new
+      // connection's first briefing must not be empty.
+      const unasked = assembleBriefing(source(), options({ since: null }));
+      const day = new Date(NOW.getTime() - 24 * 60 * 60 * 1000).toISOString();
       return [
         ...expect('delta.first_read', bundle.delta.firstRead, 'a cursorless caller was not marked first-read'),
         ...expect(
@@ -207,24 +219,67 @@ export const BRIEFING_CASES: readonly BriefingCase[] = [
           bundle.delta.changed.length > 0,
           'a first read produced an empty delta, so the caught-up check below grades nothing',
         ),
+        ...expect(
+          'delta.first_read_falls_back_to_a_day',
+          unasked.delta.since === day && unasked.delta.basis === 'cursor',
+          `a cursorless caller who named no window opened at ${unasked.delta.since}, expected ${day}`,
+        ),
       ];
     },
   },
   {
-    id: 'delta.cursor_wins_over_the_window',
-    what: 'a returning caller gets the window from their cursor, not from `since`',
+    id: 'delta.cursor_governs_an_unasked_window',
+    what: 'a returning caller who names no window gets one that opens at their cursor',
     run() {
       const at = '2026-08-13T12:00:00.000Z';
       const bundle = assembleBriefing(
         source({ cursor: { lastReadAt: at, prompt: { lastShownAt: null, lastShownDebt: 0 } } }),
-        options(),
+        options({ since: null }),
       );
       return [
         ...expect('delta.not_first_read', !bundle.delta.firstRead, 'a caller with a cursor was marked first-read'),
         ...expect(
-          'delta.cursor_wins',
+          'delta.cursor_governs',
           bundle.delta.since === at,
           `the delta opened at ${bundle.delta.since}, expected the cursor's ${at}`,
+        ),
+        ...expect(
+          'delta.cursor_basis',
+          bundle.delta.basis === 'cursor',
+          `the delta reported basis ${bundle.delta.basis}, expected cursor`,
+        ),
+      ];
+    },
+  },
+  {
+    id: 'delta.an_asked_for_window_beats_the_cursor',
+    what: 'the same returning caller, asking for a week, gets the week',
+    run() {
+      // The twin of the case above over the *same* cursor, because that is the
+      // only shape in which the rule is testable: a caller with no cursor gets
+      // the window either way, so a fixture without one grades nothing. This is
+      // the weekly review running on the connection the daily task just moved.
+      const at = '2026-08-13T12:00:00.000Z';
+      const week = '2026-08-07T00:00:00.000Z';
+      const bundle = assembleBriefing(
+        source({ cursor: { lastReadAt: at, prompt: { lastShownAt: null, lastShownDebt: 0 } } }),
+        options({ since: week }),
+      );
+      return [
+        ...expect(
+          'delta.window_wins',
+          bundle.delta.since === week,
+          `the delta opened at ${bundle.delta.since}, expected the asked-for ${week}`,
+        ),
+        ...expect(
+          'delta.window_basis',
+          bundle.delta.basis === 'window',
+          `the delta reported basis ${bundle.delta.basis}, expected window`,
+        ),
+        ...expect(
+          'delta.window_still_reports_the_bookmark',
+          !bundle.delta.firstRead,
+          'a windowed read claimed a first read for a connection that has one',
         ),
       ];
     },
@@ -243,7 +298,7 @@ export const BRIEFING_CASES: readonly BriefingCase[] = [
           changed: [],
           stated: [],
         }),
-        options(),
+        options({ since: null }),
       );
       return [
         ...expect('delta.caught_up', bundle.delta.changed.length === 0, 'a caught-up delta carried rows'),

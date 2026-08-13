@@ -257,8 +257,6 @@ export const entity: Handler = async (ctx, args) => {
   };
 };
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-
 /**
  * `briefing` — the standing bundle, assembled by SQL over U11's materialised
  * output.
@@ -281,8 +279,13 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  */
 export const briefing: Handler = async (ctx, args) => {
   const until = stringArg(args, 'until') ?? ctx.now.toISOString();
-  const since = stringArg(args, 'since') ?? new Date(ctx.now.getTime() - DAY_MS).toISOString();
-  if (Number.isNaN(Date.parse(since)) || Number.isNaN(Date.parse(until))) {
+  // `null` is passed through rather than defaulted here, and that is the seam
+  // the delta rule hangs on: the assembler has to be able to tell "no window
+  // asked for" from "a window that happens to equal the default", because the
+  // first reads the connection's bookmark and moves it while the second does
+  // neither. Defaulting at this layer erased the difference.
+  const since = stringArg(args, 'since');
+  if ((since !== null && Number.isNaN(Date.parse(since))) || Number.isNaN(Date.parse(until))) {
     return invalid('`since` and `until` must be ISO dates.');
   }
 
@@ -326,6 +329,10 @@ export const briefing: Handler = async (ctx, args) => {
       ...(focus === null ? {} : { focus }),
       meetings: bundle.meetings.map((meeting) => ({
         ...wrap(meeting),
+        // When the meeting *is*, which is what the lane sorted on. `created_at`
+        // rides along from the shared projection and stays what it says it is:
+        // when this brain heard about it.
+        occurred_at: meeting.occurredAt,
         participants: meeting.participants.map((person) => ({
           id: formatId('ent', person.entityId),
           name: person.name,
@@ -345,6 +352,10 @@ export const briefing: Handler = async (ctx, args) => {
       })),
       delta: {
         since: bundle.delta.since,
+        // Which rule put the delta where it starts. A reader who asked for a
+        // week and a reader who asked for nothing get different answers from
+        // the same field, and this is what tells them apart.
+        basis: bundle.delta.basis,
         first_read: bundle.delta.firstRead,
         changed: bundle.delta.changed.map(wrap),
         stated: bundle.delta.stated.map(wrap),
