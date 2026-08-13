@@ -319,7 +319,25 @@ export type EntityOutcome =
  * hands the caller the candidates instead of picking one for it.
  */
 const ENTITY_RUNGS = {
-  /** The recall vocabulary: normalized surface forms and declared aliases. */
+  /**
+   * The recall vocabulary: normalized surface forms and declared aliases.
+   *
+   * **This rung does not use `entity_alias_lookup`, and that is a decision with
+   * a measurement behind it.** The index is on `lower(alias)`, so hitting it
+   * would mean comparing the key against a *derived* value rather than against
+   * the stored one — `lower()` in Postgres and `toLowerCase` in the normalizer
+   * agree on almost every input and not on all of them (`U+0130` is the usual
+   * example), and a row whose key the index's expression alters is a row nothing
+   * can ever match. The whole defect this rung was rewritten to close is a fold
+   * applied on one side and not the other, so buying an index with a third fold
+   * would be closing it at the top and reopening it underneath. Measured at
+   * 20,000 entities the whole statement is ~3.7ms against the ~7.4ms of the
+   * `entity`-to-`entity_alias` join it replaced, so this is faster than what was
+   * here rather than a regression — but both are linear in the corpus, and the
+   * real remedy is an index on the key column itself (`(alias)`, not
+   * `(lower(alias))`), which is one additive line for whoever next opens the
+   * schema ladder.
+   */
   alias: 1,
   /** The addressing namespace — canonical slugs *and* redirects, so a renamed entity keeps its old address. */
   slug: 2,
