@@ -540,6 +540,10 @@ export function createPipedreamClient(options: {
         method: 'POST',
         url: `${base}/connect/${config.projectId}/tokens`,
         headers: { 'content-type': 'application/json' },
+        // The connect endpoint is the vendor's, under the same project quota.
+        // Pacing only the OAuth mint leaves a burst of these unpaced from the
+        // second call onwards, which is when the access token is cached.
+        rateKey: 'connect',
         body: JSON.stringify({
           external_user_id: request.externalUserId,
           ...(request.ttlSeconds === undefined ? {} : { lifetime: request.ttlSeconds }),

@@ -426,6 +426,14 @@ describe('the token mint is part of the traffic it authorizes', () => {
     // call that spends it without asking is a hole in the ceiling.
     expect(taken.length).toBe(2);
     expect(taken[0]).toBe('oauth');
+
+    // And the connect-token mint is one too. Pacing only the OAuth call leaves
+    // a burst of them unpaced the moment the access token is cached — which is
+    // every time after the first.
+    taken.length = 0;
+    transport.on('/tokens', { status: 200, body: { token: 'ct-1' } });
+    await client.mintConnectToken({ externalUserId: 'a', now: NOW });
+    expect(taken).toEqual(['connect']);
   });
 
   test('a token the vendor says expires immediately does not become a mint loop', async () => {

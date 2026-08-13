@@ -134,6 +134,30 @@ describe('a retryable loss holds the cursor', () => {
     expect(await countRows(fixture.tenantSql, 'page', `external_ref = '${externalRefFor('gmail', 'ok-1')}'`)).toBe(1);
   });
 
+  test('an item the ceiling never reached holds the cursor and says so', async () => {
+    // A page bigger than one pull's item ceiling is not a slice: the ids beyond
+    // it come back as rows, the cursor holds, and the run names the reason so
+    // an operator reaches for a larger `maxItems` instead of wondering.
+    const states = await storeWith(
+      stateFor('gmail', { cursor: { kind: 'delta', value: 'c-before', issuedAt: NOW.toISOString() } }),
+    );
+    const source = createFakeSource('gmail', 'email', [
+      page({
+        items: [item('gmail', 'ceil-1', mailBody('ceil-1'))],
+        failures: [
+          { externalRef: externalRefFor('gmail', 'ceil-2'), reason: 'cancelled', retryable: true },
+        ],
+        nextCursor: { kind: 'delta', value: 'c-after' },
+      }),
+    ]);
+
+    const result = await pull(source, states);
+
+    expect(result.stopReason).toBe('not_attempted');
+    expect(result.cursorAdvanced).toBe(false);
+    expect((await states.read('gmail'))?.cursor?.value).toBe('c-before');
+  });
+
   test('a permanently broken item does not wedge the source', async () => {
     // The other direction costs just as much: a message deleted between the
     // listing and the fetch answers 404 forever, and holding the cursor for it
