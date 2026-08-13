@@ -149,5 +149,5 @@ checklist: [`docs/alpha-exit.md`](../alpha-exit.md).
 ## Related
 
 - [Daily briefing](daily-briefing.md) — the same tool, every morning, and the
-  cursor this recipe shares with it.
+  bookmark this recipe reads across without moving.
 - [Capture](capture.md) — where most of what this review reads comes from.
