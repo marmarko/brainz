@@ -1,0 +1,31 @@
+{
+  "note": "Measured wall-clock for ONE consolidation cycle's deterministic tier over the committed fixture corpus. KTD11 asks U11 for a measured cycle duration as the fleet's capacity input; this is the half of it that can be measured without spending money.",
+  "generated_by": "test/consolidate/free-tier.test.ts — runConsolidationCycle at tier \"free\"",
+  "method": "evals/corpus.ts seeded into a real tenant database in its pre-consolidation state (evals/seed-tenant.ts + test/consolidate/fixture.ts), then all six deterministic phases, zero model calls. Postgres 17 + pgvector on a local container; median of three runs (259, 266, 267 ms).",
+  "corpus_digest": "133c861fae5b48ada38247fa759a2fc58b3faea4a60ebda22e9ebdf4f877193a",
+  "tier": "deterministic",
+  "measured_ms": 267,
+  "corpus": {
+    "pages": 64,
+    "chunks": 153,
+    "facts_seeded": 34,
+    "duplicate_facts_seeded": 17
+  },
+  "improvement": {
+    "duplicate_facts": {
+      "before": 17,
+      "after": 0
+    },
+    "missing_edges": {
+      "before": 4,
+      "after": 0
+    }
+  },
+  "caveat": "A LOWER BOUND on a full cycle, not the cycle. It excludes every model phase, which is where a paid cycle spends its minutes — KTD11's own estimate for a whole cycle is 3 minutes, and src/worker/scheduler.ts:ESTIMATED_CYCLE_MS still carries that estimate rather than this number, deliberately: substituting a deterministic-only measurement for a full-cycle duration would make the fleet's capacity look roughly 675x larger than it is.",
+  "capacity_if_this_were_the_whole_cycle": {
+    "concurrency": 20,
+    "ceiling_ms": 86400000,
+    "max_tenants": 6471910,
+    "note": "quoted only to show the size of the error the caveat above prevents"
+  }
+}

@@ -329,6 +329,11 @@ export async function main(argv: readonly string[]): Promise<number> {
 
   const { PROFILES } = await import('../src/ai/routing.ts');
   const { loadPinLedger } = await import('./model-pins.ts');
+  // U11's exit gate rides this command rather than R6's check list: R6 puts two
+  // floors in the canary tier and `CANARY_CHECKS` is pinned as a whole, so a
+  // reader counting R6's floors still finds R6's floors. It is reported here
+  // because this is the only command that grades a model against a live tenant.
+  const { EXIT_GATE_OPS, planExitGate, renderExitGate } = await import('./exit-gate.ts');
 
   // Derived, not declared: an op is gradeable once a committed receipt pins it,
   // which is the only evidence in the repo that it has been run and scored.
@@ -340,9 +345,22 @@ export async function main(argv: readonly string[]): Promise<number> {
   const tenant = process.env['BRAINZ_CANARY_TENANT'] ?? null;
   const plan = planCanary({ profile: PROFILES.hosted, tenant, pinnedOps });
 
+  // Authorisation is an explicit statement, never an inferred one: "somebody
+  // exported a key" is not "somebody agreed to the bill", and the plan's own
+  // discipline is estimate before run.
+  const exitGate = planExitGate({
+    profile: PROFILES.hosted,
+    tenant,
+    pinnedOps,
+    liveCallsAuthorised: process.env['BRAINZ_EXIT_GATE_AUTHORISED'] === 'yes',
+    scores: new Map(),
+  });
+
   if (argv.includes('--preflight')) {
     out(`gradeable=${plan.gradeable.length}`);
     out(`deferred=${plan.deferred.length}`);
+    out(`exit_gate_ops=${EXIT_GATE_OPS.length}`);
+    out(`exit_gate_deferred=${exitGate.deferred.length}`);
     out(`tenant=${tenant === null ? '' : tenant}`);
     return 0;
   }
@@ -355,12 +373,14 @@ export async function main(argv: readonly string[]): Promise<number> {
   }
 
   out(renderCanary(plan));
-  if (argv.includes('--json')) out(JSON.stringify(plan, null, 2));
+  out(renderExitGate(exitGate));
+  if (argv.includes('--json')) out(JSON.stringify({ canary: plan, exitGate }, null, 2));
 
   // Nothing below this line runs today: `plan.passed` is false while every
-  // check is deferred. The scoring path lands with the first gradeable check,
-  // and `scoreRecall` is already the shape it will be called in.
-  return plan.passed ? 0 : 1;
+  // check is deferred, and the exit gate is deferred for want of an authorised
+  // spend. The scoring path lands with the first gradeable check, and
+  // `scoreRecall` is already the shape it will be called in.
+  return plan.passed && exitGate.passed ? 0 : 1;
 }
 
 if (import.meta.main) {

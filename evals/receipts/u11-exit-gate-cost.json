@@ -1,0 +1,79 @@
+{
+  "note": "Committed cost ESTIMATE for one full U11 exit-gate run — the five consolidation ops plus the judge that grades them. No model was called to produce it: every number is computed from src/ai/pricing.ts by evals/exit-gate.ts:estimateExitGateCost, and test/evals/exit-gate.test.ts recomputes it and fails on drift. There is deliberately no scored_against block: an estimate that carried one would pin a model that never ran.",
+  "generated_by": "evals/exit-gate.ts:estimateExitGateCost",
+  "profile": "hosted",
+  "authorised": false,
+  "output_projection": "each op at its route maxOutputTokens ceiling — the direction a run cannot exceed while believing it is inside the estimate",
+  "workload": {
+    "extract": {
+      "items": 60,
+      "input_tokens_per_item": 500
+    },
+    "enrich": {
+      "items": 24,
+      "input_tokens_per_item": 1000
+    },
+    "contradiction": {
+      "items": 1,
+      "input_tokens_per_item": 12000
+    },
+    "salience": {
+      "items": 1,
+      "input_tokens_per_item": 24000
+    },
+    "synopsis": {
+      "items": 24,
+      "input_tokens_per_item": 500
+    },
+    "judge": {
+      "items": 5,
+      "input_tokens_per_item": 20000
+    }
+  },
+  "per_op": {
+    "extract": {
+      "model_id": "gemini-3.5-flash-lite-2026-07-21",
+      "input_tokens": 30000,
+      "output_tokens": 245760,
+      "micro_usd": 623400,
+      "usd": 0.6234
+    },
+    "enrich": {
+      "model_id": "gemini-3.5-flash-lite-2026-07-21",
+      "input_tokens": 24000,
+      "output_tokens": 49152,
+      "micro_usd": 130080,
+      "usd": 0.13008
+    },
+    "contradiction": {
+      "model_id": "gemini-3.5-flash-lite-2026-07-21",
+      "input_tokens": 12000,
+      "output_tokens": 1024,
+      "micro_usd": 6160,
+      "usd": 0.00616
+    },
+    "salience": {
+      "model_id": "@cf/nvidia/nemotron-3-120b-a12b",
+      "input_tokens": 24000,
+      "output_tokens": 1024,
+      "micro_usd": 13536,
+      "usd": 0.013536
+    },
+    "synopsis": {
+      "model_id": "@cf/nvidia/nemotron-3-120b-a12b",
+      "input_tokens": 12000,
+      "output_tokens": 12288,
+      "micro_usd": 24432,
+      "usd": 0.024432
+    },
+    "judge": {
+      "model_id": "@cf/zai-org/glm-5.2",
+      "input_tokens": 100000,
+      "output_tokens": 10240,
+      "micro_usd": 185056,
+      "usd": 0.185056
+    }
+  },
+  "total_micro_usd": 982664,
+  "total_usd": 0.982664
+}

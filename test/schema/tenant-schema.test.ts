@@ -98,6 +98,19 @@ const EXPECTED_TABLES: ReadonlyMap<string, TableClass> = new Map([
   ['contradiction_report', 'content:derived'],
 
   ['ingest_log', 'operational'],
+
+  // U11's rung. The two artifact tables carry an origin union because they quote
+  // what they were derived from; the run record, the checkpoint and the two
+  // cluster tables carry none, for the reason `fact_source` carries none — they
+  // assert nothing beyond the join, and every read of them goes through a row
+  // that is fenced.
+  ['consolidation_run', 'operational'],
+  ['consolidation_checkpoint', 'operational'],
+  ['entity_card', 'content:derived'],
+  ['commitment', 'content:derived'],
+  ['review_queue', 'content:derived'],
+  ['content_cluster', 'operational'],
+  ['cluster_member', 'operational'],
 ]);
 
 const SHARED_ORIGIN_TRIGGER_FUNCTION = 'refuse_origin_change';
@@ -354,6 +367,21 @@ const ORIGIN_FIXTURES: ReadonlyMap<string, { readonly where: string; readonly ta
         tamper: `origin_contexts = ARRAY['personal','work']`,
       },
     ],
+    [
+      'entity_card',
+      { where: `summary = 'fence card'`, tamper: `origin_contexts = ARRAY['personal','work']` },
+    ],
+    [
+      'commitment',
+      {
+        where: `statement = 'fence commitment'`,
+        tamper: `origin_contexts = ARRAY['personal','work']`,
+      },
+    ],
+    [
+      'review_queue',
+      { where: `target_ref = 'entity:fence'`, tamper: `origin_contexts = ARRAY['personal','work']` },
+    ],
   ]);
 
 describe('R15 — the database refuses to let an origin move, on every table that has one', () => {
@@ -383,6 +411,14 @@ describe('R15 — the database refuses to let an origin move, on every table tha
              (SELECT fact_id FROM fact WHERE statement = 'derived fixture, the second'),
              'value_conflict',
              ARRAY['personal'];
+      INSERT INTO entity_card (entity_id, summary, trust_level, derivation, origin_contexts)
+      SELECT (SELECT entity_id FROM entity WHERE canonical_name = 'fence-subject'),
+             'fence card', 'model_inferred', 'model_derived', ARRAY['personal'];
+      INSERT INTO commitment (fact_id, statement, trust_level, derivation, origin_contexts)
+      SELECT (SELECT fact_id FROM fact WHERE statement = 'derived fixture'),
+             'fence commitment', 'model_extracted', 'model_derived', ARRAY['personal'];
+      INSERT INTO review_queue (kind, target_ref, proposal, confidence, origin_contexts)
+      VALUES ('entity_merge', 'entity:fence', 'merge the fence entities', 0.6, ARRAY['personal']);
     `);
   });
 

@@ -77,6 +77,17 @@ afterEach(async () => {
   for (const fixture of created) await dropFixtureDatabase(fixture);
 }, TEST_TIMEOUT_MS);
 
+
+/**
+ * The rungs a v1 tenant still has to climb, derived from the ladder rather than
+ * written down. A literal list here would have to be edited every time a rung
+ * ships, and the edit that gets forgotten is the one that makes a real
+ * regression look like an off-by-one in a fixture.
+ */
+const RUNGS_ABOVE_ONE: readonly number[] = MIGRATIONS.filter((m) => m.version > 1).map(
+  (m) => m.version,
+);
+
 describe('the ladder itself', () => {
   test('is contiguous, named, and its validator can still go red', () => {
     expect(findLadderViolations(MIGRATIONS)).toEqual([]);
@@ -141,7 +152,7 @@ describe('a tenant behind the fleet is migrated inline and then served', () => {
       expect((refusal as TenantSchemaBehindError).tenantSchemaVersion).toBe(1);
 
       const result = await migrateTenantSchema(sql, { ftsLanguage: FIXTURE_FTS_LANGUAGE });
-      expect(result).toEqual({ from: 1, to: HEAD_SCHEMA_VERSION, applied: [2] });
+      expect(result).toEqual({ from: 1, to: HEAD_SCHEMA_VERSION, applied: [...RUNGS_ABOVE_ONE] });
 
       // Served now, and the rows that were there before still are.
       expect(() => assertServableSchema(result.to)).not.toThrow();
@@ -186,7 +197,7 @@ describe('a tenant behind the fleet is migrated inline and then served', () => {
       ]);
 
       // Exactly one of them did the work; both report the same destination.
-      expect([a.applied.length, b.applied.length].sort()).toEqual([0, 1]);
+      expect([a.applied.length, b.applied.length].sort()).toEqual([0, RUNGS_ABOVE_ONE.length]);
       expect(a.to).toBe(HEAD_SCHEMA_VERSION);
       expect(b.to).toBe(HEAD_SCHEMA_VERSION);
 
@@ -197,7 +208,9 @@ describe('a tenant behind the fleet is migrated inline and then served', () => {
         SELECT version, min(name) AS name, count(*)::int AS n
         FROM schema_migration GROUP BY version ORDER BY version
       `;
-      expect(ledger.map((row) => row.n)).toEqual([1, 1]);
+      expect(ledger.map((row) => row.n)).toEqual(
+        Array.from({ length: HEAD_SCHEMA_VERSION }, () => 1),
+      );
       expect(ledger[0]?.name).toContain('adopted');
       expect(ledger[1]?.name).not.toContain('adopted');
     },
@@ -367,7 +380,7 @@ describe('a rung waits for its lock, but not forever', () => {
       // there is another wake along in a moment.
       const after = await migrateTenantSchema(migrator, { ftsLanguage: FIXTURE_FTS_LANGUAGE });
       expect(after.to).toBe(HEAD_SCHEMA_VERSION);
-      expect(after.applied).toEqual([2]);
+      expect(after.applied).toEqual([...RUNGS_ABOVE_ONE]);
     },
     TEST_TIMEOUT_MS,
   );

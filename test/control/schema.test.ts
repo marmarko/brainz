@@ -1401,6 +1401,11 @@ const CONTENT_BEARING_SQL: readonly ContentBearingEntry[] = [
     because:
       "U3's knowledge core — pages, facts, entities, edges and contradiction reports — is the same per-tenant database as the file above, one rung further up the ladder; it holds the user's own documents and the statements extracted from them by design, and it is the tenant's database rather than the control plane's",
   },
+  {
+    path: 'schema/migrations/v3-consolidation.sql',
+    because:
+      "U11's consolidation rung — run records, per-phase checkpoints, entity cards, commitments, the review queue and the deterministic tier's clusters — is the same per-tenant database two rungs further up; the cards and commitments quote the user's own documents by design, and the run and checkpoint tables sit beside them in the tenant rather than in the control plane",
+  },
 ];
 
 const CONTROL_PREFIX = 'control/';
