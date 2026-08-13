@@ -16,6 +16,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
+import { readLatestRun } from '../../src/worker/consolidate/checkpoint.ts';
 import { runConsolidationCycle } from '../../src/worker/consolidate/cycle.ts';
 import { MODEL_PHASES } from '../../src/worker/consolidate/phases.ts';
 import {
@@ -153,6 +154,17 @@ describe('a full cycle', () => {
       expect(Number(rows[0]?.estimated_micro_usd ?? 0)).toBeGreaterThan(0);
       expect(Number(rows[0]?.spent_micro_usd ?? -1)).toBe(result.spentMicroUsd);
       expect(rows[0]?.dreamt).toBe(true);
+
+      // Read back through the reader an operator surface would use, rather than
+      // only through this test's own SELECT: a record nothing can read is a
+      // record that will be shaped for nobody.
+      const record = await readLatestRun(tenant.sql);
+      expect(record?.runId).toBe(result.runId);
+      expect(record?.stopReason).toBe('complete');
+      expect(record?.phasesRun).toBe(result.phases.filter((phase) => phase.ran).length);
+      expect(record?.modelCalls).toBe(result.modelCalls);
+      expect(record?.finishedAt).not.toBeNull();
+      expect(record?.wallClockMs).toBe(result.wallClockMs);
     },
     SETUP_TIMEOUT_MS,
   );

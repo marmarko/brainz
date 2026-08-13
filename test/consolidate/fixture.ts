@@ -67,16 +67,8 @@ export { CORPUS };
 export const TENANT = 'dreamer';
 export const CALLER = fleetIdentity(TENANT);
 
-/** Stands in for a sentence of the user's mail; asserted absent from metering. */
-export const CANARY = 'CANARY-4a71-consolidate-do-not-retain';
-
 export function uncappedBudget(label: string): Budget {
   return createBudget({ label, capMicroUsd: null });
-}
-
-/** A budget that refuses every priced call — the free tier's `cap = 0`. */
-export function zeroBudget(label: string): Budget {
-  return createBudget({ label, capMicroUsd: 0 });
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +207,7 @@ export async function countRows(sql: SQL, table: string, where = 'true'): Promis
   return rows[0]?.n ?? 0;
 }
 
-export function vectorLiteralOf(text: string): string {
+function vectorLiteralOf(text: string): string {
   return `[${lexicalVector(text).join(',')}]`;
 }
 
