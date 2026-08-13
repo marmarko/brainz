@@ -156,6 +156,46 @@ export interface TenantSecretStore extends TenantSecretWriter {
   invalidate(caller: CallerIdentity, tenantId: string): Promise<WriteResult>;
 }
 
+/**
+ * The warm pool's half (U15), on a **separate namespace with a separate
+ * permission** — and a separate interface, which is this repo's habit rather
+ * than a flourish: `TenantSecretWriter` exists so provisioning cannot read, and
+ * `TenantPrefixSource` exists so a caller cannot mint a credential. A caller
+ * that needs pool entries declares this and gains nothing else.
+ *
+ * A pool project is a Neon project created and not yet handed to anybody: no
+ * tenant, no user, no content. Its connection string still has to survive between
+ * the process that filled the pool and the one that claims it minutes or hours
+ * later, so it has to be stored — and the control plane is the only identity that
+ * can use it, because claiming is what the control plane does.
+ *
+ * **This does not weaken rule 3.** Provisioning still cannot read any *tenant*
+ * entry: `pool/` and `tenant/` are different prefixes and `canResolvePool` is a
+ * different predicate, so the widening is exactly one namespace wide. The moment
+ * a project is claimed the string is written under the tenant's own namespace and
+ * the pool entry is revoked, which is where the narrow permission stops applying
+ * to it.
+ */
+export interface PoolSecretStore {
+  putPool(caller: CallerIdentity, poolId: string, secret: PoolSecret): Promise<WriteResult>;
+  resolvePool(caller: CallerIdentity, poolId: string): Promise<PoolResolveResult>;
+  revokePool(caller: CallerIdentity, poolId: string): Promise<WriteResult>;
+}
+
+/**
+ * What the store holds for one unclaimed pool project. Deliberately not a
+ * {@link TenantSecret}: there is no bearer, because there is no tenant to
+ * authenticate yet, and a type that carried an empty one would invite a caller
+ * to present it.
+ */
+export interface PoolSecret {
+  readonly connectionString: string;
+}
+
+export type PoolResolveResult =
+  | { readonly ok: true; readonly secret: PoolSecret }
+  | { readonly ok: false; readonly reason: ResolveFailureReason };
+
 export interface TenantSecretStoreOptions {
   readonly backend: SecretBackend;
   /**
@@ -184,6 +224,13 @@ export const DEFAULT_MAX_ENTRIES = 512;
 const NAMESPACE_PREFIX = 'tenant';
 
 /**
+ * A different prefix, not a different suffix. `pool/alice` and `tenant/alice`
+ * cannot collide however the ids are chosen, which is what keeps the pool
+ * permission from becoming a way to read a tenant's connection string.
+ */
+const POOL_NAMESPACE_PREFIX = 'pool';
+
+/**
  * Tenant ids are lowercase alphanumeric with dashes. The pattern is a namespace
  * safety property, not a style rule: `..`, `/` or whitespace in an id would let
  * one tenant's key address another tenant's entry in a backend that treats the
@@ -203,9 +250,29 @@ export function tenantNamespace(tenantId: string): string {
   return `${NAMESPACE_PREFIX}/${tenantId}`;
 }
 
+/**
+ * The single place a pool id becomes a storage key. Same rule as
+ * {@link tenantNamespace}: no call site builds one.
+ */
+export function poolNamespace(poolId: string): string {
+  return `${POOL_NAMESPACE_PREFIX}/${poolId}`;
+}
+
 /** Resolve permission: the fleet identity serving exactly this tenant. */
 function canResolve(caller: CallerIdentity, tenantId: string): boolean {
   return caller.kind === 'fleet' && caller.tenantId === tenantId;
+}
+
+/**
+ * Pool resolve permission: the control plane, and nothing else.
+ *
+ * Note what this is **not**: it is not `canWrite`, even though it happens to
+ * admit the same identity today. They are separate predicates because they
+ * answer separate questions, and collapsing them is how the fleet identity ends
+ * up able to read pool entries the day somebody adds a second writer.
+ */
+function canResolvePool(caller: CallerIdentity): boolean {
+  return caller.kind === 'control-plane';
 }
 
 /** Write permission: the control plane, and nothing else. */
@@ -247,7 +314,9 @@ export function createInMemorySecretBackend(
   };
 }
 
-export function createTenantSecretStore(options: TenantSecretStoreOptions): TenantSecretStore {
+export function createTenantSecretStore(
+  options: TenantSecretStoreOptions,
+): TenantSecretStore & PoolSecretStore {
   const { backend } = options;
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
   const now = options.now ?? Date.now;
@@ -336,6 +405,46 @@ export function createTenantSecretStore(options: TenantSecretStoreOptions): Tena
 
       cache.delete(tenantNamespace(tenantId));
       return Promise.resolve({ ok: true });
+    },
+
+    // ---- The pool half. Separate namespace, separate permission. -----------
+    //
+    // The backend stores a pair and a pool entry has only one half, so the
+    // bearer slot is written empty and **never read back**: `resolvePool`
+    // projects the connection string and returns a `PoolSecret`, which has no
+    // bearer field for a caller to present. A pool project has no tenant to
+    // authenticate as, and the type says so.
+
+    async putPool(caller, poolId, secret) {
+      if (!canWrite(caller)) return { ok: false, reason: 'scope_denied' };
+      if (!isValidTenantId(poolId)) return { ok: false, reason: 'invalid_tenant_id' };
+
+      const namespace = poolNamespace(poolId);
+      await backend.put(namespace, frozenSecret({ connectionString: secret.connectionString, bearerGrant: '' }));
+      cache.delete(namespace);
+      return { ok: true };
+    },
+
+    async resolvePool(caller, poolId) {
+      if (!canResolvePool(caller)) return { ok: false, reason: 'scope_denied' };
+      if (!isValidTenantId(poolId)) return { ok: false, reason: 'invalid_tenant_id' };
+
+      // Not cached. A pool entry is read once, at claim, by a control-plane
+      // process — there is no request path to save a round trip on, and a cached
+      // entry would outlive the revoke that follows the claim.
+      const stored = await backend.get(poolNamespace(poolId));
+      if (stored === undefined) return { ok: false, reason: 'not_found' };
+      return { ok: true, secret: { connectionString: stored.connectionString } };
+    },
+
+    async revokePool(caller, poolId) {
+      if (!canWrite(caller)) return { ok: false, reason: 'scope_denied' };
+      if (!isValidTenantId(poolId)) return { ok: false, reason: 'invalid_tenant_id' };
+
+      const namespace = poolNamespace(poolId);
+      cache.delete(namespace);
+      await backend.delete(namespace);
+      return { ok: true };
     },
   };
 }

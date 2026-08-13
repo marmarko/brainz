@@ -558,3 +558,98 @@ CREATE TABLE control.tenant_flag (
 -- steered by, and the one an operator asks before widening it.
 CREATE INDEX tenant_flag_by_stage
   ON control.tenant_flag (flag, stage);
+
+-- ===========================================================================
+-- The warm pool (U15).
+--
+-- KTD1 says the pool is beta machinery and U2 provisions synchronously; KTD9
+-- says pool projects provision **language-neutral** and take their FTS config at
+-- assignment. That second rule is not a preference here, it is forced:
+-- `src/schema/fts-language.ts` substitutes the tenant's language into the DDL and
+-- refuses DDL that still carries the placeholder, so a pool project *cannot*
+-- have the tenant schema applied in advance. What the pool pre-pays is the slow
+-- half — Neon project, branch, role, database — and what happens at assignment is
+-- the schema, the first query and the bearer.
+--
+-- **Why it is its own table rather than tenant rows in a `pool` state.** A tenant
+-- row must name an `fts_language` (NOT NULL, no default, which is KTD9's whole
+-- point), and a pool project by construction has none. Expressing the pool as
+-- tenants would mean either defaulting that column — the silent anglicisation
+-- KTD9 forbids — or making it nullable for everybody.
+--
+-- Content-free by the same rule as the rest of this file: ids, states, timestamps
+-- and a secret reference.
+-- ===========================================================================
+
+-- `filling` is a row that exists before the vendor call returns, so a crash
+-- leaves a claim on the project name rather than an orphan nothing names.
+-- `ready` is claimable. `claimed` has become a tenant. `retired` is a project
+-- withdrawn from the pool — a failed fill, or a drain — and it is a state rather
+-- than a `DELETE` for the reason `job_state` keeps `discarded`: the record of
+-- what was withdrawn, and when, is what a reader needs to reconcile against the
+-- vendor's own list of projects we are paying for.
+CREATE TYPE control.pool_state AS ENUM ('filling', 'ready', 'claimed', 'retired');
+
+CREATE TABLE control.pool_project (
+  pool_id                control.tenant_id     NOT NULL,
+  state                  control.pool_state    NOT NULL DEFAULT 'filling',
+
+  neon_project_id        control.provider_id,
+  neon_branch_id         control.provider_id,
+  neon_database          control.provider_id,
+  neon_role              control.provider_id,
+
+  -- The pool project's connection string lives in the secret store under a
+  -- `pool/` namespace, which is the ONE namespace the control-plane identity may
+  -- resolve (`src/control/secrets.ts`). A pool project has no tenant, no user and
+  -- no content; the moment it is claimed the string is rewritten under the
+  -- tenant's own namespace and this entry is revoked.
+  connection_secret_ref  control.secret_ref,
+
+  -- Which tenant took it. Set in the same compare-and-set that moves `state`, so
+  -- "claimed by nobody" is not a state a reader can observe.
+  claimed_by             control.tenant_id,
+
+  created_at             timestamptz           NOT NULL DEFAULT now(),
+  ready_at               timestamptz,
+  claimed_at             timestamptz,
+
+  CONSTRAINT pool_project_pkey PRIMARY KEY (pool_id),
+
+  -- A claimable project is a complete one. Without this a half-filled row could
+  -- be handed to a signup, which would fail at schema apply with a tenant row
+  -- already written.
+  CONSTRAINT ready_pool_projects_are_complete CHECK (
+    state <> 'ready' OR (
+      neon_project_id           IS NOT NULL
+      AND neon_branch_id        IS NOT NULL
+      AND neon_database         IS NOT NULL
+      AND neon_role             IS NOT NULL
+      AND connection_secret_ref IS NOT NULL
+      AND ready_at              IS NOT NULL
+    )
+  ),
+
+  -- And a claimed one names its tenant and the moment. The mirror of
+  -- `only_served_tenants_carry_a_ready_at`: the two halves of a claim cannot
+  -- drift apart, so a project that looks taken by nobody is unrepresentable.
+  CONSTRAINT claimed_pool_projects_name_a_tenant CHECK (
+    (state = 'claimed') = (claimed_by IS NOT NULL AND claimed_at IS NOT NULL)
+  )
+);
+
+CREATE UNIQUE INDEX pool_project_neon_project_is_exclusive
+  ON control.pool_project (neon_project_id)
+  WHERE neon_project_id IS NOT NULL;
+
+-- A pool project becomes exactly one tenant.
+CREATE UNIQUE INDEX pool_project_claimant_is_exclusive
+  ON control.pool_project (claimed_by)
+  WHERE claimed_by IS NOT NULL;
+
+-- The claim query's access path, and the fill loop's "how many are ready".
+-- Partial, because claimed rows accumulate for the life of the fleet and must
+-- not be scanned to answer either question.
+CREATE INDEX pool_project_claimable
+  ON control.pool_project (created_at)
+  WHERE state = 'ready'::control.pool_state;
