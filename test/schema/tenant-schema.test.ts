@@ -27,6 +27,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { HEAD_SCHEMA_VERSION } from '../../src/schema/migrations.ts';
 import {
+  ORIGIN_IMMUTABLE_SQLSTATE,
   OriginFenceError,
   assertOriginFence,
   findOriginFenceViolations,
@@ -523,13 +524,30 @@ describe('R15 — the database refuses to let an origin move, on every table tha
         expect(findings[0]).toContain('page.origin_context');
         await expect(assertOriginFence(sql)).rejects.toThrow(OriginFenceError);
 
-        // And the tamper it enables, which is the reason this matters: the row
-        // moves, and moves permanently.
-        await sql.unsafe(`UPDATE page SET origin_context = 'work' WHERE title = 'fence fixture'`);
-        const moved = await sql<{ origin_context: string }[]>`
-          SELECT origin_context FROM page WHERE title = 'fence fixture'
-        `;
-        expect(moved[0]?.origin_context).toBe('work');
+        // **Rung 8 changed what happens next, and the change is the dividend.**
+        // Before H6 was pinned, disabling this one trigger moved the row. Now
+        // the same column carries a second, search-path-pinned trigger, so one
+        // arm going down is a *finding* rather than a hole: the catalog half
+        // above still reports it, and the write is still refused.
+        expect(
+          await sqlstateOfFailure(
+            sql,
+            `UPDATE page SET origin_context = 'work' WHERE title = 'fence fixture'`,
+          ),
+        ).toBe(ORIGIN_IMMUTABLE_SQLSTATE);
+
+        // The tamper this finding is a finding about now costs both arms — and
+        // with both down the row moves, and moves permanently.
+        await sql.unsafe('ALTER TABLE page DISABLE TRIGGER page_origin_is_immutable_pinned');
+        try {
+          await sql.unsafe(`UPDATE page SET origin_context = 'work' WHERE title = 'fence fixture'`);
+          const moved = await sql<{ origin_context: string }[]>`
+            SELECT origin_context FROM page WHERE title = 'fence fixture'
+          `;
+          expect(moved[0]?.origin_context).toBe('work');
+        } finally {
+          await sql.unsafe('ALTER TABLE page ENABLE TRIGGER page_origin_is_immutable_pinned');
+        }
       } finally {
         await sql.unsafe('ALTER TABLE page ENABLE TRIGGER page_origin_is_immutable');
         await sql.unsafe(`DELETE FROM page WHERE title = 'fence fixture'`);
@@ -541,41 +559,65 @@ describe('R15 — the database refuses to let an origin move, on every table tha
   test(
     'a neutered shared function is a finding, which the catalog alone cannot see',
     async () => {
-      // One statement, no DDL on any table, and every one of the seven origin
-      // triggers stops doing anything. This is the failure the behavioural probe
-      // exists for: the catalog half reports a clean sheet throughout.
-      const original = await sql<{ body: string }[]>`
-        SELECT pg_get_functiondef(oid) AS body FROM pg_proc WHERE proname = 'refuse_origin_change'
-      `;
-      const restore = original[0]?.body;
-      expect(restore).toBeDefined();
+      // One statement, no DDL on any table, and every origin trigger calling
+      // this function stops doing anything. This is the failure the behavioural
+      // probe exists for: the catalog half reports a clean sheet throughout.
+      const bodyOf = async (name: string): Promise<string> => {
+        const rows = await sql<{ body: string }[]>`
+          SELECT pg_get_functiondef(oid) AS body FROM pg_proc WHERE proname = ${name}
+        `;
+        const body = rows[0]?.body;
+        expect(body).toBeDefined();
+        return body ?? '';
+      };
+      const neuter = (name: string): string =>
+        `CREATE OR REPLACE FUNCTION ${name}() RETURNS trigger
+         LANGUAGE plpgsql AS $neutered$ BEGIN RETURN NEW; END; $neutered$`;
 
-      await sql.unsafe(
-        `CREATE OR REPLACE FUNCTION refuse_origin_change() RETURNS trigger
-         LANGUAGE plpgsql AS $neutered$ BEGIN RETURN NEW; END; $neutered$`,
-      );
+      const restore = await bodyOf('refuse_origin_change');
+      const restorePinned = await bodyOf('refuse_origin_change_pinned');
+
+      await sql.unsafe(neuter('refuse_origin_change'));
       try {
         // Blind, and that is the point of having two halves.
         expect(await findOriginFenceViolations(sql)).toEqual([]);
 
         await expect(assertOriginFence(sql)).rejects.toThrow(/no longer refuses an origin change/);
 
-        // The fence really is gone while the catalog says otherwise.
+        // **And rung 8's dividend, stated where it is measured.** One
+        // `CREATE OR REPLACE` used to take every table's fence with it. It no
+        // longer does: the pinned twin H6 added is a *different* function, so
+        // the same statement now costs one arm rather than the fence.
         expect(
           await sqlstateOfFailure(
             sql,
             `UPDATE chunk SET origin_context = 'work' WHERE content = 'immutability fixture'`,
           ),
-        ).toBeUndefined();
+        ).toBe(ORIGIN_IMMUTABLE_SQLSTATE);
+
+        // Two statements, then, rather than one — and only then is the fence
+        // really gone while the catalog still says otherwise.
+        await sql.unsafe(neuter('refuse_origin_change_pinned'));
+        try {
+          expect(await findOriginFenceViolations(sql)).toEqual([]);
+          expect(
+            await sqlstateOfFailure(
+              sql,
+              `UPDATE chunk SET origin_context = 'work' WHERE content = 'immutability fixture'`,
+            ),
+          ).toBeUndefined();
+        } finally {
+          // The row goes back BEFORE either function does. Once the fence is
+          // restored, moving this origin back is itself a change it refuses —
+          // which is the finding stated as a cleanup problem: a tamper window
+          // leaves rows the database will not let anyone put back.
+          await sql.unsafe(
+            `UPDATE chunk SET origin_context = 'personal' WHERE content = 'immutability fixture'`,
+          );
+          await sql.unsafe(restorePinned);
+        }
       } finally {
-        // The row goes back BEFORE the function does. Once the fence is
-        // restored, moving this origin back is itself a change it refuses —
-        // which is the finding stated as a cleanup problem: a tamper window
-        // leaves rows the database will not let anyone put back.
-        await sql.unsafe(
-          `UPDATE chunk SET origin_context = 'personal' WHERE content = 'immutability fixture'`,
-        );
-        await sql.unsafe(restore ?? '');
+        await sql.unsafe(restore);
       }
 
       // Restored: the fence is back, and it refuses again.

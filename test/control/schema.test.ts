@@ -1426,6 +1426,11 @@ const CONTENT_BEARING_SQL: readonly ContentBearingEntry[] = [
     because:
       "U14's panel-settings rung holds no user content: a policy name from a closed set, a connector name from a closed set, a timestamp, and which surface authorised a pause. It is named here rather than exempted for the reason rung 4 gives — a file that happens to be content-free today is exactly the one a later column gets added to — and it lives in the tenant rather than the control plane because a user's own preference is theirs, and the spend cap, which genuinely is a control-plane counter, stays on the control-plane row where it already was",
   },
+  {
+    path: 'schema/migrations/v8-search-path-pinned.sql',
+    because:
+      "H6's rung adds no table and no column at all: eight trigger functions with `SET search_path` pinned, and one twin trigger per trigger that called an unpinned one. So it holds no content in the sense this list means — but it is emphatically the tenant's database rather than the control plane's, because what it pins is R15's origin fence, and the origin fence is the mechanism that decides which of a user's own rows a fenced read may reach. It is named here rather than exempted for the reason rung 4 gives, and with one extra: a rung whose whole subject is an enforcement mechanism is the last one that should be able to arrive without a sentence from its author",
+  },
 ];
 
 const CONTROL_PREFIX = 'control/';
