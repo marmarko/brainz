@@ -54,14 +54,24 @@ afterAll(async () => {
   if (fixture !== undefined) await dropFixtureDatabase(fixture);
 }, SETUP_TIMEOUT_MS);
 
+/**
+ * The rung this suite is about, found by name rather than by "the head".
+ *
+ * It was `HEAD_SCHEMA_VERSION` until U12 added a rung above it, at which point
+ * "the head" silently became a different file and this suite would have been
+ * asserting U12's properties while claiming U11's. A rung is identified by what
+ * it is, not by where it currently sits on the ladder.
+ */
+const CONSOLIDATION_RUNG = MIGRATIONS.find((migration) => migration.name === 'consolidation');
+
 describe('the rung is on the ladder and is additive', () => {
-  test('the head names the consolidation rung', () => {
-    const head = MIGRATIONS.find((migration) => migration.version === HEAD_SCHEMA_VERSION);
-    expect(head?.name).toContain('consolidation');
+  test('the ladder names the consolidation rung', () => {
+    expect(CONSOLIDATION_RUNG).toBeDefined();
+    expect(CONSOLIDATION_RUNG!.version).toBeLessThanOrEqual(HEAD_SCHEMA_VERSION);
   });
 
   test('the rung contains no contracting statement', async () => {
-    const head = MIGRATIONS.find((migration) => migration.version === HEAD_SCHEMA_VERSION);
+    const head = CONSOLIDATION_RUNG;
     expect(head).toBeDefined();
     if (head === undefined) return;
     const ddl = await readMigrationDdl(head);

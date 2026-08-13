@@ -162,8 +162,16 @@ export type ArmName = (typeof ARM_NAMES)[number];
  * only external dependency before U12, and a provider 429 must not read to the
  * user as "the brain is down". The vector arm drops out, RRF fuses what is left,
  * and this field says so through U6's envelope.
+ *
+ * **From U12 there are two.** Enabling the cross-encoder puts a second
+ * synchronous provider call on the same path (KTD4), and it gets the same
+ * treatment for the same reason: a rerank that could not run drops stages 12 and
+ * 13 — autocut goes with it, always — and the response says
+ * `rerank_unavailable` rather than failing. A read that 500s because a reranker
+ * rate-limited would be the outage this contract exists to prevent, one stage
+ * further down the pipeline.
  */
-export const DEGRADATIONS = ['embedding_unavailable'] as const;
+export const DEGRADATIONS = ['embedding_unavailable', 'rerank_unavailable'] as const;
 export type Degradation = (typeof DEGRADATIONS)[number];
 
 /** What the arms hand the post-retrieval stack. Substrate-independent by design. */
@@ -240,6 +248,18 @@ export interface SearchResponse {
   readonly armsUsed: readonly ArmName[];
   /** Token cost of the packed payload (stage 11). */
   readonly tokens: number;
-  /** Whether autocut ran. False whenever rerank is off — see {@link ScoredCandidate}. */
+  /** Whether stage 12 scored this list. */
+  readonly rerankApplied: boolean;
+  /**
+   * Why stage 12 did or did not run: the caller never wired it, configuration
+   * says off, nothing could score, or it ran. Carried because "the list was not
+   * reranked" has four causes and an operator has to be able to tell a config
+   * decision from a provider outage.
+   */
+  readonly rerankReason: 'stage_not_wired' | 'disabled' | 'unavailable' | 'enabled';
+  /**
+   * Whether autocut ran. False whenever rerank is off — see
+   * {@link ScoredCandidate} and `rerank-stage.ts`, which owns the coupling.
+   */
   readonly autocutApplied: boolean;
 }

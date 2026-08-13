@@ -71,6 +71,15 @@ export interface EmbeddingTransportOptions {
   /** Throw instead of answering, from the Nth call onwards (1-based). */
   readonly failFromCall?: number;
   readonly failWith?: Error;
+  /**
+   * Refuse every `rerank` call, leaving the embedding half working.
+   *
+   * From U12 the read path has **two** external dependencies (KTD4), and they
+   * fail independently: a reranker that rate-limits must degrade the ordering
+   * while the vector arm keeps running. `failFromCall` cannot express that,
+   * because it counts calls rather than naming a stage.
+   */
+  readonly failRerank?: boolean;
 }
 
 export interface RecordingTransport extends ModelTransport {
@@ -134,6 +143,32 @@ export function createEmbeddingTransport(
 
       if (options.failFromCall !== undefined && calls.length >= options.failFromCall) {
         return Promise.reject(options.failWith ?? new TransportError('provider refused', 503));
+      }
+
+      if (request.input.kind === 'rerank') {
+        if (options.failRerank === true) {
+          return Promise.reject(new TransportError('the reranker refused', 429));
+        }
+        // A deterministic joint score: how much of the query the passage
+        // carries. Ordered the way a cross-encoder's output is — best first is
+        // most-covered first — without pretending to be one.
+        const query = new Set(
+          request.input.query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [],
+        );
+        const scores = request.input.candidates.map((text) => {
+          const tokens = new Set(text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
+          if (query.size === 0) return 0;
+          let hit = 0;
+          for (const term of query) if (tokens.has(term)) hit += 1;
+          return hit / query.size;
+        });
+        return Promise.resolve({
+          output: { kind: 'rerank', scores },
+          usage: {
+            inputTokens: request.input.candidates.reduce((sum, text) => sum + text.length, 0),
+            outputTokens: 0,
+          },
+        });
       }
 
       if (request.input.kind !== 'embedding') {

@@ -36,8 +36,24 @@ import type { ScoredCandidate } from './types.ts';
  */
 export const AUTOCUT_RELATIVE_DROP = 0.5;
 
-/** Never cut above this position — a single result is not a result list. */
-export const AUTOCUT_MINIMUM_KEPT = 1;
+/**
+ * Never cut above this position.
+ *
+ * **Three, and the number is R6's rather than a preference.** The blocking tier
+ * measures a dilution floor of Hit@3 = 1.0 — three distinct duplicate groups in
+ * the top three — and a title-substring floor at Hit@1. An autocut that may
+ * return two results makes the dilution floor *unsatisfiable by construction*
+ * every time it fires, which is a product promise lost to a ranking constant
+ * with no error attached anywhere.
+ *
+ * It is not hypothetical: a cross-encoder's score distribution is routinely
+ * top-heavy, so at a relative-drop threshold of 0.5 a cut at position one is the
+ * ordinary case rather than the exotic one. U12 measured exactly that when it
+ * enabled the stage. `test/core/search/rerank-stage.test.ts` derives the bound
+ * from `RANKING_FLOORS` so that a new Hit@k floor at a wider cutoff makes this
+ * constant red rather than making the floor unreachable.
+ */
+export const AUTOCUT_MINIMUM_KEPT = 3;
 
 export interface AutocutResult {
   readonly results: readonly ScoredCandidate[];

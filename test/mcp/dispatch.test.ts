@@ -465,10 +465,14 @@ describe('untrusted-content demarcation', () => {
     async () => {
       const result = await fixture.call('briefing', { since: '2026-05-01', until: '2026-07-01' });
       expect(result.ok).toBe(true);
-      const bundle = result.content as {
-        changed: { untrusted: boolean; text: string }[];
-        stated: { untrusted: boolean; text: string }[];
-      };
+      // U12 moved the cursor-relative half under `delta`; the demarcation rule
+      // it is testing is unchanged, and applies to every row in the bundle.
+      const bundle = (result.content as {
+        delta: {
+          changed: { untrusted: boolean; text: string }[];
+          stated: { untrusted: boolean; text: string }[];
+        };
+      }).delta;
 
       const commitment = bundle.stated.find((row) => row.text.includes('renews the annual plan'));
       expect(commitment).toBeDefined();
@@ -491,21 +495,44 @@ describe('untrusted-content demarcation', () => {
         until: '2026-07-01',
         focus: 'platform team',
       });
-      const bundle = focused.content as { focus?: string; changed: { text: string }[] };
+      // The delta is cursor-relative (U12), and the test above already read
+      // this exact window through this exact credential — so it is empty, and
+      // that is the cursor doing its job rather than the focus failing.
+      const first = focused.content as { focus?: string; delta: { changed: { text: string }[] } };
+      expect(first.focus).toBe('platform team');
+      expect(first.delta.changed).toEqual([]);
+
+      // Rewind this caller's bookmark to ask the parameter question on a first
+      // read. Nothing in the product does this; it is the only way to test a
+      // window twice from one credential.
+      await fixture.sql`DELETE FROM briefing_cursor`;
+
+      const fresh = await fixture.call('briefing', {
+        since: '2026-05-01',
+        until: '2026-07-01',
+        focus: 'platform team',
+      });
+      const bundle = fresh.content as { focus?: string; delta: { changed: { text: string }[] } };
       expect(bundle.focus).toBe('platform team');
-      expect(bundle.changed.length).toBeGreaterThan(0);
-      for (const row of bundle.changed) expect(row.text.toLowerCase()).toContain('platform team');
+      expect(bundle.delta.changed.length).toBeGreaterThan(0);
+      for (const row of bundle.delta.changed) {
+        expect(row.text.toLowerCase()).toContain('platform team');
+      }
 
       // The ceiling drops whole rows from the tail — never truncates one, which
       // would emit a demarcated region with no closing marker.
+      await fixture.sql`DELETE FROM briefing_cursor`;
       const tight = await fixture.call('briefing', {
         since: '2026-05-01',
         until: '2026-07-01',
         budget_tokens: 1,
       });
-      const small = tight.content as { changed: { text: string }[]; stated: unknown[]; tokens: number };
-      expect(small.changed.length).toBe(1);
-      for (const row of small.changed) {
+      const small = tight.content as {
+        delta: { changed: { text: string }[]; stated: unknown[] };
+        tokens: number;
+      };
+      expect(small.delta.changed.length).toBe(1);
+      for (const row of small.delta.changed) {
         // Balanced on THIS response's nonce. Counting bare marker text would
         // mis-read the seeded attack row, whose body legitimately contains a
         // closing marker carrying a *different* nonce — which is the escape

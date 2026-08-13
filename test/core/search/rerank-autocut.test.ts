@@ -1,5 +1,5 @@
 /**
- * Stages 12 and 13 — the flag-gated rerank and autocut.
+ * Stages 12 and 13 — the flag-gated rerank and autocut, at the module level.
  *
  * **This file's whole reason for existing is one sentence from the audit:
  * autocut reads the rerank score only, and when rerank is off, autocut is off.**
@@ -17,11 +17,17 @@
  *     the request path, which is what the flag exists to prevent (KTD4).
  *   - No result carries a `rerankScore` when rerank is off. `undefined` is not
  *     zero; autocut must be able to tell "no signal" from "a low score".
+ *
+ * **`rerank()` takes its `enabled` from the caller here.** U12 flipped
+ * `RERANK_DEFAULT_ENABLED` to true, and the stage-level resolution — which
+ * caller gets the default, and what happens when nobody wired the stage — lives
+ * in `rerank-stage.ts` and is tested in `rerank-stage.test.ts`. This file tests
+ * the two functions, not the policy.
  */
 
 import { describe, expect, test } from 'bun:test';
 
-import { autocut } from '../../../src/core/search/autocut.ts';
+import { AUTOCUT_MINIMUM_KEPT, autocut } from '../../../src/core/search/autocut.ts';
 import { RERANK_DEFAULT_ENABLED, rerank } from '../../../src/core/search/rerank.ts';
 import type { ScoredCandidate } from '../../../src/core/search/types.ts';
 
@@ -55,13 +61,13 @@ const CLIFF: ScoredCandidate[] = [
   scored('e', 0.018),
 ];
 
-describe('rerank is off until U12', () => {
-  test('the default is off, stated as a constant', () => {
-    expect(RERANK_DEFAULT_ENABLED).toBe(false);
+describe('rerank, on and off', () => {
+  test('U12 flipped the default on, stated as a constant', () => {
+    expect(RERANK_DEFAULT_ENABLED).toBe(true);
   });
 
   test('off is a pass-through: same order, same length, no scores', () => {
-    const out = rerank(CLIFF);
+    const out = rerank(CLIFF, { enabled: false });
     expect(out.map((r) => r.candidate.id)).toEqual(['a', 'b', 'c', 'd', 'e']);
     for (const entry of out) expect(entry.rerankScore).toBeUndefined();
   });
@@ -98,7 +104,7 @@ describe('rerank is off until U12', () => {
 describe('autocut reads the rerank score and nothing else', () => {
   test('with rerank off it is a no-op, even across a huge fused gap', () => {
     // The regression this file exists for. `CLIFF` drops 50× between b and c.
-    const cut = autocut(rerank(CLIFF));
+    const cut = autocut(rerank(CLIFF, { enabled: false }));
     expect(cut.applied).toBe(false);
     expect(cut.results.map((r) => r.candidate.id)).toEqual(['a', 'b', 'c', 'd', 'e']);
   });
@@ -106,11 +112,25 @@ describe('autocut reads the rerank score and nothing else', () => {
   test('with rerank on it cuts at the largest drop in the rerank score', () => {
     const reranked = rerank(CLIFF, {
       enabled: true,
-      score: (entry) => (entry.candidate.id === 'a' || entry.candidate.id === 'b' ? 0.9 : 0.05),
+      score: (entry) => (entry.candidate.id <= 'c' ? 0.9 : 0.05),
     });
     const cut = autocut(reranked);
     expect(cut.applied).toBe(true);
-    expect(cut.results.map((r) => r.candidate.id)).toEqual(['a', 'b']);
+    expect(cut.results.map((r) => r.candidate.id)).toEqual(['a', 'b', 'c']);
+  });
+
+  test('a cliff above the floor is not cut, and R6 is why', () => {
+    // A cross-encoder's top score routinely towers over the rest, so a cut at
+    // position one would be the ordinary case — and the dilution floor
+    // (Hit@3 = 1.0) would become unsatisfiable every time it fired. See
+    // `autocut.ts:AUTOCUT_MINIMUM_KEPT`, whose bound `rerank-stage.test.ts`
+    // derives from `RANKING_FLOORS` rather than restating.
+    const topHeavy = rerank(CLIFF, {
+      enabled: true,
+      score: (entry) => (entry.candidate.id === 'a' ? 0.99 : 0.01),
+    });
+    const cut = autocut(topHeavy);
+    expect(cut.results.length).toBeGreaterThanOrEqual(AUTOCUT_MINIMUM_KEPT);
   });
 
   test('a partially-scored list is treated as unscored, not half-cut', () => {
@@ -124,11 +144,11 @@ describe('autocut reads the rerank score and nothing else', () => {
 
   test('a smooth rerank distribution is not cut', () => {
     const smooth = rerank(
-      [scored('a', 1), scored('b', 1), scored('c', 1), scored('d', 1)],
+      [scored('a', 1), scored('b', 1), scored('c', 1), scored('d', 1), scored('e', 1)],
       { enabled: true, score: (_entry, index) => 1 - index * 0.02 },
     );
     const cut = autocut(smooth);
-    expect(cut.results).toHaveLength(4);
+    expect(cut.results).toHaveLength(5);
   });
 
   test('it never returns nothing', () => {

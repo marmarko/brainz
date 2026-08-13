@@ -1406,6 +1406,11 @@ const CONTENT_BEARING_SQL: readonly ContentBearingEntry[] = [
     because:
       "U11's consolidation rung — run records, per-phase checkpoints, entity cards, commitments, the review queue and the deterministic tier's clusters — is the same per-tenant database two rungs further up; the cards and commitments quote the user's own documents by design, and the run and checkpoint tables sit beside them in the tenant rather than in the control plane",
   },
+  {
+    path: 'schema/migrations/v4-briefing.sql',
+    because:
+      "U12's briefing rung holds no user content at all — a grant-derived caller key, two timestamps and a band number — so the content-free rule would pass over it; it is named here rather than exempted because the classification list is what makes a new schema file impossible to add silently, and a file that happens to be content-free today is exactly the one a later column gets added to",
+  },
 ];
 
 const CONTROL_PREFIX = 'control/';

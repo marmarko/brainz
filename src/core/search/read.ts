@@ -43,8 +43,10 @@ import { hydrate, readFtsLanguage, runArms } from './arms.ts';
 import type { Grant } from './fence.ts';
 import { classifyIntent, planFor, refinePlan, resolutionOf } from './intent.ts';
 import { normalize, normalizeQuery, tokens } from './normalize.ts';
-import { composeRanking, type ComposeRequest } from './pipeline.ts';
-import type { Candidate, Degradation, RecallOutcome, SearchResponse } from './types.ts';
+import { composeUpToPacking, finishRanking, type ComposeRequest } from './pipeline.ts';
+import { rerankPassageOf } from './rerank.ts';
+import { resolveRerankStage } from './rerank-stage.ts';
+import type { Candidate, Degradation, RecallOutcome, ScoredCandidate, SearchResponse } from './types.ts';
 
 export interface RecallRequest {
   readonly sql: SQL;
@@ -116,18 +118,99 @@ export async function embedQuery(request: {
  */
 const UNBOUNDED_READ_BUDGET: Budget = createBudget({ label: 'read-path', capMicroUsd: null });
 
+/**
+ * The cross-encoder's scores for one packed list, or `null` if it could not run.
+ *
+ * **`null` rather than a throw, and rather than zeros**, for the same reason
+ * {@link embedQuery} returns a null vector: this is the *second* synchronous
+ * provider call on the request path (KTD4), and a rate limit on it must not
+ * become a failed read. A vector of zeros would be worse than either — autocut
+ * reads this score and only this score, so a uniformly-zero list is a cliff at
+ * every position.
+ *
+ * **Bounded, and the bound is the dial.** The scorer sees at most
+ * `RERANK_CANDIDATES_DEFAULT` passages, which is what makes this "bounded
+ * scoring over a fixed candidate set" rather than the unbounded generative call
+ * KTD4 forbids at request time.
+ */
+async function scoreWithCrossEncoder(
+  request: RecallRequest,
+  candidates: readonly ScoredCandidate[],
+): Promise<readonly number[] | null> {
+  if (candidates.length === 0) return [];
+
+  let result: Awaited<ReturnType<ModelGateway['call']>>;
+  try {
+    result = await request.gateway.call({
+      op: RERANK_OP,
+      tenantId: request.tenantId,
+      caller: request.caller,
+      budget: request.budget ?? UNBOUNDED_READ_BUDGET,
+      input: {
+        kind: 'rerank',
+        query: request.query,
+        // One passage builder, shared with the eval's committed score manifest.
+        // A divergent input template is exactly the drift `eval:live-parity`
+        // exists to catch, and it would report as a score mismatch.
+        candidates: candidates.map((candidate) => rerankPassageOf(candidate)),
+      },
+    });
+  } catch {
+    return null;
+  }
+
+  if (!result.ok) return null;
+  if (result.output.kind !== 'rerank') return null;
+  // A short list is not a partial answer here: the scores are positional, so a
+  // missing tail would silently score the wrong candidates.
+  if (result.output.scores.length !== candidates.length) return null;
+  for (const score of result.output.scores) if (!Number.isFinite(score)) return null;
+  return result.output.scores;
+}
+
+/** The gateway op name. KTD13's table decides the model; nothing here names one. */
+const RERANK_OP = 'rerank' as const;
+
 /** The whole read, from a question to a ranked, fenced, packed answer. */
 export async function recall(request: RecallRequest): Promise<SearchResponse> {
   const outcome = await recallArms(request);
-  return composeRanking(
-    {
-      query: request.query,
-      limit: request.limit,
-      now: request.now,
-      ...(request.compose ?? {}),
-    },
-    outcome,
-  );
+  const compose: ComposeRequest = {
+    query: request.query,
+    limit: request.limit,
+    now: request.now,
+    ...(request.compose ?? {}),
+  };
+
+  // Stages 1–11 first, because the candidate set the cross-encoder is asked
+  // about does not exist until packing has run. This is the seam
+  // `pipeline.ts:PackedRanking` documents, and it is the only reason the read
+  // path may await mid-pipeline while the eval stays synchronous.
+  const packed = composeUpToPacking(compose, outcome);
+
+  const stage = resolveRerankStage(compose.rerank ?? {});
+  if (!stage.rerank && stage.reason !== 'unavailable') {
+    return finishRanking(packed, compose.rerank);
+  }
+
+  const scores = await scoreWithCrossEncoder(request, packed.results.slice(0, stage.candidates));
+  if (scores === null) {
+    // Both stages sit out together — autocut has no score to read — and the
+    // response says which of the two external dependencies was the one that
+    // refused.
+    const { score: _unavailable, ...rest } = compose.rerank ?? {};
+    const response = finishRanking(packed, { ...rest, enabled: true });
+    return {
+      ...response,
+      degraded: [...new Set<Degradation>([...response.degraded, 'rerank_unavailable'])],
+    };
+  }
+
+  return finishRanking(packed, {
+    ...(compose.rerank ?? {}),
+    enabled: true,
+    candidates: stage.candidates,
+    score: (_candidate, index) => scores[index] ?? 0,
+  });
 }
 
 /** Everything up to the composition — the substrate half, for callers that need it. */

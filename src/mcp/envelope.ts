@@ -91,6 +91,16 @@ export const DEGRADED_REASONS = [
   'import_in_progress',
   'embedding_backlog',
   'embedding_unavailable',
+  /**
+   * The second external dependency on the read path, from U12 (KTD4).
+   *
+   * A cross-encoder that could not be reached drops stages 12 and 13 — autocut
+   * reads the rerank score and only the rerank score, so it goes with it — and
+   * the results come back fused-and-boosted but not re-scored. Named separately
+   * from `embedding_unavailable` because they degrade *different* things: one
+   * costs an arm's recall, the other costs the ordering of what recall found.
+   */
+  'rerank_unavailable',
   'consolidation_pending',
 ] as const;
 
@@ -226,6 +236,7 @@ export function degradedSearch(
   if (state.importInProgress) reasons.push('import_in_progress');
   if (state.chunksPendingEmbedding > 0) reasons.push('embedding_backlog');
   if (readDegradations.includes('embedding_unavailable')) reasons.push('embedding_unavailable');
+  if (readDegradations.includes('rerank_unavailable')) reasons.push('rerank_unavailable');
 
   if (reasons.length === 0) return null;
 
@@ -236,19 +247,34 @@ export function degradedSearch(
   };
 }
 
-/** The pre-U11 `briefing` shape: retrieval-only, and honest about it. */
+/**
+ * The `briefing` shape, or `null` when the bundle is whole.
+ *
+ * **Null is now reachable, and that is the U12 change.** Before U11 there was
+ * nothing materialised to assemble over, so every briefing was degraded and the
+ * handler said so unconditionally. Keeping that after the cycle ships would
+ * invert the honesty: a fully consolidated brain would keep announcing that its
+ * participant cards are missing while returning them. So the caller passes what
+ * the assembler found, and `consolidation_pending` is stamped only on a layer
+ * the model tier has genuinely never completed over — which is also the
+ * permanent and correct state of a free-tier brain (R8).
+ */
 export function degradedBriefing(
   state: IndexState,
-  readDegradations: readonly string[] = [],
-): Degraded {
-  const search = degradedSearch(state, readDegradations);
-  const reasons: DegradedReason[] = [...(search?.reasons ?? []), 'consolidation_pending'];
+  input: { readonly materialized: boolean; readonly readDegradations?: readonly string[] },
+): Degraded | null {
+  const search = degradedSearch(state, input.readDegradations ?? []);
+  const reasons: DegradedReason[] = [...(search?.reasons ?? [])];
+  if (!input.materialized) reasons.push('consolidation_pending');
+  if (reasons.length === 0) return null;
+
   return {
     kind: 'briefing_degraded',
     reasons,
-    detail:
-      `${detailFor(reasons, state)} Participant cards, extracted commitments and the synopsis layer ` +
-      'are assembled by the consolidation cycle and are not part of this bundle yet.',
+    detail: input.materialized
+      ? detailFor(reasons, state)
+      : `${detailFor(reasons, state)} Participant cards, extracted commitments and the synopsis layer ` +
+        'are assembled by the consolidation cycle and are not part of this bundle yet.',
   };
 }
 
@@ -272,6 +298,9 @@ function detailFor(reasons: readonly DegradedReason[], state: IndexState): strin
   }
   if (reasons.includes('embedding_unavailable')) {
     parts.push('the meaning-based arm of this search could not run, so results came from text and graph matching only');
+  }
+  if (reasons.includes('rerank_unavailable')) {
+    parts.push('the final re-scoring pass could not run, so these results are ordered by the earlier stages alone');
   }
   if (reasons.includes('consolidation_pending')) parts.push('consolidation has not run over it yet');
   return `${parts.join('; ')}.`;

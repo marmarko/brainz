@@ -111,6 +111,12 @@ const EXPECTED_TABLES: ReadonlyMap<string, TableClass> = new Map([
   ['review_queue', 'content:derived'],
   ['content_cluster', 'operational'],
   ['cluster_member', 'operational'],
+
+  // U12's rung. One table, no origin column and no origin trigger: it holds a
+  // grant-derived caller key, two timestamps and a band number, and it asserts
+  // nothing about anybody's content. A fence over a bookmark would be a second
+  // copy of a fence that already holds on every row the bookmark points at.
+  ['briefing_cursor', 'operational'],
 ]);
 
 const SHARED_ORIGIN_TRIGGER_FUNCTION = 'refuse_origin_change';

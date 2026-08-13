@@ -239,9 +239,10 @@ describe('the fence survives a join', () => {
       );
 
       expect(result.ok).toBe(true);
-      const content = result.content as { changed: Array<{ text: string }> };
-      const bodies = content.changed.map((record) => record.text).join('\n');
-      expect(bodies).not.toContain(SECRET_LINE);
+      // Every lane of the bundle, not just the delta: U12 added meetings,
+      // commitments, participant cards and the stale list, and a fence that
+      // held on one of five lanes would be a fence that leaks through four.
+      expect(JSON.stringify(result.content)).not.toContain(SECRET_LINE);
     },
     TEST_TIMEOUT_MS,
   );

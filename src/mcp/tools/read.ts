@@ -14,12 +14,13 @@
  * (`reads.ts`, `dispatch.ts`), enforced by a scan.
  */
 
-import { estimateTokens } from '../../core/search/pipeline.ts';
+import { briefing as assembleBriefing, type BriefingRecord } from '../../core/briefing/assemble.ts';
 import { recall as rankedRead } from '../../core/search/read.ts';
-import { recordUrl } from '../ids.ts';
+import { formatId, recordUrl } from '../ids.ts';
 import { parseId } from '../ids.ts';
+import { demarcateIfExternal } from '../demarcation.ts';
 import { degradedBriefing, degradedSearch } from '../envelope.ts';
-import { briefingBundle, entityCard, fetchRecord } from '../reads.ts';
+import { entityCard, fetchRecord } from '../reads.ts';
 import {
   intArg,
   invalid,
@@ -259,13 +260,24 @@ export const entity: Handler = async (ctx, args) => {
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
- * `briefing` — the standing bundle, assembled by SQL, and honestly degraded.
+ * `briefing` — the standing bundle, assembled by SQL over U11's materialised
+ * output.
  *
- * U11 materialises the inputs this tool is designed around: participant cards,
- * extracted commitments, the synopsis layer. Until then it serves what SQL can
- * reach — what arrived and what was stated in the window — marked
- * `briefing_degraded`. Serving it unmarked would teach agents that this is what
- * a briefing is, and the upgrade would then read as a regression in shape.
+ * **The whole assembly lives in `core/briefing/assemble.ts`**, which is where
+ * the "no request-time fan-out that scales with corpus size" constraint is
+ * argued statement by statement. This handler does four things and no more:
+ * parse the window, call it, wrap every piece of row content in R2a's
+ * demarcation, and put the bounded upgrade prompt in the advisory lane.
+ *
+ * **Degraded is now conditional.** A cold layer — a brain that has never
+ * consolidated, or a free-tier brain that never will — gets `briefing_degraded`
+ * and a `not_included` list naming what the paid tier would add (R8). A
+ * consolidated one gets neither, because a bundle that keeps announcing missing
+ * cards while returning them teaches an agent to distrust the shape.
+ *
+ * **Every participant card is demarcated too.** A card is a model's summary of
+ * mail an outsider wrote; returning it outside the untrusted region would be the
+ * exact laundering R2a's wrapper exists to prevent, one derivation removed.
  */
 export const briefing: Handler = async (ctx, args) => {
   const until = stringArg(args, 'until') ?? ctx.now.toISOString();
@@ -275,40 +287,85 @@ export const briefing: Handler = async (ctx, args) => {
   }
 
   const focus = stringArg(args, 'focus');
-  const bundle = await briefingBundle(ctx.sql, ctx.grant, { since, until, focus });
+  const bundle = await assembleBriefing(ctx.sql, ctx.grant, {
+    since,
+    until,
+    focus,
+    callerKey: ctx.callerKey,
+    now: ctx.now,
+    budgetTokens: intArg(args, 'budget_tokens', DEFAULT_BRIEFING_TOKENS, MAX_BRIEFING_TOKENS),
+  });
 
-  // The token ceiling is applied by *dropping whole rows from the tail*, never
-  // by truncating one. A half-quoted external message is a demarcated region
-  // with no closing marker, which is the one shape the wrapper exists to make
-  // impossible — so the budget must not be able to produce it.
-  const budget = intArg(args, 'budget_tokens', DEFAULT_BRIEFING_TOKENS, MAX_BRIEFING_TOKENS);
-  const changed: ProjectedRecord[] = [];
-  const stated: ProjectedRecord[] = [];
-  let spent = 0;
-  for (const [into, records] of [
-    [changed, bundle.changed],
-    [stated, bundle.facts],
-  ] as const) {
-    for (const record of records) {
-      const projected = project(record, ctx.nonce);
-      const cost = estimateTokens(projected.text) + estimateTokens(projected.title ?? '');
-      if (spent + cost > budget && into.length > 0) break;
-      spent += cost;
-      into.push(projected);
-    }
-  }
+  const wrap = (record: BriefingRecord): ProjectedRecord =>
+    project(
+      {
+        id: formatId(record.kind, record.id),
+        kind: record.kind,
+        title: record.title,
+        text: record.text,
+        origins: record.origins,
+        sourceType: record.sourceType,
+        createdAt: record.createdAt,
+      },
+      ctx.nonce,
+    );
+
+  const degraded = degradedBriefing(await ctx.indexState(), {
+    materialized: bundle.coverage === 'materialized',
+  });
 
   return {
     ok: true,
-    resultClass: 'degraded',
-    degraded: degradedBriefing(await ctx.indexState()),
+    ...(degraded === null ? {} : { resultClass: 'degraded' as const }),
+    degraded,
+    ...(bundle.prompt === null ? {} : { notice: [`${bundle.prompt.text} ${bundle.prompt.dismissal}`] }),
     content: {
-      window: { since, until },
+      coverage: bundle.coverage,
+      tier: bundle.tier,
+      window: bundle.window,
       ...(focus === null ? {} : { focus }),
-      changed,
-      stated,
-      tokens: spent,
-      not_included: ['participant_cards', 'extracted_commitments', 'synopsis'],
+      meetings: bundle.meetings.map((meeting) => ({
+        ...wrap(meeting),
+        participants: meeting.participants.map((person) => ({
+          id: formatId('ent', person.entityId),
+          name: person.name,
+          card:
+            person.card === null
+              ? null
+              : demarcateIfExternal(person.card, person.origins, ctx.nonce).text,
+        })),
+      })),
+      commitments: bundle.commitments.map((commitment) => ({
+        id: formatId('fact', commitment.id),
+        statement: demarcateIfExternal(commitment.statement, commitment.origins, ctx.nonce).text,
+        owner: commitment.owner,
+        due_on: commitment.dueOn,
+        // R12a's stored admission decision, surfaced rather than recomputed.
+        corroborated: commitment.compiledTruth,
+      })),
+      delta: {
+        since: bundle.delta.since,
+        first_read: bundle.delta.firstRead,
+        changed: bundle.delta.changed.map(wrap),
+        stated: bundle.delta.stated.map(wrap),
+      },
+      stale: bundle.stale.map((entry) => ({
+        id: formatId('doc', entry.id),
+        title:
+          entry.title === null
+            ? null
+            : demarcateIfExternal(entry.title, entry.origins, ctx.nonce).text,
+        stale_at: entry.staleAt,
+        relevance: entry.relevance,
+      })),
+      counts: {
+        contradictions: bundle.counts.contradictions,
+        pending_debt: bundle.counts.pendingDebt,
+        pending_review: bundle.counts.pendingReview,
+        uncorroborated_claims: bundle.counts.uncorroboratedClaims,
+      },
+      tokens: bundle.tokens,
+      not_included: bundle.notIncluded,
     },
   };
 };

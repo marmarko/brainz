@@ -296,6 +296,9 @@ export async function dispatch(
     grant,
     writeOrigin: claims.writeOrigin,
     tenantId: authenticatedTenantId,
+    // The same identity the access log records. Derived from the credential,
+    // never from an argument — see `tools/context.ts:ToolContext.callerKey`.
+    callerKey: claims.grantId,
     caller: fleetIdentity(authenticatedTenantId),
     gateway: deps.gateway,
     now,

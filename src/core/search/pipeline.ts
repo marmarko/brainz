@@ -17,11 +17,24 @@
  * per-page cap must keep the *best* chunk, which is not knowable before the
  * boosts land), autocut last and only ever on a rerank score.
  *
- * **Autocut reads the rerank score and nothing else.** When rerank is off — its
- * state until U12 — autocut does not run. The audit's finding is explicit: cut
- * on the RRF gap and you cut on noise, because the gap between fused ranks is an
- * artefact of how many arms happened to agree rather than a statement about
- * relevance. `rerank.test.ts` pins the off case behaviourally.
+ * **Autocut reads the rerank score and nothing else.** When rerank is off,
+ * autocut does not run. The audit's finding is explicit: cut on the RRF gap and
+ * you cut on noise, because the gap between fused ranks is an artefact of how
+ * many arms happened to agree rather than a statement about relevance.
+ * `rerank-autocut.test.ts` pins the off case behaviourally and
+ * `rerank-stage.ts` carries the coupling as a value.
+ *
+ * **The stage-11/12 seam is a public split, and U12 is why.** The cross-encoder
+ * is an *external* call, so the production read path has to `await` between
+ * packing and reranking — and this function must stay synchronous, because U7's
+ * `Ranker` interface is synchronous and a stack reachable only through an
+ * `await` could not be graded by the blocking tier at all. So the stages are
+ * exposed as two halves: {@link composeUpToPacking} (1–11) and
+ * {@link finishRanking} (12–13). `composeRanking` is their composition, the
+ * eval calls it with a scorer that reads committed scores, and `read.ts` calls
+ * the two halves around one gateway round trip. Two entry points, one
+ * implementation — a second `composeRankingAsync` would be the second
+ * implementation this whole file exists to prevent.
  */
 
 import { autocut } from './autocut.ts';
@@ -30,8 +43,9 @@ import { applyBoosts, type BoostOptions } from './boosts.ts';
 import { dedupe, type DedupOptions } from './dedup.ts';
 import { classifyIntent, planFor, type RankingPlan } from './intent.ts';
 import { fuse, foldRanked } from './rrf.ts';
-import { rerank, type RerankOptions } from './rerank.ts';
-import type { RecallOutcome, ScoredCandidate, SearchResponse } from './types.ts';
+import { rerank, rerankPassageOf, type RerankOptions } from './rerank.ts';
+import { resolveRerankStage, type RerankStagePlan } from './rerank-stage.ts';
+import type { Degradation, RecallOutcome, ScoredCandidate, SearchResponse } from './types.ts';
 
 export interface ComposeRequest {
   readonly query: string;
@@ -50,6 +64,21 @@ export interface ComposeRequest {
 }
 
 /**
+ * Stages 1–11, ending at the packed candidate set the cross-encoder is asked
+ * about.
+ *
+ * This is the boundary a rerank call is made across, so it is what the request
+ * path holds while it awaits one. The plan travels on it because
+ * {@link finishRanking} must not recompute one — see `types.ts:RecallOutcome.plan`.
+ */
+export interface PackedRanking {
+  readonly results: readonly ScoredCandidate[];
+  readonly plan: RankingPlan;
+  readonly degraded: readonly Degradation[];
+  readonly armsUsed: SearchResponse['armsUsed'];
+}
+
+/**
  * Everything after the arms, in the plan's order.
  *
  * Pure and synchronous. The only inputs are the request, the plan and what the
@@ -57,6 +86,11 @@ export interface ComposeRequest {
  * provider.
  */
 export function composeRanking(request: ComposeRequest, outcome: RecallOutcome): SearchResponse {
+  return finishRanking(composeUpToPacking(request, outcome), request.rerank);
+}
+
+/** Stages 1–11. See {@link PackedRanking} for why this is a public seam. */
+export function composeUpToPacking(request: ComposeRequest, outcome: RecallOutcome): PackedRanking {
   // The outcome's plan, not a fresh one. See `types.ts:RecallOutcome.plan` —
   // recomputing here silently scores the ranking under a plan the arms never
   // ran under. `request.plan` stays as an explicit override.
@@ -101,22 +135,51 @@ export function composeRanking(request: ComposeRequest, outcome: RecallOutcome):
   const packed =
     request.budget === undefined ? capped : packToBudget(capped, request.budget.maxTokens);
 
-  // Stage 12 — rerank, flag-gated and off until U12.
-  const reranked = rerank(packed, request.rerank);
-
-  // Stage 13 — autocut, on the rerank score only.
-  const cut = autocut(reranked);
-
   return {
-    results: cut.results,
-    intent: plan.intent,
+    results: packed,
     plan,
     degraded: outcome.degraded,
     armsUsed: outcome.arms.filter((arm) => arm.ranked.length > 0).map((arm) => arm.arm),
+  };
+}
+
+/**
+ * Stages 12 and 13, over an already-packed list.
+ *
+ * **They resolve together and they run together.** `rerank-stage.ts` decides
+ * once whether the pair is on; autocut is not consulted separately, because a
+ * second opinion about whether there is a rerank score to cut on is how the two
+ * come apart. A configuration that says rerank is on with nothing to score with
+ * resolves to `unavailable` and both stages sit out — the read degrades rather
+ * than throwing, which is the same call `read.ts:embedQuery` makes about the
+ * other external dependency on this path.
+ */
+export function finishRanking(packed: PackedRanking, options?: RerankOptions): SearchResponse {
+  const stage: RerankStagePlan = resolveRerankStage(options);
+
+  // The candidate cap is the latency dial, applied where the cost is: the tail
+  // beyond it is never scored and never reordered, so it keeps its packed order
+  // and sits below everything the cross-encoder saw.
+  const scored = stage.rerank ? packed.results.slice(0, stage.candidates) : packed.results;
+  const tail = stage.rerank ? packed.results.slice(stage.candidates) : [];
+
+  const reranked = stage.rerank ? [...rerank(scored, options), ...tail] : [...packed.results];
+  const cut = stage.autocut ? autocut(reranked) : { results: reranked, applied: false };
+
+  return {
+    results: cut.results,
+    intent: packed.plan.intent,
+    plan: packed.plan,
+    degraded: packed.degraded,
+    armsUsed: packed.armsUsed,
     tokens: tokensOf(cut.results),
+    rerankApplied: stage.rerank,
+    rerankReason: stage.reason,
     autocutApplied: cut.applied,
   };
 }
+
+export { rerankPassageOf };
 
 /** The packed payload's cost, recomputed rather than carried, so it cannot lie. */
 function tokensOf(results: readonly ScoredCandidate[]): number {

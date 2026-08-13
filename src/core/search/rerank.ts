@@ -18,12 +18,25 @@
  * **The scorer is injected.** U12 supplies one backed by the gateway's `rerank`
  * op — which is where routing, metering and the key resolution live — so no
  * provider reaches this module and no model is named in it.
+ *
+ * **U12 flipped the flag.** What that buys and what it costs is KTD4's
+ * accounting: the largest single quality lever, against a second synchronous
+ * external call on a path promising a warm p99. The dial when that budget misses
+ * is the candidate count — `rerank-stage.ts` owns it, and owns the reason the
+ * flag itself is not the dial.
  */
 
 import type { ScoredCandidate } from './types.ts';
 
-/** Off. U12 flips it, and KTD4 records what that costs. */
-export const RERANK_DEFAULT_ENABLED = false;
+/**
+ * On, as of U12.
+ *
+ * Read by `rerank-stage.ts:resolveRerankStage` for a caller that supplies a
+ * scorer and states no opinion — which is both the production read path and the
+ * blocking tier's rerank leg. Setting it back to `false` observably stops both
+ * from reranking, which is what makes the flip a fact rather than a comment.
+ */
+export const RERANK_DEFAULT_ENABLED = true;
 
 export interface RerankOptions {
   readonly enabled?: boolean;
@@ -32,6 +45,29 @@ export interface RerankOptions {
    * earlier stages produced — never over the corpus.
    */
   readonly score?: (candidate: ScoredCandidate, index: number) => number;
+  /**
+   * How many candidates the scorer may be asked about. KTD4's named latency
+   * dial; see `rerank-stage.ts:LATENCY_DIAL`. Read there rather than here,
+   * because this module scores what it is handed.
+   */
+  readonly candidates?: number;
+}
+
+/**
+ * The text one candidate is scored as, for the cross-encoder's second half.
+ *
+ * **One builder, two callers**, and that is the whole point: the production
+ * scorer in `read.ts` and the eval's committed score manifest must send the
+ * cross-encoder the *same* string, or `eval:live-parity`'s rerank leg compares a
+ * score against one produced from a different input and reports drift that is
+ * really a template divergence. A title is part of what a passage says — a mail
+ * subject routinely carries the answer — so it leads.
+ */
+export function rerankPassageOf(candidate: ScoredCandidate): string {
+  const title = candidate.candidate.title;
+  return title === null || title.length === 0
+    ? candidate.candidate.content
+    : `${title}\n${candidate.candidate.content}`;
 }
 
 /**

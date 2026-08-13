@@ -62,17 +62,48 @@ const CALLER: CallerIdentity = fleetIdentity(TENANT);
 let fixture: SearchFixture;
 let sql: SQL;
 
+interface TransportOptions {
+  /** Refuse the embedding call — Assumption 5's availability half. */
+  readonly refuse: boolean;
+  /**
+   * Refuse the *rerank* call, independently.
+   *
+   * From U12 this path has two external dependencies (KTD4) and they fail on
+   * their own schedules: a reranker that rate-limits costs the ordering while
+   * the vector arm keeps answering. One flag cannot express that.
+   */
+  readonly refuseRerank?: boolean;
+}
+
 /** A transport that answers, or refuses, and records what it was asked to encode. */
-function transportThat(options: { readonly refuse: boolean }): ModelTransport & {
+function transportThat(options: TransportOptions): ModelTransport & {
   readonly texts: string[];
+  readonly rerankCalls: number;
 } {
   const texts: string[] = [];
+  let rerankCalls = 0;
   return {
     id: 'u5-read-fake',
     get texts() {
       return texts;
     },
+    get rerankCalls() {
+      return rerankCalls;
+    },
     invoke(request: TransportRequest): Promise<TransportResponse> {
+      if (request.input.kind === 'rerank') {
+        rerankCalls += 1;
+        if (options.refuseRerank === true) {
+          return Promise.reject(new Error('the reranker is having a day'));
+        }
+        const count = request.input.candidates.length;
+        // Descending and smooth: this file is about availability, not ranking,
+        // and a cliff here would make autocut's truncation the thing under test.
+        return Promise.resolve({
+          output: { kind: 'rerank', scores: request.input.candidates.map((_text, index) => 1 - index * 0.01 / Math.max(count, 1)) },
+          usage: { inputTokens: 8, outputTokens: 0 },
+        });
+      }
       if (request.input.kind === 'embedding') texts.push(...request.input.texts);
       if (options.refuse) return Promise.reject(new Error('provider is having a day'));
       // A unit vector along the first axis. Nothing in this file depends on
@@ -89,7 +120,7 @@ function transportThat(options: { readonly refuse: boolean }): ModelTransport & 
   };
 }
 
-function gatewayThat(options: { readonly refuse: boolean }): {
+function gatewayThat(options: TransportOptions): {
   readonly gateway: ModelGateway;
   readonly transport: ReturnType<typeof transportThat>;
 } {
@@ -165,6 +196,38 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
   );
 
   test(
+    'the reranker refusing costs the ordering, not the read (U12, KTD4)',
+    async () => {
+      const { gateway, transport } = gatewayThat({ refuse: false, refuseRerank: true });
+
+      const response = await recall({
+        sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        query: 'widget calibration advisory',
+        grant: GRANT,
+        limit: 5,
+        now: new Date('2026-06-01T00:00:00Z'),
+      });
+
+      // The read succeeds, the vector arm is unaffected, and the two coupled
+      // stages sit out together — autocut reads the rerank score and only the
+      // rerank score, so it cannot run either.
+      expect(response.degraded).toEqual(['rerank_unavailable']);
+      expect(response.results.length).toBeGreaterThan(0);
+      expect(response.armsUsed).toContain('vector');
+      expect(response.rerankApplied).toBe(false);
+      expect(response.autocutApplied).toBe(false);
+      for (const result of response.results) expect(result.rerankScore).toBeUndefined();
+      // It really was attempted; a path that skipped the call would pass every
+      // assertion above having proved nothing.
+      expect(transport.rerankCalls).toBe(1);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
     'a working provider runs the vector arm and reports no degradation',
     async () => {
       const { gateway, transport } = gatewayThat({ refuse: false });
@@ -181,6 +244,9 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
       });
 
       expect(response.degraded).toEqual([]);
+      // U12: the second external call ran, and both stages are on.
+      expect(response.rerankApplied).toBe(true);
+      expect(transport.rerankCalls).toBe(1);
       expect(response.armsUsed).toContain('vector');
       // KTD8's asymmetry: the query is encoded as a query, not as a document.
       expect(transport.texts[0]).toBe(queryEncoding('widget calibration advisory'));

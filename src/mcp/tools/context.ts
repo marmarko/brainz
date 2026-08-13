@@ -32,6 +32,19 @@ export interface ToolContext {
   /** Where this grant's writes land. Also derived, also never from arguments. */
   readonly writeOrigin: string;
   readonly tenantId: string;
+  /**
+   * This credential's stable identity, as `dispatch.ts` derived it from the
+   * credential itself.
+   *
+   * The `briefing` read cursor is keyed on it (rung 4). It is deliberately the
+   * same value the access log names as the actor — a hash prefix for a
+   * provisioned bearer, the signed grant id for an OAuth token — so "how far has
+   * this connection read" and "what has this connection done" answer to one
+   * identity. It is never a request parameter, for the reason `grant` is never
+   * one: a caller that could name its own cursor could read another
+   * connection's delta and reset its own upgrade-prompt bound at will.
+   */
+  readonly callerKey: string;
   readonly caller: CallerIdentity;
   readonly gateway: ModelGateway;
   readonly now: Date;
