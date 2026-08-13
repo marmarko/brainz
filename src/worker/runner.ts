@@ -254,34 +254,53 @@ export function createJobRunner(deps: RunnerDeps): JobRunner {
       if (passInFlight) {
         throw new Error('invariant: a runner pass is already in flight — the concurrency bound is per pass');
       }
+      // The latch is set immediately before the block that clears it. Anything
+      // between the two — the claim loop especially, which is a store call like
+      // any other — would otherwise leave it set on the way out, and a runner
+      // that latched once refuses every later pass for the life of the process
+      // while looking perfectly alive.
       passInFlight = true;
-      storeErrors = [];
-      const outcomes: Record<JobOutcome, number> = {
-        completed: 0,
-        failed: 0,
-        superseded: 0,
-        store_error: 0,
-      };
-
-      // **The concurrency bound.** Claimed one at a time up to the remaining
-      // headroom, so a pass can never exceed it — and so a fleet with 100 due
-      // tenants runs 20 of them rather than opening 100 database connections and
-      // 100 model conversations.
-      const headroom = Math.max(0, deps.concurrency - running.size);
-      const leases: JobLease[] = [];
-      for (let i = 0; i < headroom; i++) {
-        const lease = await deps.queue.claim({
-          owner: deps.owner,
-          now: options.now,
-          leaseTtlMs: config.leaseTtlMs,
-          maxAttemptMs: config.maxAttemptMs,
-          kinds,
-        });
-        if (lease === undefined) break;
-        leases.push(lease);
-      }
-
       try {
+        storeErrors = [];
+        const outcomes: Record<JobOutcome, number> = {
+          completed: 0,
+          failed: 0,
+          superseded: 0,
+          store_error: 0,
+        };
+
+        // **The concurrency bound.** Claimed one at a time up to the remaining
+        // headroom, so a pass can never exceed it — and so a fleet with 100 due
+        // tenants runs 20 of them rather than opening 100 database connections and
+        // 100 model conversations.
+        const headroom = Math.max(0, deps.concurrency - running.size);
+        const leases: JobLease[] = [];
+        for (let i = 0; i < headroom; i++) {
+          let lease: JobLease | undefined;
+          try {
+            lease = await deps.queue.claim({
+              owner: deps.owner,
+              now: options.now,
+              leaseTtlMs: config.leaseTtlMs,
+              maxAttemptMs: config.maxAttemptMs,
+              kinds,
+            });
+          } catch (storeError) {
+            // A claim that fails is the **store** failing, and it gets the same
+            // treatment `complete` and `fail` get: carried out, never flattened
+            // onto a job. Letting it propagate abandoned every lease already
+            // taken this pass — rows left `running` with no worker behind them,
+            // recovered only when the reaper takes them and charges an attempt
+            // each, which is a control-plane blip walking healthy tenants up the
+            // retry ladder and into a quarantine that was never theirs.
+            storeErrors.push(storeError);
+            onError(storeError);
+            break;
+          }
+          if (lease === undefined) break;
+          leases.push(lease);
+        }
+
         const results = await Promise.all(leases.map((lease) => runOne(lease, options.now)));
         for (const result of results) outcomes[result] += 1;
         return { claimed: leases.length, outcomes, storeErrors: [...storeErrors] };

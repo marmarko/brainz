@@ -263,6 +263,120 @@ describe('outcomes', () => {
   });
 });
 
+/**
+ * **The claim loop is a store call too, and it was the one place the discipline
+ * above did not reach.**
+ *
+ * `complete` and `fail` are wrapped: a control plane that fails while an outcome
+ * is being recorded produces a `store_error` rather than a poison job. `claim`
+ * was not, and it sits between the `passInFlight` latch being set and the
+ * `try/finally` that clears it. One transient failure mid-loop therefore did two
+ * things, neither of them an error anybody sees:
+ *
+ *   - it **abandoned every lease the pass already held** — rows left `running`
+ *     with no worker behind them, recovered only when the reaper takes them and
+ *     burns an attempt each, which is the retry ladder walking healthy tenants
+ *     toward a quarantine for an outage that was not theirs; and
+ *   - it **left the latch set**, so every later `runOnce` threw "a runner pass is
+ *     already in flight" — one blip and the process claims nothing again, ever,
+ *     while looking alive.
+ *
+ * The second is the shape this session keeps producing: a guard set before the
+ * block that releases it.
+ */
+describe('a control plane that fails mid-claim', () => {
+  /** A queue whose nth `claim` rejects, and whose other calls are the real ones. */
+  function failingClaimOn(nth: number, seen: { calls: number }): JobQueue & { connection: unknown } {
+    return {
+      ...queue,
+      claim: (request) => {
+        seen.calls += 1;
+        if (seen.calls === nth) return Promise.reject(new Error('control plane unreachable'));
+        return queue.claim(request);
+      },
+    };
+  }
+
+  test('does not abandon the leases the pass already holds', async () => {
+    await seedTenant(sideSql, 'blip');
+    // Two lanes, claimed in `run_at, created_at` order: gmail is in hand when the
+    // second claim fails.
+    for (const target of ['gmail', 'calendar'] as const) {
+      const enqueued = await side.enqueue({
+        tenantId: 'blip',
+        kind: 'ingest_pull',
+        target,
+        trigger: 'connector_cadence',
+        now: T0,
+      });
+      expect(enqueued.enqueued).toBe(true);
+    }
+
+    const seen = { calls: 0 };
+    const ran: string[] = [];
+    const errors: unknown[] = [];
+    const runner = runnerWith(
+      {
+        ingest_pull: async ({ lease }) => {
+          ran.push(lease.target);
+        },
+      },
+      { queue: failingClaimOn(2, seen), onError: (error) => errors.push(error) },
+    );
+
+    const result = await runner.runOnce({ now: T0 });
+
+    // The failure is carried out, not swallowed and not flattened onto a job.
+    expect(result.storeErrors).toHaveLength(1);
+    expect(errors).toHaveLength(1);
+    expect(result.outcomes.failed).toBe(0);
+
+    // And the lease claimed before the blip was run to completion rather than
+    // left `running` for the reaper to charge an attempt for.
+    expect(ran).toEqual(['gmail']);
+    expect(result.claimed).toBe(1);
+    expect(result.outcomes.completed).toBe(1);
+
+    const rows = (await sideSql`
+      SELECT target, state FROM control.job WHERE tenant_id = 'blip' ORDER BY target::text
+    `) as unknown as { target: string; state: string }[];
+    expect(rows).toEqual([
+      { target: 'calendar', state: 'due' },
+      { target: 'gmail', state: 'done' },
+    ]);
+  });
+
+  test('does not wedge the runner: the next pass still claims', async () => {
+    await seedTenant(sideSql, 'wedge');
+    await side.enqueue({
+      tenantId: 'wedge',
+      kind: 'consolidate',
+      target: 'whole_brain',
+      trigger: 'time_ceiling',
+      now: T0,
+    });
+
+    // The first claim of the first pass fails, so the pass holds nothing at all —
+    // the case where "carry on with what you have" carries nothing, and the latch
+    // is the only thing left to get wrong.
+    const seen = { calls: 0 };
+    const runner = runnerWith({ consolidate: async () => undefined }, {
+      queue: failingClaimOn(1, seen),
+      onError: () => undefined,
+    });
+
+    const first = await runner.runOnce({ now: T0 });
+    expect(first.claimed).toBe(0);
+    expect(first.storeErrors).toHaveLength(1);
+
+    // The blip is over. A runner that latched on the way out would throw here,
+    // and would go on throwing for the life of the process.
+    const second = await runner.runOnce({ now: T0 });
+    expect(second.claimed).toBe(1);
+    expect(second.outcomes.completed).toBe(1);
+  });
+});
+
 describe('renewal and lease loss', () => {
   /** Enqueues one job and returns a handler gate the test can open. */
   async function inFlightJob(tenantId: string) {
