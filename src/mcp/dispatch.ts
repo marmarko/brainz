@@ -30,6 +30,11 @@
  */
 
 import type { ModelGateway } from '../ai/gateway.ts';
+import {
+  assertServableSchema,
+  TenantSchemaBehindError,
+  UnservableTenantSchemaError,
+} from '../control/migrate.ts';
 import { fleetIdentity, type TenantSecretStore } from '../control/secrets.ts';
 import type { Grant } from '../core/search/fence.ts';
 import type { AccessLog, ResultClass } from './access-log.ts';
@@ -262,6 +267,21 @@ export async function dispatch(
 
   const { sql, coldStart } = opened.connection;
 
+  // ---- 3a. The schema this fleet understands. ------------------------------
+  //
+  // Before the fence is derived, because deriving it reads four content tables,
+  // and before any handler runs, because a handler's SQL names columns a rung it
+  // has not seen may not have. U3's promise is a *typed refusal* rather than a
+  // best-effort query against an unknown shape, and it is the request path's to
+  // make: the two flavours differ in what resolves them, so they differ in what
+  // the caller is told.
+  const unservable = await schemaRefusal(deps, authenticatedTenantId, opened.connection.schemaVersion);
+  if (unservable !== null) {
+    return refuse('unavailable', unservable.message, 'unavailable', actor, {
+      suggestion: unservable.suggestion,
+    });
+  }
+
   // ---- 4. The fence, derived from the credential. --------------------------
   let grant: Grant;
   try {
@@ -390,6 +410,64 @@ function verifyCredential(
     case 'unknown':
       return null;
   }
+}
+
+interface SchemaRefusal {
+  readonly message: string;
+  readonly suggestion: string;
+}
+
+/**
+ * Whether this fleet may serve a tenant at `version`, and what to say if not.
+ *
+ * **The two refusals are not the same sentence, because they are not the same
+ * problem.** A tenant behind the fleet is the ordinary post-deploy state of
+ * every suspended brain; something migrates it and the next call works. A tenant
+ * ahead of it is a *rolling deploy*: this instance predates the rung, no retry
+ * against this instance will ever help, and the thing that resolves it is the
+ * instance being replaced. Both are content-free — nothing here names a table, a
+ * column or a version to a caller.
+ *
+ * **The behind case is re-read once, on this path only.** The version came off a
+ * cached connection entry, and the event that changes it is exactly the event
+ * that fixes it, so refusing on a stale reading would hold a migrated tenant out
+ * for the rest of the entry's TTL. Costing a round trip on a call that is
+ * already failing is not a warm-path cost.
+ */
+async function schemaRefusal(
+  deps: DispatchDeps,
+  tenantId: string,
+  version: number,
+): Promise<SchemaRefusal | null> {
+  const verdict = (at: number): UnservableTenantSchemaError | null => {
+    try {
+      assertServableSchema(at);
+      return null;
+    } catch (error) {
+      if (error instanceof UnservableTenantSchemaError) return error;
+      throw error;
+    }
+  };
+
+  let error = verdict(version);
+  if (error === null) return null;
+
+  if (error instanceof TenantSchemaBehindError) {
+    const fresh = await deps.connections.refreshSchemaVersion(tenantId);
+    if (fresh !== undefined) error = verdict(fresh);
+    if (error === null) return null;
+  }
+
+  return error.migratable
+    ? {
+        message: 'This brain is being upgraded and cannot be read until that finishes.',
+        suggestion: 'Try the same call again shortly — the upgrade runs in the background.',
+      }
+    : {
+        message: 'This brain has been upgraded past what this server understands.',
+        suggestion:
+          'Try the same call again shortly — this instance is being replaced by one that understands it.',
+      };
 }
 
 /** Every origin this brain holds, plus the one its agent writes through. */

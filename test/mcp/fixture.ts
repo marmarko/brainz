@@ -78,6 +78,12 @@ export interface McpFixtureOptions {
   readonly tenantId?: string;
   readonly endpoint?: Endpoint;
   readonly startAt?: number;
+  /**
+   * Stop the tenant's ladder partway up, so the request path can be asked what
+   * it does with a tenant whose schema this fleet does not understand. There is
+   * no other way to build that state: provisioning runs the whole ladder.
+   */
+  readonly schemaVersion?: number;
   /** Swap the signal sink to observe or to break it. */
   readonly sink?: (control: SQL) => SignalSink;
 }
@@ -89,7 +95,10 @@ export async function createMcpFixture(
   options: McpFixtureOptions = {},
 ): Promise<McpFixture> {
   const tenantId = options.tenantId ?? `t-${slug.replace(/_/g, '-')}`;
-  const schema = await provisionFixture(slug);
+  const schema = await provisionFixture(
+    slug,
+    options.schemaVersion === undefined ? {} : { targetVersion: options.schemaVersion },
+  );
   const control = await createControlPlane(slug);
   const sql = connect(schema);
   const controlSql = new SQL(control.dsn, { max: 1 });

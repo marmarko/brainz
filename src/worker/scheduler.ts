@@ -30,6 +30,15 @@
  * instead. So the debounce additionally requires that user activity **exists**
  * and is **newer than the last cycle**: somebody was here, and they have gone.
  *
+ * **What is on the tick and is not a trigger at all.** Three things run here that
+ * are not jobs and are not *for* a tenant: reclaiming the leases of workers that
+ * died, stamping a due time onto a tenant that has none, and — U3's — migrating
+ * tenants whose schema this fleet cannot read. None of them fits the job table
+ * (its kinds are fixed, and a job runs under a lease against one tenant's brain),
+ * all of them are fleet maintenance, and every one of them has to happen before
+ * the enqueue rather than after it. The sweep is the newest of the three and the
+ * only one that touches a tenant database.
+ *
  * **The concurrency bound is a resource decision; its consequences are computed.**
  * `describeCapacity` turns a bound into the fleet size it buys, from the plan's
  * own arithmetic — `tenants ÷ (ceiling ÷ cycle duration) ≤ bound` — so the
@@ -39,6 +48,11 @@
 
 import type { SQL } from 'bun';
 
+import {
+  sweepTenantSchemas,
+  type SweepOutcome,
+  type SweepPorts,
+} from '../control/migrate.ts';
 import type { EnqueueRefusal, JobQueue, JobTrigger } from './jobs.ts';
 
 // ---------------------------------------------------------------------------
@@ -60,6 +74,17 @@ export interface SchedulerConfig {
   readonly ceilingMs: number;
   /** How many due tenants one tick will look at. */
   readonly batchLimit: number;
+  /**
+   * How many tenants behind the fleet's schema head one tick will migrate.
+   *
+   * Much smaller than {@link batchLimit}, and for a different reason: enqueueing
+   * is a control-plane write, migrating is a *wake* plus DDL against somebody's
+   * suspended database. The bound is what keeps the sweep from being an
+   * availability event dressed as maintenance, and it is per tick rather than
+   * per run, so the fleet converges at a rate an operator can read off the
+   * cadence instead of all at once.
+   */
+  readonly schemaSweepLimit: number;
 }
 
 export const ALPHA_CEILING_MS = 24 * 60 * 60 * 1000;
@@ -70,6 +95,11 @@ export const ALPHA_SCHEDULER: SchedulerConfig = {
   minIntervalMs: 30 * 60 * 1000,
   ceilingMs: ALPHA_CEILING_MS,
   batchLimit: 500,
+  // Ten a tick. At a one-minute cadence that walks a ten-thousand-tenant fleet
+  // inside a day while never having more than one compute woken for migration
+  // at a time — and it bounds the tick itself, since the sweep is sequential and
+  // each tenant carries a wall-clock budget of its own.
+  schemaSweepLimit: 10,
 };
 
 /** Why a tenant is due. Maps onto the job's recorded `trigger_reason`. */
@@ -322,11 +352,32 @@ export interface SchedulerDeps {
   readonly config: SchedulerConfig;
   /** How far past expiry a lease must be before the sweep takes it. */
   readonly stealGraceMs: number;
+  /**
+   * The world U3's migration sweep runs against
+   * (`control/schema-sweep.ts:createSchemaSweepPorts`).
+   *
+   * **Required, deliberately.** The sweep spent a unit written and uncalled, and
+   * an optional dependency is how that state comes back: a tick assembled
+   * without it would compile, run, report cheerfully, and migrate nothing. A
+   * fleet that genuinely has no schema work to do says so with ports that list
+   * nothing, which is a statement someone made rather than a field someone
+   * forgot.
+   */
+  readonly schemas: SweepPorts;
 }
 
 export interface SchedulerTickResult {
   readonly reclaimed: number;
   readonly stamped: number;
+  /**
+   * What the schema sweep did this tick, per tenant — including the failures.
+   *
+   * Carried out rather than counted, for the same reason `refused` is: a sweep
+   * whose every tenant comes back `failed` looks exactly like a fleet with
+   * nothing to migrate from any number, and the difference is the whole point of
+   * running it.
+   */
+  readonly schemas: readonly SweepOutcome[];
   readonly due: number;
   readonly enqueued: readonly { readonly tenantId: string; readonly reason: DueReason }[];
   /**
@@ -339,20 +390,42 @@ export interface SchedulerTickResult {
 }
 
 /**
- * One pass: reap what died, give new tenants a due time, enqueue who is due.
+ * One pass: reap what died, migrate who is behind, give new tenants a due time,
+ * enqueue who is due.
  *
- * Reclaim runs **first**. A tenant whose consolidation is stuck in a dead
+ * **Reclaim runs first.** A tenant whose consolidation is stuck in a dead
  * worker's lease is not due — its lane is occupied — so sweeping afterwards
  * would leave it one full tick behind on every cycle.
+ *
+ * **The schema sweep runs second, ahead of the enqueue, and that ordering is the
+ * argument for putting it here at all.** A tenant whose schema this fleet cannot
+ * read cannot be consolidated either: the handler would query a shape it does
+ * not understand. Enqueueing first therefore manufactures work that can only
+ * fail, and failing work walks a perfectly healthy tenant up the retry ladder
+ * towards a dead letter and a quarantine that was never theirs. Migrating first
+ * costs at most one tick's delay and cannot do that.
+ *
+ * It is bounded (`config.schemaSweepLimit`) and failure-isolated inside
+ * `sweepTenantSchemas`, so the worst a bad batch does to the rest of the tick is
+ * take its own budget.
  */
 export async function runSchedulerTick(
   deps: SchedulerDeps,
-  options: { readonly now: Date; readonly cycleMs?: number },
+  options: {
+    readonly now: Date;
+    readonly cycleMs?: number;
+    /** The run's own deadline, threaded in: the sweep stops between tenants. */
+    readonly signal?: AbortSignal;
+  },
 ): Promise<SchedulerTickResult> {
   const { sql, queue, config } = deps;
   const { now } = options;
 
   const reclaimed = await queue.reclaim({ now, stealGraceMs: deps.stealGraceMs });
+  const schemas = await sweepTenantSchemas(deps.schemas, {
+    limit: config.schemaSweepLimit,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
   const stamped = await stampMissingDueTimes(sql, { now, config });
   const due = await selectDueTenants(sql, { now, config });
 
@@ -375,6 +448,7 @@ export async function runSchedulerTick(
   return {
     reclaimed: reclaimed.length,
     stamped,
+    schemas,
     due: due.length,
     enqueued,
     refused,

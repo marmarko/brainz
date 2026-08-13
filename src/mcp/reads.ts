@@ -28,6 +28,10 @@
 import type { SQL } from 'bun';
 
 import { fenceEntity, fenceRow, fenceScalar, type Grant } from '../core/search/fence.ts';
+// The shared normalizer, reached through the read side's re-export — the same
+// function objects `write/links.ts` files aliases with, never a second copy.
+// `test/core/search/normalize.test.ts` asserts that identity across the seam.
+import { normalize, slugify } from '../core/search/normalize.ts';
 import { textArrayLiteral } from '../core/write/pg-values.ts';
 import type { IndexState } from './envelope.ts';
 import { formatId, type IdKind, type OpaqueId } from './ids.ts';
@@ -298,15 +302,67 @@ export type EntityOutcome =
   | { readonly status: 'not_found'; readonly suggestions: readonly string[] };
 
 /**
+ * The rungs this tool resolves a name on, in the order it tries them.
+ *
+ * **The order is the increasing speculation the ranked read's ladder uses**
+ * (`search/alias-hop.ts`), read back rather than re-invented — the write side
+ * already walks the first two in the same order (`write/links.ts:findEntityByName`,
+ * "the read path's ladder, applied on the write side"), and this tool having
+ * only the first of them is what made that docstring aspirational.
+ *
+ * What is deliberately *not* here is the ladder's speculative tail — the
+ * slug-suffix guess that a bare surname means the person whose slug ends with
+ * it, and the mention rung. Both exist to *nominate* candidates into a ranking
+ * that then decides between them. This tool returns one card and no ranking, so
+ * a guess arrives wearing the same confidence as an exact match; the honest
+ * degradation for that tier is the suggestion list a miss already returns, which
+ * hands the caller the candidates instead of picking one for it.
+ */
+const ENTITY_RUNGS = {
+  /** The recall vocabulary: normalized surface forms and declared aliases. */
+  alias: 1,
+  /** The addressing namespace — canonical slugs *and* redirects, so a renamed entity keeps its old address. */
+  slug: 2,
+  /**
+   * The canonical name, compared raw.
+   *
+   * Last, and it is the one comparison here not made against a stored key.
+   * `canonical_name` holds the user's own spelling — the normalizer deliberately
+   * does not touch stored text — so `lower()` on it is a weaker fold than the
+   * one the write path applied. It stays because nothing in the schema *requires*
+   * an alias row, so a row filed by a path that did not write one would otherwise
+   * be unreachable by its own name; every entity `resolveOrCreateEntity` creates
+   * carries its normalized name as an alias and is answered by rung 1 first.
+   */
+  canonical_name: 3,
+} as const;
+
+/**
  * One entity as a card. Zero model calls, by construction — this is the tool
  * whose entire justification for having a name is that it is fast.
+ *
+ * **The name is folded by the shared normalizer, and the comparison is made
+ * against the keys the write path wrote.** Both halves matter and the second is
+ * the easy one to miss: `write/links.ts` stores every alias as a
+ * {@link normalize} key, so `lower(alias) = lower(asked)` is a *second*
+ * normalizer sitting on top of the first — it folds case and nothing else,
+ * which means the punctuation fold the write path applied is invisible to it. A
+ * name carrying a curly apostrophe, a fullwidth letter or an ellipsis then
+ * resolves through `recall`'s alias ladder and misses here, silently, with
+ * `found: false` on the tool that exists to answer exactly that question. So the
+ * key is computed once, through the one module, and each rung below compares it
+ * against a column written through the same module — never against a second
+ * fold expressed in SQL, which would be that same failure one layer down.
  */
 export async function entityCard(sql: SQL, grant: Grant, name: string): Promise<EntityOutcome> {
-  const needle = name.trim().toLowerCase();
-  if (needle.length === 0) return { status: 'not_found', suggestions: [] };
+  const key = normalize(name);
+  if (key.length === 0) return { status: 'not_found', suggestions: [] };
   const grantLiteral = textArrayLiteral(grant);
+  // Derived from `normalize`, not from a second lowercasing convention, so the
+  // address a name resolves to is the address that name was filed under.
+  const slug = slugify(name);
 
-  // In-grant matches first, then a stable tiebreak.
+  // In-grant matches first, then the rung, then a stable tiebreak.
   //
   // The lookup is deliberately unfenced — an id-addressed or name-addressed read
   // answers `scope_denied` rather than `not_found` when a row exists outside the
@@ -318,28 +374,48 @@ export async function entityCard(sql: SQL, grant: Grant, name: string): Promise<
   // `scope_denied` on its own entity depending on which row the planner happened
   // to return. Resolving in-grant first keeps the disclosure for the case it was
   // meant for, which is the name this grant genuinely cannot reach.
+  //
+  // The grant outranks the rung, and that ordering is the same decision: a
+  // caller's own entity, reached on a lower rung, is a better answer than a
+  // neighbouring origin's exact match that this credential may not read.
   const rows = (await sql.unsafe(
-    `SELECT e.entity_id::text AS entity_id, e.canonical_name, e.entity_type, e.origin_contexts
-       FROM entity e
-       LEFT JOIN entity_alias a ON a.entity_id = e.entity_id
+    `WITH matched AS (
+       SELECT a.entity_id, ${ENTITY_RUNGS.alias} AS rung FROM entity_alias a WHERE a.alias = $1
+       UNION ALL
+       SELECT s.entity_id, ${ENTITY_RUNGS.slug} AS rung FROM entity_slug s WHERE s.slug = $3
+       UNION ALL
+       SELECT e.entity_id, ${ENTITY_RUNGS.canonical_name} AS rung FROM entity e WHERE lower(e.canonical_name) = $1
+     ),
+     resolved AS (
+       -- An id appears in its highest rung only, which is the ladder's own
+       -- de-duplication rule and, here, the tie-break.
+       SELECT entity_id, min(rung) AS rung FROM matched GROUP BY entity_id
+     )
+     SELECT e.entity_id::text AS entity_id, e.canonical_name, e.entity_type, e.origin_contexts
+       FROM resolved r
+       JOIN entity e ON e.entity_id = r.entity_id
       WHERE e.deleted_at IS NULL
-        AND (lower(e.canonical_name) = $1 OR lower(a.alias) = $1)
-      GROUP BY e.entity_id, e.canonical_name, e.entity_type, e.origin_contexts
-      ORDER BY (e.origin_contexts && $2::text[]) DESC, e.entity_id
-      LIMIT 2`,
-    [needle, grantLiteral],
+      ORDER BY (e.origin_contexts && $2::text[]) DESC, r.rung, e.entity_id
+      LIMIT 1`,
+    [key, grantLiteral, slug],
   )) as Array<{ entity_id: string; canonical_name: string; entity_type: string; origin_contexts: string[] }>;
 
   const row = rows[0];
   if (row === undefined) {
+    // The suggestion arm folds the same way the resolution arm does. A prefix
+    // taken from a normalized key and matched only against the unnormalized
+    // column suggests nothing in precisely the case the caller needed the hint —
+    // the spelling that just missed.
     const suggestions = (await sql.unsafe(
-      `SELECT canonical_name FROM entity
-        WHERE deleted_at IS NULL
-          AND origin_contexts && $2::text[]
-          AND lower(canonical_name) LIKE $1
-        ORDER BY canonical_name
+      `SELECT e.canonical_name
+         FROM entity e
+        WHERE e.deleted_at IS NULL
+          AND e.origin_contexts && $2::text[]
+          AND (lower(e.canonical_name) LIKE $1
+               OR EXISTS (SELECT 1 FROM entity_alias a WHERE a.entity_id = e.entity_id AND a.alias LIKE $1))
+        ORDER BY e.canonical_name
         LIMIT 3`,
-      [`${needle.split(/\s+/)[0] ?? needle}%`, grantLiteral],
+      [`${key.split(/\s+/)[0] ?? key}%`, grantLiteral],
     )) as Array<{ canonical_name: string }>;
     return { status: 'not_found', suggestions: suggestions.map((s) => s.canonical_name) };
   }

@@ -40,7 +40,22 @@ import {
   staggerOffsetMs,
   type DueTenant,
 } from '../../src/worker/scheduler.ts';
+import type { SweepPorts } from '../../src/control/migrate.ts';
 import { connect, createControlPlane, dropControlPlane, seedTenant, type ControlFixture } from './fixture.ts';
+
+/**
+ * A fleet with no schema work, stated rather than omitted.
+ *
+ * `SchedulerDeps.schemas` is required precisely so that "this tick migrates
+ * nothing" has to be something a caller said. The tests in this file are about
+ * KTD11's triggers; `test/worker/schema-sweep.test.ts` is where the sweep's own
+ * wiring is asserted.
+ */
+const NO_SCHEMA_WORK: SweepPorts = {
+  listBehind: () => Promise.resolve([]),
+  migrate: () => Promise.reject(new Error('invariant: nothing was listed to migrate')),
+  recordSchemaVersion: () => Promise.resolve(),
+};
 
 const NOW = new Date('2026-08-12T12:00:00Z');
 const MINUTE = 60_000;
@@ -369,7 +384,7 @@ describe('a scheduler tick', () => {
       lastCycleAt: ago(6 * HOUR),
     });
 
-    const deps = { sql, queue, config: CONFIG, stealGraceMs: 15_000 };
+    const deps = { sql, queue, config: CONFIG, stealGraceMs: 15_000, schemas: NO_SCHEMA_WORK };
     const first = await runSchedulerTick(deps, { now: NOW });
     expect(first.enqueued).toEqual([{ tenantId: 'quiet-with-debt', reason: 'debt_debounce' }]);
 
@@ -387,7 +402,7 @@ describe('a scheduler tick', () => {
   test('the job records which trigger enqueued it', async () => {
     await seedTenant(sql, 'ceiling-only', { lastCycleAt: ago(30 * HOUR), nextDueAt: ago(MINUTE) });
 
-    await runSchedulerTick({ sql, queue, config: CONFIG, stealGraceMs: 15_000 }, { now: NOW });
+    await runSchedulerTick({ sql, queue, config: CONFIG, stealGraceMs: 15_000, schemas: NO_SCHEMA_WORK }, { now: NOW });
     const rows = (await sql`
       SELECT trigger_reason, debt_observed FROM control.job WHERE tenant_id = 'ceiling-only'
     `) as unknown as { trigger_reason: string; debt_observed: number }[];
@@ -397,7 +412,7 @@ describe('a scheduler tick', () => {
   test('a brand-new tenant is stamped on one tick and served on a later one', async () => {
     // R3 end to end, with no user in the loop: connect, walk away, get consolidated.
     await seedTenant(sql, 'connected-and-idle', { pendingDebt: 0, lastActivity: null, nextDueAt: null });
-    const deps = { sql, queue, config: CONFIG, stealGraceMs: 15_000 };
+    const deps = { sql, queue, config: CONFIG, stealGraceMs: 15_000, schemas: NO_SCHEMA_WORK };
 
     const first = await runSchedulerTick(deps, { now: NOW });
     expect(first.stamped).toBe(1);
@@ -424,7 +439,7 @@ describe('a scheduler tick', () => {
     }
 
     const result = await runSchedulerTick(
-      { sql, queue, config: CONFIG, stealGraceMs: 15_000 },
+      { sql, queue, config: CONFIG, stealGraceMs: 15_000, schemas: NO_SCHEMA_WORK },
       { now: NOW, cycleMs: ALPHA_CEILING_MS },
     );
 

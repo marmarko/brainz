@@ -5,7 +5,7 @@ implementation units in the roadmap plan; the plan is the authority on scope.
 
 | Directory | Owns | Units |
 |---|---|---|
-| `control/` | Control plane (content-free), tenant provisioning, secret store, the migration runner that moves a tenant along the schema ladder | U2, U3 |
+| `control/` | Control plane (content-free), tenant provisioning, secret store, the migration runner that moves a tenant along the schema ladder and the ports the fleet's scheduled sweep runs it through | U2, U3 |
 | `schema/` | The per-tenant schema as an ordered ladder of rungs, the applier that provisioning calls, and the one vector-query helper every read goes through | U3 |
 | `ai/` | The single model gateway — routing by op, metering, pricing, key resolution. **No other directory imports a provider SDK.** | U20 |
 | `core/` | Write path, retrieval stack, consolidation cycle, briefing assembly, media/OCR | U4, U5, U11, U12, U21 |
@@ -21,6 +21,13 @@ provisioning-only DDL path for the migration tests to miss. Every rung must be a
 previous release is still serving tenants a newer instance has already migrated. That is
 enforced twice: `findExpandContractViolations` scans each rung, and `test/schema/rollout.test.ts`
 runs the previous release's own frozen statements against a migrated database.
+
+**And nothing serves a tenant at a rung it does not understand.** The two halves of that
+live outside `control/`, which is why they are stated here: `mcp/dispatch.ts` asserts a
+servable schema — off the version the connection accessor caches on its entry, so a warm
+request pays nothing for it — before the fence is derived or any handler runs, and
+`worker/scheduler.ts`'s tick sweeps tenants behind the head through
+`control/schema-sweep.ts`, bounded, warmest first, ahead of enqueueing work that would fail.
 
 ## Two invariants that outlive any single unit
 
