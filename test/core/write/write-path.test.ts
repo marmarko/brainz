@@ -498,6 +498,59 @@ describe('the asynchronous half is resumable, not promised', () => {
     expect(await countRows(tenant.sql, 'page')).toBe(0);
     expect(await countRows(tenant.sql, 'fact')).toBe(0);
   }, TEST_TIMEOUT_MS);
+
+  test('the backfill stops on a short batch instead of spinning on it', async () => {
+    // The write path has a second alignment check of its own, so removing the
+    // count guard leaves ingestion looking fine. The backfill has no such
+    // second check: it skips the chunk it got no vector for and loops, the
+    // backlog query returns the same row, and the pass turns into a provider
+    // call in a loop — spending money on a batch that can never drain. Bounded
+    // here by a short timeout, because the failure shape is a hang.
+    await reset();
+    const harness = createGateway();
+    await ingestDocument(contextFor(harness), {
+      originContext: 'personal',
+      sourceType: 'note',
+      title: null,
+      body: 'A paragraph with no extractable structure in it whatsoever.',
+    });
+    expect(await backlogSize(tenant.sql)).toBe(1);
+
+    const base = createEmbeddingTransport();
+    const short: ModelTransport = {
+      id: 'short',
+      async invoke(request) {
+        const answer = await base.invoke(request);
+        if (answer.output.kind !== 'embedding') return answer;
+        return { ...answer, output: { kind: 'embedding', vectors: [] } };
+      },
+    };
+
+    const result = await runChunkEmbedBacklog({
+      sql: tenant.sql,
+      gateway: createModelGateway({
+        profile: HOSTED_PROFILE,
+        transport: short,
+        meter: createInMemorySpendMeter(),
+        keys: {
+          store: createTenantProviderKeyStore({ backend: createInMemoryProviderKeyBackend() }),
+          hosted: createHostedKeyPool({
+            openai: 'k',
+            google: 'k',
+            cloudflare: 'k',
+            'self-host': 'k',
+          }),
+        },
+      }),
+      tenantId: TENANT,
+      caller: CALLER,
+      budget: uncappedBudget('backfill'),
+    });
+
+    expect(result.embedded).toBe(0);
+    expect(result.failure).toBe('embedding_count_mismatch');
+    expect(await backlogSize(tenant.sql)).toBe(1);
+  }, 15_000);
 });
 
 describe('KTD8 end to end: a wrong-width provider writes nothing', () => {

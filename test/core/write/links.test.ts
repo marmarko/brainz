@@ -412,8 +412,12 @@ describe('editing a page removes the edges it no longer states', () => {
     await write({ origin: 'personal', ref: 'scan-1', body: statement });
     expect(await liveEdges()).toHaveLength(1);
 
-    // Nothing live states it any more, so an exhaustive scan would remove it.
+    // Nothing live states it any more, so an exhaustive scan would remove it —
+    // but one unrelated live fact remains, so the scan has something to consume
+    // its budget on. Without that, "gave up" and "there was nothing to read"
+    // are the same execution and the ceiling could stop counting unnoticed.
     await tenant.sql`UPDATE fact SET deleted_at = now()`;
+    await say('The spare key is in the blue tin on the top shelf.');
 
     const request = {
       facts: [],
@@ -422,8 +426,15 @@ describe('editing a page removes the edges it no longer states', () => {
       taxonomyVersion: 1,
     };
 
-    const gaveUp = await reconcileEdges(tenant.sql, { ...request, scanLimit: 0 });
-    expect(gaveUp.removed).toBe(0);
+    const refused = await reconcileEdges(tenant.sql, { ...request, scanLimit: 0 });
+    expect(refused.removed).toBe(0);
+    expect(await liveEdges()).toHaveLength(1);
+
+    // One statement of budget: enough to read the unrelated fact, not enough to
+    // conclude anything — so it still keeps the edge. This is the arm that
+    // requires the counter to actually count.
+    const spent = await reconcileEdges(tenant.sql, { ...request, scanLimit: 1 });
+    expect(spent.removed).toBe(0);
     expect(await liveEdges()).toHaveLength(1);
 
     const looked = await reconcileEdges(tenant.sql, request);
