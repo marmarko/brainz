@@ -58,6 +58,17 @@ Q1 and Q2 are blocking. Q3 is not blocking but should be asked in the same email
 
 ---
 
+## Where each answer lands in code (U9, 2026-08-13)
+
+U9's substrate is built so that either answer is absorbable without a rewrite.
+The three places an answer changes something:
+
+| Answer | What changes |
+|---|---|
+| **Q1 — no** (their OAuth apps do not cover production restricted Gmail scopes) | `src/ingest/pipedream/sources/gmail.ts` is replaced, and nothing else is. The adapters depend on `ProviderApi` — one method — so the fallback (CASA-free scopes plus an MBOX mailbox export through U8's folder import) is a new `ProviderSource`, not a new pipeline. `src/ingest/cursor.ts`, `junk.ts`, `pipedream/pull.ts`, `first-import.ts` and `log.ts` never mention Gmail. **The fallback is deliberately not built** — building it before the answer arrives would be a second mail path to maintain for a question one email settles. |
+| **Q2** (programmatic external-user deletion with token revocation) | `PipedreamClient.deleteExternalUser` in `src/ingest/pipedream/client.ts` already makes the call R12's fourth erasure leg needs. What it *reports* is `tokensRevoked: 'unverified'`, and a test pins that string: promoting it to `'confirmed'` without a written vendor answer would put a false sentence in a privacy policy. When the answer arrives, change the literal and the test together. |
+| **Q3** (whether message bodies transit Pipedream) | Only prose: R10's register entry and U15's subprocessor list read "credential vendor" or "content processor". No code depends on it. The vendor's URL and header shape for the proxied call is a separate unverified detail, confined to `providerUrl` and `connectionHeaders` in `client.ts`. |
+
 ## Recording the answer
 
 Write the reply into this file under a `## Answer (YYYY-MM-DD)` heading, verbatim
@@ -66,3 +77,4 @@ where it matters. Then update:
 - **Assumption 1** in the plan — mark verified, or take the priced no-branch.
 - **R12 / U17** — confirm or correct the erasure leg's description.
 - **R10 register + U15 subprocessor list** — set Pipedream's classification from Q3.
+- **`client.ts`'s `ExternalUserDeletion.tokensRevoked`** — and its test.
