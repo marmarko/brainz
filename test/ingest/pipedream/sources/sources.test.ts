@@ -16,12 +16,14 @@
 
 import { describe, expect, test } from 'bun:test';
 
+import { MAX_MEDIA_BYTES } from '../../../../src/core/media/accept.ts';
 import { createPipedreamClient } from '../../../../src/ingest/pipedream/client.ts';
 import { createCalendarSource } from '../../../../src/ingest/pipedream/sources/calendar.ts';
 import { createDriveSource } from '../../../../src/ingest/pipedream/sources/drive.ts';
 import { createGmailSource } from '../../../../src/ingest/pipedream/sources/gmail.ts';
 import { externalRefFor } from '../../../../src/ingest/pipedream/sources/types.ts';
-import { CONFIG, createScriptedTransport, withToken } from '../fixture.ts';
+import { screenshotBytes } from '../../../media/fixture.ts';
+import { CONFIG, createScriptedTransport, withToken, type ScriptedResponse } from '../fixture.ts';
 
 const NOW = new Date('2026-08-13T10:00:00.000Z');
 const SINCE = new Date('2026-05-15T00:00:00.000Z');
@@ -527,36 +529,113 @@ describe('drive', () => {
     expect(outcome.page.nextCursor).toEqual({ kind: 'delta', value: 'p-9' });
   });
 
-  test('a binary file is not decoded leniently into a page of noise', async () => {
-    const transport = withToken(createScriptedTransport());
-    transport.on('/changes?', {
+  function changeFor(file: Record<string, unknown>): ScriptedResponse {
+    return {
       status: 200,
-      body: {
-        newStartPageToken: 'p-9',
-        changes: [
-          {
-            fileId: 'f4',
-            file: { id: 'f4', name: 'photo.png', mimeType: 'image/png', trashed: false },
-          },
-        ],
-      },
-    });
+      body: { newStartPageToken: 'p-9', changes: [{ fileId: file.id, file }] },
+    };
+  }
 
-    const source = createDriveSource(client(transport));
-    const outcome = await source.list({
-      ...CONNECTION,
-      mode: 'delta',
-      cursor: 'p-8',
-      since: null,
-      maxItems: 100,
-      now: NOW,
-    });
+  const delta = { ...CONNECTION, mode: 'delta', cursor: 'p-8', since: null, maxItems: 100, now: NOW } as const;
+
+  test('a screenshot arrives as media, byte for byte', async () => {
+    // It is never decoded leniently into a page of noise — that much was always
+    // right. What was wrong is that the honest failure row was the *end* of it:
+    // a Drive full of screenshots imported as a Drive full of failures, and
+    // U21's transcribe queue stayed permanently empty.
+    const transport = withToken(createScriptedTransport());
+    transport.on(
+      '/changes?',
+      changeFor({ id: 'f4', name: 'photo.png', mimeType: 'image/png', trashed: false, size: '278' }),
+    );
+    const bytes = screenshotBytes();
+    transport.on('/files/f4', { status: 200, body: '', bytes });
+
+    const outcome = await createDriveSource(client(transport)).list(delta);
 
     expect(outcome.ok).toBe(true);
     if (!outcome.ok) return;
     expect(outcome.page.items.length).toBe(0);
-    // U21 owns the media path; what belongs here is the honest skip.
+    expect(outcome.page.failures.length).toBe(0);
+    const media = outcome.page.media?.[0];
+    expect(media?.externalRef).toBe(externalRefFor('drive', 'f4'));
+    expect(media?.mediaType).toBe('image/png');
+    // Byte-for-byte, and the fixture carries a NUL, a lone 0xFF and an illegal
+    // UTF-8 pair precisely so a string round trip cannot survive this.
+    expect([...(media?.bytes ?? [])]).toEqual([...bytes]);
+    // Fetched as bytes, not as text: the request that produced them said so.
+    const fetched = transport.requests.find((request) => request.url.includes('/files/f4'));
+    expect(fetched?.binary).toBe(true);
+  });
+
+  test('a voice memo is still refused, and visibly', async () => {
+    // The closed set is the point of `classifyMedia`: opening the media door
+    // must not open it to everything. A user who sends a voice memo has asked
+    // for a feature that does not exist, and the row is what says so.
+    const transport = withToken(createScriptedTransport());
+    transport.on(
+      '/changes?',
+      changeFor({ id: 'f5', name: 'memo.m4a', mimeType: 'audio/mp4', trashed: false, size: '900' }),
+    );
+
+    const outcome = await createDriveSource(client(transport)).list(delta);
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.media ?? []).toEqual([]);
+    expect(outcome.page.failures[0]?.externalRef).toBe(externalRefFor('drive', 'f5'));
     expect(outcome.page.failures[0]?.reason).toBe('parse_failed');
+    // And it was never downloaded. A refusal that fetches first is a refusal
+    // that already paid for the thing it refused.
+    expect(transport.requests.some((request) => request.url.includes('/files/f5'))).toBe(false);
+  });
+
+  test('an oversize file is refused from the listing, before it is fetched', async () => {
+    // Nothing here streams, so an unbounded object is the whole file in memory
+    // on the way to the object store. The listing already states the size; a
+    // two-gigabyte PDF must never become a request.
+    const transport = withToken(createScriptedTransport());
+    transport.on(
+      '/changes?',
+      changeFor({
+        id: 'f6',
+        name: 'scans.pdf',
+        mimeType: 'application/pdf',
+        trashed: false,
+        size: String(MAX_MEDIA_BYTES + 1),
+      }),
+    );
+
+    const outcome = await createDriveSource(client(transport)).list(delta);
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.media ?? []).toEqual([]);
+    expect(outcome.page.failures[0]?.reason).toBe('parse_failed');
+    expect(outcome.page.failures[0]?.retryable).toBe(false);
+    expect(transport.requests.some((request) => request.url.includes('/files/f6'))).toBe(false);
+  });
+
+  test('a client that cannot answer in bytes holds the cursor rather than skipping the file', async () => {
+    // This is a fact about how the fleet is wired, not about the file. A
+    // non-retryable row here would advance the cursor past a change the
+    // provider offers exactly once, and the user's screenshots would be gone
+    // for good because of a transport nobody noticed was text-only.
+    const transport = withToken(createScriptedTransport());
+    transport.on(
+      '/changes?',
+      changeFor({ id: 'f7', name: 'wifi.png', mimeType: 'image/png', trashed: false }),
+    );
+    // No `bytes` on the answer: a transport that only speaks text.
+    transport.on('/files/f7', { status: 200, body: 'not the bytes' });
+
+    const outcome = await createDriveSource(client(transport)).list(delta);
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.media ?? []).toEqual([]);
+    expect(outcome.page.failures[0]?.reason).toBe('provider_error');
+    expect(outcome.page.failures[0]?.retryable).toBe(true);
   });
 });
 

@@ -18,15 +18,18 @@
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
+import { MAX_MEDIA_BYTES } from '../../src/core/media/accept.ts';
 import { ingestDocument } from '../../src/core/write/write-path.ts';
 import {
   FOLDER_REF_PREFIX,
   decodeEntry,
   externalRefFor,
   isScannableRootId,
+  mediaFrom,
   seenRefsFrom,
   tombstoneMissing,
 } from '../../src/ingest/import/folder.ts';
+import { pdfWithTextLayer, screenshotBytes } from '../media/fixture.ts';
 import {
   CALLER,
   TENANT,
@@ -293,6 +296,47 @@ describe('decoding is text-only, and says so', () => {
   test('a binary file is null rather than a page of mojibake with a vector on it', () => {
     const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0xfe]);
     expect(decodeEntry({ path: 'chart.png', bytes: png, modifiedAt: null })).toBeNull();
+  });
+
+  test('...and then it is offered to the media path instead of being dropped', () => {
+    // `decodeEntry` returning null was the end of a file's journey: the caller
+    // wrote a failure row and the bytes went nowhere, so a folder of screenshots
+    // imported as a folder of failures. Right while nothing could read an image;
+    // U21 built the reader.
+    const entry = { path: 'chart.png', bytes: screenshotBytes(), modifiedAt: null };
+    expect(decodeEntry(entry)).toBeNull();
+    const media = mediaFrom(entry);
+    expect(media?.mediaType).toBe('image/png');
+    expect([...(media?.bytes ?? [])]).toEqual([...screenshotBytes()]);
+  });
+
+  test('the type is read from the bytes, never from the name', () => {
+    // A filename is the user's. A sniffer that trusted `.png` would hand a
+    // mislabelled file to a decoder that cannot open it, and — the expensive
+    // direction — would accept anything at all as long as it was named right.
+    const png = { path: 'holiday.mp4', bytes: screenshotBytes(), modifiedAt: null };
+    expect(mediaFrom(png)?.mediaType).toBe('image/png');
+
+    const video = {
+      path: 'screenshot.png',
+      bytes: new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]),
+      modifiedAt: null,
+    };
+    expect(mediaFrom(video)).toBeNull();
+  });
+
+  test('a PDF is media; a voice memo is still nothing at all', () => {
+    // The closed set is what keeps the media door from being every door.
+    expect(mediaFrom({ path: 'invoice.pdf', bytes: pdfWithTextLayer('hello'), modifiedAt: null })
+      ?.mediaType).toBe('application/pdf');
+    const memo = new Uint8Array([0x66, 0x74, 0x79, 0x70, 0x4d, 0x34, 0x41, 0x20]);
+    expect(mediaFrom({ path: 'memo.m4a', bytes: memo, modifiedAt: null })).toBeNull();
+  });
+
+  test('an object over the ceiling is refused before anything holds it', () => {
+    const huge = new Uint8Array(MAX_MEDIA_BYTES + 1);
+    huge.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    expect(mediaFrom({ path: 'scan.png', bytes: huge, modifiedAt: null })).toBeNull();
   });
 
   test('invalid UTF-8 with no NUL byte is still refused', () => {

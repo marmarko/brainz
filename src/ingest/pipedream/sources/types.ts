@@ -97,6 +97,24 @@ export interface PulledItem {
   readonly junk?: JunkInput;
 }
 
+/**
+ * One object a listing carried — a screenshot in Drive, a PDF on a message.
+ *
+ * Separate from {@link PulledItem} because what happens to it is a different
+ * verb: an item becomes a page now, an object is preserved now and read by
+ * U11's `transcribe` phase later. Structurally the same shape the import runner
+ * takes as `ImportMediaItem`, and deliberately so — one seam, reached from both
+ * doors.
+ */
+export interface PulledMedia {
+  readonly externalRef: string;
+  /** The provider's own content type. `classifyMedia` refuses anything outside the set. */
+  readonly mediaType: string;
+  readonly bytes: Uint8Array;
+  /** What the junk gate reads. Absent for sources that carry no headers. */
+  readonly junk?: JunkInput;
+}
+
 export type TombstoneReason = 'deleted' | 'trashed' | 'cancelled' | 'removed';
 
 export interface PulledTombstone {
@@ -187,6 +205,14 @@ export interface CursorSeed {
 
 export interface PullPage {
   readonly items: readonly PulledItem[];
+  /**
+   * Objects this listing carried. Absent for a source that has none.
+   *
+   * Drive answered every image and PDF with a `parse_failed` row before U21's
+   * reader existed. It was the right refusal then and it is a permanently empty
+   * transcribe queue now.
+   */
+  readonly media?: readonly PulledMedia[];
   readonly tombstones: readonly PulledTombstone[];
   /** Items the provider offered but could not be turned into a page. */
   readonly failures: readonly PulledFailure[];

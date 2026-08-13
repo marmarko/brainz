@@ -7,14 +7,23 @@
  * both are tombstones here, because a document in the bin must stop answering
  * queries whatever the mechanism was.
  *
- * **A binary file is refused, not decoded leniently.** A PDF or a PNG run
- * through a text decoder becomes a page of replacement characters with a vector
- * attached to it: it costs an embedding call and pollutes retrieval with a
- * document that says nothing. U21 owns the media path; what belongs here is the
- * honest failure row — the same choice U8's folder import makes, one store
- * over.
+ * **A binary file is never decoded leniently.** A PDF or a PNG run through a
+ * text decoder becomes a page of replacement characters with a vector attached
+ * to it: it costs an embedding call and pollutes retrieval with a document that
+ * says nothing. That was the whole argument for the failure row this adapter
+ * used to write for every image — and the failure row was only ever half the
+ * answer, because it meant a Drive full of screenshots imported as a Drive full
+ * of failures and U21's transcribe queue stayed empty for good.
+ *
+ * So: a binary whose content type U21 can read is **fetched as bytes** and
+ * offered as media. It is preserved by the runner and transcribed later, in the
+ * cycle, under a phase budget. A binary U21 cannot read still gets the honest
+ * failure row, and so does one the provider says is too big to hold — refused
+ * from the *listing*, before a download, because the listing already states the
+ * size and a two-gigabyte file should never become a request.
  */
 
+import { MAX_MEDIA_BYTES, classifyMedia } from '../../../core/media/accept.ts';
 import type { ProviderApi } from '../client.ts';
 import {
   asArray,
@@ -32,6 +41,7 @@ import {
   type ProviderSource,
   type PulledFailure,
   type PulledItem,
+  type PulledMedia,
   type PulledTombstone,
 } from './types.ts';
 
@@ -42,7 +52,7 @@ const GOOGLE_DOC = 'application/vnd.google-apps.document';
 const GOOGLE_SHEET = 'application/vnd.google-apps.spreadsheet';
 const GOOGLE_SLIDES = 'application/vnd.google-apps.presentation';
 
-const FILE_FIELDS = 'id,name,mimeType,trashed,modifiedTime';
+const FILE_FIELDS = 'id,name,mimeType,trashed,modifiedTime,size';
 
 /** Mime types this unit can turn into prose without a model. */
 function isTextual(mimeType: string): boolean {
@@ -60,11 +70,66 @@ function exportMimeFor(mimeType: string): string | null {
   return null;
 }
 
+/** Drive states `size` as a decimal string, and only for binary files. */
+function declaredSize(file: Record<string, unknown>): number | null {
+  const raw = asString(file.size);
+  if (raw === null || !/^\d+$/.test(raw)) return null;
+  const size = Number(raw);
+  return Number.isSafeInteger(size) ? size : null;
+}
+
 export function createDriveSource(api: ProviderApi): ProviderSource {
+  /**
+   * A file U21 can read, fetched as bytes.
+   *
+   * The size check is against the *listing*, before the request: nothing here
+   * streams, so an unbounded object is the whole file in memory on the way to
+   * the object store — and a listing that says two gigabytes should never
+   * become a download. `acceptMedia` re-checks at the boundary for the files
+   * Drive did not size.
+   */
+  async function fetchMedia(
+    request: ProviderListRequest,
+    file: Record<string, unknown>,
+    externalRef: string,
+    mediaType: string,
+  ): Promise<PulledMedia | PulledFailure> {
+    const size = declaredSize(file);
+    if (size !== null && size > MAX_MEDIA_BYTES) {
+      return { externalRef, reason: 'parse_failed', retryable: false };
+    }
+
+    const id = asString(file.id) ?? '';
+    const outcome = await api.request({
+      app: APP,
+      method: 'GET',
+      path: `/drive/v3/files/${encodeURIComponent(id)}`,
+      query: { alt: 'media' },
+      externalUserId: request.externalUserId,
+      accountId: request.accountId ?? null,
+      binary: true,
+    });
+    if (!outcome.ok) return itemFailureFor(externalRef, outcome);
+
+    const bytes = outcome.value instanceof Uint8Array ? outcome.value : null;
+    if (bytes === null) {
+      // The client in use cannot answer in bytes. That is a fact about this
+      // deployment, not about the file, so the cursor holds: a fleet that gains
+      // a binary-capable transport tomorrow must be offered this change again,
+      // and the alternative is a user's screenshots skipped for good by a
+      // configuration nobody noticed.
+      return { externalRef, reason: 'provider_error', retryable: true };
+    }
+    if (bytes.length === 0 || bytes.length > MAX_MEDIA_BYTES) {
+      return { externalRef, reason: 'parse_failed', retryable: false };
+    }
+    return { externalRef, mediaType, bytes };
+  }
+
   async function fetchContent(
     request: ProviderListRequest,
     file: Record<string, unknown>,
-  ): Promise<PulledItem | PulledFailure> {
+  ): Promise<PulledItem | PulledMedia | PulledFailure> {
     const id = asString(file.id);
     if (id === null) return { externalRef: null, reason: 'parse_failed', retryable: false };
     const externalRef = externalRefFor('drive', id);
@@ -72,6 +137,11 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
     const exportMime = exportMimeFor(mimeType);
 
     if (exportMime === null && !isTextual(mimeType)) {
+      // Drive states its own content type for its own object, so it is used
+      // rather than sniffed — and `classifyMedia` refuses anything outside the
+      // closed set regardless, which is what keeps a voice memo out.
+      const verdict = classifyMedia(mimeType);
+      if (verdict.ok) return await fetchMedia(request, file, externalRef, verdict.mediaType);
       return { externalRef, reason: 'parse_failed', retryable: false };
     }
 
@@ -109,8 +179,9 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
   async function collect(
     request: ProviderListRequest,
     files: ReadonlyArray<Record<string, unknown>>,
-  ): Promise<{ items: PulledItem[]; failures: PulledFailure[] }> {
+  ): Promise<{ items: PulledItem[]; media: PulledMedia[]; failures: PulledFailure[] }> {
     const items: PulledItem[] = [];
+    const media: PulledMedia[] = [];
     const failures: PulledFailure[] = [];
     const ceiling = Math.max(0, request.maxItems);
     // Beyond the ceiling is accounted for, not sliced away: a retryable row
@@ -126,9 +197,10 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
     for (const file of files.slice(0, ceiling)) {
       const fetched = await fetchContent(request, file);
       if ('reason' in fetched) failures.push(fetched);
+      else if ('bytes' in fetched) media.push(fetched);
       else items.push(fetched);
     }
-    return { items, failures };
+    return { items, media, failures };
   }
 
   async function delta(request: ProviderListRequest): Promise<ProviderListOutcome> {
@@ -175,7 +247,7 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
       if (file !== null) live.push(file);
     }
 
-    const { items, failures } = await collect(request, live);
+    const { items, media, failures } = await collect(request, live);
     const nextPageToken = asString(body?.nextPageToken ?? null);
     const newStartPageToken = asString(body?.newStartPageToken ?? null);
 
@@ -183,6 +255,7 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
       ok: true,
       page: {
         items,
+        media,
         tombstones,
         failures,
         // **A truncated change page is still a delta.** The changes feed's own
@@ -241,13 +314,14 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
       .filter((file): file is Record<string, unknown> => file !== null)
       .slice(0, request.maxItems);
 
-    const { items, failures } = await collect(request, files);
+    const { items, media, failures } = await collect(request, files);
     const nextPageToken = asString(body?.nextPageToken ?? null);
 
     return {
       ok: true,
       page: {
         items,
+        media,
         tombstones: [],
         failures,
         nextCursor:

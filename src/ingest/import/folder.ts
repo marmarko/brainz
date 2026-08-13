@@ -40,6 +40,7 @@
 
 import type { SQL } from 'bun';
 
+import { MAX_MEDIA_BYTES, sniffMediaType } from '../../core/media/accept.ts';
 import { reconcileEdges } from '../../core/write/links.ts';
 
 /** Every folder page's external ref starts here. */
@@ -162,7 +163,10 @@ export function seenRefsFrom(rootId: string, scan: FolderScan): string[] {
  * becomes a page of replacement characters with a vector attached to it, which
  * costs an embedding call and pollutes retrieval with a document that says
  * nothing. `fatal: true` is what makes that a refusal rather than mojibake.
- * U21 owns the media path; what belongs here is the honest `null`.
+ *
+ * `null` is not the end of the file's journey any more: {@link mediaFrom} is
+ * asked next, and a screenshot or a PDF goes down U21's media path instead.
+ * Only what neither of them recognises becomes a failure row.
  */
 export function decodeEntry(entry: FolderEntry): DecodedFile | null {
   let text: string;
@@ -181,6 +185,35 @@ export function decodeEntry(entry: FolderEntry): DecodedFile | null {
     body: text,
     modifiedAt: entry.modifiedAt,
   };
+}
+
+/** One scanned entry that is not text but *is* something the brain can read. */
+export interface FolderMedia {
+  readonly path: string;
+  /** Read from the bytes, never from the extension. */
+  readonly mediaType: string;
+  readonly bytes: Uint8Array;
+}
+
+/**
+ * The other half of {@link decodeEntry}: a screenshot or a PDF rather than prose.
+ *
+ * `decodeEntry` returning `null` used to be the end of a file's journey — the
+ * caller wrote a failure row and the bytes went nowhere, so a folder of
+ * screenshots imported as a folder of failures. That was the safe answer while
+ * nothing downstream could read an image; U21 built the reader, and this is the
+ * door to it.
+ *
+ * **Null still means "not something this brain reads"**, and the caller still
+ * owes it a visible failure row. A folder scan carries no content type, so the
+ * type is read from the bytes: an extension is the user's, and `holiday.png`
+ * that is really a video must not become an object nothing can ever transcribe.
+ */
+export function mediaFrom(entry: FolderEntry): FolderMedia | null {
+  const mediaType = sniffMediaType(entry.bytes);
+  if (mediaType === null) return null;
+  if (entry.bytes.length === 0 || entry.bytes.length > MAX_MEDIA_BYTES) return null;
+  return { path: entry.path, mediaType, bytes: entry.bytes };
 }
 
 /**

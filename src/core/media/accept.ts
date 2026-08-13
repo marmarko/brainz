@@ -65,6 +65,51 @@ export const SUPPORTED_MEDIA_TYPES: readonly string[] = Object.freeze([
 ]);
 
 /**
+ * The largest payload this brain will take in one object.
+ *
+ * A ceiling rather than a correctness rule, in the same spirit as
+ * `sources/types.ts:MAX_ITEM_CHARACTERS`: nothing here streams, so an
+ * unbounded object is the whole file in memory on the way to the store and the
+ * whole file in memory again on the way to the vision model. Sources refuse
+ * *before* fetching wherever the provider states a size — a listing that says
+ * two gigabytes should never become a download — and this constant is the
+ * backstop for the ones that do not say.
+ */
+export const MAX_MEDIA_BYTES = 10_000_000;
+
+/**
+ * What these bytes actually are, read from the bytes.
+ *
+ * A filename extension is the user's, and a source that trusted `.png` would
+ * hand a mislabelled file to a decoder that cannot read it — or, worse, accept
+ * `invoice.png` that is really a 900MB video because the name said otherwise.
+ * The signatures below are the four image formats U21 supports plus PDF, which
+ * is the whole closed set; anything else returns `null` and the caller records
+ * the refusal that {@link classifyMedia} would have produced anyway.
+ *
+ * Sources that carry a *provider-asserted* content type (Drive, mail) use that
+ * instead: it is the same class of claim as `occurred_at` — content, not truth
+ * — but it is the provider's own answer for its own object, and `classifyMedia`
+ * refuses anything outside the closed set regardless.
+ */
+export function sniffMediaType(bytes: Uint8Array): string | null {
+  const starts = (...signature: number[]): boolean =>
+    bytes.length >= signature.length && signature.every((byte, index) => bytes[index] === byte);
+
+  if (starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return 'image/png';
+  if (starts(0xff, 0xd8, 0xff)) return 'image/jpeg';
+  if (starts(0x47, 0x49, 0x46, 0x38)) return 'image/gif';
+  // RIFF....WEBP — the four length bytes in between are not part of the claim.
+  if (starts(0x52, 0x49, 0x46, 0x46) && bytes.length >= 12) {
+    const webp = [0x57, 0x45, 0x42, 0x50];
+    if (webp.every((byte, index) => bytes[8 + index] === byte)) return 'image/webp';
+  }
+  if (starts(0x25, 0x50, 0x44, 0x46)) return PDF_MEDIA_TYPE;
+
+  return null;
+}
+
+/**
  * The families the plan declines by name, kept separate from "we do not
  * recognise this". A user who sends a voice memo has asked for a feature that
  * does not exist; a user who sends `application/x-quicken` has asked for one
@@ -220,6 +265,8 @@ export interface AcceptMediaInput {
 export type AcceptFailureReason =
   | 'unsupported_media_type'
   | 'empty_payload'
+  /** Over {@link MAX_MEDIA_BYTES}. The backstop for a source that fetched first. */
+  | 'payload_too_large'
   | 'origin_missing'
   | 'key_denied'
   | 'preservation_failed';
@@ -293,6 +340,9 @@ export async function acceptMedia(
     return { ok: false, reason: 'unsupported_media_type', media: verdict };
   }
   if (input.bytes.length === 0) return { ok: false, reason: 'empty_payload' };
+  if (input.bytes.length > MAX_MEDIA_BYTES) {
+    return { ok: false, reason: 'payload_too_large', detail: String(input.bytes.length) };
+  }
 
   const origin = input.originContext.trim();
   if (origin.length === 0) return { ok: false, reason: 'origin_missing' };

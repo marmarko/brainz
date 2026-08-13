@@ -74,6 +74,8 @@ import type { SQL } from 'bun';
 import { createBudget } from '../../ai/gateway.ts';
 import type { PriceBook } from '../../ai/pricing.ts';
 import type { NamedProfile } from '../../ai/routing.ts';
+import type { TenantStorage } from '../../control/storage.ts';
+import { acceptMedia } from '../../core/media/accept.ts';
 import { runChunkEmbedBacklog } from '../../core/write/embed.ts';
 import {
   contentDigest,
@@ -114,7 +116,8 @@ import {
 } from '../first-import.ts';
 import { gateJunk } from '../junk.ts';
 import { countRunItem, finishRun, openRun, recordItem, type IngestFailureCode } from '../log.ts';
-import type { TenantRuntime } from '../import/run.ts';
+import { mediaFailureFor, type TenantRuntime } from '../import/run.ts';
+import type { RawStore } from '../import/raw.ts';
 import type { PullFailureReason } from './client.ts';
 import { tombstoneRefs } from './tombstone.ts';
 import type { ProviderSource } from './sources/types.ts';
@@ -146,6 +149,17 @@ export interface PullRequest {
   readonly profile: NamedProfile;
   readonly source: ProviderSource;
   readonly states: ConnectorStateStore;
+  /**
+   * Where an object goes, and the accessor that decides its key.
+   *
+   * Optional because a source that offers no media needs neither, and required
+   * in practice for Drive: a listing that carries objects and a runner with
+   * nowhere to put them writes a failure row per object and **holds the
+   * cursor**, so the file is offered again once the fleet is wired rather than
+   * skipped for good by a configuration nobody noticed.
+   */
+  readonly storage?: TenantStorage;
+  readonly rawStore?: RawStore;
   readonly now: Date;
   readonly window?: ImportWindow;
   readonly queue?: JobQueue;
@@ -234,6 +248,12 @@ export interface PullCounts {
   readonly warned: number;
   readonly failed: number;
   readonly tombstoned: number;
+  /**
+   * Objects preserved and queued for transcription — stored, replaced or
+   * already held. Apart from `written` because an attachment is not a page: it
+   * becomes one later, in U11's cycle, if there is anything written on it.
+   */
+  readonly attachments: number;
 }
 
 export interface PullResult {
@@ -262,6 +282,7 @@ const EMPTY_COUNTS: PullCounts = {
   warned: 0,
   failed: 0,
   tombstoned: 0,
+  attachments: 0,
 };
 
 interface MutableCounts {
@@ -271,6 +292,7 @@ interface MutableCounts {
   warned: number;
   failed: number;
   tombstoned: number;
+  attachments: number;
 }
 
 /** A provider failure, in the vocabulary `ingest_log.failure_code` admits. */
@@ -818,6 +840,93 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     }
 
     // ------------------------------------------------------------------
+    // 7a. The objects this listing carried.
+    //
+    // Behind the gate and ahead of the items, for the reasons `import/run.ts`
+    // step 7 states: acceptance issues no provider call, so it must not be
+    // starved by an item loop that ran out of embedding money, and a refused
+    // pull stores nothing at all.
+    //
+    // **Which refusals hold the cursor is the decision no later pull can
+    // correct.** A provider offers a change once. If the cursor steps over an
+    // object the object *store* refused, that file is never offered again and
+    // the user's screenshot is gone from the brain for good — so a failure
+    // about us holds, and a failure about the file (an unreadable type, an
+    // empty payload, something over the ceiling) does not, because asking again
+    // produces the identical refusal and holding would wedge the source.
+    // `mediaFailureFor` is the single place that tells them apart.
+    // ------------------------------------------------------------------
+    for (const { item, quarantine } of gateJunk(
+      (listed.media ?? []).map((entry) => ({ ...entry, body: '' })),
+    )) {
+      if (request.storage === undefined || request.rawStore === undefined) {
+        // Objects offered and nowhere to put them. A row each and the cursor
+        // holds: this is a fact about how the fleet is wired, and the file is
+        // still there to be fetched once it is wired right.
+        counts.failed += 1;
+        incomplete ??= 'provider_error';
+        await countRunItem(tenant.sql, run.ingestId, { written: 0, quarantined: 0 });
+        await recordItem(tenant.sql, {
+          originContext,
+          sourceType,
+          externalRef: item.externalRef,
+          disposition: 'failed',
+          failureCode: 'provider_error',
+        });
+        continue;
+      }
+
+      const outcome = await acceptMedia(
+        { sql: tenant.sql, storage: request.storage, store: request.rawStore },
+        {
+          tenantId: tenant.tenantId,
+          caller: tenant.caller,
+          originContext,
+          mediaType: item.mediaType,
+          bytes: item.bytes,
+          externalId: item.externalRef,
+          quarantine,
+        },
+      );
+
+      if (!outcome.ok) {
+        const failure = mediaFailureFor(outcome.reason);
+        counts.failed += 1;
+        if (failure.retryable) incomplete ??= 'provider_error';
+        await countRunItem(tenant.sql, run.ingestId, { written: 0, quarantined: 0 });
+        await recordItem(tenant.sql, {
+          originContext,
+          sourceType,
+          externalRef: item.externalRef,
+          disposition: 'failed',
+          failureCode: failure.code,
+        });
+        continue;
+      }
+
+      counts.attachments += 1;
+      const disposition =
+        outcome.status === 'unchanged'
+          ? 'unchanged'
+          : quarantine !== null
+            ? 'quarantined'
+            : 'written';
+      // `acceptMedia` advances no counter of its own, unlike `ingestDocument`.
+      // Without this the run row reports a clean pull of a Drive whose every
+      // image it refused.
+      await countRunItem(tenant.sql, run.ingestId, {
+        written: disposition === 'written' ? 1 : 0,
+        quarantined: disposition === 'quarantined' ? 1 : 0,
+      });
+      await recordItem(tenant.sql, {
+        originContext,
+        sourceType,
+        externalRef: item.externalRef,
+        disposition,
+      });
+    }
+
+    // ------------------------------------------------------------------
     // 8. The items.
     // ------------------------------------------------------------------
     /** Processing stopped part-way, so nothing after this point should run. */
@@ -1001,6 +1110,14 @@ export interface PullHandlerDeps {
     tenant: TenantRuntime,
     source: ConnectorSource,
   ) => Promise<{ readonly source: ProviderSource; readonly states: ConnectorStateStore }>;
+  /**
+   * Where an object goes. Threaded through, because a handler that opened a
+   * source capable of offering media and then ran it with nowhere to put the
+   * bytes would be the same "built but never reached" shape the media path
+   * already spent a unit in: every screenshot a failure row, forever.
+   */
+  readonly storage?: TenantStorage;
+  readonly rawStore?: RawStore;
   readonly priceBook?: PriceBook;
   readonly maxItems?: number;
   /**
@@ -1050,6 +1167,8 @@ export function createIngestPullHandler(
         now: context.now,
         interactive: false,
         jobId: lease.jobId,
+        ...(deps.storage === undefined ? {} : { storage: deps.storage }),
+        ...(deps.rawStore === undefined ? {} : { rawStore: deps.rawStore }),
         ...(banked === null
           ? {}
           : {

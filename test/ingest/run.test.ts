@@ -23,12 +23,14 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { createBudget } from '../../src/ai/gateway.ts';
+import { selectPendingAttachments } from '../../src/core/media/ocr-phase.ts';
 import { backlogSize } from '../../src/core/write/embed.ts';
 import { parseChatExport, parseChatExportBytes } from '../../src/ingest/import/chat-export.ts';
 import { manifestKeyFor, rawKeyFor, readManifest } from '../../src/ingest/import/raw.ts';
 import { createImportHandler, runImport, type ImportMaterial } from '../../src/ingest/import/run.ts';
 import { externalRefFor } from '../../src/ingest/import/folder.ts';
 import { DEFAULT_INLINE_ITEM_CEILING } from '../../src/ingest/first-import.ts';
+import { screenshotBytes } from '../media/fixture.ts';
 import {
   CALLER,
   HOSTED_PROFILE,
@@ -142,6 +144,7 @@ async function resetBrain(): Promise<void> {
   await fixture.tenantSql`DELETE FROM entity_alias`;
   await fixture.tenantSql`DELETE FROM entity`;
   await fixture.tenantSql`DELETE FROM chunk`;
+  await fixture.tenantSql`DELETE FROM attachment`;
   await fixture.tenantSql`UPDATE page SET ingest_id = NULL`;
   await fixture.tenantSql`DELETE FROM page`;
   await fixture.tenantSql`DELETE FROM ingest_log`;
@@ -756,5 +759,179 @@ describe('bulk filtering is a seam both runners reach', () => {
 
     expect(result.counts.written).toBe(1);
     expect(result.counts.quarantined).toBe(0);
+  });
+});
+
+/**
+ * The objects a folder scan carries.
+ *
+ * `acceptMedia` and the transcribe phase existed and nothing in `src/ingest/`
+ * called either, so images and PDFs never arrived in production at all and the
+ * transcribe queue was empty by construction. The assertions are on the rows,
+ * the object store and the queue predicate — a summary count is what a loop
+ * reports about itself, and a loop that never ran reports its initial value.
+ */
+describe('the objects a folder scan carries', () => {
+  const ROOT = 'shots';
+  const MEDIA_ORIGIN = 'folder:shots';
+
+  function mediaRequest(material: ImportMaterial) {
+    return {
+      ...baseRequest(material),
+      originContext: MEDIA_ORIGIN,
+      sourceType: 'document' as const,
+      target: 'folder' as const,
+    };
+  }
+
+  function mediaFor(path: string, bytes = screenshotBytes(), mediaType = 'image/png') {
+    return { externalRef: externalRefFor(ROOT, path), mediaType, bytes };
+  }
+
+  async function attachmentRows(where = 'true') {
+    return (await fixture.tenantSql.unsafe(
+      `SELECT object_key, media_type, byte_size, ocr_text, origin_context
+         FROM attachment WHERE ${where} ORDER BY attachment_id`,
+    )) as Array<{
+      object_key: string;
+      media_type: string;
+      byte_size: string | number | null;
+      ocr_text: string | null;
+      origin_context: string;
+    }>;
+  }
+
+  test('a screenshot is preserved, recorded and queued — and costs no model call', async () => {
+    await resetBrain();
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 0, capMicroUsd: 5_000_000 });
+    const before = fixture.transport.calls.length;
+
+    const result = await runImport(
+      mediaRequest({
+        items: [],
+        failures: [],
+        media: [mediaFor('wifi.png')],
+      }),
+    );
+
+    expect(result.outcome).toBe('completed');
+    expect(result.counts.attachments).toBe(1);
+    expect(result.counts.failed).toBe(0);
+    // Acceptance is not extraction. A write path that quietly OCR'd would still
+    // return a receipt, and the only place it would show up is the bill.
+    expect(fixture.transport.calls.length).toBe(before);
+
+    const rows = await attachmentRows(`origin_context = '${MEDIA_ORIGIN}'`);
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.media_type).toBe('image/png');
+    expect(Number(rows[0]?.byte_size)).toBe(screenshotBytes().length);
+    expect(rows[0]?.ocr_text).toBeNull();
+
+    const key = rows[0]?.object_key ?? '';
+    expect(key.length).toBeGreaterThan(0);
+    const stored = await fixture.rawStore.get(key as never);
+    expect([...(stored?.bytes ?? [])]).toEqual([...screenshotBytes()]);
+
+    // The queue U21 exists to fill, actually filled.
+    const pending = await selectPendingAttachments(fixture.tenantSql, { limit: 10 });
+    expect(pending.map((entry) => entry.objectKey)).toContain(key);
+
+    // Counted on the run row: `acceptMedia` advances nothing itself, so a loop
+    // that forgot would leave a run reporting a clean import of nothing.
+    const logRows = await ingestLogRows(fixture.tenantSql);
+    const runRow = logRows.find((row) => row.external_ref === null);
+    expect(runRow?.items_seen).toBe(1);
+    expect(runRow?.items_written).toBe(1);
+    expect(
+      logRows.some((row) => row.external_ref === externalRefFor(ROOT, 'wifi.png')),
+    ).toBe(true);
+  });
+
+  test('an object the store refuses leaves a visible failure row', async () => {
+    // The property the old refusal path got right and this must keep: nothing
+    // is silently dropped. An absence property passes when the path never runs,
+    // so it is asserted against the rows the run actually wrote.
+    await resetBrain();
+    fixture.rawStore.failNextPut();
+
+    const result = await runImport(
+      mediaRequest({ items: [], failures: [], media: [mediaFor('lost.png')] }),
+    );
+
+    expect(result.counts.attachments).toBe(0);
+    expect(result.counts.failed).toBe(1);
+    expect(await countRows(fixture.tenantSql, 'attachment')).toBe(0);
+    const row = (await ingestLogRows(fixture.tenantSql)).find(
+      (entry) => entry.external_ref === externalRefFor(ROOT, 'lost.png'),
+    );
+    expect(row?.outcome).toBe('failed');
+    expect(row?.failure_code).toBe('provider_error');
+  });
+
+  test('an object the brain cannot read leaves a row too', async () => {
+    await resetBrain();
+
+    const result = await runImport(
+      mediaRequest({
+        items: [],
+        failures: [],
+        media: [mediaFor('memo.m4a', new Uint8Array([1, 2, 3, 4]), 'audio/mp4')],
+      }),
+    );
+
+    expect(result.counts.attachments).toBe(0);
+    expect(result.counts.failed).toBe(1);
+    expect(await countRows(fixture.tenantSql, 'attachment')).toBe(0);
+    const row = (await ingestLogRows(fixture.tenantSql)).find(
+      (entry) => entry.external_ref === externalRefFor(ROOT, 'memo.m4a'),
+    );
+    expect(row?.failure_code).toBe('parse_failed');
+  });
+
+  test('an item loop that runs out of money still banks the objects', async () => {
+    // The ordering decision, stated as a consequence. Preserving an object
+    // issues no provider call, so it must not be the thing dropped when the
+    // *embedding* budget goes — and re-running costs nothing for what was
+    // already stored, because `acceptMedia` answers `unchanged`.
+    await resetBrain();
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 0, capMicroUsd: 5 });
+
+    const result = await runImport(
+      mediaRequest({
+        items: parseChatExport(factfulDocument(8)).conversations.map((conversation) => ({
+          externalRef: conversation.externalRef,
+          title: conversation.title,
+          body: conversation.body,
+          occurredAt: conversation.occurredAt,
+        })),
+        failures: [],
+        media: [mediaFor('under-pressure.png')],
+      }),
+    );
+
+    expect(result.stopReason).toBe('budget_exhausted');
+    expect(result.counts.attachments).toBe(1);
+    expect(await countRows(fixture.tenantSql, 'attachment')).toBe(1);
+  });
+
+  test('a refused import stores no objects at all', async () => {
+    // Behind the gate, and this is the half that says so. A ceiling that
+    // refused the run and a runner that banked its objects anyway would be two
+    // parts of the system disagreeing about whether the import happened.
+    await resetBrain();
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 1_000, capMicroUsd: 1_000 });
+
+    const result = await runImport(
+      mediaRequest({
+        items: [itemFrom(externalRefFor(ROOT, 'a.md'), proseOf('alpha', 4), null, 'a.md')],
+        failures: [],
+        media: [mediaFor('refused.png')],
+      }),
+    );
+
+    expect(result.outcome).toBe('refused');
+    expect(result.counts.attachments).toBe(0);
+    expect(await countRows(fixture.tenantSql, 'attachment')).toBe(0);
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 0, capMicroUsd: 5_000_000 });
   });
 });

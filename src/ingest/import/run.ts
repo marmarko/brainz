@@ -46,7 +46,14 @@
  * U4's `countIngestItem` advances `items_seen` for everything it accepts; a
  * malformed conversation and a file that failed to decode never reach it. The
  * runner counts those itself, or a run that skipped a third of a broken export
- * reports a clean import.
+ * reports a clean import. **Media is entirely in that category** — `acceptMedia`
+ * advances no counter of its own — so the object loop counts every outcome it
+ * has, accepted and refused alike.
+ *
+ * **Objects sit between the two orderings above.** They are behind the gate,
+ * like the items, because a refused import stores nothing; and ahead of the
+ * items, because preserving one issues no provider call and must not be starved
+ * by an item loop that ran out of embedding money. See step 7.
  */
 
 import type { SQL } from 'bun';
@@ -56,6 +63,7 @@ import type { PriceBook } from '../../ai/pricing.ts';
 import type { NamedProfile } from '../../ai/routing.ts';
 import type { CallerIdentity } from '../../control/secrets.ts';
 import type { TenantStorage } from '../../control/storage.ts';
+import { acceptMedia, type AcceptFailureReason } from '../../core/media/accept.ts';
 import { runChunkEmbedBacklog } from '../../core/write/embed.ts';
 import {
   contentDigest,
@@ -127,11 +135,44 @@ export interface ImportItemFailure {
   readonly reason: IngestFailureCode;
 }
 
+/**
+ * One object this scan carried that is not prose — a screenshot, a PDF.
+ *
+ * Structurally the media twin of {@link ImportItem}, and separate for the same
+ * reason `PulledTombstone` is separate from `PulledItem`: what happens to it is
+ * a different verb. An item is chunked, embedded and made a page *now*; an
+ * object is preserved now and read by U11's `transcribe` phase later, under a
+ * phase budget, because transcription is a model call.
+ */
+export interface ImportMediaItem {
+  /**
+   * The provider's own id, twice over: the ingest log records it, and the
+   * storage accessor hashes it into the object key. One identifier rather than
+   * two, so re-offering the same file lands on the same object and costs
+   * nothing (`acceptMedia` answers `unchanged`).
+   */
+  readonly externalRef: string;
+  /** As the provider stated it, or as the bytes were sniffed. Normalised downstream. */
+  readonly mediaType: string;
+  readonly bytes: Uint8Array;
+  /** What the junk gate reads. Absent for a source that carries no headers. */
+  readonly junk?: JunkInput;
+}
+
 /** Everything a source offers this run, already parsed and already scanned. */
 export interface ImportMaterial {
   readonly items: readonly ImportItem[];
   /** Items the source could not produce. Logged and skipped; the rest completes. */
   readonly failures: readonly ImportItemFailure[];
+  /**
+   * The objects this scan carried. Absent for a source that has none.
+   *
+   * U8's folder importer and U9's Drive source used to answer every binary with
+   * a failure row — safe, and it meant images and PDFs never arrived at all, so
+   * the transcribe phase had a permanently empty queue. This is the seam U21
+   * named.
+   */
+  readonly media?: readonly ImportMediaItem[];
   /** The bytes to preserve under `{tenant}/raw/`, and the untrusted id to key them by. */
   readonly raw?: { readonly id: string; readonly object: RawObject } | null;
   /** Folder only: the deletion reconciliation this scan supports, if any. */
@@ -177,6 +218,14 @@ export interface ImportCounts {
   readonly warned: number;
   readonly failed: number;
   readonly tombstoned: number;
+  /**
+   * Objects preserved and queued for transcription — stored, replaced or
+   * already held. Counted apart from `written` because an attachment is not a
+   * page: it becomes one later, in U11's cycle, if there is anything written on
+   * it. An object that could not be accepted lands in `failed`, like any other
+   * item the run could not take.
+   */
+  readonly attachments: number;
 }
 
 export interface ImportRunResult {
@@ -238,6 +287,7 @@ const EMPTY_COUNTS: ImportCounts = {
   warned: 0,
   failed: 0,
   tombstoned: 0,
+  attachments: 0,
 };
 
 interface MutableCounts {
@@ -247,6 +297,36 @@ interface MutableCounts {
   warned: number;
   failed: number;
   tombstoned: number;
+  attachments: number;
+}
+
+/**
+ * Which ingest-log code a refused object is, and whether asking again could
+ * change the answer.
+ *
+ * The second half is the one no later run can correct on a connector: a cursor
+ * that steps over a preservation failure means the provider never offers that
+ * file again, and the user's screenshot is gone from the brain for good. So the
+ * two classes are told apart here, once, and both callers read the same answer:
+ *
+ *   * **About the object** — an unrecognised type, an empty payload, something
+ *     over the ceiling. Asking again produces the identical refusal, so the
+ *     cursor may move on.
+ *   * **About us** — the object store refused the write, or the accessor would
+ *     not mint a key. Nothing is wrong with the file; the run should be offered
+ *     it again.
+ */
+export function mediaFailureFor(reason: AcceptFailureReason): {
+  readonly code: IngestFailureCode;
+  readonly retryable: boolean;
+} {
+  switch (reason) {
+    case 'preservation_failed':
+    case 'key_denied':
+      return { code: 'provider_error', retryable: true };
+    default:
+      return { code: 'parse_failed', retryable: false };
+  }
 }
 
 export async function runImport(request: ImportRunRequest): Promise<ImportRunResult> {
@@ -331,6 +411,18 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
 
     const selected = new Set(selection.selected.map((candidate) => candidate.externalRef));
     const items = gated.filter((entry) => selected.has(entry.item.externalRef));
+
+    // The objects go through the *same* gate, here rather than at the point of
+    // acceptance, so "the junk gate runs in front of the meter" holds for media
+    // too. A tracking pixel that arrives quarantined is stored and excluded from
+    // `selectPendingAttachments`, so it never costs a vision call — the same
+    // structural saving a quarantined page gets from being kept out of the
+    // embedding backlog. Media contributes no characters to the estimate
+    // because accepting it spends nothing; what it costs is paid later, out of
+    // the cycle's own phase budget.
+    const gatedMedia = gateJunk(
+      (material.media ?? []).map((item) => ({ ...item, body: '' })),
+    );
 
     // ------------------------------------------------------------------
     // 3. Deletion reconciliation, **before the gate**.
@@ -504,7 +596,77 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
     }
 
     // ------------------------------------------------------------------
-    // 7. The items.
+    // 7. The objects — behind the gate, and ahead of the items.
+    //
+    // **Behind the gate**, because a refused import stores nothing at all and a
+    // deferred one re-materialises its source when it resumes; banking objects
+    // for a run that was told no would be the ceiling deciding one thing and the
+    // runner doing another.
+    //
+    // **Ahead of the items**, because acceptance issues no provider call. A
+    // screenshot that costs nothing to store is not the thing to drop when the
+    // *embedding* budget runs out, and this order means a run that stops on
+    // `budget_exhausted` has still banked every object it was offered — which
+    // costs the re-run nothing, since `acceptMedia` answers `unchanged` on
+    // bytes it already holds.
+    //
+    // Nothing here transcribes. Preservation and a row; U11's `transcribe`
+    // phase does the reading, later, under a phase budget — which is the whole
+    // reason acceptance is not extraction.
+    //
+    // **Every object leaves a row, accepted or not.** `acceptMedia` advances no
+    // counter of its own (unlike `ingestDocument`, which calls `countIngestItem`
+    // internally), so a media loop that forgot `countRunItem` would leave a run
+    // reporting a clean import of a folder whose every image it refused.
+    // ------------------------------------------------------------------
+    for (const { item, quarantine } of gatedMedia) {
+      const outcome = await acceptMedia(
+        { sql: tenant.sql, storage: request.storage, store: request.rawStore },
+        {
+          tenantId: tenant.tenantId,
+          caller: tenant.caller,
+          originContext: request.originContext,
+          mediaType: item.mediaType,
+          bytes: item.bytes,
+          externalId: item.externalRef,
+          quarantine,
+        },
+      );
+
+      if (!outcome.ok) {
+        counts.failed += 1;
+        await countRunItem(tenant.sql, run.ingestId, { written: 0, quarantined: 0 });
+        await recordItem(tenant.sql, {
+          originContext: request.originContext,
+          sourceType: request.sourceType,
+          externalRef: item.externalRef,
+          disposition: 'failed',
+          failureCode: mediaFailureFor(outcome.reason).code,
+        });
+        continue;
+      }
+
+      counts.attachments += 1;
+      const disposition =
+        outcome.status === 'unchanged'
+          ? 'unchanged'
+          : quarantine !== null
+            ? 'quarantined'
+            : 'written';
+      await countRunItem(tenant.sql, run.ingestId, {
+        written: disposition === 'written' ? 1 : 0,
+        quarantined: disposition === 'quarantined' ? 1 : 0,
+      });
+      await recordItem(tenant.sql, {
+        originContext: request.originContext,
+        sourceType: request.sourceType,
+        externalRef: item.externalRef,
+        disposition,
+      });
+    }
+
+    // ------------------------------------------------------------------
+    // 8. The items.
     // ------------------------------------------------------------------
     let stopReason: ImportStopReason | undefined;
 
@@ -576,7 +738,7 @@ export async function runImport(request: ImportRunRequest): Promise<ImportRunRes
     }
 
     // ------------------------------------------------------------------
-    // 8. The chunk pass — the one the estimate priced.
+    // 9. The chunk pass — the one the estimate priced.
     //
     // U4 defers chunk embedding by design, so a runner that only writes pages
     // spends almost nothing and the gate would be bounding a pass that never

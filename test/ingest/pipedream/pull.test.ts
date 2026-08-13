@@ -34,11 +34,18 @@ import {
 } from '../../../src/ingest/cursor.ts';
 import { sourceStaleness } from '../../../src/ingest/log.ts';
 import {
+  createIngestPullHandler,
   enqueuePullIfDue,
   originContextFor,
   runPull,
+  type PullResult,
 } from '../../../src/ingest/pipedream/pull.ts';
-import { externalRefFor } from '../../../src/ingest/pipedream/sources/types.ts';
+import type { JobLease } from '../../../src/worker/jobs.ts';
+import {
+  externalRefFor,
+  type PulledMedia,
+} from '../../../src/ingest/pipedream/sources/types.ts';
+import { selectPendingAttachments } from '../../../src/core/media/ocr-phase.ts';
 import {
   CALLER,
   TENANT,
@@ -49,6 +56,7 @@ import {
   uncappedBudget,
   type IngestFixture,
 } from '../fixture.ts';
+import { screenshotBytes } from '../../media/fixture.ts';
 import { createFakeSource, mailBody, page } from './fixture.ts';
 
 let fixture: IngestFixture;
@@ -92,6 +100,8 @@ interface PullOptions {
   readonly interactive?: boolean;
   readonly queue?: IngestFixture['queue'];
   readonly now?: Date;
+  /** False runs the pull with nowhere to put an object, which is its own case. */
+  readonly withStorage?: boolean;
 }
 
 async function pull(
@@ -106,6 +116,9 @@ async function pull(
     source,
     states,
     now: options.now ?? NOW,
+    ...(options.withStorage === false
+      ? {}
+      : { storage: fixture.storage, rawStore: fixture.rawStore }),
     ...(options.window === undefined ? {} : { window: options.window }),
     ...(options.interactive === undefined ? {} : { interactive: options.interactive }),
     ...(options.queue === undefined ? {} : { queue: options.queue }),
@@ -600,5 +613,270 @@ describe('the ingest log', () => {
     const mine = rows.find((row) => row.ingest_id === result.runId);
     expect(mine?.outcome).toBe('ok');
     expect(mine?.finished_at).not.toBeNull();
+  });
+});
+
+/**
+ * The objects a listing carries.
+ *
+ * U21 built `acceptMedia` and the transcribe phase and nothing in `src/ingest/`
+ * called either, so a Drive full of screenshots imported as a Drive full of
+ * failure rows and the transcribe queue was empty by construction. What the
+ * block below has to prove is *reachability* — an attachment row, its bytes in
+ * the store, and the queue predicate actually selecting it — plus the property
+ * the refusal path got right and must keep: nothing is silently dropped.
+ *
+ * The assertions are on the gateway and on the rows. A summary field is what a
+ * phase reports about itself, and a phase that never ran reports whatever its
+ * initial value was.
+ */
+describe('the objects a listing carries', () => {
+  const DRIVE_ORIGIN = originContextFor('drive');
+
+  function mediaItem(id: string, overrides: Partial<PulledMedia> = {}): PulledMedia {
+    return {
+      externalRef: externalRefFor('drive', id),
+      mediaType: 'image/png',
+      bytes: screenshotBytes(),
+      ...overrides,
+    };
+  }
+
+  async function attachments(where = 'true'): Promise<
+    Array<{
+      object_key: string;
+      media_type: string;
+      byte_size: string | number | null;
+      ocr_text: string | null;
+      quarantined: boolean;
+      origin_context: string;
+    }>
+  > {
+    return (await fixture.tenantSql.unsafe(
+      `SELECT object_key, media_type, byte_size, ocr_text, origin_context,
+              (quarantined_at IS NOT NULL) AS quarantined
+         FROM attachment WHERE ${where} ORDER BY attachment_id`,
+    )) as never;
+  }
+
+  async function itemRow(externalRef: string) {
+    const rows = await ingestLogRows(fixture.tenantSql);
+    return rows.filter((row) => row.external_ref === externalRef).at(-1);
+  }
+
+  test('a screenshot is preserved, queued for transcription, and costs no model call', async () => {
+    const states = await storeWith(stateFor('drive'));
+    const source = createFakeSource('drive', 'document', [
+      page({ media: [mediaItem('shot-1')], nextCursor: { kind: 'delta', value: 'd-1' } }),
+    ]);
+
+    const before = fixture.transport.calls.length;
+    const result = await pull(source, states, { window: 'all' });
+
+    expect(result.outcome).toBe('completed');
+    expect(result.counts.attachments).toBe(1);
+    expect(result.counts.failed).toBe(0);
+    // **Acceptance is not extraction.** Not one provider call: the transcription
+    // this queues is U11's, paid out of a phase budget, and a write path that
+    // quietly OCR'd would show up only on the bill.
+    expect(fixture.transport.calls.length).toBe(before);
+
+    const rows = await attachments(`origin_context = '${DRIVE_ORIGIN}'`);
+    expect(rows.length).toBe(1);
+    expect(rows[0]?.media_type).toBe('image/png');
+    expect(Number(rows[0]?.byte_size)).toBe(screenshotBytes().length);
+    // NULL, not '': `ocr_text IS NULL` is what "still queued" means.
+    expect(rows[0]?.ocr_text).toBeNull();
+    expect(rows[0]?.quarantined).toBe(false);
+
+    // The bytes are actually there, byte for byte. A row pointing at an object
+    // that is not there is a transcription the cycle queues, pays a phase stop
+    // for, and never resolves.
+    const stored = await fixture.rawStore.get(rows[0]!.object_key as never);
+    expect([...(stored?.bytes ?? [])]).toEqual([...screenshotBytes()]);
+
+    // And the queue the whole unit exists for actually selects it. This is the
+    // assertion that would have failed for the entire life of U21.
+    const objectKey = rows[0]?.object_key ?? '';
+    expect(objectKey.length).toBeGreaterThan(0);
+    const pending = await selectPendingAttachments(fixture.tenantSql, { limit: 10 });
+    expect(pending.map((entry) => entry.objectKey)).toContain(objectKey);
+
+    // Counted on the run row: `acceptMedia` advances no counter of its own, so
+    // a loop that forgot to would leave the run reporting a clean, empty pull.
+    const runRow = (await ingestLogRows(fixture.tenantSql)).find((row) => row.ingest_id === result.runId);
+    expect(runRow?.items_seen).toBe(1);
+    expect(runRow?.items_written).toBe(1);
+    expect((await itemRow(externalRefFor('drive', 'shot-1')))?.outcome).toBe('ok');
+  });
+
+  test('the same file offered again costs nothing and creates nothing', async () => {
+    const states = await storeWith(stateFor('drive'));
+    const source = createFakeSource('drive', 'document', [
+      page({ media: [mediaItem('shot-1')], nextCursor: { kind: 'delta', value: 'd-2' } }),
+    ]);
+    const before = await attachments(`origin_context = '${DRIVE_ORIGIN}'`);
+
+    const result = await pull(source, states, { window: 'all' });
+
+    expect(result.counts.attachments).toBe(1);
+    expect((await attachments(`origin_context = '${DRIVE_ORIGIN}'`)).length).toBe(before.length);
+    // `unchanged` is `ok` with nothing written — the table's vocabulary has four
+    // outcomes over five dispositions, and `items_written` is what tells the
+    // second sighting of a file from the first.
+    const again = await itemRow(externalRefFor('drive', 'shot-1'));
+    expect(again?.outcome).toBe('ok');
+    expect(again?.items_written).toBe(0);
+    expect(again?.items_quarantined).toBe(0);
+  });
+
+  test('an object the store refuses leaves a row AND holds the cursor', async () => {
+    // The one mistake in this file no later pull can correct. A provider offers
+    // a change once; a cursor that steps over a *preservation* failure means the
+    // user's screenshot is gone from the brain for good, over a bad minute in
+    // the object store.
+    const states = await storeWith(stateFor('drive'));
+    const source = createFakeSource('drive', 'document', [
+      page({ media: [mediaItem('shot-lost')], nextCursor: { kind: 'delta', value: 'd-lost' } }),
+    ]);
+    fixture.rawStore.failNextPut();
+
+    const result = await pull(source, states, { window: 'all' });
+
+    expect(result.counts.attachments).toBe(0);
+    expect(result.counts.failed).toBe(1);
+    expect(result.cursorAdvanced).toBe(false);
+    expect(await countRows(fixture.tenantSql, 'attachment', `object_key LIKE '%'`)).toBeGreaterThanOrEqual(0);
+    const row = await itemRow(externalRefFor('drive', 'shot-lost'));
+    expect(row?.outcome).toBe('failed');
+    expect(row?.failure_code).toBe('provider_error');
+  });
+
+  test('an object the brain cannot read leaves a row and does NOT hold the cursor', async () => {
+    // The other direction, and it is not symmetrical: asking again produces the
+    // identical refusal, so holding here would wedge the source forever on a
+    // file that is never going to become readable.
+    const states = await storeWith(stateFor('drive'));
+    const source = createFakeSource('drive', 'document', [
+      page({
+        media: [mediaItem('memo', { mediaType: 'audio/mp4' })],
+        nextCursor: { kind: 'delta', value: 'd-memo' },
+      }),
+    ]);
+
+    const result = await pull(source, states, { window: 'all' });
+
+    expect(result.counts.failed).toBe(1);
+    expect(result.cursorAdvanced).toBe(true);
+    const row = await itemRow(externalRefFor('drive', 'memo'));
+    expect(row?.outcome).toBe('failed');
+    expect(row?.failure_code).toBe('parse_failed');
+    expect(await countRows(fixture.tenantSql, 'attachment', `media_type = 'audio/mp4'`)).toBe(0);
+  });
+
+  test('nowhere to put an object is a row per object, not a silence', async () => {
+    // A fleet wired without an object store must not look like a fleet with
+    // nothing to import. The row says what happened and the cursor holds, so the
+    // files are still offered once the wiring is fixed.
+    const states = await storeWith(stateFor('drive'));
+    const source = createFakeSource('drive', 'document', [
+      page({ media: [mediaItem('unwired')], nextCursor: { kind: 'delta', value: 'd-unwired' } }),
+    ]);
+
+    const result = await pull(source, states, { window: 'all', withStorage: false });
+
+    expect(result.counts.attachments).toBe(0);
+    expect(result.counts.failed).toBe(1);
+    expect(result.cursorAdvanced).toBe(false);
+    expect((await itemRow(externalRefFor('drive', 'unwired')))?.failure_code).toBe('provider_error');
+  });
+
+  test('a junk-quarantined object is stored, and stays out of the transcribe queue', async () => {
+    // The junk gate in front of the meter, applied to media: a tracking pixel is
+    // preserved (R23 — extraction improves, and the fleet cannot re-derive from
+    // bytes it no longer has) and never costs a vision call, because the queue
+    // predicate excludes it. The structural saving, not a careful caller.
+    const states = await storeWith(stateFor('drive'));
+    const source = createFakeSource('drive', 'document', [
+      page({
+        media: [
+          mediaItem('pixel', { junk: { headers: { 'List-Unsubscribe': '<https://x.test/u>' } } }),
+        ],
+        nextCursor: { kind: 'delta', value: 'd-pixel' },
+      }),
+    ]);
+
+    const result = await pull(source, states, { window: 'all' });
+
+    expect(result.counts.attachments).toBe(1);
+    const hidden = await attachments(`quarantined_at IS NOT NULL`);
+    expect(hidden.length).toBe(1);
+    const hiddenKey = hidden[0]?.object_key ?? '';
+    expect(hiddenKey.length).toBeGreaterThan(0);
+    const pending = await selectPendingAttachments(fixture.tenantSql, { limit: 50 });
+    expect(pending.map((entry) => entry.objectKey)).not.toContain(hiddenKey);
+    const row = await itemRow(externalRefFor('drive', 'pixel'));
+    expect(row?.outcome).toBe('ok');
+    expect(row?.items_quarantined).toBe(1);
+    expect(row?.items_written).toBe(0);
+  });
+});
+
+describe('the ingest_pull handler', () => {
+  test('carries the object store through, so a background pull can take media', async () => {
+    // The handler is where a connector actually runs in production. One that
+    // opened a media-capable source and then ran it with nowhere to put the
+    // bytes would reproduce the exact shape this whole change exists to close:
+    // working code the fleet never reaches.
+    const states = await storeWith(stateFor('drive'));
+    const source = createFakeSource('drive', 'document', [
+      page({
+        media: [
+          {
+            externalRef: externalRefFor('drive', 'handler-shot'),
+            mediaType: 'image/png',
+            bytes: screenshotBytes(),
+          },
+        ],
+        nextCursor: { kind: 'delta', value: 'd-handler' },
+      }),
+    ]);
+
+    let observed: PullResult | null = null;
+    const handler = createIngestPullHandler({
+      control: fixture.controlSql,
+      profile: HOSTED_PROFILE,
+      storage: fixture.storage,
+      rawStore: fixture.rawStore,
+      openTenant: () => Promise.resolve(fixture.runtime),
+      openSource: () => Promise.resolve({ source, states }),
+      onResult: (result) => {
+        observed = result;
+      },
+    });
+
+    const lease: JobLease = {
+      jobId: 'job-media-1',
+      tenantId: TENANT,
+      kind: 'ingest_pull',
+      target: 'drive',
+      leaseToken: 1,
+      owner: 'worker-1',
+      expiresAt: new Date(NOW.getTime() + 60_000),
+      attemptDeadlineAt: new Date(NOW.getTime() + 600_000),
+      attempts: 1,
+      maxAttempts: 5,
+      debtObserved: 0,
+    };
+
+    await handler({ lease, signal: new AbortController().signal, now: NOW });
+
+    expect(observed).not.toBeNull();
+    expect((observed as unknown as PullResult).counts.attachments).toBe(1);
+    expect((observed as unknown as PullResult).counts.failed).toBe(0);
+    const rows = (await fixture.tenantSql`
+      SELECT object_key FROM attachment WHERE media_type = 'image/png' AND ocr_text IS NULL
+    `) as Array<{ object_key: string }>;
+    expect(rows.length).toBeGreaterThan(0);
   });
 });
