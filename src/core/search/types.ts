@@ -179,6 +179,16 @@ export interface RecallOutcome {
   readonly aliasLadder: readonly LadderTier[];
   /** Entities the query resolved to, for the graph-adjacency boost. */
   readonly resolvedEntityIds: readonly string[];
+  /**
+   * The names and aliases **as they appear in the query** that resolved those
+   * entities — `MV`, not `Marcus Vandenberg`.
+   *
+   * Stage 6 needs the typed text rather than the canonical name, because a
+   * title run is made of what the user typed. See `boosts.ts:RESOLVED_NAME_RUN`.
+   * Optional so a substrate that resolved nothing need not say so twice; absent
+   * leaves the guard inert, which is the behaviour that predates it.
+   */
+  readonly resolvedNames?: readonly string[];
   /** Empty on a complete read. */
   readonly degraded: readonly Degradation[];
 }

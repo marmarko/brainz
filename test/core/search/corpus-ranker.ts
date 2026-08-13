@@ -50,7 +50,7 @@ import {
 import { CHANNEL_BY_SOURCE_TYPE } from '../../../src/core/search/arms.ts';
 import { visibleUnder } from '../../../src/core/search/fence.ts';
 import { classifyIntent, planFor, refinePlan, resolutionOf } from '../../../src/core/search/intent.ts';
-import { normalize, tokens } from '../../../src/core/search/normalize.ts';
+import { PHRASE_STOPWORDS, normalize, tokens } from '../../../src/core/search/normalize.ts';
 import { composeRanking } from '../../../src/core/search/pipeline.ts';
 import { candidatePoolFor } from '../../../src/schema/vector-query.ts';
 import type {
@@ -397,7 +397,7 @@ function ladderLookup(index: CorpusIndex, visible: ReadonlySet<string>): LadderL
 }
 
 function bm25(index: CorpusIndex, visible: readonly string[], query: string, pool: number): string[] {
-  const terms = tokenize(query);
+  const terms = tokenize(query).filter((term) => !PHRASE_STOPWORDS.has(term));
   const scored: { id: string; score: number }[] = [];
 
   for (const chunkId of visible) {
@@ -631,6 +631,7 @@ export function recallOverCorpus(
         .map((tier): LadderTier => ({ ...tier, ids: tier.ids.filter((id) => candidates.has(id)) }))
         .filter((tier) => tier.ids.length > 0),
       resolvedEntityIds: seeds.map((seed) => seed.entityId),
+      resolvedNames: seeds.map((seed) => seed.matchedKey ?? seed.canonicalName),
       degraded: options.withoutVectorArm === true ? ['embedding_unavailable'] : [],
     },
     now: index.now,

@@ -86,6 +86,7 @@ export function composeRanking(request: ComposeRequest, outcome: RecallOutcome):
     plan,
     now: request.now,
     resolvedEntityIds: outcome.resolvedEntityIds,
+    ...(outcome.resolvedNames === undefined ? {} : { resolvedNames: outcome.resolvedNames }),
     aliasLadder: outcome.aliasLadder.flatMap((tier) => [...tier.ids]),
     ...(request.boosts ?? {}),
   });

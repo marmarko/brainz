@@ -134,6 +134,36 @@ export const GRAPH_ADJACENCY_BOOST = 0.2;
 export const TITLE_FULL_PHRASE_BONUS = 0.5;
 
 /**
+ * Why a **partial** title run made only of a resolved name earns nothing.
+ *
+ * **This is a double-count, not a preference.** When the alias ladder resolves
+ * `MV` to Marcus Vandenberg, that one query token is already paid three times
+ * over: both lexical arms recall every row containing it, the ladder's mention
+ * rung injects every page naming him, and {@link GRAPH_ADJACENCY_BOOST} lifts
+ * every chunk adjacent to him. The title-phrase boost is the fourth payment,
+ * and it is the one that decides — a load-test rig whose document is titled
+ * "MV load test results" takes a 53% envelope lift for sharing one token with
+ * "MV roast contract", and outranks the row that states what Marcus actually
+ * does with the roast contract. The stage's own header says a boost that fires
+ * on unordered word overlap is "a second keyword arm under another name"; a
+ * one-token run is unordered by definition, and when that token is a name the
+ * ladder has already spent, the stage is a second *alias* arm.
+ *
+ * **Confined to partial runs, and that confinement is the whole rule.** A title
+ * that *is* the asked phrase is the user naming a document, whatever the phrase
+ * is made of — "Marcus Vandenberg" asked of the page titled *Marcus
+ * Vandenberg*, or "Dana Ilves who she is" asked of the note titled that. Those
+ * reach `complete` and are untouched. What is refused is the fragment: a run
+ * that covers part of the query, and covers it with nothing but the name.
+ *
+ * **Exactly parallel to {@link PHRASE_STOPWORDS}**, one line above it in
+ * {@link titleTerm}: a run of pure grammar carries no subject, and a run of
+ * pure name carries no *document*. Both say the title matched on something that
+ * cannot distinguish which page was meant.
+ */
+export const RESOLVED_NAME_RUN = 'partial title runs made only of a resolved name earn no title credit';
+
+/**
  * Function words a matched run may not consist *entirely* of.
  *
  * Without this the title boost fires on grammar: "who is Sam" against a page
@@ -262,6 +292,18 @@ export interface BoostInputs extends Partial<BoostOptions> {
   /** Injected. Never the wall clock — see the header. */
   readonly now: Date;
   readonly resolvedEntityIds: readonly string[];
+  /**
+   * The names and aliases **in the query** that caused an entity to resolve.
+   *
+   * Not the canonical names: what {@link titleTerm} has to recognise is the
+   * text the user typed, because that is what a title run is made of. `MV` and
+   * `Marcus Vandenberg` resolve the same entity and only one of them appears in
+   * `MV roast contract`. Absent or empty means "resolution found nothing", which
+   * leaves the guard inert — the fail-open direction is the pre-existing
+   * behaviour, and a caller that cannot supply this is a caller whose ladder
+   * resolved nothing to double-count.
+   */
+  readonly resolvedNames?: readonly string[];
   readonly aliasLadder: readonly string[];
 }
 
@@ -287,7 +329,12 @@ function recencyTerm(candidate: Candidate, now: Date, tilt: number): number {
   return tilt * Math.pow(0.5, ageDays / halfLife);
 }
 
-function titleTerm(candidate: Candidate, query: string, plan: RankingPlan): number {
+function titleTerm(
+  candidate: Candidate,
+  query: string,
+  plan: RankingPlan,
+  resolvedNameTokens: ReadonlySet<string>,
+): number {
   if (plan.exactMatchBoost === 0) return 0;
   const title = candidate.title;
   if (title === null || title.trim().length === 0) return 0;
@@ -307,6 +354,19 @@ function titleTerm(candidate: Candidate, query: string, plan: RankingPlan): numb
     (titleTokens.length > 0 &&
       queryTokens.length > 0 &&
       normalizeQuery(title) === normalizeQuery(query));
+
+  // **A run of pure name is not a title match either**, and the reason is the
+  // same shape as the stopword rule above: the run carries nothing that says
+  // *which document*. See {@link RESOLVED_NAME_RUN} for why this is a
+  // double-count rather than a tuning preference, and why it is confined to
+  // partial runs.
+  if (
+    !complete &&
+    resolvedNameTokens.size > 0 &&
+    run.every((token) => resolvedNameTokens.has(token))
+  ) {
+    return 0;
+  }
 
   return plan.exactMatchBoost * (overlap + (complete ? TITLE_FULL_PHRASE_BONUS : 0));
 }
@@ -405,13 +465,17 @@ export function applyBoosts(inputs: BoostInputs): ScoredCandidate[] {
   const graphAdjacencyBoost = inputs.graphAdjacencyBoost ?? GRAPH_ADJACENCY_BOOST;
   const restatementPenalty = inputs.restatementPenalty ?? RESTATEMENT_PENALTY;
   const resolved = new Set(inputs.resolvedEntityIds);
+  const resolvedNameTokens = new Set<string>();
+  for (const name of inputs.resolvedNames ?? []) {
+    for (const token of tokens(name)) resolvedNameTokens.add(token);
+  }
 
   const scored: ScoredCandidate[] = [];
 
   for (const [id, candidate] of inputs.candidates) {
     const fused = inputs.fused.get(id) ?? 0;
 
-    const title = titleTerm(candidate, inputs.query, inputs.plan);
+    const title = titleTerm(candidate, inputs.query, inputs.plan, resolvedNameTokens);
     const recency = recencyTerm(candidate, inputs.now, inputs.plan.recencyTilt);
     const sourceType = sourceTypeTerm(candidate, inputs.plan);
     const trust = trustTerm(candidate);

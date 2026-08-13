@@ -174,6 +174,9 @@ export async function recallArms(request: RecallRequest): Promise<RecallOutcome>
       .map((tier) => ({ ...tier, ids: tier.ids.filter((id) => candidates.has(id)) }))
       .filter((tier) => tier.ids.length > 0),
     resolvedEntityIds: seeds.map((seed) => seed.entityId),
+    // The matched key when the substrate recorded which one matched, else the
+    // canonical name: stage 6 recognises the text the user typed.
+    resolvedNames: seeds.map((seed) => seed.matchedKey ?? seed.canonicalName),
     // A **set** union, not a concatenation. Both layers legitimately report the
     // same event — `embedQuery` because it saw the provider refuse, `runArms`
     // because it saw a null vector — and a response that carries

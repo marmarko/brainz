@@ -61,7 +61,10 @@ function scoreTwo(
   query: string,
   a: Candidate,
   b: Candidate,
-  extra: { readonly resolvedEntityIds?: readonly string[] } = {},
+  extra: {
+    readonly resolvedEntityIds?: readonly string[];
+    readonly resolvedNames?: readonly string[];
+  } = {},
 ) {
   const plan = planFor(classifyIntent(query));
   const scored = applyBoosts({
@@ -77,10 +80,56 @@ function scoreTwo(
     plan,
     now: NOW,
     resolvedEntityIds: extra.resolvedEntityIds ?? [],
+    resolvedNames: extra.resolvedNames ?? [],
     aliasLadder: [],
   });
   return { order: scored.map((s) => s.candidate.id), scored };
 }
+
+describe('stage 6 — a run that is nothing but a resolved name is not a title match', () => {
+  // The rule, and why it is not a tuning choice. The title-phrase boost answers
+  // "did the user name this document". A **partial** run made only of the alias
+  // that resolved an entity answers a different question — "does this document
+  // mention that entity" — which the ladder's mention rung and the
+  // graph-adjacency boost already pay, out of the same token. Paying it a third
+  // time here is what lets a load-test rig called `MV` outrank the page about
+  // the person `MV` resolves to. Exactly parallel to the PHRASE_STOPWORDS rule
+  // one line above it: a run of pure grammar is not a phrase match, and neither
+  // is a run of pure name.
+  test('a partial run of nothing but the resolved alias earns no title credit', () => {
+    const rig = candidate('rig', {
+      title: 'MV load test results',
+      content: 'The MV rig held 4,000 requests a second before MV latency crossed the budget.',
+    });
+    const answer = candidate('answer', {
+      title: 'Kettle and Quill supplier list',
+      content: 'Marcus Vandenberg renegotiates the roast contract every February.',
+    });
+
+    const { order } = scoreTwo('MV roast contract', rig, answer, {
+      resolvedNames: ['MV'],
+    });
+    expect(order[0]).toBe('answer');
+  });
+
+  test('the guard is confined to partial runs: a title that IS the query still pays', () => {
+    const named = candidate('named', { title: 'Marcus Vandenberg', content: 'A profile.' });
+    const other = candidate('other', { title: 'Something else', content: 'A profile.' });
+    const { scored } = scoreTwo('Marcus Vandenberg', named, other, {
+      resolvedNames: ['Marcus Vandenberg'],
+    });
+    const title = scored.find((s) => s.candidate.id === 'named')?.boosts.title ?? 0;
+    expect(title).toBeGreaterThan(0);
+  });
+
+  test('a partial run carrying one word that is not the name still pays', () => {
+    const near = candidate('near', { title: 'MV roast schedule', content: 'unrelated body' });
+    const other = candidate('other', { title: 'Something else', content: 'unrelated body' });
+    const { scored } = scoreTwo('MV roast contract', near, other, { resolvedNames: ['MV'] });
+    const title = scored.find((s) => s.candidate.id === 'near')?.boosts.title ?? 0;
+    expect(title).toBeGreaterThan(0);
+  });
+});
 
 describe('stage 6 — the title-phrase boost', () => {
   test('an ordered phrase in the title beats a denser body decoy', () => {
