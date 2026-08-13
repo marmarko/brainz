@@ -25,10 +25,13 @@ runs the previous release's own frozen statements against a migrated database.
 ## Two invariants that outlive any single unit
 
 **Every model call goes through `ai/`.** Routing, metering, the spend cap and the
-unpriced-model hard-fail all live in one module. A guard test asserts no
-provider SDK is imported outside `src/ai/` — because a direct call is not a
+unpriced-model hard-fail all live in one module. This is enforced rather than
+agreed: `test/ai/boundary.test.ts` scans every file under `src/` and fails on a
+provider SDK import, a model-endpoint literal, a raw `@cf/…` model id and a
+direct platform AI binding outside `src/ai/` — because a direct call is not a
 style problem, it is unmetered spend that surfaces as a bill rather than an
-error.
+error. `test/ai/price-drift.test.ts` holds the other half: `src/ai/pricing.ts`
+is the only file under `src/` that may contain a price.
 
 **Every tenant-scoped read derives its scope from authenticated context.** No
 call site constructs a database key, an object-storage prefix, or a connection
