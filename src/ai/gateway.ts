@@ -317,9 +317,17 @@ export function createInMemorySpendMeter(): InMemorySpendMeter {
 export const DEFAULT_SPEND_WINDOW_SECONDS = 30 * 24 * 60 * 60;
 
 /**
- * The production meter: R14's **rolling** counter on the control-plane row.
+ * The production meter: R14's **rolling** counter on the control-plane row, and
+ * R22's hosted-COGS counter beside it.
  *
- * Three properties, each of which is a way the counter goes quietly wrong:
+ * **Two numbers, because they answer different questions.** `spend_micro_usd` is
+ * what this tenant spent — their visibility, their cap, whoever's key it was.
+ * `hosted_cogs_micro_usd` is what the *platform* paid, which excludes every call
+ * made on a key the tenant brought. R22 states the exclusion; the gateway
+ * computes it per call; this is the only place it is written down, and a flag
+ * computed and dropped is an exclusion nobody can report.
+ *
+ * Four properties, each of which is a way the counters go quietly wrong:
  *
  *  - **`x = x + $1` in one statement, not read-then-write.** Two tenants under
  *    concurrent load is the easy case; the same tenant under concurrent load is
@@ -334,6 +342,10 @@ export const DEFAULT_SPEND_WINDOW_SECONDS = 30 * 24 * 60 * 60;
  *  - **A zero-row update is an error, not a no-op.** `UPDATE … WHERE tenant_id
  *    = $1` that matches nothing succeeds at the protocol level, so a meter that
  *    shrugs at it is an unmetered path with a green tick on it.
+ *  - **Both counters roll on one predicate, in one statement.** They are only
+ *    ever read against each other, so a window boundary that moved one and not
+ *    the other would show a hosted margin changing every month for reasons
+ *    nobody spent.
  */
 export function createPostgresSpendMeter(options: {
   readonly sql: SQL;
@@ -351,12 +363,27 @@ export function createPostgresSpendMeter(options: {
         throw new Error(`refusing to meter a non-countable cost: ${String(record.costMicroUsd)}`);
       }
 
+      // R22's exclusion, resolved to a number here rather than left on the
+      // record. A call on the tenant's own key still moves `spend_micro_usd` —
+      // they asked for it, they can see it, it counts against their cap — and
+      // contributes nothing to what the platform paid for.
+      const cogsDelta = record.countsTowardHostedCogs ? delta : 0;
+
       const rows = (await sql`
         UPDATE control.tenant
            SET spend_micro_usd = CASE
                  WHEN spend_window_started_at <= now() - make_interval(secs => ${windowSeconds})
                  THEN ${delta}
                  ELSE spend_micro_usd + ${delta}
+               END,
+               -- The same CASE, on the same predicate, in the same statement.
+               -- Rolling the two counters separately — or rolling one and
+               -- letting the other accumulate — makes a hosted margin that
+               -- moves every window for reasons nobody spent.
+               hosted_cogs_micro_usd = CASE
+                 WHEN spend_window_started_at <= now() - make_interval(secs => ${windowSeconds})
+                 THEN ${cogsDelta}
+                 ELSE hosted_cogs_micro_usd + ${cogsDelta}
                END,
                spend_window_started_at = CASE
                  WHEN spend_window_started_at <= now() - make_interval(secs => ${windowSeconds})

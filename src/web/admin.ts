@@ -179,11 +179,18 @@ async function fleetStatus(sql: SQL): Promise<Record<string, unknown>> {
   const rows = await sql<{ state: string; tier: string; n: number }[]>`
     SELECT state::text AS state, tier::text AS tier, count(*)::int AS n
     FROM control.tenant GROUP BY state, tier ORDER BY state, tier`;
-  const spend = await sql<{ total: string | null }[]>`
-    SELECT sum(spend_micro_usd)::bigint AS total FROM control.tenant`;
+  // Both totals, because the interesting number is the difference. R22 excludes
+  // BYOK calls from hosted COGS, so metered spend above what the platform paid
+  // is exactly the work users are funding themselves — and reporting only the
+  // first makes every BYOK tenant look like a cost centre they are not.
+  const spend = await sql<{ total: string | null; cogs: string | null }[]>`
+    SELECT sum(spend_micro_usd)::bigint AS total,
+           sum(hosted_cogs_micro_usd)::bigint AS cogs
+      FROM control.tenant`;
   return {
     tenants: rows.map((row) => ({ state: row.state, tier: row.tier, count: row.n })),
     spend_micro_usd: Number(spend[0]?.total ?? 0),
+    hosted_cogs_micro_usd: Number(spend[0]?.cogs ?? 0),
   };
 }
 
@@ -219,13 +226,15 @@ async function tenantStatus(sql: SQL, tenantId: string): Promise<Record<string, 
       schema_version: number;
       pending_debt: number;
       spend_micro_usd: string;
+      hosted_cogs_micro_usd: string;
       last_activity: Date | null;
       last_cycle_at: Date | null;
       next_due_at: Date | null;
     }[]
   >`
     SELECT tenant_id, state::text AS state, tier::text AS tier, schema_version,
-           pending_debt, spend_micro_usd, last_activity, last_cycle_at, next_due_at
+           pending_debt, spend_micro_usd, hosted_cogs_micro_usd,
+           last_activity, last_cycle_at, next_due_at
     FROM control.tenant WHERE tenant_id = ${tenantId}`;
 
   const found = rows[0];
@@ -237,6 +246,9 @@ async function tenantStatus(sql: SQL, tenantId: string): Promise<Record<string, 
     schema_version: found.schema_version,
     pending_debt: found.pending_debt,
     spend_micro_usd: Number(found.spend_micro_usd),
+    // What this tenant cost the platform, which is not what they spent the
+    // moment they bring their own key (R22).
+    hosted_cogs_micro_usd: Number(found.hosted_cogs_micro_usd),
     last_activity: found.last_activity,
     last_cycle_at: found.last_cycle_at,
     next_due_at: found.next_due_at,

@@ -117,6 +117,8 @@ export interface ControlPlaneFixture {
   seedTenant(tenantId: string, capMicroUsd?: number): Promise<void>;
   /** Reads the counter as text: Bun surfaces `bigint` in more than one shape. */
   spendOf(tenantId: string): Promise<bigint>;
+  /** The R22 half of the same read: what the platform actually paid for. */
+  hostedCogsOf(tenantId: string): Promise<bigint>;
   close(): Promise<void>;
 }
 
@@ -166,6 +168,14 @@ export async function createControlPlaneFixture(slug: string): Promise<ControlPl
       const row = rows[0];
       if (row === undefined) throw new Error(`no tenant row: ${tenantId}`);
       return BigInt(row.spend);
+    },
+    async hostedCogsOf(tenantId) {
+      const rows = (await sql`
+        SELECT hosted_cogs_micro_usd::text AS cogs FROM control.tenant WHERE tenant_id = ${tenantId}
+      `) as Array<{ cogs: string }>;
+      const row = rows[0];
+      if (row === undefined) throw new Error(`no tenant row: ${tenantId}`);
+      return BigInt(row.cogs);
     },
     async close() {
       await sql.close();

@@ -195,6 +195,97 @@ describe('the control-plane spend counter', () => {
     }
   });
 
+  test('A BYOK CALL MOVES THE TENANT COUNTER AND NOT HOSTED COGS', async () => {
+    // R22, in the one place it can be checked: *"BYOK calls are still metered
+    // (for the user's own visibility and their spend cap) but do not count
+    // against hosted COGS."*
+    //
+    // The gateway computed `countsTowardHostedCogs` correctly and handed it to
+    // `meter.record`, which read `costMicroUsd`, read `tenantId`, and dropped
+    // the flag on the floor. Every store in `src/` kept the first number and
+    // none kept the second — so the exclusion existed as an expression and not
+    // as a fact anybody could report, which for a COGS number is the same as
+    // not having it. Two calls, identical but for who paid.
+    const fixture = await createControlPlaneFixture('cogs');
+    try {
+      await fixture.seedTenant(ALICE);
+      const meter = createPostgresSpendMeter({ sql: fixture.sql });
+      const base: MeteringRecord = {
+        tenantId: ALICE,
+        op: 'extract',
+        profile: 'hosted',
+        modelId: routeFor(HOSTED_PROFILE, 'extract').id,
+        provider: 'google',
+        inputTokens: 1_000,
+        outputTokens: 200,
+        price: 'known',
+        costMicroUsd: 700,
+        keySource: 'hosted',
+        countsTowardHostedCogs: true,
+        budgetLabel: 'consolidation',
+        atMs: Date.now(),
+      };
+
+      await meter.record(base);
+      expect(await fixture.spendOf(ALICE)).toBe(700n);
+      expect(await fixture.hostedCogsOf(ALICE)).toBe(700n);
+
+      // The same call, on the tenant's own key.
+      await meter.record({ ...base, keySource: 'byok', countsTowardHostedCogs: false });
+      expect(await fixture.spendOf(ALICE)).toBe(1_400n);
+      // The user sees their spend; the platform did not pay for it.
+      expect(await fixture.hostedCogsOf(ALICE)).toBe(700n);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test('both counters roll together, or the exclusion drifts a window at a time', async () => {
+    // The two numbers are compared against each other, so they have to be true
+    // of the *same* window. A COGS column that accumulated forever beside a
+    // spend column that resets monthly would read as a hosted margin collapsing
+    // every month, entirely as an artifact of the roll.
+    const fixture = await createControlPlaneFixture('cogswindow');
+    try {
+      await fixture.seedTenant(ALICE);
+      const meter = createPostgresSpendMeter({ sql: fixture.sql, windowSeconds: 60 });
+      const hosted: MeteringRecord = {
+        tenantId: ALICE,
+        op: 'extract',
+        profile: 'hosted',
+        modelId: routeFor(HOSTED_PROFILE, 'extract').id,
+        provider: 'google',
+        inputTokens: 1_000,
+        outputTokens: 200,
+        price: 'known',
+        costMicroUsd: 700,
+        keySource: 'hosted',
+        countsTowardHostedCogs: true,
+        budgetLabel: 'consolidation',
+        atMs: Date.now(),
+      };
+
+      await meter.record(hosted);
+      await meter.record(hosted);
+      expect(await fixture.spendOf(ALICE)).toBe(1_400n);
+      expect(await fixture.hostedCogsOf(ALICE)).toBe(1_400n);
+
+      await fixture.sql`
+        UPDATE control.tenant
+           SET spend_window_started_at = now() - interval '2 hours'
+         WHERE tenant_id = ${ALICE}
+      `;
+      // A BYOK call opens the new window. Spend carries this call's cost;
+      // hosted COGS carries nothing, and the old window's total is gone from
+      // both rather than from one.
+      await meter.record({ ...hosted, keySource: 'byok', countsTowardHostedCogs: false });
+      expect(await fixture.spendOf(ALICE)).toBe(700n);
+      expect(await fixture.hostedCogsOf(ALICE)).toBe(0n);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   test('the counter never goes backwards, and the schema refuses if it tries', async () => {
     const fixture = await createControlPlaneFixture('negative');
     try {

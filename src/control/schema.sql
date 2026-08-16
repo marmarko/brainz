@@ -176,6 +176,24 @@ CREATE TABLE control.tenant (
   spend_window_started_at  timestamptz                  NOT NULL DEFAULT now(),
   spend_cap_micro_usd      bigint,
 
+  -- **What the platform actually paid, as opposed to what the tenant spent.**
+  -- R22: a call on the tenant's own key is still metered — they want to see it
+  -- and it counts against their cap — but it does not count against hosted
+  -- COGS, because nobody here bought those tokens. The gateway decides which is
+  -- which (`hosted` key source, and a canonical price rather than a
+  -- self-hoster's overlay); this column is where the decision is *kept*, and
+  -- without it the exclusion is an expression evaluated and dropped.
+  --
+  -- Same window as `spend_micro_usd`, rolled in the same statement, because the
+  -- two numbers are only ever read against each other: a COGS total that
+  -- accumulated forever beside a spend total that resets monthly would show a
+  -- margin collapsing every month as a pure artifact of the roll.
+  --
+  -- Not derivable after the fact. Nothing else stores a per-call row — that is
+  -- deliberate, the control plane is content-free — so a counter not incremented
+  -- at metering time is a number that cannot be reconstructed later.
+  hosted_cogs_micro_usd    bigint                       NOT NULL DEFAULT 0,
+
   created_at               timestamptz                  NOT NULL DEFAULT now(),
   updated_at               timestamptz                  NOT NULL DEFAULT now(),
 
@@ -207,6 +225,7 @@ CREATE TABLE control.tenant (
     AND provisioning_attempts >= 0
     AND provisioning_lease >= 0
     AND spend_micro_usd >= 0
+    AND hosted_cogs_micro_usd >= 0
     AND rank1_sample_count >= 0
     AND (spend_cap_micro_usd IS NULL OR spend_cap_micro_usd >= 0)
   ),

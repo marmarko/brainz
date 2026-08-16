@@ -1095,6 +1095,11 @@ describe('nullability follows the invariant, and every column is classified', ()
     'rank1_sample_count',
     'spend_micro_usd',
     'spend_window_started_at',
+    // R22's half of the same window. NOT NULL for the same reason its sibling
+    // is: a null here is a hosted-COGS total that reads as "unknown" the moment
+    // one tenant is missing from a `sum()`, which is indistinguishable from a
+    // margin nobody can account for.
+    'hosted_cogs_micro_usd',
     'created_at',
     'updated_at',
     'provisioning_started_at',

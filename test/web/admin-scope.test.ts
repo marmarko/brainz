@@ -117,6 +117,10 @@ describe('the surface is not simply refusing everything', () => {
     if (!result.ok) throw new Error('tenant_status was refused');
 
     expect(Object.keys(result.content).sort()).toEqual([
+      // R22's counter is a counter like the rest — what the platform paid for
+      // this tenant, which stops being their metered spend the moment they
+      // bring their own key. It carries no more content than `pending_debt`.
+      'hosted_cogs_micro_usd',
       'last_activity',
       'last_cycle_at',
       'next_due_at',
