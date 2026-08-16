@@ -52,9 +52,33 @@ const DEFAULT_TIMEOUT_MS = 30_000;
  * `PORT=0` is passed by default so the OS picks the port and two suites can run
  * at once; the process reports back what it got, which is also the only way a
  * caller could know.
+ *
+ * `--env-file=/dev/null` is load-bearing, not tidiness. Passing an explicit
+ * `env` to `Bun.spawn` does NOT give the child that environment and nothing
+ * else: Bun reads `.env` again *inside the child*, from `cwd`, and those values
+ * land in its `process.env`. So on any machine with a real `.env` — which is
+ * every machine where the fleet has actually been configured — every variable
+ * an operator set leaks into every fleet test, and a test that asks what happens
+ * when a variable is ABSENT is instead told what happens when it is present.
+ *
+ * That failure is invisible in CI, which has no `.env`, and appears only where
+ * the credentials are real. It is therefore exactly backwards: the fail-closed
+ * guarantee stops being tested precisely where it matters most. Suppressing the
+ * child's own `.env` read is what makes `options.env` mean what it says.
  */
+/**
+ * The argv every fleet entrypoint is started with.
+ *
+ * Exported so the suppression above is asserted rather than trusted: it is one
+ * flag whose absence changes nothing visible on a machine without a `.env`, so
+ * nothing else in the suite would notice it being dropped.
+ */
+export function spawnArgv(entry: string): readonly string[] {
+  return ['bun', 'run', '--env-file=/dev/null', entry];
+}
+
 export async function startService(options: StartOptions): Promise<RunningService> {
-  const proc = Bun.spawn(['bun', 'run', options.entry], {
+  const proc = Bun.spawn([...spawnArgv(options.entry)], {
     cwd: REPO_ROOT,
     env: { PATH: process.env['PATH'] ?? '', PORT: '0', ...options.env },
     stdout: 'pipe',
