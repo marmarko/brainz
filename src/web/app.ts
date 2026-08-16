@@ -122,6 +122,69 @@ export interface SeverancePort {
   >;
 }
 
+/**
+ * Subject-scoped erasure (R12), as a port — and the reason it is on this
+ * surface and not on `tools/call`.
+ *
+ * U15's controller/processor determination (§6.3) fixes four properties for
+ * `src/core/lifecycle/subject-erasure.ts`, and the third is that it must be
+ * **invocable by the controlling user, out of band**. R12a's rule is the whole
+ * argument: the assistant that would issue the erasure is the assistant reading
+ * the correspondent's mail, so an MCP tool would put the request and the
+ * material it is about behind one credential. The web app is the out-of-band
+ * surface this product has, and until this route existed `eraseSubject` had no
+ * caller anywhere in `src/` — a correspondent could ask, and nothing in the
+ * running system could answer them.
+ *
+ * **A port for the reason {@link SeverancePort} is one.** The sweep runs
+ * against the tenant's own database and R11 forbids this module from resolving
+ * a connection string, so the tenant-side half lives where tenant access
+ * legitimately lives and arrives here as an interface.
+ *
+ * **Two methods, and the split is the mitigation.** The module's stated defence
+ * against a widened text sweep is the *flow* — the controller reads a preview
+ * that names every row rather than counting them, and only then instructs. A
+ * shape with one method would make erasure invocable without the preview, which
+ * that module's header says re-opens the hazard.
+ */
+export interface SubjectErasurePort {
+  preview(request: { readonly tenantId: string; readonly identifier: string }): Promise<{
+    readonly subjectDigest: string;
+    readonly entityIds: readonly string[];
+    readonly surfaceForms: readonly string[];
+    readonly pages: readonly { readonly pageId: string; readonly handle: string }[];
+    readonly rows: readonly {
+      readonly kind: string;
+      readonly id: string;
+      readonly excerpt: string;
+      readonly handle: string;
+    }[];
+    readonly removed: Readonly<Record<string, number>>;
+    readonly recomputed: Readonly<Record<string, number>>;
+    readonly recomputeRequired: boolean;
+  }>;
+  execute(request: {
+    readonly tenantId: string;
+    readonly identifier: string;
+    readonly confirm: string;
+  }): Promise<
+    | {
+        readonly ok: true;
+        readonly subjectDigest: string;
+        readonly removed: Readonly<Record<string, number>>;
+        readonly recomputeRequired: boolean;
+        readonly reingestionTombstoned: boolean;
+        readonly rawObjectsRemoved: number;
+        readonly rawObjectsUnreachable: number;
+        readonly attachmentObjectsRemoved: number;
+        readonly attachmentObjectsUnreachable: number;
+        readonly unrecoverableAfterDays: number;
+        readonly erasedAt: string;
+      }
+    | { readonly ok: false; readonly reason: string }
+  >;
+}
+
 export interface ConnectorVendor {
   mintClaimUrl(request: {
     readonly tenantId: string;
@@ -170,6 +233,14 @@ export interface WebAppDeps {
    * `applied: true` lie one unit over, on an operation that is destructive.
    */
   readonly severance?: SeverancePort;
+  /**
+   * R12's subject-scoped erasure. Absent disables the routes for the reason
+   * `severance` is absent-able: a `501` is a surface that admits it cannot do
+   * the thing, and on an erasure the alternative — answering with a receipt
+   * nothing performed — is the worst artifact this system could produce, because
+   * it is handed to a third party as the answer to their request.
+   */
+  readonly subjectErasure?: SubjectErasurePort;
   /** The Stripe endpoint signing secret, resolved from the secret store. */
   readonly stripeWebhookSecret: string;
   /** Set for an operator deployment; absent disables `/admin` entirely. */
@@ -416,6 +487,10 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     if (path === '/api/severance/preview') return handleSeverancePreview(url, session);
     if (path === '/api/severance' && request.method === 'POST') {
       return handleSeverance(request, session);
+    }
+    if (path === '/api/subject-erasure/preview') return handleSubjectErasurePreview(url, session);
+    if (path === '/api/subject-erasure' && request.method === 'POST') {
+      return handleSubjectErasure(request, session);
     }
 
     if (path === '/' || path === '/dashboard') return renderDashboard(session);
@@ -913,6 +988,103 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         severance_id: outcome.severanceId,
         already_severed: outcome.alreadySevered,
         polling_stopped: stopped.length,
+      });
+    }
+
+    /**
+     * What erasing this correspondent would take, before anyone instructs it.
+     *
+     * **The list, not the counts, is the deliverable.** `subject-erasure.ts`
+     * matches a *name* through the entity's inferred aliases, and an alias is
+     * whatever spelling an outside sender used — a correspondent who signs off
+     * `Al` puts a two-character form into the vocabulary this sweep reads. The
+     * module's stated mitigation for that is not a filter, it is this flow: the
+     * controller reads a preview naming every row with the text that matched,
+     * and a preview that reported `facts: 2` as a bare number could not see what
+     * it was authorising. So the rows travel to the caller.
+     */
+    async function handleSubjectErasurePreview(url: URL, session: Session): Promise<Response> {
+      if (deps.subjectErasure === undefined) {
+        return json({ ok: false, code: 'unavailable' }, 501);
+      }
+      const identifier = (url.searchParams.get('identifier') ?? '').trim();
+      if (identifier.length === 0) return json({ ok: false, code: 'identifier_required' }, 400);
+
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return json({ ok: false, code: 'no_brain_yet' }, 409);
+
+      const preview = await deps.subjectErasure.preview({ tenantId, identifier });
+      return json({
+        ok: true,
+        subject_digest: preview.subjectDigest,
+        entity_ids: preview.entityIds,
+        // Every spelling the sweep will match on, so the widest thing it could
+        // reach is visible before it reaches it.
+        surface_forms: preview.surfaceForms,
+        pages: preview.pages,
+        rows: preview.rows,
+        removed: preview.removed,
+        // The column a preview that only counted deletions would omit: rows that
+        // survive having lost an input are wrong rather than gone.
+        recomputed: preview.recomputed,
+        recompute_required: preview.recomputeRequired,
+      });
+    }
+
+    /**
+     * Erase the correspondent.
+     *
+     * **The confirmation is an echo of the identifier**, checked here as well as
+     * inside the port, for the reason `handleSeverance` gives: a boolean
+     * `confirm: true` is a field a bug fills in, a retry replays and a model can
+     * guess, and the exact string is one only something that read the preview can
+     * produce. The stakes are higher here than on severance — this is the request
+     * of a third party who is not the account holder, executed against records
+     * about them — which is why the check is the first thing that happens and
+     * the port is not reached at all when it fails.
+     *
+     * **Not on `tools/call`, and this route is why that is affordable.** R12a
+     * says the assistant that would issue this is the assistant reading the
+     * correspondent's mail. Refusing to register the tool is only honest while
+     * some other surface can perform it; before this, refusing the tool meant
+     * refusing the request.
+     */
+    async function handleSubjectErasure(request: Request, session: Session): Promise<Response> {
+      if (deps.subjectErasure === undefined) {
+        return json({ ok: false, code: 'unavailable' }, 501);
+      }
+      const fields = await body(request);
+      const identifier = stringOf(fields, 'identifier').trim();
+      const confirm = stringOf(fields, 'confirm').trim();
+      if (identifier.length === 0) return json({ ok: false, code: 'identifier_required' }, 400);
+      if (confirm !== identifier) return json({ ok: false, code: 'not_confirmed' }, 400);
+
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return json({ ok: false, code: 'no_brain_yet' }, 409);
+
+      const outcome = await deps.subjectErasure.execute({ tenantId, identifier, confirm });
+      if (!outcome.ok) return json({ ok: false, code: outcome.reason }, 400);
+
+      return json({
+        ok: true,
+        // The digest, never the identifier: the receipt for an erasure must not
+        // be the one place the address survives.
+        subject_digest: outcome.subjectDigest,
+        removed: outcome.removed,
+        recompute_required: outcome.recomputeRequired,
+        // The property U15's determination flags as most likely to be missed. It
+        // travels on the receipt because a caller who was told the rows went and
+        // not that the re-ingestion is suppressed has been told half of it.
+        reingestion_tombstoned: outcome.reingestionTombstoned,
+        raw_objects_removed: outcome.rawObjectsRemoved,
+        raw_objects_unreachable: outcome.rawObjectsUnreachable,
+        attachment_objects_removed: outcome.attachmentObjectsRemoved,
+        attachment_objects_unreachable: outcome.attachmentObjectsUnreachable,
+        // Rows stop being queryable when the call returns; they stop being
+        // recoverable when this window rolls, and it is the second number a
+        // data-subject answer has to quote.
+        unrecoverable_after_days: outcome.unrecoverableAfterDays,
+        erased_at: outcome.erasedAt,
       });
     }
 
