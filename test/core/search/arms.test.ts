@@ -32,6 +32,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import {
   CHANNEL_BY_SOURCE_TYPE,
+  DEFAULT_SOURCE_TYPE,
   ftsArm,
   graphArm,
   hydrate,
@@ -42,6 +43,7 @@ import {
 } from '../../../src/core/search/arms.ts';
 import { candidatePoolFor } from '../../../src/schema/vector-query.ts';
 import {
+  EMBEDDING_DIMENSIONS,
   LADDER_QUERY,
   createSearchFixture,
   seedDistanceLadder,
@@ -176,6 +178,116 @@ describe('the fence is in the statement, not applied afterwards', () => {
     const allowed = await hydrate(sql, ladderIds.slice(0, 3), PERSONAL);
     expect(allowed.size).toBe(3);
   });
+
+  test(
+    'a passage in grant under a page that is not does not carry its parent’s title',
+    async () => {
+      // Nothing in the schema ties a chunk's origin to its page's: both columns
+      // are credential-derived and separately immutable, which is why
+      // `reads.ts:fetchPage` counts them separately and fences BOTH. The
+      // id-addressed read (`reads.ts:fetchChunk`) therefore fences the join
+      // itself and nulls the title of an out-of-grant parent. The ranked read
+      // joined the page unfenced and selected `p.title` and `p.external_ref` off
+      // it — so the same row answered one way by id and another way by search.
+      //
+      // A title is row content, and a mail subject is attacker-authored: it is
+      // the one field the `/openai` shape can make the whole of what a model
+      // sees. So this is not a cosmetic asymmetry — it is a sentence a
+      // personal-origin sender wrote, handed to a work-scoped grant.
+      const pages = (await sql`
+        INSERT INTO page (origin_context, source_type, title, external_ref, created_at,
+                          embedding_model, embedding_dimensions, chunker_version,
+                          normalizer_version, content_sha256)
+        VALUES ('personal:mail', 'email', 'Personal subject line nobody at work may read',
+                'mail:split-origin?sender=someone%40personal.example', '2026-06-02'::timestamptz,
+                'fixture-model', ${EMBEDDING_DIMENSIONS}, 1, 1, ${'0'.repeat(64)})
+        RETURNING page_id::text AS page_id
+      `) as Array<{ page_id: string }>;
+      const pageId = pages[0]?.page_id ?? '';
+
+      const chunks = (await sql`
+        INSERT INTO chunk (origin_context, content, page_id, ordinal)
+        VALUES ('work:mail', 'a passage the work grant is entitled to read', ${pageId}::bigint, 0)
+        RETURNING chunk_id::text AS chunk_id
+      `) as Array<{ chunk_id: string }>;
+      const chunkId = chunks[0]?.chunk_id ?? '';
+
+      const hydrated = await hydrate(sql, [chunkId], WORK);
+      const candidate = hydrated.get(chunkId);
+
+      // The passage itself is in grant, so it still comes back.
+      expect(candidate?.content).toBe('a passage the work grant is entitled to read');
+      // Its parent is not, so nothing of the parent's comes back with it.
+      expect(candidate?.title).toBeNull();
+      // The row lands on `DEFAULT_SOURCE_TYPE` — which is what that default was
+      // written for: an unattributable row is neutral rather than promoted. The
+      // R12a reading is the fail-closed one, and it matters that it is checked
+      // here: `external_ref` rides the same join and decides the sender key, so
+      // an unfenced parent hands a work-scoped row a personal sender's identity
+      // to count as an independent origin. Collapsing to `user_curated` can only
+      // ever under-count independence, never manufacture it — and `external` is
+      // not a corroborating channel either way, so nothing is admitted to
+      // compiled truth by this route.
+      expect(candidate?.sourceType).toBe(DEFAULT_SOURCE_TYPE);
+      expect(candidate?.attestations[0]?.channel).toBe('user_curated');
+      expect(candidate?.attestations[0]?.senderKey).toBeUndefined();
+
+      // The harder half: the full-text arm *recalls* on `p.title_tsv` and ranks
+      // on it. Scrubbing the selected columns would not close that — a query
+      // matching nothing but the out-of-grant title still gets the passage
+      // back, and the caller learns the title exists and roughly what it says.
+      // Only fencing the join itself makes the title unaskable.
+      const fts = await ftsArm(sql, {
+        query: 'personal subject line',
+        grant: WORK,
+        limit: 10,
+        ftsLanguage,
+      });
+      expect(fts.ranked).not.toContain(chunkId);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a retired page still hides its passages from a reader who cannot see the page',
+    async () => {
+      // The other edge of the same change, and the reason the liveness test is
+      // asked of the parent rather than of the join. Once the join fences, an
+      // out-of-grant parent arrives as NULL — and a `p.deleted_at IS NULL` test
+      // reads NULL as "no parent, therefore live". A page retired by its owner
+      // would then start surfacing its passages to exactly the readers who
+      // cannot see that it was retired. Liveness is not access, so that arm of
+      // the predicate is deliberately unfenced.
+      const pages = (await sql`
+        INSERT INTO page (origin_context, source_type, title, created_at,
+                          embedding_model, embedding_dimensions, chunker_version,
+                          normalizer_version, content_sha256, quarantined_at)
+        VALUES ('personal:mail', 'email', 'Quarantined parent', '2026-06-03'::timestamptz,
+                'fixture-model', ${EMBEDDING_DIMENSIONS}, 1, 1, ${'0'.repeat(64)}, now())
+        RETURNING page_id::text AS page_id
+      `) as Array<{ page_id: string }>;
+      const pageId = pages[0]?.page_id ?? '';
+
+      const chunks = (await sql`
+        INSERT INTO chunk (origin_context, content, page_id, ordinal)
+        VALUES ('work:mail', 'quarantined parent, live passage, work origin',
+                ${pageId}::bigint, 0)
+        RETURNING chunk_id::text AS chunk_id
+      `) as Array<{ chunk_id: string }>;
+      const chunkId = chunks[0]?.chunk_id ?? '';
+
+      expect(await hydrate(sql, [chunkId], WORK)).toEqual(new Map());
+
+      const fts = await ftsArm(sql, {
+        query: 'quarantined parent live passage',
+        grant: WORK,
+        limit: 10,
+        ftsLanguage,
+      });
+      expect(fts.ranked).not.toContain(chunkId);
+    },
+    TEST_TIMEOUT_MS,
+  );
 });
 
 describe('soft-deleted and quarantined rows never surface', () => {

@@ -126,13 +126,54 @@ interface ChunkRow {
 }
 
 /**
+ * The parent join, **fenced in the `ON` clause**, as one string for the same
+ * reason the predicate below is one string. `$1` is always the grant array.
+ *
+ * Two columns, two fences. Nothing in the schema ties `chunk.origin_context` to
+ * its page's — both are credential-derived and each carries its own
+ * immutability trigger, which is why `reads.ts` counts them separately — so a
+ * passage inside a grant can hang off a page outside it. Joined unfenced, the
+ * parent then decides three things it has no right to decide here:
+ *
+ *   * {@link CHUNK_COLUMNS} selects `p.title`. A title is row content and a mail
+ *     subject is attacker-authored — the one field the `/openai` shape can make
+ *     the whole of what a model sees.
+ *   * It selects `p.external_ref`, from which {@link senderKeyFor} derives
+ *     R12a's corroboration identity, so an out-of-grant parent decides *whose
+ *     word* an in-grant row counts as.
+ *   * The full-text arm **recalls** on `p.title_tsv` and ranks on it. Unfenced,
+ *     a work-scoped query matches nothing but a personal title and gets the
+ *     passage back because of it — a leak that survives even if every selected
+ *     column were scrubbed afterwards.
+ *
+ * The fence belongs in `ON` and never in `WHERE`: an out-of-grant parent must
+ * null the parent's fields and leave the passage, which is exactly what the
+ * id-addressed read does (`src/mcp/reads.ts:fetchChunk`). In `WHERE` it would
+ * drop the row — a chunk the grant holds, vanishing for a reason no fence was
+ * asked about.
+ */
+const PAGE_JOIN = `LEFT JOIN page p
+         ON p.page_id = c.page_id
+        AND p.origin_context = ANY($1::text[])`;
+
+/**
  * The predicate every read carries, as one string, so the four statements below
  * cannot drift apart. `$1` is always the grant array.
+ *
+ * **The parent's liveness is asked of the parent, not of the join.** Once
+ * {@link PAGE_JOIN} fences, `p` is NULL for an out-of-grant parent — so a
+ * `p.deleted_at IS NULL` test would read as "no parent, therefore live" and a
+ * tombstoned or quarantined page would stop hiding its passages the moment the
+ * reader could not see it. Liveness is not access: this arm of the predicate is
+ * deliberately unfenced, and it is the one place in the statement that is.
  */
 const LIVE_AND_IN_GRANT = `c.deleted_at IS NULL
        AND c.quarantined_at IS NULL
        AND c.origin_context = ANY($1::text[])
-       AND (p.page_id IS NULL OR (p.deleted_at IS NULL AND p.quarantined_at IS NULL))`;
+       AND NOT EXISTS (
+             SELECT 1 FROM page retired
+              WHERE retired.page_id = c.page_id
+                AND (retired.deleted_at IS NOT NULL OR retired.quarantined_at IS NOT NULL))`;
 
 function toCandidate(row: ChunkRow, entityIds: readonly string[] = []): Candidate {
   const sourceType = (row.source_type ?? DEFAULT_SOURCE_TYPE) as SourceType;
@@ -186,7 +227,7 @@ export async function hydrate(
   const rows = (await sql.unsafe(
     `SELECT ${CHUNK_COLUMNS}
        FROM chunk c
-       LEFT JOIN page p ON p.page_id = c.page_id
+       ${PAGE_JOIN}
       WHERE c.chunk_id = ANY($2::bigint[])
         AND ${LIVE_AND_IN_GRANT}`,
     [textArrayLiteral(grant), textArrayLiteral(ids)],
@@ -210,7 +251,7 @@ export async function hydrate(
 export function vectorArmSql(): string {
   return `SELECT ${CHUNK_COLUMNS}
        FROM chunk c
-       LEFT JOIN page p ON p.page_id = c.page_id
+       ${PAGE_JOIN}
       WHERE c.embedding IS NOT NULL
         AND ${LIVE_AND_IN_GRANT}
       ORDER BY c.embedding <=> $2::vector
@@ -329,7 +370,7 @@ export async function ftsArm(
             ts_rank_cd(c.content_tsv, q.tsq)
               + 0.4 * coalesce(ts_rank_cd(p.title_tsv, q.tsq), 0) AS score
        FROM chunk c
-       LEFT JOIN page p ON p.page_id = c.page_id
+       ${PAGE_JOIN}
        CROSS JOIN q
       WHERE (c.content_tsv @@ q.tsq OR p.title_tsv @@ q.tsq)
         AND ${LIVE_AND_IN_GRANT}
@@ -496,7 +537,7 @@ export async function graphArm(
        FROM evidence ev
        JOIN fact_source fs ON fs.fact_id = ev.fact_id
        JOIN chunk c ON c.chunk_id = fs.chunk_id
-       LEFT JOIN page p ON p.page_id = c.page_id
+       ${PAGE_JOIN}
       WHERE ${LIVE_AND_IN_GRANT}
       ORDER BY (ev.asked_edge = 1) DESC,
                (ev.hits_seed = 1) DESC,
