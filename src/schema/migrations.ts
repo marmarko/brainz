@@ -53,6 +53,7 @@ export const MIGRATIONS: readonly TenantMigration[] = [
   { version: 8, name: 'search-path-pinned', file: 'migrations/v8-search-path-pinned.sql' },
   { version: 9, name: 'lifecycle', file: 'migrations/v9-lifecycle.sql' },
   { version: 10, name: 'severance', file: 'migrations/v10-severance.sql' },
+  { version: 11, name: 'alias-origin', file: 'migrations/v11-alias-origin.sql' },
 ];
 
 /** The version this code applies to a fresh tenant, derived rather than typed twice. */

@@ -406,6 +406,13 @@ const ORIGIN_FIXTURES: ReadonlyMap<string, { readonly where: string; readonly ta
       'entity_edge',
       { where: `edge_type = 'related_to'`, tamper: `origin_contexts = ARRAY['personal','work']` },
     ],
+    // Rung 11. An alias is a spelling somebody wrote in a message, so widening
+    // it in place is how a personal-origin nickname would become readable to a
+    // work-scoped grant that can already resolve the entity by intersect.
+    [
+      'entity_alias',
+      { where: `alias = 'fence alias'`, tamper: `origin_contexts = ARRAY['personal','work']` },
+    ],
     [
       'contradiction_report',
       {
@@ -451,6 +458,9 @@ describe('R15 — the database refuses to let an origin move, on every table tha
       INSERT INTO entity (canonical_name, entity_type, origin_contexts)
       VALUES ('fence-subject', 'person', ARRAY['personal']),
              ('fence-object', 'organization', ARRAY['personal']);
+      INSERT INTO entity_alias (entity_id, alias, alias_source, origin_contexts)
+      SELECT (SELECT entity_id FROM entity WHERE canonical_name = 'fence-subject'),
+             'fence alias', 'user', ARRAY['personal'];
       INSERT INTO entity_edge (subject_entity_id, edge_type, object_entity_id, origin_contexts)
       SELECT (SELECT entity_id FROM entity WHERE canonical_name = 'fence-subject'),
              'related_to',

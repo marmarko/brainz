@@ -287,9 +287,21 @@ export async function resolveOrCreateEntity(
   if (found !== null) {
     const missing = request.origins.filter((origin) => !found.originContexts.includes(origin));
     const current = missing.length === 0 ? found : await widenEntityOrigins(db, found, missing);
+    // **The origins of the write that planted the spelling, not the entity's.**
+    // An entity accumulates origins as more of the brain mentions it; an alias is
+    // one string from one write, and R15 fences on where a row came from. Stamped
+    // at insert because it is immutable afterwards, and because the read
+    // (`mcp/reads.ts:entityCard`) has nothing else to fence on.
+    //
+    // `ON CONFLICT DO NOTHING` means a spelling first seen at one origin keeps
+    // that origin when a second origin restates it. That under-shows — a grant
+    // holding only the second origin will not see a name it could legitimately
+    // have been told — and it is the fail-closed direction, which is the one to
+    // be wrong in.
     await db`
-      INSERT INTO entity_alias (entity_id, alias, alias_source, confidence)
-      VALUES (${current.entityId}::bigint, ${key}, 'inferred', ${INFERRED_ALIAS_CONFIDENCE})
+      INSERT INTO entity_alias (entity_id, alias, alias_source, confidence, origin_contexts)
+      VALUES (${current.entityId}::bigint, ${key}, 'inferred', ${INFERRED_ALIAS_CONFIDENCE},
+              ${textArrayLiteral([...new Set(request.origins)].sort())}::text[])
       ON CONFLICT (entity_id, alias) DO NOTHING
     `;
     return current;
@@ -310,8 +322,9 @@ export async function resolveOrCreateEntity(
     VALUES (${await availableSlug(db, request.name)}, ${entity.entity_id}::bigint, 'canonical')
   `;
   await db`
-    INSERT INTO entity_alias (entity_id, alias, alias_source, confidence)
-    VALUES (${entity.entity_id}::bigint, ${key}, 'inferred', ${INFERRED_ALIAS_CONFIDENCE})
+    INSERT INTO entity_alias (entity_id, alias, alias_source, confidence, origin_contexts)
+    VALUES (${entity.entity_id}::bigint, ${key}, 'inferred', ${INFERRED_ALIAS_CONFIDENCE},
+            ${textArrayLiteral([...new Set(request.origins)].sort())}::text[])
     ON CONFLICT (entity_id, alias) DO NOTHING
   `;
 

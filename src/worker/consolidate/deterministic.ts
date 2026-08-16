@@ -373,9 +373,13 @@ export async function mergeEntitiesByRule(sql: SQL): Promise<MergeResult> {
     for (const loser of losers) {
       // Aliases first: recall vocabulary is additive and the unique key is
       // (entity, alias), so a name both rows knew is not a conflict.
+      // `origin_contexts` travels with the spelling. A merge moves a name from
+      // one row to another; it does not change where the name came from, and a
+      // copy that dropped the provenance would arrive at the keeper unstamped —
+      // which the card then judges against the keeper's whole union.
       await sql`
-        INSERT INTO entity_alias (entity_id, alias, alias_source, confidence)
-        SELECT ${keeper}::bigint, alias, alias_source, confidence
+        INSERT INTO entity_alias (entity_id, alias, alias_source, confidence, origin_contexts)
+        SELECT ${keeper}::bigint, alias, alias_source, confidence, origin_contexts
           FROM entity_alias WHERE entity_id = ${loser}::bigint
         ON CONFLICT (entity_id, alias) DO NOTHING
       `;

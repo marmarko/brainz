@@ -156,8 +156,20 @@ beforeAll(async () => {
     origins: [PERSONAL_MAIL, WORK_MAIL],
   });
   await sql`
-    INSERT INTO entity_alias (entity_id, alias, alias_source)
-    VALUES (${sharedEntityId}::bigint, 'acme example', 'user')
+    INSERT INTO entity_alias (entity_id, alias, alias_source, origin_contexts)
+    VALUES (${sharedEntityId}::bigint, 'acme example', 'user', ARRAY[${WORK_MAIL}]::text[])
+  `;
+  // **A spelling only the personal half ever used.** `entity_alias` is recall
+  // vocabulary written from the text of the page being ingested, so an alias is
+  // a string an outside sender chose — content, not structure. The entity itself
+  // resolves under a work grant by design (`fence.ts` fences entities on
+  // *intersect*, because a subset rule would refuse every name that appears in
+  // both halves of a brain), and the licence for that looser rule is that every
+  // row the resolution then produces goes back through a fence. This row is the
+  // one that did not.
+  await sql`
+    INSERT INTO entity_alias (entity_id, alias, alias_source, origin_contexts)
+    VALUES (${sharedEntityId}::bigint, ${`acme ${SENTINEL} holdings`}, 'user', ARRAY[${PERSONAL_MAIL}]::text[])
   `;
   await seedFact(sql, {
     statement: `Acme Example sent the ${SENTINEL} invoice to the home address.`,
@@ -587,6 +599,60 @@ describe('a work grant cannot reach a personal row through any tool on any endpo
       // personal statement hanging off it.
       expect(card.ok).toBe(true);
       expect(JSON.stringify(card.content)).not.toContain(SENTINEL);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'the shared entity keeps the spellings the work half wrote and drops the ones it did not',
+    async () => {
+      // The absence assertion above proves nothing on its own: a card that
+      // returned no aliases at all would satisfy it. So this checks both
+      // directions on the same row — the work-origin spelling is there, the
+      // personal-origin spelling is not — which is what makes it a fence rather
+      // than a blanket refusal.
+      const authorization = `Bearer ${tokenFor({
+        scope: 'narrowed',
+        origins: ['work:*'],
+        writeOrigin: WORK_AGENT,
+      })}`;
+      const card = await fixture.call('entity', { name: 'Acme Example' }, { authorization });
+      const aliases = (card.content as { card: { aliases: string[] } }).card.aliases;
+      expect(aliases).toEqual(['acme example']);
+
+      // And the whole-brain credential sees both, so the personal spelling is
+      // genuinely in the fixture and genuinely reachable by a grant that holds it.
+      const whole = await fixture.call('entity', { name: 'Acme Example' });
+      const wholeAliases = (whole.content as { card: { aliases: string[] } }).card.aliases;
+      expect(wholeAliases).toEqual(['acme example', `acme ${SENTINEL} holdings`]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'an alias written before rung 11 is judged by its entity, which is the fail-closed reading',
+    async () => {
+      // Expand-only means the column arrives nullable and unbackfilled, and a
+      // previous fleet release keeps writing unstamped rows for the length of a
+      // rolling deploy. NULL says nobody recorded the provenance — not that
+      // there is none — so the read coalesces to the entity's own union. On a
+      // shared entity that hides the row from every narrowed grant; on a
+      // single-origin entity it behaves exactly as it always did.
+      await fixture.sql`
+        INSERT INTO entity_alias (entity_id, alias, alias_source)
+        VALUES (${sharedEntityId}::bigint, ${`legacy ${SENTINEL} spelling`}, 'user')
+      `;
+
+      const authorization = `Bearer ${tokenFor({
+        scope: 'narrowed',
+        origins: ['work:*'],
+        writeOrigin: WORK_AGENT,
+      })}`;
+      const card = await fixture.call('entity', { name: 'Acme Example' }, { authorization });
+      expect(JSON.stringify(card.content)).not.toContain(SENTINEL);
+
+      const whole = await fixture.call('entity', { name: 'Acme Example' });
+      expect(JSON.stringify(whole.content)).toContain(`legacy ${SENTINEL} spelling`);
     },
     TEST_TIMEOUT_MS,
   );

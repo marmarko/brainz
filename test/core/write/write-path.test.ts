@@ -1069,6 +1069,24 @@ describe('R15: a derived row is never narrower than what it came from', () => {
     for (const row of rows) expect(row.origins).toContain(row.page_origin);
   }, TEST_TIMEOUT_MS);
 
+  test('an alias carries the origin of the write that planted the spelling', async () => {
+    // `entity_alias` is recall vocabulary written from the *text* being
+    // ingested, so an alias is a spelling an outside sender chose. Unstamped, it
+    // is the one derived row the entity card had nothing to fence on — and
+    // entities resolve on intersect, so a personal-origin spelling reached every
+    // work-scoped grant that could resolve the name.
+    const rows = (await tenant.sql`
+      SELECT a.alias, a.origin_contexts AS origins
+        FROM entity_alias a
+       ORDER BY a.alias
+    `) as Array<{ alias: string; origins: string[] | null }>;
+
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) expect(`${row.alias}: ${JSON.stringify(row.origins)}`).toBe(
+      `${row.alias}: ["work"]`,
+    );
+  }, TEST_TIMEOUT_MS);
+
   test('an edge carries the union of both endpoints origins', async () => {
     const rows = (await tenant.sql`
       SELECT e.origin_contexts AS edge_origins,

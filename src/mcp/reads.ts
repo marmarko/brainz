@@ -440,9 +440,35 @@ export async function entityCard(sql: SQL, grant: Grant, name: string): Promise<
 
   if (!fenceEntity(row.origin_contexts, grant)) return { status: 'scope_denied' };
 
+  // **An alias is a row, and the entity's fence does not cover it.** Entities are
+  // fenced on *intersect* (`fence.ts`), deliberately: a subset rule would refuse
+  // to resolve any name appearing in both halves of a brain, which is most of
+  // the interesting ones. The licence for the looser rule is the sentence beside
+  // it — "resolving a name is not reading a row; every row the fan-out then
+  // produces goes back through the subset and scalar rules". This was the query
+  // that did not. `resolveOrCreateEntity` plants the normalized surface form
+  // taken from the text being ingested, so an alias is a spelling an outside
+  // sender chose, and a personal-origin spelling on a shared entity was handed
+  // to every work-scoped grant that could resolve it.
+  //
+  // Subset, matching the facts query below rather than the entity's intersect:
+  // derived text is admitted only when the grant holds every origin behind it.
+  //
+  // `coalesce` is how rows written before rung 11 are judged. The column is
+  // nullable because every rung is expand-only — the previous fleet release is
+  // still inserting rows that name the old column list — and NULL means nobody
+  // recorded the provenance, not that there is none. Treating such a row as
+  // carrying its entity's whole union is the strongest honest reading and the
+  // fail-closed one: an unstamped alias is shown only to a grant that holds
+  // every origin the entity has.
   const aliases = (await sql.unsafe(
-    `SELECT alias FROM entity_alias WHERE entity_id = $1::bigint ORDER BY alias`,
-    [row.entity_id],
+    `SELECT a.alias
+       FROM entity_alias a
+       JOIN entity e ON e.entity_id = a.entity_id
+      WHERE a.entity_id = $1::bigint
+        AND coalesce(a.origin_contexts, e.origin_contexts) <@ $2::text[]
+      ORDER BY a.alias`,
+    [row.entity_id, grantLiteral],
   )) as Array<{ alias: string }>;
 
   const facts = (await sql.unsafe(
