@@ -91,6 +91,11 @@ export const NOT_A_DESTINATION: readonly NotADestination[] = [
     reason:
       'a documentation URL in a comment in `src/control/neon-api.ts`, citing the reference the client was written against and the date it was read. Nothing is sent to it. Its live sibling `console.neon.tech` IS a destination and has its own entry.',
   },
+  {
+    host: 'developers.openai.com',
+    reason:
+      "a documentation URL in comments in `src/mcp/openai.ts` and `src/ingest/oauth/seam.ts`, citing the `search`/`fetch` contract the `/openai` surface was built against and the date it was read (2026-08-15). Nothing is sent to it, and it is deliberately not deleted from the comment: the citation is the receipt for a shape this repository is conformant to. Its live sibling `api.openai.com` IS a destination — the hosted embedding provider — and has its own register entry.",
+  },
 ];
 
 export const SHARED_COMPONENTS: readonly RegisterEntry[] = [

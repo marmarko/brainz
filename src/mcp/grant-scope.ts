@@ -339,3 +339,65 @@ export function contextGrant(contextClass: string): ScopedClaims | null {
     writeOrigin: agentOriginFor(contextClass),
   };
 }
+
+/**
+ * The OAuth `scope` value that asks for one context, e.g. `brainz:context:work`.
+ *
+ * Namespaced because `scope` is a public, client-supplied, space-delimited
+ * string and this server is a public issuer: an unprefixed `work` would collide
+ * with whatever a future spec or client decides `work` means, and the collision
+ * would resolve into a *grant*.
+ */
+export const CONTEXT_SCOPE_PREFIX = 'brainz:context:';
+
+/**
+ * Read a requested scope off an OAuth `scope` parameter.
+ *
+ * **Absent means the whole brain, and one unrecognised token means refuse.**
+ * That asymmetry is deliberate. Absent is the ordinary case — every client
+ * shipping today sends no scope, and treating that as "nothing" would break
+ * every existing connector. But a client that *did* ask for something and got
+ * something else has been silently over-granted, and the failure is invisible
+ * from both ends: the client believes it holds a work connector and holds the
+ * brain. So an unrecognised token is an error rather than a fallback.
+ *
+ * Only one context may be requested. Two would be a grant covering two classes,
+ * which is expressible — but it is not a shape any product surface asks for, and
+ * a parser that silently supports an unasked-for combination is a parser whose
+ * behaviour nobody has decided.
+ */
+export type RequestedScope =
+  | { readonly ok: true; readonly scoped: ScopedClaims }
+  | { readonly ok: false; readonly reason: string };
+
+export function parseRequestedScope(
+  raw: string | null,
+  wholeBrainWriteOrigin: string,
+): RequestedScope {
+  const whole: ScopedClaims = {
+    scope: 'whole_brain',
+    origins: [],
+    writeOrigin: wholeBrainWriteOrigin,
+  };
+
+  const tokens = (raw ?? '').split(/\s+/).filter((token) => token.length > 0);
+  if (tokens.length === 0) return { ok: true, scoped: whole };
+
+  const contexts: string[] = [];
+  for (const token of tokens) {
+    if (!token.startsWith(CONTEXT_SCOPE_PREFIX)) {
+      return { ok: false, reason: `unknown scope ${JSON.stringify(token)}` };
+    }
+    contexts.push(token.slice(CONTEXT_SCOPE_PREFIX.length));
+  }
+
+  if (contexts.length > 1) {
+    return { ok: false, reason: 'only one context may be requested per grant' };
+  }
+
+  const scoped = contextGrant(contexts[0] ?? '');
+  if (scoped === null) {
+    return { ok: false, reason: `${JSON.stringify(contexts[0] ?? '')} is not a context class` };
+  }
+  return { ok: true, scoped };
+}

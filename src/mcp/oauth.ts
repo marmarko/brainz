@@ -754,5 +754,11 @@ export function authorizationServerMetadata(issuer: string): Record<string, unkn
     // refuses is a bug report waiting to happen.
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none'],
+    /**
+     * U18's context grants, advertised so a client can discover the vocabulary
+     * rather than guess it. Omitting `scope` still grants the whole brain —
+     * which is why these are advertised as *supported* rather than required.
+     */
+    scopes_supported: ['brainz:context:personal', 'brainz:context:work'],
   };
 }

@@ -48,6 +48,7 @@ import {
   verifyTenantBearer,
   type RegistrationAllowlist,
 } from './oauth.ts';
+import { parseRequestedScope } from './grant-scope.ts';
 import { PROTOCOL_VERSION } from './envelope.ts';
 import { readClientCapabilities, UI_EXTENSION } from './client-capabilities.ts';
 import { listResources, readResource } from './resources.ts';
@@ -327,6 +328,23 @@ async function handleAuthorize(deps: ServerDeps, request: Request, url: URL): Pr
   const params = url.searchParams;
   const endpoint = params.get('resource')?.endsWith('/openai') === true ? 'openai' : 'mcp';
 
+  // **U18: this is where a work-connector grant becomes obtainable.** Before it,
+  // every narrowed grant in the codebase was minted by a test helper — the fence
+  // was real and nothing could ask for it, which is a fence with no product.
+  //
+  // `scope` is OAuth's own parameter, so a client asks for a work connector the
+  // way it asks for anything else. Absent still means the whole brain, because
+  // every connector shipping today sends no scope; an *unrecognised* token is
+  // refused rather than defaulted, because a client that asked for a slice and
+  // silently received the brain has been over-granted invisibly from both ends.
+  const requested = parseRequestedScope(
+    params.get('scope'),
+    deps.writeOrigin ?? DEFAULT_WRITE_ORIGIN,
+  );
+  if (!requested.ok) {
+    return Response.json({ error: 'invalid_scope', error_description: requested.reason }, { status: 400 });
+  }
+
   const outcome = authorize(deps.store, {
     clientId: params.get('client_id') ?? '',
     redirectUri: params.get('redirect_uri') ?? '',
@@ -334,13 +352,10 @@ async function handleAuthorize(deps: ServerDeps, request: Request, url: URL): Pr
     codeChallengeMethod: params.get('code_challenge_method') ?? '',
     state: params.get('state') ?? '',
     tenantId,
-    // U18's explicit marker. The alpha consent step still grants the whole
-    // brain — narrowing is a UI choice U15's consent screen owns — but the
-    // grant now *says* whole brain rather than expressing it as an empty list
-    // a reader downstream has to interpret as "everything".
-    scope: 'whole_brain',
-    origins: [],
-    writeOrigin: deps.writeOrigin ?? DEFAULT_WRITE_ORIGIN,
+    // Spread, so the three halves of a scope cannot be assembled inconsistently
+    // here: `contextGrant` derives the write origin from the class rather than
+    // accepting one, and `authorize` refuses the combination again at mint.
+    ...requested.scoped,
     endpoint,
     now: deps.now().getTime(),
   });

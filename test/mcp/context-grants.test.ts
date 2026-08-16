@@ -383,6 +383,123 @@ describe('the class wildcard matches a class, not a prefix', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 3b. The product path: a work grant a user can actually obtain.
+// ---------------------------------------------------------------------------
+
+describe('a work-scoped grant can be obtained through the real OAuth flow', () => {
+  /**
+   * **The gap this closes.** Before U18 every narrowed grant in this repo was
+   * minted by a test helper — `handleAuthorize` hardcoded `origins: []`. The
+   * fence was real and nothing could ask for it, which is a fence with no
+   * product, and a suite built entirely on hand-minted tokens would never have
+   * noticed.
+   */
+  async function flow(scope: string | null): Promise<Response> {
+    const { createMcpServer } = await import('../../src/mcp/server.ts');
+    const { registerClient } = await import('../../src/mcp/oauth.ts');
+    const redirectUri = 'https://claude.ai/api/mcp/auth_callback';
+    const registered = registerClient(
+      fixture.deps.store,
+      { clientName: 'test-connector', redirectUris: [redirectUri] },
+      { allowlist: { redirectUris: [redirectUri], maxRegistrationsPerHour: 10 }, now: fixture.now() },
+    );
+    if (!registered.ok) throw new Error(`client did not register: ${registered.error}`);
+
+    const server = createMcpServer({
+      ...fixture.deps,
+      issuer: 'https://brainz.test',
+      registrationAllowlist: { redirectUris: [redirectUri], maxRegistrationsPerHour: 10 },
+    });
+
+    const query = new URLSearchParams({
+      client_id: registered.client.client_id,
+      redirect_uri: redirectUri,
+      code_challenge: 'a'.repeat(43),
+      code_challenge_method: 'S256',
+      state: 'opaque-state',
+      ...(scope === null ? {} : { scope }),
+    });
+    return server.fetch(
+      new Request(`https://brainz.test/authorize?${query.toString()}`, {
+        headers: { authorization: `Bearer ${fixture.bearer}` },
+      }),
+    );
+  }
+
+  test(
+    'asking for the work context yields a grant that cannot read a personal row',
+    async () => {
+      const response = await flow('brainz:context:work');
+      expect(response.status).toBe(302);
+
+      const code = new URL(response.headers.get('location') ?? '').searchParams.get('code') ?? '';
+      const record = fixture.deps.store.takeCode(code);
+      expect(record).toBeDefined();
+      expect(record?.scope).toBe('narrowed');
+      expect(record?.origins).toEqual(['work:*']);
+      // Derived from the class, never accepted from the request — a consent step
+      // that took a write origin from a query parameter would let a client aim
+      // its writes at a context it cannot read.
+      expect(record?.writeOrigin).toBe(WORK_AGENT);
+
+      // And the grant that flow produces actually fences. This is the assertion
+      // that connects the consent step to the property: a code carrying the
+      // right strings proves nothing if the strings do not narrow anything.
+      if (record === undefined) throw new Error('the flow issued no code');
+      const authorization = `Bearer ${tokenFor({
+        scope: record.scope,
+        origins: record.origins,
+        writeOrigin: record.writeOrigin,
+      })}`;
+      const denied = await fixture.call('fetch', { id: `chunk:${personalChunkId}` }, { authorization });
+      expect(denied.ok).toBe(false);
+      expect(denied.error?.code).toBe('scope_denied');
+      expect(JSON.stringify(denied)).not.toContain(SENTINEL);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'no scope at all still grants the whole brain — every shipping connector sends none',
+    async () => {
+      const response = await flow(null);
+      expect(response.status).toBe(302);
+      const code = new URL(response.headers.get('location') ?? '').searchParams.get('code') ?? '';
+      const record = fixture.deps.store.takeCode(code);
+      expect(record?.scope).toBe('whole_brain');
+      expect(record?.origins).toEqual([]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'an unrecognised scope is refused rather than quietly granting everything',
+    async () => {
+      // The asymmetry that matters: absent is the ordinary case, but a client
+      // that ASKED for something and silently received the brain has been
+      // over-granted invisibly from both ends.
+      for (const scope of [
+        'work',
+        'brainz:context:Work',
+        'brainz:context:work brainz:context:personal',
+        // **The case that isolates the prefix check**, and the realistic one: a
+        // client that sends a standard scope alongside ours. Skipping the token
+        // it did not recognise would hand back a grant the client did not ask
+        // for — narrower than the brain here, but chosen by the server rather
+        // than by the caller, which is the same class of silent substitution.
+        // Refusing is the fail-closed reading and it is what the docstring says.
+        'openid brainz:context:work',
+      ]) {
+        const response = await flow(scope);
+        expect(response.status, scope).toBe(400);
+        expect(((await response.json()) as { error: string }).error).toBe('invalid_scope');
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------
 // 4. The sweep: every tool, both endpoints, one sentinel.
 // ---------------------------------------------------------------------------
 
