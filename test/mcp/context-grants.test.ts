@@ -47,6 +47,30 @@
  *      the platform matches the string it was given rather than a boundary at
  *      the separator. The same mistake one store over: `work` is a prefix of
  *      `workplace`.
+ *
+ * ============================================================================
+ * WHAT THIS FILE PROVES, AND WHAT A GREEN RUN OF IT DOES NOT MEAN
+ * ============================================================================
+ *
+ * **Every `work:mail` row below is planted by this fixture, in SQL.** No
+ * production write path in `src/` produces a `work:` or `personal:` origin for
+ * connector content: connectors file at `pipedream:<source>`
+ * (`src/ingest/pipedream/pull.ts:originContextFor`), and the only `work:` origin
+ * anything can currently write is `work:agent`, from a work-scoped grant's own
+ * `remember`. On a real brain a `work:*` grant therefore expands to
+ * `['work:agent']` and reads back exactly its own memories.
+ *
+ * So a green run here means **the fence holds** — the origin grammar, the
+ * wildcard's class match, the subset and intersect rules, the write-origin
+ * coherence check, and the sweep over every tool on both endpoints. It does not
+ * mean a user can connect a work mailbox and have it land in their work context;
+ * nothing files there yet. That is a product gap and it is recorded as one in
+ * `src/mcp/grant-scope.ts` and in `upstream/concepts.jsonl`.
+ *
+ * The fixture is the right shape regardless: a fence is worth testing against
+ * the rows it will fence, and planting them directly is how the test stays
+ * meaningful *before* the producer exists rather than after. What would be
+ * wrong is reading the green tick as the capability.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';

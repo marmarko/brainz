@@ -72,6 +72,37 @@
  * mirroring what the whole-brain grant already does, and giving a `work:*` grant
  * on a brain with no work rows the value `['work:agent']` rather than `[]`. So
  * the fail-open path above cannot be reached even through an unlucky corpus.
+ *
+ * ============================================================================
+ * WHAT A CONTEXT GRANT CAN CURRENTLY READ, STATED BEFORE ANYBODY INFERS IT
+ * ============================================================================
+ *
+ * **Nothing a connector wrote — because no production write path produces a
+ * `work:` or `personal:` origin for one.** The three origin producers in `src/`,
+ * exhaustively:
+ *
+ *   * `src/ingest/pipedream/pull.ts:originContextFor` → `pipedream:<source>`.
+ *     Every connector page, chunk and fact. The class is `pipedream`.
+ *   * `src/mcp/dispatch.ts:DEFAULT_WRITE_ORIGIN` → `personal:agent`. Where a
+ *     `remember` under a whole-brain credential lands.
+ *   * {@link agentOriginFor}, through a narrowed grant's own `writeOrigin` →
+ *     `<class>:agent`. Where a `remember` under *that* grant lands.
+ *
+ * So a `work:*` grant obtained through the real consent flow expands to
+ * `['work:agent']` on every brain this repo can currently produce, and reads
+ * exactly the memories it wrote itself. "A work-scoped grant cannot read
+ * personal rows" is true of it, and so is "it cannot read a mailbox".
+ *
+ * That is a **product** gap, not a fence gap, and the distinction is the reason
+ * this paragraph exists rather than a patch: which context class a connected
+ * Gmail account belongs to is a decision a user makes on a consent surface that
+ * does not exist yet, and inventing an answer here would write an unobserved
+ * value into the one column access is decided on. The fence, the grammar, the
+ * wildcard expansion and the consent endpoint are all real and all tested
+ * against rows planted directly in the database; what is missing is a connector
+ * that files at a context class. `upstream/concepts.jsonl:gap.context-injection-gate`
+ * carries the same sentence, and `test/mcp/context-grants.test.ts` says in its
+ * header which half of this it proves.
  */
 
 import type { Grant } from '../core/search/fence.ts';
