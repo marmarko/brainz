@@ -322,7 +322,7 @@ export async function authenticate(
   // A self-contained token cannot be withdrawn by rewriting it, so revocation
   // is a list and it is consulted on every call — including the ones that would
   // otherwise never touch the store.
-  if (deps.store.isRevoked(claims.grantId)) {
+  if (deps.store.isRevoked(claims.tenantId, claims.grantId)) {
     return {
       ok: false,
       refusal: {

@@ -414,11 +414,19 @@ async function handleToken(deps: ServerDeps, request: Request): Promise<Response
  * unguessable, which bounds the exposure and does not make an open write
  * endpoint on a public issuer acceptable.
  *
- * The residual, written down rather than discovered: the store's revocation
- * list is keyed by grant id alone and holds no tenant, so an *authenticated*
- * tenant presenting another tenant's grant id would still retire it. Closing
- * that needs a tenant column on the revocation record, which belongs with the
- * durable store U15 owns; this is the half that can be closed here.
+ * **Authenticating says who is asking; it does not say what they may retire.**
+ * The version before this one stopped at the first half: it proved the caller
+ * held *a* tenant bearer and then acted on a grant id, so an authenticated
+ * tenant presenting a stranger's grant id retired the stranger's connector. The
+ * unguessability of the id was doing the whole job, and support transcripts,
+ * client logs and screen shares are all places it stops being unguessable. So
+ * the revocation list is keyed on `(tenant, grant)` and the tenant handed to it
+ * is the one this function just authenticated — never one the caller supplied.
+ *
+ * The answer stays 200 either way. RFC 7009 is explicit that revocation must not
+ * report whether a token was known, and a refusal here would turn the endpoint
+ * into an oracle for which grant ids exist on which tenant — which is a better
+ * disclosure channel than the one being closed.
  */
 async function handleRevoke(deps: ServerDeps, request: Request): Promise<Response> {
   const presented = stripBearer(request.headers.get('authorization') ?? '');
@@ -432,7 +440,7 @@ async function handleRevoke(deps: ServerDeps, request: Request): Promise<Respons
 
   const form = new URLSearchParams(await request.text());
   const grantId = form.get('grant_id') ?? '';
-  if (grantId.length > 0) deps.store.revokeGrant(grantId);
+  if (grantId.length > 0) deps.store.revokeGrant(tenantId, grantId);
   // RFC 7009: revocation answers 200 whether or not the token was known, so the
   // endpoint is not an oracle for which grant ids exist.
   return new Response(null, { status: 200 });

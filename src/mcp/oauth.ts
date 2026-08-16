@@ -27,7 +27,11 @@
  *     `HMAC(bearer, "brainz/mcp/access-token/v1")`, not the bearer itself.
  *   * **Per-grant revocation needs a list**, because a self-contained token
  *     cannot be individually withdrawn. {@link AuthorizationStore} carries one,
- *     and dispatch consults it on every call.
+ *     keyed on `(tenant, grant)` rather than on the grant id alone, and dispatch
+ *     consults it on every call. The tenant half is the access control: the
+ *     revocation endpoint receives a grant id from its caller and nothing else,
+ *     so a list keyed on that id is a list any authenticated tenant can write
+ *     into a stranger's row of.
  *
  * **The tenant id inside a token is a routing hint, never an authorisation.**
  * The Worker reads it to pick a Durable Object before anything is verified
@@ -358,8 +362,30 @@ export interface AuthorizationStore {
   takeCode(code: string): CodeRecord | undefined;
   putRefresh(tokenHash: string, record: RefreshRecord): void;
   takeRefresh(tokenHash: string): RefreshRecord | undefined;
-  revokeGrant(grantId: string): void;
-  isRevoked(grantId: string): boolean;
+  /**
+   * Retire one grant, **of one tenant**.
+   *
+   * The tenant is a required parameter rather than a field on a record this
+   * store looks up, because a grant id is the only thing the revocation
+   * endpoint receives from its caller and a list keyed on it alone is a list
+   * any authenticated tenant can write into somebody else's row of. Revocation
+   * ids are unguessable, which bounds that and does not close it: they turn up
+   * in support transcripts, client logs and screen shares.
+   */
+  revokeGrant(tenantId: string, grantId: string): void;
+  isRevoked(tenantId: string, grantId: string): boolean;
+}
+
+/**
+ * The revocation list's key.
+ *
+ * A NUL separator rather than a colon or a slash: tenant ids and grant ids are
+ * both opaque strings this module does not get to constrain, and R9's finding
+ * one store over is that a boundary matched anywhere but at a separator no
+ * value can contain is not a boundary. NUL cannot appear in either.
+ */
+function revocationKey(tenantId: string, grantId: string): string {
+  return `${tenantId}\u0000${grantId}`;
 }
 
 export function createInMemoryAuthorizationStore(): AuthorizationStore {
@@ -398,11 +424,11 @@ export function createInMemoryAuthorizationStore(): AuthorizationStore {
       refresh.delete(tokenHash);
       return record;
     },
-    revokeGrant(grantId) {
-      revoked.add(grantId);
+    revokeGrant(tenantId, grantId) {
+      revoked.add(revocationKey(tenantId, grantId));
     },
-    isRevoked(grantId) {
-      return revoked.has(grantId);
+    isRevoked(tenantId, grantId) {
+      return revoked.has(revocationKey(tenantId, grantId));
     },
   };
 }
@@ -702,7 +728,7 @@ export function redeemRefreshToken(
   if (record === undefined) return refused;
   if (record.expiresAt <= request.now) return refused;
   if (record.clientId !== request.clientId) return refused;
-  if (store.isRevoked(record.grantId)) return refused;
+  if (store.isRevoked(record.tenantId, record.grantId)) return refused;
 
   return {
     ok: true,

@@ -37,6 +37,7 @@ import {
 } from '../../src/mcp/oauth.ts';
 import { createMcpServer } from '../../src/mcp/server.ts';
 import { agentOriginFor, classOf } from '../../src/mcp/grant-scope.ts';
+import { controlPlaneIdentity } from '../../src/control/secrets.ts';
 import { AGENT_ORIGIN, createMcpFixture, seedEntity, seedFact, seedPage, type McpFixture } from './fixture.ts';
 
 const SETUP_TIMEOUT_MS = 180_000;
@@ -506,7 +507,63 @@ describe('revocation is not an open endpoint', () => {
     );
 
     expect(response.status).toBe(401);
-    expect(fixture.store.isRevoked('g-victim')).toBe(false);
+    expect(fixture.store.isRevoked(fixture.tenantId, 'g-victim')).toBe(false);
+  });
+
+  test('one tenant cannot retire another tenant\u2019s grant', async () => {
+    // Authenticating proves *who is asking*, and the endpoint then acted on a
+    // grant id alone. Revocation ids are unguessable, which bounds this and does
+    // not close it: they turn up in support transcripts, client logs and screen
+    // shares, and any tenant with an account can spend one against a stranger's
+    // connector. A revocation that answers 200 and kills somebody else's
+    // connection is a denial of service with a receipt.
+    const other = 't-other-tenant';
+    const otherBearer = mintTenantBearer(other);
+    await fixture.secrets.put(controlPlaneIdentity(), other, {
+      connectionString: fixture.schema.dsn,
+      bearerGrant: otherBearer,
+    });
+
+    const server = createMcpServer({
+      ...fixture.deps,
+      issuer: 'https://mcp.brainz.test',
+      registrationAllowlist: { redirectUris: ['https://claude.ai/cb'], maxRegistrationsPerHour: 10 },
+    });
+
+    const response = await server.fetch(
+      new Request('https://mcp.brainz.test/revoke', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+          authorization: `Bearer ${otherBearer}`,
+        },
+        body: 'grant_id=g-not-theirs',
+      }),
+    );
+
+    // RFC 7009: still a 200, because the endpoint must not become an oracle for
+    // which grant ids exist. What must not happen is the retirement itself.
+    expect(response.status).toBe(200);
+    expect(fixture.store.isRevoked(fixture.tenantId, 'g-not-theirs')).toBe(false);
+
+    // And the victim's credential still works, which is the property a status
+    // code cannot show.
+    const victim = mintAccessToken(
+      {
+        grantId: 'g-not-theirs',
+        tenantId: fixture.tenantId,
+        clientId: 'client-victim',
+        scope: 'whole_brain',
+        origins: [],
+        writeOrigin: AGENT_ORIGIN,
+        endpoint: 'mcp',
+        issuedAt: fixture.now(),
+        expiresAt: fixture.now() + 3_600_000,
+      },
+      deriveSigningKey(fixture.bearer),
+    );
+    const stillWorks = await fixture.call('brain', {}, { authorization: `Bearer ${victim}` });
+    expect(stillWorks.ok).toBe(true);
   });
 
   test('the tenant holding the bearer can still revoke', async () => {
@@ -528,6 +585,6 @@ describe('revocation is not an open endpoint', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(fixture.store.isRevoked('g-mine')).toBe(true);
+    expect(fixture.store.isRevoked(fixture.tenantId, 'g-mine')).toBe(true);
   });
 });

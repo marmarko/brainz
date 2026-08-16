@@ -652,7 +652,7 @@ describe('auth refusals are typed, and they are refusals everywhere', () => {
     const before = await fixture.call('recall', { query: 'renewal' }, { authorization });
     expect(before.ok).toBe(true);
 
-    fixture.store.revokeGrant('g-revoked');
+    fixture.store.revokeGrant(fixture.tenantId, 'g-revoked');
 
     for (const tool of READ_AND_WRITE) {
       const result = await fixture.call(tool, { query: 'x', id: 'chunk:1', name: 'x', statement: 'x' }, { authorization });
