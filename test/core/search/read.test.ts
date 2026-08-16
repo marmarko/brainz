@@ -283,8 +283,8 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
       // unbounded-input hazard on this path and not the one under test here.
       const { gateway, transport } = gatewayThat({ refuse: false });
 
-      // Comfortably past `READ_PATH_BUDGET_MICRO_USD` (3,000 µUSD): 150k chars
-      // is ~37.5k tokens, and `text-embedding-3-large` prices that near 4,900.
+      // Comfortably past `READ_PATH_SPEND_CEILING` (4,000): 150k chars is ~37.5k
+      // tokens, which the embedder prices near 4,900.
       const enormous = 'widget '.repeat(21_500);
       expect(enormous.length).toBeGreaterThan(150_000);
 
@@ -319,8 +319,8 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
       // second is refused, and the difference is exactly the bug.
       const { gateway, transport } = gatewayThat({ refuse: false });
 
-      // ~70k chars is ~17.5k tokens, ~2,275 µUSD against a 3,000 µUSD ceiling:
-      // one fits, two do not. Driven through `embedQuery` rather than `recall`
+      // ~70k chars is ~17.5k tokens, ~2,275 against a ceiling of 4,000: one fits,
+      // two do not. Driven through `embedQuery` rather than `recall`
       // for the reason the test above gives — a query this size does not survive
       // the FTS arm.
       const costly = 'widget '.repeat(10_000);

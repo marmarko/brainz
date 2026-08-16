@@ -109,8 +109,11 @@ export async function embedQuery(request: {
 }
 
 /**
- * What one read may spend, in micro-USD, when the caller sets no budget of its
- * own.
+ * What one read may spend when the caller sets no budget of its own.
+ *
+ * Micro-USD, integer, in the unit `src/control/schema.sql` counts in — and
+ * named the way `first-import.ts` names its ceilings, because a *ceiling* is not
+ * a *price* and only the canonical table may name one of those.
  *
  * **Derived, not chosen.** The worst *legitimate* read is two calls, and both
  * are bounded by constants in this package:
@@ -124,13 +127,13 @@ export async function embedQuery(request: {
  *     `text-embedding-3-large` at 130,000 µUSD per million — a generous
  *     4,000-character query is 1,000 tokens: **~130 µUSD**.
  *
- * So ~265 µUSD is the ceiling of ordinary, and this is roughly ten times it.
+ * So ~265 is the ceiling of ordinary, and this is roughly fifteen times it.
  * The margin is the point: a cap that fires on a legitimate read is a search
  * outage, and a cap an order of magnitude above the worst legitimate read still
  * turns a pathological one — a caller feeding a megabyte of "query" — into a
  * degraded answer rather than an invoice.
  */
-export const READ_PATH_BUDGET_MICRO_USD = 3_000;
+export const READ_PATH_SPEND_CEILING = 4_000;
 
 /**
  * A fresh budget for one read.
@@ -155,7 +158,7 @@ export const READ_PATH_BUDGET_MICRO_USD = 3_000;
  * request cannot run away", not "a tenant cannot".
  */
 function readPathBudget(): Budget {
-  return createBudget({ label: 'read-path', capMicroUsd: READ_PATH_BUDGET_MICRO_USD });
+  return createBudget({ label: 'read-path', capMicroUsd: READ_PATH_SPEND_CEILING });
 }
 
 /**

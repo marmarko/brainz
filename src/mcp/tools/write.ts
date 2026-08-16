@@ -34,7 +34,9 @@ import { invalid, stringArg, type Handler } from './context.ts';
 const ALLOWED_SOURCE_TYPES = new Set(['note', 'document', 'file']);
 
 /**
- * What one `remember` may spend, in micro-USD.
+ * What one `remember` may spend. Micro-USD, integer, and named as a ceiling
+ * rather than as money: the canonical pricing table is the only place in `src/`
+ * that may name a price, and this is a limit on spending rather than a rate.
  *
  * One statement, chunked and embedded through `text-embedding-3-large` at
  * 130,000 µUSD per million input tokens — a 10,000-character statement is 2,500
@@ -43,7 +45,7 @@ const ALLOWED_SOURCE_TYPES = new Set(['note', 'document', 'file']);
  * that: wide enough that no honest write meets it, narrow enough that a caller
  * pasting a book into one tool call gets a typed refusal instead of a bill.
  */
-const REMEMBER_BUDGET_MICRO_USD = 6_000;
+const REMEMBER_SPEND_CEILING = 6_000;
 
 export const remember: Handler = async (ctx, args) => {
   const statement = stringArg(args, 'statement');
@@ -76,7 +78,7 @@ export const remember: Handler = async (ctx, args) => {
       // path to fall back on. A refusal returns `embed_failed` through
       // `writeRemember`'s typed outcome, which is answered as `unavailable`
       // below rather than thrown.
-      budget: createBudget({ label: 'mcp-remember', capMicroUsd: REMEMBER_BUDGET_MICRO_USD }),
+      budget: createBudget({ label: 'mcp-remember', capMicroUsd: REMEMBER_SPEND_CEILING }),
     },
     {
       // R15, in one line: where this lands is decided by the credential.
