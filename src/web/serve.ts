@@ -26,10 +26,17 @@
 
 import { SQL } from 'bun';
 
-import { createWebApp, type ConnectorVendor, type ProviderKeyWriter, type SeverancePort } from './app.ts';
+import {
+  createWebApp,
+  type ConnectorVendor,
+  type ProviderKeyWriter,
+  type SeverancePort,
+  type SubjectErasurePort,
+} from './app.ts';
 import { createTenantProviderKeyStore, type ProviderId } from '../ai/keys.ts';
 import { previewSeverance } from '../core/lifecycle/blast-radius.ts';
 import { severOrigin } from '../core/lifecycle/severance.ts';
+import { eraseSubject, previewSubjectErasure } from '../core/lifecycle/subject-erasure.ts';
 import { createStripeCheckout, type CheckoutPort } from '../control/checkout.ts';
 import { createPostgresControlPlaneStore } from '../control/control-store.ts';
 import { createBrainProvisioner } from '../control/provisioner.ts';
@@ -63,6 +70,12 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
   const controlSql = openControlPlane(env);
   const secrets = openSecretStore(env);
 
+  // One resolver for both tenant-side ports, so "how this process reaches a
+  // brain" has one implementation rather than two that can drift on the
+  // question R11 cares about — which identity resolves the namespace, and where
+  // the tenant id came from.
+  const withTenant = tenantDatabases(secrets);
+
   const handle = createWebApp({
     sql,
     controlSql,
@@ -71,7 +84,8 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
     stripeWebhookSecret: required(env, 'BRAINZ_STRIPE_WEBHOOK_SECRET'),
     byok: writeOnlyProviderKeys(secrets),
     connectors: connectorVendor(),
-    severance: severancePort(secrets),
+    severance: severancePort(withTenant),
+    subjectErasure: subjectErasurePort(withTenant),
     provisioner: createBrainProvisioner({
       controlSql,
       store: createPostgresControlPlaneStore(controlSql),
@@ -151,19 +165,11 @@ function writeOnlyProviderKeys(secrets: FleetSecrets): ProviderKeyWriter {
 }
 
 /**
- * U18's severance flow, given the caller it did not have.
- *
- * **The defect this closes.** `severOrigin` was correct, tested and imported by
- * nothing outside its own test; `app.ts` declared `SeverancePort` and no
- * composition root supplied one, so `/api/severance` and its preview answered
- * `501 unavailable` in every deployment. A destructive operation that cannot be
- * performed is a smaller problem than one that lies, which is why the app fails
- * closed on an absent port — but the port has to exist somewhere, and this is
- * the process that owns both halves it needs.
+ * Running one piece of work against one tenant's own database.
  *
  * **Why the fleet identity is constructed here and not in `app.ts`.** R11 says
  * the web-app identity holds no resolve permission on any tenant namespace, and
- * that stays true: `app.ts` is handed this interface and never the store, so
+ * that stays true: `app.ts` is handed the ports below and never the store, so
  * nothing reachable from a request handler can name a namespace or read a
  * connection string. The composition root already holds the store — it builds
  * the write-only BYOK port and the provisioner out of it — and the tenant id it
@@ -172,13 +178,24 @@ function writeOnlyProviderKeys(secrets: FleetSecrets): ProviderKeyWriter {
  * `src/worker/serve.ts` satisfies when it opens a tenant's database to
  * consolidate it, by the same construction.
  *
- * **A connection per call, closed in a `finally`.** Severance is a rare,
- * user-initiated request rather than a loop, so a pool held open for it would be
- * a connection per tenant this process has ever severed for — and the per-tenant
- * LRU those handles come out of is the reason `worker/serve.ts` honours `close`.
+ * **A connection per call, closed in a `finally`.** Severance and subject
+ * erasure are rare, user-initiated requests rather than loops, so a pool held
+ * open for them would be a connection per tenant this process has ever acted
+ * for — and the per-tenant LRU those handles come out of is the reason
+ * `worker/serve.ts` honours `close`.
+ *
+ * **One resolver, two ports.** This was inside `severancePort` until
+ * {@link subjectErasurePort} needed the same thing. Two copies of "resolve a
+ * namespace under the fleet identity and open a connection" are two places for
+ * the R11 constraint to be true, and only one of them has to be edited for it
+ * to stop being.
  */
-function severancePort(secrets: FleetSecrets): SeverancePort {
-  async function withTenant<T>(tenantId: string, work: (sql: SQL) => Promise<T>): Promise<T> {
+interface TenantWork {
+  <T>(tenantId: string, work: (sql: SQL) => Promise<T>): Promise<T>;
+}
+
+function tenantDatabases(secrets: FleetSecrets): TenantWork {
+  return async function withTenant<T>(tenantId: string, work: (sql: SQL) => Promise<T>): Promise<T> {
     const resolved = await secrets.store.resolve(fleetIdentity(tenantId), tenantId);
     if (!resolved.ok) {
       // Thrown rather than reported as a refusal: "this brain's connection
@@ -187,7 +204,7 @@ function severancePort(secrets: FleetSecrets): SeverancePort {
       // forever. The entrypoint's error boundary turns it into a generic 500
       // and writes the reason to stderr, where an operator is.
       throw new Error(
-        `no resolvable connection secret for ${tenantId} (${resolved.reason}); this process cannot sever for it`,
+        `no resolvable connection secret for ${tenantId} (${resolved.reason}); this process cannot reach that brain`,
       );
     }
     const sql = new SQL(resolved.secret.connectionString, { max: 2 });
@@ -196,8 +213,21 @@ function severancePort(secrets: FleetSecrets): SeverancePort {
     } finally {
       await sql.close();
     }
-  }
+  };
+}
 
+/**
+ * U18's severance flow, given the caller it did not have.
+ *
+ * **The defect this closed.** `severOrigin` was correct, tested and imported by
+ * nothing outside its own test; `app.ts` declared `SeverancePort` and no
+ * composition root supplied one, so `/api/severance` and its preview answered
+ * `501 unavailable` in every deployment. A destructive operation that cannot be
+ * performed is a smaller problem than one that lies, which is why the app fails
+ * closed on an absent port — but the port has to exist somewhere, and this is
+ * the process that owns both halves it needs.
+ */
+function severancePort(withTenant: TenantWork): SeverancePort {
   return {
     preview: (request) =>
       withTenant(request.tenantId, async (sql) => {
@@ -229,6 +259,100 @@ function severancePort(secrets: FleetSecrets): SeverancePort {
             }
           : { ok: false as const, reason: outcome.reason };
       }),
+  };
+}
+
+/**
+ * R12's subject-scoped erasure, given the caller it did not have.
+ *
+ * **The defect this closes, which is the severance one a second time.**
+ * `src/core/lifecycle/subject-erasure.ts` is complete: it resolves a
+ * correspondent through the entity graph and the identifier as text, names every
+ * row it will take, sweeps the three residue classes the 72h purge cannot reach,
+ * and writes the re-ingestion tombstone. Its header says the erasure is
+ * *"invocable by the controlling user, out of band"* and that the module
+ * *"exports a function and registers no MCP tool"* — and the second half had
+ * swallowed the first: `eraseSubject` and `previewSubjectErasure` were imported
+ * by their own test and by nothing else in `src/`, so `app.ts`'s
+ * `/api/subject-erasure` routes answered `501 unavailable` in every deployment.
+ * A correspondent could ask, and the only way to answer them was to run a test
+ * harness against somebody's brain. R12a is why the answer is not an MCP tool:
+ * the assistant that would issue the erasure is the assistant reading the
+ * correspondent's mail. Refusing to register that tool is only honest while some
+ * other surface can perform it, and this is the process that owns it.
+ *
+ * **The echo is checked here as well as in the route.** `eraseSubject` takes no
+ * confirmation of its own — it is the executor, and its caller is expected to
+ * have obtained consent — so unlike `severOrigin` there is no third check
+ * underneath this one. That makes the check here the last one, on the most
+ * destructive operation this system performs against records about a third
+ * party. `app.ts` checks it before the port is reached and this refuses again,
+ * for the reason `severancePort` gives: a control checked in exactly one place
+ * is one edit away from being checked nowhere.
+ *
+ * **No object store is passed, and the receipt says so rather than rounding
+ * down.** `ErasableObjectStore` has no production implementation in `src/`
+ * (`upstream/concepts.jsonl:gap.erasure-path` is where that is recorded), and
+ * `rawKeyOf` may only come from the one accessor allowed to derive a raw key.
+ * A run without either reports every raw payload and every stored attachment as
+ * *unreachable* — counted, named on the receipt, and surfaced by the route —
+ * which is what a data-subject answer needs in order to be true. Inventing a
+ * key here would be a second key-derivation site, which `src/README.md` forbids
+ * for exactly the reason that it would eventually disagree with the first.
+ *
+ * **The preview is projected, not passed through.** `SubjectMatch` carries the
+ * page's `external_ref` and `origin_context` because the sweep needs them to
+ * name a snapshot's document key; the port declares `{ pageId, handle }` and
+ * that is what crosses, along with the row list minus its `objectKey`. What the
+ * controller needs is which rows go and what text named her.
+ */
+function subjectErasurePort(withTenant: TenantWork): SubjectErasurePort {
+  return {
+    preview: (request) =>
+      withTenant(request.tenantId, async (sql) => {
+        const preview = await previewSubjectErasure(sql, { identifier: request.identifier });
+        return {
+          subjectDigest: preview.subjectDigest,
+          entityIds: preview.entityIds,
+          surfaceForms: preview.surfaceForms,
+          pages: preview.matches.map((match) => ({ pageId: match.pageId, handle: match.handle })),
+          rows: preview.rows.map((row) => ({
+            kind: row.kind,
+            id: row.id,
+            excerpt: row.excerpt,
+            handle: row.handle,
+          })),
+          removed: { ...preview.removed },
+          recomputed: { ...preview.recomputed },
+          recomputeRequired: preview.recomputeRequired,
+        };
+      }),
+    execute: (request) => {
+      // Before the connection, not after: an erasure whose confirmation does not
+      // echo the identifier must not reach a brain at all, and a check inside
+      // `withTenant` would already have resolved a namespace and opened one.
+      if (request.confirm !== request.identifier) {
+        return Promise.resolve({ ok: false as const, reason: 'not_confirmed' });
+      }
+      return withTenant(request.tenantId, async (sql) => {
+        const receipt = await eraseSubject({ sql }, { identifier: request.identifier, erasedBy: 'app' });
+        return {
+          ok: true as const,
+          // The digest, never the identifier. The receipt for an erasure must
+          // not be the one place the address survives.
+          subjectDigest: receipt.subjectDigest,
+          removed: { ...receipt.removed },
+          recomputeRequired: receipt.recomputeRequired,
+          reingestionTombstoned: receipt.reingestionTombstoned,
+          rawObjectsRemoved: receipt.rawObjectsRemoved,
+          rawObjectsUnreachable: receipt.rawObjectsUnreachable,
+          attachmentObjectsRemoved: receipt.attachmentObjectsRemoved,
+          attachmentObjectsUnreachable: receipt.attachmentObjectsUnreachable,
+          unrecoverableAfterDays: receipt.unrecoverableAfterDays,
+          erasedAt: receipt.erasedAt,
+        };
+      });
+    },
   };
 }
 
