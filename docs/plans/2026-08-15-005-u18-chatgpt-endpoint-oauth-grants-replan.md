@@ -350,3 +350,54 @@ in isolation — is the reason each mutation is applied alone and reverted by di
 - Any part of §2's conformance that needs a live ChatGPT connector, and the whole of §5.1, stay
   **not-yet/deferred** with the missing half named. Four agents have declined flips on that basis; this is
   the fifth.
+
+---
+
+## 8. What execution changed about this plan
+
+Written after the work, per the convention `docs/plans/2026-08-13-002-u14-…` and the U16 execution-note
+commit established. Five things the plan did not know:
+
+**1. The plan under-described the fail-open in §3.1 — the guards make its branch unreachable, so it was
+unprovable.** A mutation restoring the pre-U18 line (`origins.length > 0 ? origins : wholeBrain`) **survived
+the entire integration suite**. Once `grantScopeViolations` refuses `narrowed` with no origins at mint *and*
+at verify, and `expandGrant`'s class floor keeps every valid narrowing non-empty, nothing the request path
+can construct reaches the fall-through. A guard nothing can provoke is a guard nobody can prove. The
+decision was therefore extracted into `grant-scope.ts:resolveGrant` — a named function a unit test can hand
+the shape the request path can no longer produce — and the mutation dies there. **This is the plan's most
+important correction and it generalises**: defence in depth is only depth if each layer is separately
+reachable by a test.
+
+**2. Two of the three §3 guards overlap on the obvious fixture, and the overlap hid one of them.** Removing
+the empty-origins check alone (M1) killed only its unit test; the integration assertion survived, because
+`origins: []` also fails the `writeOrigin ⊆ grant` check. It took a *combined* mutation (M3) to show the
+pair is what closes the hole — and to show that even with both gone the grant resolves to `[]` and
+`fence.ts` refuses everything, so the explicit `scope` marker in the resolution is the load-bearing control
+and the two claim-side guards are the second layer. That is exactly the repo's recorded defect ("three
+access controls where only one was doing the work") caught in the act, and the isolating test is the unit
+one asserting the *specific* finding text rather than merely that something was found.
+
+**3. Three U6 fixtures expressed grants that write where they cannot read.** `dispatch.test.ts`,
+`adversarial.test.ts` and `schema-guard.test.ts` all minted `origins: ['work:mail']` with
+`writeOrigin: 'personal:agent'`. Under §3.3 those are now incoherent credentials and the suite went red on
+landing — correctly. They derive the write origin from the origins now. The plan treated §3.3 as an
+addition; it is also a **correction to existing fixtures**, and any future narrowed grant has to be built
+the same way.
+
+**4. §3.4's enumeration was right about the read paths and missed a residual in the entity card.**
+`entityCard`'s fact hydration is fenced (the mutation dropping that predicate is killed). Its **alias list
+is not**, because `entity_alias` carries no origin column at all — so a work grant resolving a shared person
+receives aliases written only from personal mail. Vocabulary and labels rather than statements or bodies,
+and the suite asserts that bound. It is the reason `gap.context-injection-gate` stays `not-yet` on two and a
+half legs of three rather than flipping.
+
+**5. The plan forgot that a fence nobody can request is not a product.** §3 designed the credential and §6
+ordered the work, and neither noticed that `handleAuthorize` hardcoded `origins: []` — so the first four
+commits' worth of fence could not be *obtained* by any user. `scope=brainz:context:work` closes it, and the
+mutation that skips unrecognised scope tokens survived three of the four cases first written for it: only
+`openid brainz:context:work`, the realistic client string, isolates the prefix check.
+
+Also landed and not in the plan: `ClientFailure.detail` (an erasure receipt that cannot say *why* a leg
+failed names a problem without naming the work), and `developers.openai.com` as an R10 not-a-destination
+entry — the register scanner flagged the docs URL cited in `openai.ts`, and the citation is the receipt for
+a shape this repo conforms to, so it is registered rather than deleted.

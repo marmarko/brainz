@@ -9,7 +9,7 @@
  * called the handlers directly would assert none of them.
  */
 
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { createHmac } from 'node:crypto';
 import type { SQL } from 'bun';
 
@@ -57,9 +57,10 @@ let recorded: {
   byokRevokes: { tenantId: string; provider: string }[];
   minted: { tenantId: string; source: string }[];
   disconnected: { tenantId: string; source: string }[];
+  severed: { tenantId: string; origin: string; confirm: string }[];
 };
 
-function app(overrides: { adminCredential?: string } = {}) {
+function app(overrides: { adminCredential?: string; severance?: boolean } = {}) {
   return createWebApp({
     sql,
     controlSql,
@@ -92,6 +93,32 @@ function app(overrides: { adminCredential?: string } = {}) {
         return Promise.resolve({ deleted: true, tokensRevoked: 'unverified' as const });
       },
     },
+    // U18. Absent when `severance: false`, so the "no port wired" branch is a
+    // state a test can reach rather than a comment — an endpoint that answered
+    // ok for a severance nothing performed is the lie this port shape exists to
+    // make impossible.
+    ...(overrides.severance === false
+      ? {}
+      : {
+          severance: {
+            preview() {
+              return Promise.resolve({
+                removed: { pages: 2, chunks: 5, facts: 1 },
+                recomputed: { facts: 3, entities: 2 },
+                recomputeRequired: true,
+                survivingOrigins: ['personal:mail'],
+              });
+            },
+            execute(request: { tenantId: string; origin: string; confirm: string }) {
+              recorded.severed.push({ ...request });
+              return Promise.resolve({
+                ok: true as const,
+                severanceId: '7',
+                alreadySevered: false,
+              });
+            },
+          },
+        }),
   });
 }
 
@@ -120,7 +147,7 @@ async function reset(): Promise<void> {
   await sql`DELETE FROM account.billing_event`;
   await controlSql`DELETE FROM control.job`;
   await controlSql`DELETE FROM control.tenant`;
-  recorded = { byokPuts: [], byokRevokes: [], minted: [], disconnected: [] };
+  recorded = { byokPuts: [], byokRevokes: [], minted: [], disconnected: [], severed: [] };
 }
 
 /** A signed-in account whose brain is a seeded tenant. */
@@ -157,7 +184,7 @@ beforeAll(async () => {
   control = await createControlPlane('webapp');
   sql = connectIdentity(identity);
   controlSql = connectControl(control);
-  recorded = { byokPuts: [], byokRevokes: [], minted: [], disconnected: [] };
+  recorded = { byokPuts: [], byokRevokes: [], minted: [], disconnected: [], severed: [] };
 }, 60_000);
 
 afterAll(async () => {
@@ -624,4 +651,92 @@ describe('the session cookie outlives the idle window', () => {
     const maxAge = Number(/Max-Age=(\d+)/.exec(cookie)?.[1] ?? '0');
     expect(maxAge).toBe(Math.floor(ABSOLUTE_SESSION_MS / 1000));
   });
+});
+
+// ---------------------------------------------------------------------------
+// U18 — the severance surface.
+// ---------------------------------------------------------------------------
+
+describe('context severance', () => {
+  beforeEach(reset);
+
+  test(
+    'the preview returns BOTH columns, not just what would be removed',
+    async () => {
+      const cookie = await signedIn();
+      const response = await app()(get('/api/severance/preview?origin=work:mail', { cookie }));
+      expect(response.status).toBe(200);
+
+      const payload = (await response.json()) as {
+        removed: Record<string, number>;
+        recomputed: Record<string, number>;
+        recompute_required: boolean;
+        surviving_origins: string[];
+      };
+      expect(payload.removed.chunks).toBe(5);
+      // The column a preview that only counted deletions would omit — and the
+      // one that tells the user severing work also costs them their shared
+      // history with everyone they know through both accounts.
+      expect(payload.recomputed.facts).toBe(3);
+      expect(payload.recompute_required).toBe(true);
+      expect(payload.surviving_origins).toEqual(['personal:mail']);
+    },
+    60_000,
+  );
+
+  test(
+    'severance refuses without an echo of the origin, and the port is never called',
+    async () => {
+      const cookie = await signedIn();
+      const response = await app()(
+        post('/api/severance', { origin: 'work:mail', confirm: 'yes' }, { cookie }),
+      );
+      expect(response.status).toBe(400);
+      expect(((await response.json()) as { code: string }).code).toBe('not_confirmed');
+      // The half that matters: a route that refused *after* calling the port
+      // would be a route whose refusal is a message rather than a control.
+      expect(recorded.severed).toEqual([]);
+    },
+    60_000,
+  );
+
+  test(
+    'a confirmed severance reaches the port and stops the polling',
+    async () => {
+      const cookie = await signedIn();
+      await controlSql`
+        INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason,
+                                 run_at, created_at, updated_at)
+        VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'gmail', 'due',
+                'connector_cadence', ${AT}, ${AT}, ${AT})`;
+
+      const response = await app()(
+        post('/api/severance', { origin: 'work:mail', confirm: 'work:mail' }, { cookie }),
+      );
+      expect(response.status).toBe(200);
+      const payload = (await response.json()) as { severance_id: string; polling_stopped: number };
+      expect(payload.severance_id).toBe('7');
+      expect(recorded.severed).toEqual([
+        { tenantId: TENANT, origin: 'work:mail', confirm: 'work:mail' },
+      ]);
+      // Leaving the pull queued means the next worker re-imports what was just
+      // severed, on a cadence, and the user watches their disconnection undo
+      // itself.
+      expect(payload.polling_stopped).toBe(1);
+    },
+    60_000,
+  );
+
+  test(
+    'with no port wired the route refuses rather than reporting a severance nobody performed',
+    async () => {
+      const cookie = await signedIn();
+      const response = await app({ severance: false })(
+        post('/api/severance', { origin: 'work:mail', confirm: 'work:mail' }, { cookie }),
+      );
+      expect(response.status).toBe(501);
+      expect(recorded.severed).toEqual([]);
+    },
+    60_000,
+  );
 });

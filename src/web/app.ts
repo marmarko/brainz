@@ -83,6 +83,42 @@ export interface ProviderKeyWriter {
 }
 
 /** What the connector vendor can be asked to do on disconnect (R12 leg four). */
+/**
+ * Context severance, as a port (U18).
+ *
+ * **A port rather than a connection, because R11 forbids the alternative.** The
+ * web-app identity cannot resolve a tenant connection string from the secret
+ * store — that is the guard `test/control/accessor-boundary.test.ts` and U2's
+ * `scope_denied` case exist for — so the tenant-side work of a severance runs
+ * where tenant access legitimately lives and arrives here as an interface. Same
+ * shape `ConnectorVendor` and `ProviderKeyWriter` already use, for the same
+ * reason.
+ *
+ * **Two methods, and the split is the flow.** `preview` is a read the page
+ * renders; `execute` re-runs that preview inside its own transaction and acts on
+ * *that*, because the number a user consented to and the number that happened
+ * are only the same number if nothing arrived in between.
+ */
+export interface SeverancePort {
+  preview(request: {
+    readonly tenantId: string;
+    readonly origin: string;
+  }): Promise<{
+    readonly removed: Readonly<Record<string, number>>;
+    readonly recomputed: Readonly<Record<string, number>>;
+    readonly recomputeRequired: boolean;
+    readonly survivingOrigins: readonly string[];
+  }>;
+  execute(request: {
+    readonly tenantId: string;
+    readonly origin: string;
+    readonly confirm: string;
+  }): Promise<
+    | { readonly ok: true; readonly severanceId: string; readonly alreadySevered: boolean }
+    | { readonly ok: false; readonly reason: string }
+  >;
+}
+
 export interface ConnectorVendor {
   mintClaimUrl(request: {
     readonly tenantId: string;
@@ -105,6 +141,12 @@ export interface WebAppDeps {
   readonly mcpUrl: string;
   readonly byok: ProviderKeyWriter;
   readonly connectors: ConnectorVendor;
+  /**
+   * U18's severance flow. Absent disables the routes rather than faking them:
+   * an endpoint that answered `ok` for a severance nothing performed is the
+   * `applied: true` lie one unit over, on an operation that is destructive.
+   */
+  readonly severance?: SeverancePort;
   /** The Stripe endpoint signing secret, resolved from the secret store. */
   readonly stripeWebhookSecret: string;
   /** Set for an operator deployment; absent disables `/admin` entirely. */
@@ -346,6 +388,10 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     if (path === '/api/byok' && request.method === 'POST') return handleByok(request, session);
     if (path === '/api/byok' && request.method === 'DELETE') return handleByokRevoke(request, session);
     if (path === '/api/export-config') return handleExportConfig();
+    if (path === '/api/severance/preview') return handleSeverancePreview(url, session);
+    if (path === '/api/severance' && request.method === 'POST') {
+      return handleSeverance(request, session);
+    }
 
     if (path === '/' || path === '/dashboard') return renderDashboard(session);
     if (path === '/connect') return renderConnect(session);
@@ -637,6 +683,85 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
 
       await deps.byok.revoke(tenantId, provider as ProviderId);
       return json({ ok: true, provider });
+    }
+
+    /**
+     * What severing this origin would cost, in both currencies (U17's two
+     * columns). A GET, and a read — the suite asserts a before/after census
+     * across every content table, because a preview that mutates is not a
+     * preview.
+     */
+    async function handleSeverancePreview(url: URL, session: Session): Promise<Response> {
+      if (deps.severance === undefined) {
+        return json({ ok: false, code: 'unavailable' }, 501);
+      }
+      const origin = url.searchParams.get('origin') ?? '';
+      if (origin.length === 0) return json({ ok: false, code: 'origin_required' }, 400);
+
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return json({ ok: false, code: 'no_brain_yet' }, 409);
+
+      const preview = await deps.severance.preview({ tenantId, origin });
+      return json({
+        ok: true,
+        origin,
+        removed: preview.removed,
+        // The column a preview that only counted deletions would omit, and the
+        // one the user actually needs: disconnecting work costs them their work
+        // mail AND their shared history with everyone they know through both.
+        recomputed: preview.recomputed,
+        recompute_required: preview.recomputeRequired,
+        surviving_origins: preview.survivingOrigins,
+      });
+    }
+
+    /**
+     * Sever it.
+     *
+     * **The confirmation is an echo of the origin, not a flag**, and this route
+     * checks it before the port is called as well as inside it. A boolean
+     * `confirm: true` is a field a bug fills in, a retry replays and a model can
+     * guess; the exact string is one only something that read the preview can
+     * produce. R12a's rule is why this lives here and not on `tools/call` at
+     * all: the assistant holding `remember` is the assistant reading the user's
+     * mail.
+     */
+    async function handleSeverance(request: Request, session: Session): Promise<Response> {
+      if (deps.severance === undefined) {
+        return json({ ok: false, code: 'unavailable' }, 501);
+      }
+      const fields = await body(request);
+      const origin = stringOf(fields, 'origin');
+      const confirm = stringOf(fields, 'confirm');
+      if (origin.length === 0) return json({ ok: false, code: 'origin_required' }, 400);
+      if (confirm !== origin) return json({ ok: false, code: 'not_confirmed' }, 400);
+
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return json({ ok: false, code: 'no_brain_yet' }, 409);
+
+      const outcome = await deps.severance.execute({ tenantId, origin, confirm });
+      if (!outcome.ok) return json({ ok: false, code: outcome.reason }, 400);
+
+      // Stop the polling for every source of this origin's class, for the reason
+      // `handleDisconnect` gives one route over: leaving an `ingest_pull` queued
+      // means the next worker re-imports what was just severed, on a cadence,
+      // and the user watches their disconnection undo itself.
+      const stopped = await deps.controlSql<{ job_id: string }[]>`
+        UPDATE control.job
+        SET state = 'discarded', finished_at = ${now()}, updated_at = ${now()},
+            lease_owner = NULL, lease_expires_at = NULL, attempt_deadline_at = NULL
+        WHERE tenant_id = ${tenantId}
+          AND kind = 'ingest_pull'
+          AND state IN ('due', 'running')
+        RETURNING job_id::text AS job_id`;
+
+      return json({
+        ok: true,
+        origin,
+        severance_id: outcome.severanceId,
+        already_severed: outcome.alreadySevered,
+        polling_stopped: stopped.length,
+      });
     }
 
     function handleExportConfig(): Response {
