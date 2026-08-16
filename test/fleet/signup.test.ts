@@ -52,6 +52,16 @@ const CHOSEN_LANGUAGE = 'spanish';
 let control: ControlFixture;
 let identity: IdentityFixture;
 let poolProject: SchemaFixture;
+/**
+ * A second, untouched pool database for the retry case.
+ *
+ * Not fastidiousness: the schema ladder refuses to migrate a tenant indexed in
+ * one language as another (KTD9's guard, and it fired the first time this case
+ * reused the shared project), so a case that picks a different language needs a
+ * project no earlier case has already indexed. Which is exactly true of a real
+ * pool: every project is claimed once.
+ */
+let secondPoolProject: SchemaFixture;
 let controlSql: SQL;
 let identitySql: SQL;
 let scratch: string;
@@ -65,6 +75,7 @@ beforeAll(async () => {
   // reachable, and carrying no schema, because KTD9 forbids applying one before
   // the tenant's language is known.
   poolProject = await createEmptyDatabase('signuppool');
+  secondPoolProject = await createEmptyDatabase('signuppooltwo');
   controlSql = new SQL(control.dsn, { max: 2 });
   identitySql = new SQL(identity.dsn, { max: 2 });
 
@@ -92,11 +103,12 @@ afterAll(async () => {
   if (control !== undefined) await dropControlPlane(control);
   if (identity !== undefined) await dropIdentityStore(identity);
   if (poolProject !== undefined) await dropFixtureDatabase(poolProject);
+  if (secondPoolProject !== undefined) await dropFixtureDatabase(secondPoolProject);
   if (scratch !== undefined) rmSync(scratch, { recursive: true, force: true });
 });
 
 /** Refill the pool the way a filler does: a `ready` row plus a stored string. */
-async function fillPool(): Promise<void> {
+async function fillPool(project: SchemaFixture = poolProject): Promise<void> {
   await controlSql`DELETE FROM control.pool_project`;
   await controlSql`
     INSERT INTO control.pool_project (
@@ -107,7 +119,7 @@ async function fillPool(): Promise<void> {
       ${poolNamespace(POOL_ID)}, now(), now()
     )`;
   await writeSecretsFile(secretsFile, {
-    secrets: { [poolNamespace(POOL_ID)]: { connectionString: poolProject.dsn, bearerGrant: '' } },
+    secrets: { [poolNamespace(POOL_ID)]: { connectionString: project.dsn, bearerGrant: '' } },
   });
 }
 
@@ -247,6 +259,58 @@ describe('signup provisions a brain', () => {
       expect(created.body['code']).toBe('provisioning_unavailable');
       expect(await controlSql`SELECT tenant_id FROM control.tenant`).toHaveLength(0);
       expect(await identitySql`SELECT tenant_id FROM account.brain`).toHaveLength(0);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
+    'the account left without a brain can still get one, and asking twice does not take two',
+    async () => {
+      // Without a retry the 503 above is terminal: the email is taken, the
+      // password works, and no route in the app can ever give that account a
+      // brain.
+      await controlSql`DELETE FROM control.pool_project`;
+      expect((await signUp('retrying@example.com')).status).toBe(503);
+
+      const signedIn = await fetch(`${web.url}/api/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: WEB_ORIGIN },
+        body: JSON.stringify({
+          email: 'retrying@example.com',
+          password: 'correct horse battery staple',
+        }),
+      });
+      expect(signedIn.status).toBe(200);
+      const cookie = (signedIn.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
+
+      await fillPool(secondPoolProject);
+      const retry = async (): Promise<Response> =>
+        fetch(`${web.url}/api/brain`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', origin: WEB_ORIGIN, cookie },
+          // Asked again, never remembered: the row that keeps the choice is the
+          // one the failed signup did not write, and defaulting here would be
+          // KTD9's silent anglicisation arriving through the back door.
+          body: JSON.stringify({ fts_language: 'french' }),
+        });
+
+      const first = await retry();
+      expect(first.status).toBe(201);
+      const created = (await first.json()) as { tenant_id: string; created: boolean };
+      expect(created.created).toBe(true);
+
+      const tenants = await controlSql<{ tenant_id: string; fts_language: string }[]>`
+        SELECT tenant_id, fts_language::text AS fts_language FROM control.tenant`;
+      expect(tenants).toEqual([{ tenant_id: created.tenant_id, fts_language: 'french' }]);
+
+      const second = await retry();
+      expect(second.status).toBe(200);
+      expect(await second.json()).toMatchObject({ tenant_id: created.tenant_id, created: false });
+      // One brain, and one pool project spent on it. A retry that provisioned
+      // again would leave the account pointing at the first tenant and the
+      // second paid for and unreachable.
+      expect(await controlSql`SELECT tenant_id FROM control.tenant`).toHaveLength(1);
+      expect(await identitySql`SELECT tenant_id FROM account.brain`).toHaveLength(1);
     },
     SETUP_TIMEOUT_MS,
   );
