@@ -975,6 +975,78 @@ describe('R16: ingestion is idempotent, and an edit reconciles rather than accum
     `) as Array<{ items_seen: number; items_written: number; items_quarantined: number }>;
     expect(counts[0]).toEqual({ items_seen: 2, items_written: 1, items_quarantined: 0 });
   }, TEST_TIMEOUT_MS);
+
+  test('the same external ref under a second origin is a new page, not a replacement', async () => {
+    // A shared calendar event, pulled by two connectors. `external_ref` is the
+    // *provider's* id and nothing makes it unique across origins — the schema
+    // carries no unique index on it, and two credentials legitimately see the
+    // same event. Keying replacement on the ref alone therefore makes ingestion
+    // a cross-origin write: the work connector's pull tombstones the personal
+    // connector's page, and R15's fence never sees it because the deletion
+    // happens above every fence. The sibling retirement path
+    // (`ingest/pipedream/tombstone.ts`) already fences on origin for exactly
+    // this reason; the replacement path is the half that did not.
+    await reset();
+    const shared = 'calendar:abc123sharedeventid';
+
+    const personal = await ingestDocument(contextFor(createGateway()), {
+      originContext: 'personal',
+      sourceType: 'calendar',
+      title: 'Personal view of the shared event',
+      body: 'Marcus Fell founded Kettle Works.',
+      externalRef: shared,
+    });
+    expect(personal.ok && personal.status).toBe('written');
+
+    const work = await ingestDocument(contextFor(createGateway()), {
+      originContext: 'work',
+      sourceType: 'calendar',
+      title: 'Work view of the shared event',
+      body: 'Kettle Works is based in Lisbon.',
+      externalRef: shared,
+    });
+    expect(work.ok && work.status).toBe('written');
+
+    const live = (await tenant.sql`
+      SELECT origin_context, title FROM page
+       WHERE external_ref = ${shared} AND deleted_at IS NULL
+       ORDER BY origin_context
+    `) as Array<{ origin_context: string; title: string }>;
+    expect(live.map((row) => row.origin_context)).toEqual(['personal', 'work']);
+    expect(live.map((row) => row.title)).toEqual([
+      'Personal view of the shared event',
+      'Work view of the shared event',
+    ]);
+  }, TEST_TIMEOUT_MS);
+
+  test('idempotency still holds within one origin when another origin shares the ref', async () => {
+    // The other half of the same fence: narrowing the lookup must not turn a
+    // poller's ordinary re-read into a duplicate page. The `unchanged` shortcut
+    // has to keep finding *this* origin's row with the other origin's row
+    // sitting beside it under the same ref.
+    const input = {
+      originContext: 'work' as const,
+      sourceType: 'calendar' as const,
+      title: 'Work view of the shared event',
+      body: 'Kettle Works is based in Lisbon.',
+      externalRef: 'calendar:abc123sharedeventid',
+    };
+    const again = await ingestDocument(contextFor(createGateway()), input);
+    expect(again.ok && again.status).toBe('unchanged');
+
+    const edited = await ingestDocument(contextFor(createGateway()), {
+      ...input,
+      body: 'Kettle Works is based in Lisbon and Porto.',
+    });
+    expect(edited.ok && edited.status).toBe('replaced');
+
+    const live = (await tenant.sql`
+      SELECT origin_context FROM page
+       WHERE external_ref = ${input.externalRef} AND deleted_at IS NULL
+       ORDER BY origin_context
+    `) as Array<{ origin_context: string }>;
+    expect(live.map((row) => row.origin_context)).toEqual(['personal', 'work']);
+  }, TEST_TIMEOUT_MS);
 });
 
 describe('R15: a derived row is never narrower than what it came from', () => {

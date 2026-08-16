@@ -196,13 +196,37 @@ interface ExistingPage {
   readonly quarantined: boolean;
 }
 
-async function livePageByRef(sql: SQL, externalRef: string): Promise<ExistingPage | null> {
+/**
+ * The page this write replaces — **within this credential's origin, never across
+ * it.**
+ *
+ * `external_ref` is the provider's own id, and nothing makes it unique across
+ * origins: the schema carries no unique index on it, and two credentials
+ * legitimately fetch the same object — a shared calendar event pulled by both a
+ * work connector and a personal one is the ordinary case, not an edge one.
+ * Keyed on the ref alone this lookup returns the *other* origin's page, and the
+ * caller then tombstones it and writes its own in its place: a cross-origin
+ * delete-and-replace performed above every fence, so no fence is consulted and
+ * nothing reports it. The sibling retirement path (`ingest/pipedream/tombstone.ts`)
+ * already fences on origin for exactly this reason; this is the half that did not.
+ *
+ * The narrowing costs nothing an operator would notice: a poller re-reading its
+ * own items still finds its own row, because its own row is the one at its own
+ * origin.
+ */
+async function livePageByRef(
+  sql: SQL,
+  externalRef: string,
+  originContext: string,
+): Promise<ExistingPage | null> {
   const rows = (await sql`
     SELECT p.page_id::text AS page_id, p.content_sha256,
            (p.quarantined_at IS NOT NULL) AS quarantined,
            (SELECT count(*)::int FROM chunk c WHERE c.page_id = p.page_id AND c.deleted_at IS NULL) AS chunks
       FROM page p
-     WHERE p.external_ref = ${externalRef} AND p.deleted_at IS NULL
+     WHERE p.external_ref = ${externalRef}
+       AND p.origin_context = ${originContext}
+       AND p.deleted_at IS NULL
      ORDER BY p.page_id DESC
      LIMIT 1
   `) as Array<{ page_id: string; content_sha256: string; quarantined: boolean; chunks: number }>;
@@ -422,7 +446,7 @@ export async function ingestDocument(
 
   const digest = contentDigest(input.title, input.body);
   const externalRef = input.externalRef ?? null;
-  const existing = externalRef === null ? null : await livePageByRef(ctx.sql, externalRef);
+  const existing = externalRef === null ? null : await livePageByRef(ctx.sql, externalRef, origin);
   const quarantined = (input.quarantine ?? '').trim().length > 0;
 
   // **The digest is not the whole idempotency key; the verdict is the rest of
