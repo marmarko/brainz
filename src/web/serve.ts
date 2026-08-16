@@ -26,12 +26,14 @@
 
 import { SQL } from 'bun';
 
-import { createWebApp, type ConnectorVendor, type ProviderKeyWriter } from './app.ts';
+import { createWebApp, type ConnectorVendor, type ProviderKeyWriter, type SeverancePort } from './app.ts';
 import { createTenantProviderKeyStore, type ProviderId } from '../ai/keys.ts';
+import { previewSeverance } from '../core/lifecycle/blast-radius.ts';
+import { severOrigin } from '../core/lifecycle/severance.ts';
 import { createStripeCheckout, type CheckoutPort } from '../control/checkout.ts';
 import { createPostgresControlPlaneStore } from '../control/control-store.ts';
 import { createBrainProvisioner } from '../control/provisioner.ts';
-import { controlPlaneIdentity } from '../control/secrets.ts';
+import { controlPlaneIdentity, fleetIdentity } from '../control/secrets.ts';
 import { createTenantStorage } from '../control/storage.ts';
 import {
   openControlPlane,
@@ -69,6 +71,7 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
     stripeWebhookSecret: required(env, 'BRAINZ_STRIPE_WEBHOOK_SECRET'),
     byok: writeOnlyProviderKeys(secrets),
     connectors: connectorVendor(),
+    severance: severancePort(secrets),
     provisioner: createBrainProvisioner({
       controlSql,
       store: createPostgresControlPlaneStore(controlSql),
@@ -144,6 +147,88 @@ function writeOnlyProviderKeys(secrets: FleetSecrets): ProviderKeyWriter {
     async revoke(tenantId: string, provider: ProviderId) {
       return { ok: (await store.revoke(caller, tenantId, provider)).ok };
     },
+  };
+}
+
+/**
+ * U18's severance flow, given the caller it did not have.
+ *
+ * **The defect this closes.** `severOrigin` was correct, tested and imported by
+ * nothing outside its own test; `app.ts` declared `SeverancePort` and no
+ * composition root supplied one, so `/api/severance` and its preview answered
+ * `501 unavailable` in every deployment. A destructive operation that cannot be
+ * performed is a smaller problem than one that lies, which is why the app fails
+ * closed on an absent port — but the port has to exist somewhere, and this is
+ * the process that owns both halves it needs.
+ *
+ * **Why the fleet identity is constructed here and not in `app.ts`.** R11 says
+ * the web-app identity holds no resolve permission on any tenant namespace, and
+ * that stays true: `app.ts` is handed this interface and never the store, so
+ * nothing reachable from a request handler can name a namespace or read a
+ * connection string. The composition root already holds the store — it builds
+ * the write-only BYOK port and the provisioner out of it — and the tenant id it
+ * resolves against arrives from `account.brain`, the authenticated mapping,
+ * never from request input. That is the same constraint
+ * `src/worker/serve.ts` satisfies when it opens a tenant's database to
+ * consolidate it, by the same construction.
+ *
+ * **A connection per call, closed in a `finally`.** Severance is a rare,
+ * user-initiated request rather than a loop, so a pool held open for it would be
+ * a connection per tenant this process has ever severed for — and the per-tenant
+ * LRU those handles come out of is the reason `worker/serve.ts` honours `close`.
+ */
+function severancePort(secrets: FleetSecrets): SeverancePort {
+  async function withTenant<T>(tenantId: string, work: (sql: SQL) => Promise<T>): Promise<T> {
+    const resolved = await secrets.store.resolve(fleetIdentity(tenantId), tenantId);
+    if (!resolved.ok) {
+      // Thrown rather than reported as a refusal: "this brain's connection
+      // string is unresolvable" is an outage, and answering the user `400
+      // not_confirmed` for it would send them round the confirmation again
+      // forever. The entrypoint's error boundary turns it into a generic 500
+      // and writes the reason to stderr, where an operator is.
+      throw new Error(
+        `no resolvable connection secret for ${tenantId} (${resolved.reason}); this process cannot sever for it`,
+      );
+    }
+    const sql = new SQL(resolved.secret.connectionString, { max: 2 });
+    try {
+      return await work(sql);
+    } finally {
+      await sql.close();
+    }
+  }
+
+  return {
+    preview: (request) =>
+      withTenant(request.tenantId, async (sql) => {
+        const preview = await previewSeverance(sql, { origin: request.origin });
+        return {
+          removed: { ...preview.removed },
+          recomputed: { ...preview.recomputed },
+          recomputeRequired: preview.recomputeRequired,
+          survivingOrigins: preview.survivingOrigins,
+        };
+      }),
+    execute: (request) =>
+      withTenant(request.tenantId, async (sql) => {
+        // The confirmation is passed through rather than re-derived. `app.ts`
+        // checks it too, and deliberately: the echo is the control, and a
+        // control checked in exactly one place is one edit away from being
+        // checked nowhere. `severOrigin` refuses on a mismatch before it opens
+        // a transaction, so the second check costs a string comparison.
+        const outcome = await severOrigin(sql, {
+          origin: request.origin,
+          confirm: request.confirm,
+          now: new Date(),
+        });
+        return outcome.ok
+          ? {
+              ok: true as const,
+              severanceId: outcome.receipt.severanceId,
+              alreadySevered: outcome.receipt.alreadySevered,
+            }
+          : { ok: false as const, reason: outcome.reason };
+      }),
   };
 }
 
