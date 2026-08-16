@@ -27,6 +27,7 @@ import { SQL } from 'bun';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import {
+  createBudget,
   createInMemorySpendMeter,
   createModelGateway,
   type ModelGateway,
@@ -42,7 +43,7 @@ import {
 import { HOSTED_PROFILE } from '../../../src/ai/routing.ts';
 import { fleetIdentity, type CallerIdentity } from '../../../src/control/secrets.ts';
 import { queryEncoding } from '../../../src/core/write/embed.ts';
-import { recall, recallArms } from '../../../src/core/search/read.ts';
+import { embedQuery, recall, recallArms } from '../../../src/core/search/read.ts';
 import {
   EMBEDDING_DIMENSIONS,
   createSearchFixture,
@@ -109,12 +110,18 @@ function transportThat(options: TransportOptions): ModelTransport & {
       // A unit vector along the first axis. Nothing in this file depends on
       // where it lands — only on whether the arm ran.
       const vector = [1, ...new Array<number>(EMBEDDING_DIMENSIONS - 1).fill(0)];
+      const encoded = (request.input as { texts: readonly string[] }).texts;
+      // **Usage proportional to the input, the way a provider reports it.** A
+      // flat count here is a fake that charges the same for a word and for a
+      // novel, which makes every budget assertion in this file vacuous: a
+      // reservation is *released* and replaced by the settled cost, so a
+      // constant-cost transport can never fill a budget however much it is
+      // asked to encode. The gateway's own estimator uses four characters to
+      // the token; matching it keeps the settled cost near the reserved one.
+      const inputTokens = encoded.reduce((total, text) => total + Math.ceil(text.length / 4), 0);
       return Promise.resolve({
-        output: {
-          kind: 'embedding',
-          vectors: (request.input as { texts: readonly string[] }).texts.map(() => vector),
-        },
-        usage: { inputTokens: 8, outputTokens: 0 },
+        output: { kind: 'embedding', vectors: encoded.map(() => vector) },
+        usage: { inputTokens, outputTokens: 0 },
       });
     },
   };
@@ -250,6 +257,117 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
       expect(response.armsUsed).toContain('vector');
       // KTD8's asymmetry: the query is encoded as a query, not as a document.
       expect(transport.texts[0]).toBe(queryEncoding('widget calibration advisory'));
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'A READ THAT WOULD COST TOO MUCH NEVER REACHES THE PROVIDER',
+    async () => {
+      // **The request path had no ceiling at all.** `RecallRequest.budget` is
+      // optional and nothing in `src/` ever supplied one, so every read ran on a
+      // module-level `capMicroUsd: null` budget — justified in a comment that
+      // said the caps that mattered were "the tenant-level ones the gateway's
+      // meter enforces". No such layer exists: the meter accumulates
+      // `spend_micro_usd` and has no way to refuse anything.
+      //
+      // A caller-sized query is the shape of the hole, because the estimate is
+      // computed from the caller's own bytes. This one prices past the default
+      // ceiling, and the assertion that matters is on the **transport**: the cap
+      // has to fire before the provider is reached, or it is a record of the
+      // money rather than a limit on it.
+      //
+      // Asserted through `embedQuery` rather than `recall` because a query this
+      // size never survives the FTS arm — `websearch_to_tsquery` exhausts
+      // Postgres's parser stack somewhere above 100kB, which is a separate
+      // unbounded-input hazard on this path and not the one under test here.
+      const { gateway, transport } = gatewayThat({ refuse: false });
+
+      // Comfortably past `READ_PATH_BUDGET_MICRO_USD` (3,000 µUSD): 150k chars
+      // is ~37.5k tokens, and `text-embedding-3-large` prices that near 4,900.
+      const enormous = 'widget '.repeat(21_500);
+      expect(enormous.length).toBeGreaterThan(150_000);
+
+      const embedded = await embedQuery({
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        // No `budget`. That is the point: this is what the *default* does.
+        query: enormous,
+      });
+
+      // Never asked. Not "asked and refused" — the difference is the whole cap.
+      expect(transport.texts).toEqual([]);
+      expect(embedded.vector).toBeNull();
+      expect(embedded.degraded).toEqual(['embedding_unavailable']);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'THE CEILING IS PER REQUEST, NOT PER PROCESS',
+    async () => {
+      // **The way a finite cap goes wrong is worse than having none.** The
+      // budget this replaced was a module-level constant, and writing a cap into
+      // it in place would have made it a *process-lifetime* budget: it
+      // accumulates across every request the instance ever serves, and once
+      // full, every read from that instance degrades forever with nothing in the
+      // response saying why. A restart would fix it; nothing else would.
+      //
+      // Two reads, each priced at about three quarters of the ceiling. Under a
+      // per-request budget both reach the provider. Under one shared object the
+      // second is refused, and the difference is exactly the bug.
+      const { gateway, transport } = gatewayThat({ refuse: false });
+
+      // ~70k chars is ~17.5k tokens, ~2,275 µUSD against a 3,000 µUSD ceiling:
+      // one fits, two do not. Driven through `embedQuery` rather than `recall`
+      // for the reason the test above gives — a query this size does not survive
+      // the FTS arm.
+      const costly = 'widget '.repeat(10_000);
+
+      const first = await embedQuery({ gateway, tenantId: TENANT, caller: CALLER, query: costly });
+      expect(first.vector).not.toBeNull();
+      expect(transport.texts).toHaveLength(1);
+
+      const second = await embedQuery({ gateway, tenantId: TENANT, caller: CALLER, query: costly });
+      expect(second.vector).not.toBeNull();
+      expect(transport.texts).toHaveLength(2);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'AND A CAP THAT FIRES DEGRADES THE READ RATHER THAN FAILING IT',
+    async () => {
+      // The half that makes a finite ceiling shippable on this path at all. A
+      // budget refusal has to reach the user as the same event a provider
+      // refusal does — a partial answer, flagged — because a cap that turns an
+      // expensive read into a 500 is a search outage with a spend rationale.
+      // A cap of one micro-dollar is the cheapest way to observe the exhausted
+      // branch. Only the embedding call is reached: this corpus packs fewer
+      // candidates than `RERANK_CANDIDATES_FLOOR`, so the cross-encoder stage
+      // resolves off before it can be refused — which the test above ("the
+      // reranker refusing costs the ordering, not the read") already covers on
+      // the other side of the same conversion.
+      const { gateway } = gatewayThat({ refuse: false });
+
+      const response = await recall({
+        sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        budget: createBudget({ label: 'spent', capMicroUsd: 1 }),
+        query: 'widget calibration advisory',
+        grant: GRANT,
+        limit: 5,
+        now: new Date('2026-06-01T00:00:00Z'),
+      });
+
+      expect(response.degraded).toContain('embedding_unavailable');
+      // Still an answer. The FTS arm never needed the provider.
+      expect(response.results.length).toBeGreaterThan(0);
+      expect(response.armsUsed).toContain('fts');
+      expect(response.armsUsed).not.toContain('vector');
     },
     TEST_TIMEOUT_MS,
   );

@@ -82,7 +82,7 @@ export async function embedQuery(request: {
   readonly budget?: Budget;
   readonly query: string;
 }): Promise<{ readonly vector: readonly number[] | null; readonly degraded: Degradation[] }> {
-  const budget = request.budget ?? UNBOUNDED_READ_BUDGET;
+  const budget = request.budget ?? readPathBudget();
 
   let outcome: Awaited<ReturnType<typeof embedTexts>>;
   try {
@@ -109,14 +109,54 @@ export async function embedQuery(request: {
 }
 
 /**
- * A budget that does not cap, for callers that have not set one.
+ * What one read may spend, in micro-USD, when the caller sets no budget of its
+ * own.
  *
- * The read path's per-call spend is a single embedding; the caps that matter are
- * the tenant-level ones the gateway's meter enforces. This is the absence of a
- * *per-request* ceiling, not the absence of metering — every call is still
- * recorded.
+ * **Derived, not chosen.** The worst *legitimate* read is two calls, and both
+ * are bounded by constants in this package:
+ *
+ *   - the cross-encoder sees at most `RERANK_CANDIDATES_DEFAULT` (100) passages
+ *     of about `TARGET_CHUNK_CHARS` (1,800) characters, which the gateway
+ *     estimates at 4 characters per token — 45,000 tokens, and
+ *     `@cf/baai/bge-reranker-base` is priced at 3,000 µUSD per million input
+ *     tokens: **~135 µUSD**;
+ *   - the query embedding is one short string through
+ *     `text-embedding-3-large` at 130,000 µUSD per million — a generous
+ *     4,000-character query is 1,000 tokens: **~130 µUSD**.
+ *
+ * So ~265 µUSD is the ceiling of ordinary, and this is roughly ten times it.
+ * The margin is the point: a cap that fires on a legitimate read is a search
+ * outage, and a cap an order of magnitude above the worst legitimate read still
+ * turns a pathological one — a caller feeding a megabyte of "query" — into a
+ * degraded answer rather than an invoice.
  */
-const UNBOUNDED_READ_BUDGET: Budget = createBudget({ label: 'read-path', capMicroUsd: null });
+export const READ_PATH_BUDGET_MICRO_USD = 3_000;
+
+/**
+ * A fresh budget for one read.
+ *
+ * **A function, never a module constant.** A single `Budget` at module scope
+ * with a finite cap is a *process-lifetime* budget: it accumulates across every
+ * request the instance ever serves, and once it fills, every read from that
+ * instance degrades forever, with nothing in the response explaining why. That
+ * is a strictly worse failure than the uncapped budget this replaced, and it is
+ * the shape the previous constant would have taken if a cap had simply been
+ * written into it.
+ *
+ * **What this is not.** It is a *per-request* ceiling and nothing more. There is
+ * **no tenant-level cap on the request path at all** — this comment used to say
+ * that the caps that mattered were "the tenant-level ones the gateway's meter
+ * enforces", and no such layer exists: `createPostgresSpendMeter` accumulates
+ * `spend_micro_usd` and has no way to refuse a call. The two readers that do
+ * enforce a tenant ceiling — `first-import.ts:readHeadroom` and
+ * `tier.ts:consolidationTierOf` — are on the ingest and consolidation paths and
+ * are never consulted here. A tenant may therefore issue unboundedly many
+ * bounded reads, and the honest statement of this module's protection is "one
+ * request cannot run away", not "a tenant cannot".
+ */
+function readPathBudget(): Budget {
+  return createBudget({ label: 'read-path', capMicroUsd: READ_PATH_BUDGET_MICRO_USD });
+}
 
 /**
  * The cross-encoder's scores for one packed list, or `null` if it could not run.
@@ -145,7 +185,7 @@ async function scoreWithCrossEncoder(
       op: RERANK_OP,
       tenantId: request.tenantId,
       caller: request.caller,
-      budget: request.budget ?? UNBOUNDED_READ_BUDGET,
+      budget: request.budget ?? readPathBudget(),
       input: {
         kind: 'rerank',
         query: request.query,
@@ -173,7 +213,13 @@ const RERANK_OP = 'rerank' as const;
 
 /** The whole read, from a question to a ranked, fenced, packed answer. */
 export async function recall(request: RecallRequest): Promise<SearchResponse> {
-  const outcome = await recallArms(request);
+  // **One budget for the whole read, minted here.** The two model calls below
+  // are stages of a single request, so they share a single ceiling: a budget
+  // minted per stage would let the two of them together spend twice what either
+  // is allowed, and a caller who set their own budget keeps it either way.
+  const budgeted: RecallRequest = { ...request, budget: request.budget ?? readPathBudget() };
+
+  const outcome = await recallArms(budgeted);
   const compose: ComposeRequest = {
     query: request.query,
     limit: request.limit,
@@ -192,7 +238,7 @@ export async function recall(request: RecallRequest): Promise<SearchResponse> {
     return finishRanking(packed, compose.rerank);
   }
 
-  const scores = await scoreWithCrossEncoder(request, packed.results.slice(0, stage.candidates));
+  const scores = await scoreWithCrossEncoder(budgeted, packed.results.slice(0, stage.candidates));
   if (scores === null) {
     // Both stages sit out together — autocut has no score to read — and the
     // response says which of the two external dependencies was the one that

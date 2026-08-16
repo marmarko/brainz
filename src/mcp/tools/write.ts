@@ -33,6 +33,18 @@ import { invalid, stringArg, type Handler } from './context.ts';
  */
 const ALLOWED_SOURCE_TYPES = new Set(['note', 'document', 'file']);
 
+/**
+ * What one `remember` may spend, in micro-USD.
+ *
+ * One statement, chunked and embedded through `text-embedding-3-large` at
+ * 130,000 µUSD per million input tokens — a 10,000-character statement is 2,500
+ * tokens, about 325 µUSD, and the write path embeds the extracted fact beside
+ * the chunk, so call the ordinary ceiling ~650 µUSD. This is roughly ten times
+ * that: wide enough that no honest write meets it, narrow enough that a caller
+ * pasting a book into one tool call gets a typed refusal instead of a bill.
+ */
+const REMEMBER_BUDGET_MICRO_USD = 6_000;
+
 export const remember: Handler = async (ctx, args) => {
   const statement = stringArg(args, 'statement');
   if (statement === null) return invalid('remember needs a `statement`.');
@@ -57,7 +69,14 @@ export const remember: Handler = async (ctx, args) => {
       gateway: ctx.gateway,
       tenantId: ctx.tenantId,
       caller: ctx.caller,
-      budget: createBudget({ label: 'mcp-remember', capMicroUsd: null }),
+      // A ceiling on this one write, minted per call. `remember` embeds one
+      // statement, so the same order-of-magnitude argument the read path makes
+      // applies here with far more room: an uncapped budget on a request-path
+      // write is a caller-sized bill, and there is no tenant-level cap on this
+      // path to fall back on. A refusal returns `embed_failed` through
+      // `writeRemember`'s typed outcome, which is answered as `unavailable`
+      // below rather than thrown.
+      budget: createBudget({ label: 'mcp-remember', capMicroUsd: REMEMBER_BUDGET_MICRO_USD }),
     },
     {
       // R15, in one line: where this lands is decided by the credential.
