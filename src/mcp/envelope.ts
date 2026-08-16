@@ -101,6 +101,16 @@ export const DEGRADED_REASONS = [
    * costs an arm's recall, the other costs the ordering of what recall found.
    */
   'rerank_unavailable',
+  /**
+   * The text arm dropped out because the database refused to parse the query.
+   *
+   * Not a provider failure and not a refusal: a caller that pastes a document
+   * into `query` blows `websearch_to_tsquery` past `max_stack_depth` (SQLSTATE
+   * `54001`) or past the tsquery value limit (`54000`). The vector and graph
+   * arms never see the query text, so the read still answers — this is what
+   * tells the caller the keyword half of it did not.
+   */
+  'query_too_complex',
   'consolidation_pending',
 ] as const;
 
@@ -237,6 +247,7 @@ export function degradedSearch(
   if (state.chunksPendingEmbedding > 0) reasons.push('embedding_backlog');
   if (readDegradations.includes('embedding_unavailable')) reasons.push('embedding_unavailable');
   if (readDegradations.includes('rerank_unavailable')) reasons.push('rerank_unavailable');
+  if (readDegradations.includes('query_too_complex')) reasons.push('query_too_complex');
 
   if (reasons.length === 0) return null;
 
@@ -301,6 +312,15 @@ function detailFor(reasons: readonly DegradedReason[], state: IndexState): strin
   }
   if (reasons.includes('rerank_unavailable')) {
     parts.push('the final re-scoring pass could not run, so these results are ordered by the earlier stages alone');
+  }
+  if (reasons.includes('query_too_complex')) {
+    // No length, no excerpt, no count of anything the caller typed: this
+    // sentence reaches logs and support tickets, and the query is the user's own
+    // words — a pasted document, in the case that produced this reason.
+    parts.push(
+      'the keyword arm of this search could not run because the query was too large for the ' +
+        'text index to parse, so results came from meaning and graph matching only',
+    );
   }
   if (reasons.includes('consolidation_pending')) parts.push('consolidation has not run over it yet');
   return `${parts.join('; ')}.`;

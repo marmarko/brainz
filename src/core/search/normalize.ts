@@ -114,6 +114,23 @@ export function containsPhrase(haystack: string, phrase: string): boolean {
  * scattered words with it, and a binary containment test cannot express that.
  * The longest *run* rather than the total overlap, for the same reason
  * containment is contiguous.
+ *
+ * **The inner loop starts at the haystack's length, not the needle's, and that
+ * is a bound rather than an optimisation.** `phrase` here is the *query* — a
+ * value the caller chooses the size of — and `haystack` is a page title, which
+ * is short. Started at `needle.length` the search is O(needle²) *slices*, each
+ * up to needle-length long, so the work grows about cubically in what the caller
+ * typed: measured on this repo's own tokenizer, a 10,000-character query costs
+ * 235ms, 20,000 costs 1.7s and 40,000 costs 13s — per candidate, per request, on
+ * the request path. `arms.ts` used to hide it by raising 54001 before the
+ * ranking stage was reached, which stopped being true the moment that became a
+ * degradation instead of a refusal; it was never true below the tsquery
+ * threshold, where a 40KB query already bought thirteen seconds of CPU.
+ *
+ * The cap changes no result. `runIndex` returns -1 for any run longer than the
+ * haystack — it is the first thing it checks — so every iteration this skips was
+ * one that could not have matched. `test/core/search/normalize.test.ts` pins the
+ * equivalence over the cases the boost actually ranks on.
  */
 export function longestPhraseRun(haystack: string, phrase: string): string[] {
   const needle = tokens(phrase);
@@ -123,7 +140,9 @@ export function longestPhraseRun(haystack: string, phrase: string): string[] {
 
   let best: string[] = [];
   for (let start = 0; start < needle.length; start += 1) {
-    for (let end = needle.length; end > start + best.length; end -= 1) {
+    // A run longer than the haystack cannot appear in it.
+    const longest = Math.min(needle.length, start + hay.length);
+    for (let end = longest; end > start + best.length; end -= 1) {
       const run = needle.slice(start, end);
       if (runIndex(hay, run) >= 0) {
         if (run.length > best.length) best = run;

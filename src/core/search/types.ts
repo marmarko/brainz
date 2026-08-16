@@ -170,8 +170,18 @@ export type ArmName = (typeof ARM_NAMES)[number];
  * `rerank_unavailable` rather than failing. A read that 500s because a reranker
  * rate-limited would be the outage this contract exists to prevent, one stage
  * further down the pipeline.
+ *
+ * **And a third that is not a provider at all.** `query_too_complex` is the text
+ * arm dropping out because Postgres refused to *parse* the query — a caller that
+ * pasted a document into `query` blows `websearch_to_tsquery`'s parser past
+ * `max_stack_depth` (SQLSTATE `54001`) or past the tsquery value limit (`54000`).
+ * The vector arm is handed an embedding and the graph arm entity ids, so neither
+ * sees the text and both can still answer. Same treatment for the same reason:
+ * `read.ts` states beside `READ_PATH_SPEND_CEILING` that a caller feeding a
+ * megabyte of "query" gets "a degraded answer rather than an invoice", and a
+ * whole-read refusal is neither.
  */
-export const DEGRADATIONS = ['embedding_unavailable', 'rerank_unavailable'] as const;
+export const DEGRADATIONS = ['embedding_unavailable', 'rerank_unavailable', 'query_too_complex'] as const;
 export type Degradation = (typeof DEGRADATIONS)[number];
 
 /** What the arms hand the post-retrieval stack. Substrate-independent by design. */

@@ -333,6 +333,38 @@ export async function readFtsLanguage(sql: SQL): Promise<string> {
   return language;
 }
 
+/**
+ * The two SQLSTATEs that mean "this query text is more than the tsquery parser
+ * will take", and nothing else.
+ *
+ *   * `54001` `statement_too_complex` — `check_stack_depth` firing inside
+ *     `websearch_to_tsquery`. This is the ordinary one, and it arrives from
+ *     roughly 100KB of text on a default `max_stack_depth`.
+ *   * `54000` `program_limit_exceeded` — `pushValue_internal`'s "value is too
+ *     big in tsquery", which is the same event around a megabyte with the parser
+ *     refusing before the stack does.
+ *
+ * **A length cap was the other candidate and is worse.** The threshold belongs
+ * to the database: it moves with `max_stack_depth`, with how many distinct terms
+ * the text carries, and with the server version. A number chosen here would
+ * refuse queries this deployment could answer and still throw on the next one.
+ *
+ * **The list is closed on purpose.** A connection reset (`08006`), a
+ * cancellation or statement timeout (`57014`), an undefined column (`42703`), a
+ * permission error (`42501`) and pool exhaustion (`53300`) must all still throw.
+ * An arm that swallowed those would report "your query was too complex" for an
+ * outage — a plausible-looking lie, which is a worse failure than the refusal
+ * this degradation replaced.
+ */
+const QUERY_TOO_COMPLEX_SQLSTATES: ReadonlySet<string> = new Set(['54001', '54000']);
+
+/** Whether a thrown value is one of {@link QUERY_TOO_COMPLEX_SQLSTATES}. */
+export function isQueryTooComplexError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const errno = (error as { errno?: unknown }).errno;
+  return typeof errno === 'string' && QUERY_TOO_COMPLEX_SQLSTATES.has(errno);
+}
+
 export interface FtsArmRequest {
   readonly query: string;
   readonly grant: Grant;
@@ -361,10 +393,43 @@ export interface FtsArmRequest {
 export async function ftsArm(
   sql: SQL,
   request: FtsArmRequest,
-): Promise<{ ranked: string[]; candidates: Map<string, Candidate> }> {
+): Promise<{ ranked: string[]; candidates: Map<string, Candidate>; tooComplex?: boolean }> {
   const pool = candidatePoolFor({ limit: request.limit, offset: request.offset ?? 0 });
 
-  const rows = (await sql.unsafe(
+  let rows: Array<ChunkRow & { score: number }>;
+  try {
+    rows = await ftsRows(sql, request, pool);
+  } catch (error) {
+    // **The arm drops out; the read does not.** Postgres refuses to parse a
+    // query this large (`54001`/`54000` — see {@link isQueryTooComplexError}),
+    // and before this the whole call came back `code: 'error'` with "That call
+    // could not be completed" — no cause, no partial answer, on the path whose
+    // stated contract beside `read.ts:READ_PATH_SPEND_CEILING` is that a caller
+    // feeding a megabyte of "query" gets "a degraded answer rather than an
+    // invoice". The vector arm is handed an embedding and the graph arm entity
+    // ids, so neither touches the text and both can still answer.
+    //
+    // Anything else rethrows. An arm that swallowed a connection reset would
+    // report "your query was too complex" for an outage.
+    if (!isQueryTooComplexError(error)) throw error;
+    return { ranked: [], candidates: new Map<string, Candidate>(), tooComplex: true };
+  }
+
+  const candidates = new Map<string, Candidate>();
+  const ranked: string[] = [];
+  for (const row of rows) {
+    candidates.set(row.id, toCandidate(row));
+    ranked.push(row.id);
+  }
+  return { ranked, candidates };
+}
+
+async function ftsRows(
+  sql: SQL,
+  request: FtsArmRequest,
+  pool: number,
+): Promise<Array<ChunkRow & { score: number }>> {
+  return (await sql.unsafe(
     `WITH q AS (SELECT websearch_to_tsquery($2::regconfig, $3) AS tsq)
      SELECT ${CHUNK_COLUMNS},
             ts_rank_cd(c.content_tsv, q.tsq)
@@ -378,14 +443,6 @@ export async function ftsArm(
       LIMIT $4`,
     [textArrayLiteral(request.grant), request.ftsLanguage, request.query, pool],
   )) as Array<ChunkRow & { score: number }>;
-
-  const candidates = new Map<string, Candidate>();
-  const ranked: string[] = [];
-  for (const row of rows) {
-    candidates.set(row.id, toCandidate(row));
-    ranked.push(row.id);
-  }
-  return { ranked, candidates };
 }
 
 // ---------------------------------------------------------------------------
@@ -644,16 +701,18 @@ export async function runArms(dispatch: ArmDispatch): Promise<ArmsOutcome> {
     );
   }
 
-  absorb(
-    'fts',
-    await ftsArm(dispatch.sql, {
-      query: dispatch.query,
-      grant: dispatch.grant,
-      limit: dispatch.limit,
-      ...(dispatch.offset === undefined ? {} : { offset: dispatch.offset }),
-      ftsLanguage: dispatch.ftsLanguage,
-    }),
-  );
+  // Same treatment the vector arm gets above and for the same reason: an arm
+  // that could not run is reported, never thrown. `ftsArm` converts the two
+  // tsquery-parser SQLSTATEs into this flag and rethrows everything else.
+  const fts = await ftsArm(dispatch.sql, {
+    query: dispatch.query,
+    grant: dispatch.grant,
+    limit: dispatch.limit,
+    ...(dispatch.offset === undefined ? {} : { offset: dispatch.offset }),
+    ftsLanguage: dispatch.ftsLanguage,
+  });
+  if (fts.tooComplex === true) degraded.push('query_too_complex');
+  absorb('fts', fts);
 
   if (dispatch.useGraphArm && dispatch.entityIds.length > 0) {
     absorb(
