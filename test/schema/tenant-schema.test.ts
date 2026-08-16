@@ -125,6 +125,17 @@ const EXPECTED_TABLES: ReadonlyMap<string, TableClass> = new Map([
   // authorising channel — is the R12a distinction `review_queue.closed_by`
   // makes one table over, kept rather than flattened into "the user".
   ['source_pause', 'operational'],
+
+  // U17's rung. `page_version` holds the user's own document text — one
+  // credential, one scalar origin — so it is fenced exactly as `page` is; a
+  // snapshot table outside the fence would be a second, unfenced copy of every
+  // document in the brain. The other three carry no origin and no content: an
+  // export record, a per-caller reminder bound, and an erasure tombstone that
+  // stores a digest rather than the correspondent's identifier.
+  ['page_version', 'content:ingested'],
+  ['self_export', 'operational'],
+  ['self_export_nag', 'operational'],
+  ['erased_subject', 'operational'],
 ]);
 
 const SHARED_ORIGIN_TRIGGER_FUNCTION = 'refuse_origin_change';
@@ -410,6 +421,7 @@ const ORIGIN_FIXTURES: ReadonlyMap<string, { readonly where: string; readonly ta
       'review_queue',
       { where: `target_ref = 'entity:fence'`, tamper: `origin_contexts = ARRAY['personal','work']` },
     ],
+    ['page_version', { where: `doc_key = 'fence:version'`, tamper: `origin_context = 'work'` }],
   ]);
 
 describe('R15 — the database refuses to let an origin move, on every table that has one', () => {
@@ -447,6 +459,10 @@ describe('R15 — the database refuses to let an origin move, on every table tha
              'fence commitment', 'model_extracted', 'model_derived', ARRAY['personal'];
       INSERT INTO review_queue (kind, target_ref, proposal, confidence, origin_contexts)
       VALUES ('entity_merge', 'entity:fence', 'merge the fence entities', 0.6, ARRAY['personal']);
+      INSERT INTO page_version (doc_key, version, origin_context, source_type, title, body,
+                                content_sha256, captured_from)
+      VALUES ('fence:version', 1, 'personal', 'note', 'fence fixture', 'the body as it stood',
+              repeat('d', 64), 'live');
     `);
   });
 

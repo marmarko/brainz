@@ -34,6 +34,12 @@ const IMPLEMENTATIONS: Readonly<Record<string, () => Promise<CommandModule>>> = 
   'eval:live-parity': () => import('../evals/live-parity.ts'),
   'eval:canary': () => import('../evals/canary.ts'),
   conformance: () => import('../evals/conformance/run.ts'),
+  // U17's knowledge-parity leg. Registered here rather than in `package.json`,
+  // which already points every declared command at this router — so the command
+  // name never moved and the placeholder's contract is preserved: it still
+  // exits non-zero, now because it refuses without a substrate rather than
+  // because nobody wrote it.
+  'test:roundtrip': () => import('../evals/roundtrip.ts'),
 };
 
 const [command, owningUnit, ...rest] = process.argv.slice(2);

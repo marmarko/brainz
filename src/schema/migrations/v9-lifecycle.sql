@@ -164,9 +164,19 @@ CREATE UNIQUE INDEX page_version_is_numbered_per_doc ON page_version (doc_key, v
 CREATE INDEX page_version_by_doc ON page_version (doc_key, version DESC);
 CREATE INDEX page_version_by_page ON page_version (page_id) WHERE page_id IS NOT NULL;
 
+-- **Both arms, as rung 8 requires of every origin column.** The unpinned
+-- original is what `src/schema/origin-fence.ts` looks for by name, and the
+-- pinned twin is what actually holds under a hostile `search_path` (H6). A new
+-- table is not an exception to that: the twin is the arm that cannot be fooled,
+-- and writing only the original here would put the newest copy of the user's
+-- documents behind the weakest fence in the schema.
 CREATE TRIGGER page_version_origin_is_immutable
   BEFORE UPDATE OF origin_context ON page_version
   FOR EACH ROW EXECUTE FUNCTION refuse_origin_change('origin_context');
+
+CREATE TRIGGER page_version_origin_is_immutable_pinned
+  BEFORE UPDATE OF origin_context ON page_version
+  FOR EACH ROW EXECUTE FUNCTION refuse_origin_change_pinned('origin_context');
 
 
 -- ---------------------------------------------------------------------------
