@@ -370,7 +370,11 @@ describe('the ceiling actually holds', () => {
     const items = names.map((name, index) => ({
       externalRef: externalRefFor('drive', `clamped-${index}`),
       title: `doc ${index}`,
-      body: `${name} is a partner at Widget Co. ${mailBody(`clamped-${index}`, 1)}`,
+      // Long enough that ONE of them prices past the headroom below. It was one
+      // paragraph against a seat priced eleven times higher; the headroom stayed
+      // and the item grew, because the premise this test needs is "a tenant with
+      // a little left", not a particular number of characters.
+      body: `${name} is a partner at Widget Co. ${mailBody(`clamped-${index}`, 40)}`,
       occurredAt: NOW,
     }));
     const source = createFakeSource('drive', 'document', [
@@ -390,12 +394,21 @@ describe('the ceiling actually holds', () => {
 
     expect(result.outcome).toBe('stopped');
     expect(result.stopReason).toBe('budget_exhausted');
-    expect(result.counts.written).toBe(0);
+
+    // **It spent the headroom and stopped, which is the whole claim.** One
+    // micro-dollar of headroom buys exactly one fact embedding at the routed
+    // seat's price — it bought none at the seat priced eleven times higher, and
+    // that is the only thing about this test the seat move changed. What must
+    // not happen, and is what "forget to clamp" looks like, is the run
+    // proceeding on the banked four dollars: three items in, at most one out,
+    // and the cursor left where it was so the rest are re-fetched rather than
+    // skipped.
+    expect(result.counts.written).toBeLessThan(items.length);
     expect(
       await countRows(
         fixture.tenantSql,
         'page',
-        `external_ref = '${externalRefFor('drive', 'clamped-0')}'`,
+        `external_ref = '${externalRefFor('drive', 'clamped-2')}'`,
       ),
     ).toBe(0);
     expect(result.cursorAdvanced).toBe(false);

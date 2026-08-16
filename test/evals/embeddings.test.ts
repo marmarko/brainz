@@ -154,7 +154,14 @@ describe('the loader fails closed on', () => {
 
   test('a dimension that does not match the tenant column', () => {
     const target = rowFor('p-verdant-overview#0');
-    const broken = manifestOnDisk.replace(target, target.replace('"dimensions":1536', '"dimensions":1024'));
+    const broken = manifestOnDisk.replace(
+      target,
+      target.replace(`"dimensions":${EMBEDDING_DIMENSIONS}`, `"dimensions":${EMBEDDING_DIMENSIONS + 512}`),
+    );
+    // The rewrite has to have taken, or this asserts nothing — and it stopped
+    // taking once the active seat changed width, which is precisely why the
+    // number is derived here rather than typed.
+    expect(broken).not.toBe(manifestOnDisk);
     expect(() => loadEmbeddings(broken, texts)).toThrow(/the tenant column is/);
   });
 

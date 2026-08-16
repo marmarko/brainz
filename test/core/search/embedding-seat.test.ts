@@ -34,8 +34,16 @@ import { createSearchFixture, seedPage, type SearchFixture } from './fixture.ts'
 const SETUP_TIMEOUT_MS = 120_000;
 const GRANT = ['personal'] as const;
 
-/** The other seat — the one the fleet is not provisioned at. */
-const QWEN = requireSeatById('cf-qwen3-embedding-0.6b-1024');
+/**
+ * The other seat — the one the fleet is not provisioned at.
+ *
+ * It is the 1536 one now; rung 14 made the 1024 seat active. Which member is
+ * which is deliberately not what any assertion below turns on: the property is
+ * that a query embedded by one seat reads that seat's column and no other, and
+ * a test that named a particular model would have had to be rewritten to keep
+ * saying the same thing.
+ */
+const OTHER = requireSeatById('openai-3-large-1536');
 
 /** `[1, 0, 0, …]` at an arbitrary width. */
 function unitQuery(dimensions: number): number[] {
@@ -47,44 +55,44 @@ function unitLiteral(dimensions: number): string {
 }
 
 let fixture: SearchFixture;
-/** The chunk whose vector lives in the 1024 column and nowhere else. */
-let qwenChunkId: string;
-/** The chunk whose vector lives in the 1536 column and nowhere else. */
-let openaiChunkId: string;
+/** The chunk whose vector lives in the OTHER seat's column and nowhere else. */
+let otherSeatChunkId: string;
+/** The chunk whose vector lives in the ACTIVE seat's column and nowhere else. */
+let activeSeatChunkId: string;
 
 beforeAll(async () => {
   fixture = await createSearchFixture('seat');
 
-  const [openai] = await seedPage(fixture.sql, {
-    id: 'p-openai',
-    title: 'a page embedded by the shipped seat',
+  const [active] = await seedPage(fixture.sql, {
+    id: 'p-active-seat',
+    title: 'a page embedded by the active seat',
     sourceType: 'note',
     origin: 'personal',
     createdAt: '2026-01-01T00:00:00Z',
-    paragraphs: ['written under the 1536-dimension seat'],
+    paragraphs: ['written under the active seat'],
     ladder: [0],
   });
-  if (openai === undefined) throw new Error('seed failed');
-  openaiChunkId = openai;
+  if (active === undefined) throw new Error('seed failed');
+  activeSeatChunkId = active;
 
-  const [qwen] = await seedPage(fixture.sql, {
-    id: 'p-qwen',
+  const [other] = await seedPage(fixture.sql, {
+    id: 'p-other-seat',
     title: 'a page embedded by the other seat',
     sourceType: 'note',
     origin: 'personal',
     createdAt: '2026-01-01T00:00:00Z',
-    paragraphs: ['written under the 1024-dimension seat'],
+    paragraphs: ['written under the other seat'],
   });
-  if (qwen === undefined) throw new Error('seed failed');
-  qwenChunkId = qwen;
+  if (other === undefined) throw new Error('seed failed');
+  otherSeatChunkId = other;
 
-  // Only the 1024 column, so a read that scanned the other one cannot find it
-  // by accident — and the 1536 row above has NULL here, so it cannot be found
-  // by this one either. Between them the two rows make "which column did you
+  // Only the other seat's column, so a read that scanned the active one cannot
+  // find it by accident — and the row above has NULL here, so it cannot be
+  // found by this one either. Between them the two rows make "which column did you
   // scan" answerable from the result rather than from the source text.
   await fixture.sql.unsafe(
-    `UPDATE chunk SET ${QWEN.column} = $1::vector WHERE chunk_id = $2::bigint`,
-    [unitLiteral(QWEN.dimensions), qwenChunkId],
+    `UPDATE chunk SET ${OTHER.column} = $1::vector WHERE chunk_id = $2::bigint`,
+    [unitLiteral(OTHER.dimensions), otherSeatChunkId],
   );
 }, SETUP_TIMEOUT_MS);
 
@@ -93,19 +101,19 @@ afterAll(async () => {
 });
 
 describe('the vector arm reads the seat that wrote the vectors', () => {
-  test('a query embedded by the 1024 seat recalls the 1024 row', async () => {
+  test('a query embedded by the other seat recalls the other seat’s row', async () => {
     const result = await vectorArm(fixture.sql, {
-      queryVector: unitQuery(QWEN.dimensions),
-      column: QWEN.column,
+      queryVector: unitQuery(OTHER.dimensions),
+      column: OTHER.column,
       grant: [...GRANT],
       limit: 10,
     });
 
-    expect(result.ranked).toContain(qwenChunkId);
-    expect(result.ranked).not.toContain(openaiChunkId);
+    expect(result.ranked).toContain(otherSeatChunkId);
+    expect(result.ranked).not.toContain(activeSeatChunkId);
   });
 
-  test('a query embedded by the shipped seat recalls the shipped row', async () => {
+  test('a query embedded by the active seat recalls the active seat’s row', async () => {
     const result = await vectorArm(fixture.sql, {
       queryVector: unitQuery(ACTIVE_EMBEDDING_SEAT.dimensions),
       column: ACTIVE_EMBEDDING_SEAT.column,
@@ -113,13 +121,13 @@ describe('the vector arm reads the seat that wrote the vectors', () => {
       limit: 10,
     });
 
-    expect(result.ranked).toContain(openaiChunkId);
-    expect(result.ranked).not.toContain(qwenChunkId);
+    expect(result.ranked).toContain(activeSeatChunkId);
+    expect(result.ranked).not.toContain(otherSeatChunkId);
   });
 
   test('the statement names the column it was given, not a literal', () => {
-    expect(vectorArmSql(QWEN.column)).toContain(`c.${QWEN.column} <=>`);
-    expect(vectorArmSql(QWEN.column)).not.toContain('c.embedding <=>');
+    expect(vectorArmSql(OTHER.column)).toContain(`c.${OTHER.column} <=>`);
+    expect(vectorArmSql(OTHER.column)).not.toContain(`c.${ACTIVE_EMBEDDING_SEAT.column} <=>`);
     expect(vectorArmSql(ACTIVE_EMBEDDING_SEAT.column)).toContain(
       `c.${ACTIVE_EMBEDDING_SEAT.column} <=>`,
     );
@@ -139,7 +147,7 @@ describe('the vector arm reads the seat that wrote the vectors', () => {
     expect(embeddingSeatFor(null)).toBeUndefined();
     // And the two registered ones resolve to different columns, which is what
     // makes a same-width swap catchable: nothing here consults a width.
-    expect(embeddingSeatFor('@cf/qwen/qwen3-embedding-0.6b')?.column).toBe(QWEN.column);
-    expect(embeddingSeatFor('text-embedding-3-large')?.column).toBe(ACTIVE_EMBEDDING_SEAT.column);
+    expect(embeddingSeatFor('text-embedding-3-large')?.column).toBe(OTHER.column);
+    expect(embeddingSeatFor('@cf/qwen/qwen3-embedding-0.6b')?.column).toBe(ACTIVE_EMBEDDING_SEAT.column);
   });
 });

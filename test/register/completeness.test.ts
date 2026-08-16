@@ -64,7 +64,14 @@ describe('the evidence is real before anything is concluded from it', () => {
   });
 
   test('the provider reduction reaches every shipped profile', () => {
-    expect(providersReachable()).toEqual(['cloudflare', 'google', 'openai', 'self-host']);
+    // **`openai` is not in this list, and its absence is the seat move.** The
+    // embedding op was the last row pointing at it; it now resolves through
+    // Cloudflare on the hosted profile and through the operator's own endpoint
+    // on the self-host one. `api.openai.com` is still a string in
+    // `PROVIDER_DIRECT_BASES`, which is why it is excused as not-a-destination
+    // rather than deleted — but nothing routes there, and if anything ever does
+    // again this assertion is what says so first.
+    expect(providersReachable()).toEqual(['cloudflare', 'google', 'self-host']);
   });
 
   test('the binding scan reads the real deployment manifest', () => {
@@ -168,18 +175,27 @@ describe('the register accounts for everything the code names', () => {
     }
   });
 
-  test('exactly two model-side processors receive content, per KTD13', () => {
-    // The claim that makes a third provider a subprocessor change rather than a
-    // config edit. If this number moves, the register moved with it — which is
-    // the sequence R10 asks for.
+  test('exactly one external lab still receives content, and it is Google', () => {
+    // The claim that makes a new provider a subprocessor change rather than a
+    // config edit. If this list moves, the register moved with it — which is the
+    // sequence R10 asks for.
+    //
+    // **It is one lab now, and the arithmetic is worth stating so nobody reads
+    // the wrong story into it.** OpenAI left because the embedding seat moved to
+    // Cloudflare. Google did NOT: three ops resolve to `google/gemini-…` over
+    // Unified Billing, where Cloudflare holds the provider relationship and
+    // passes the inference through — so the content still reaches Google, the
+    // platform simply holds no Google credential. "Everything runs on
+    // Cloudflare" is a billing sentence, and writing it as a data-flow sentence
+    // would understate the subprocessor list by exactly one party.
     const contentProviders = SHARED_COMPONENTS.filter(
       (entry) => entry.kind === 'model-provider' && entry.transmits_user_content,
     ).map((entry) => entry.id);
-    expect(contentProviders.sort()).toEqual(['cloudflare-models', 'google', 'openai']);
+    expect(contentProviders.sort()).toEqual(['cloudflare-models', 'google']);
     // `cloudflare-models` is open weights on Cloudflare's own plane, so the
-    // count of external labs holding user content is two, not three.
+    // count of external labs holding user content is one, not two.
     const externalLabs = contentProviders.filter((id) => !id.startsWith('cloudflare'));
-    expect(externalLabs.length).toBe(2);
+    expect(externalLabs).toEqual(['google']);
   });
 });
 

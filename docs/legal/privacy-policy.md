@@ -42,16 +42,17 @@ would need one for every person who has ever emailed every user. There is no bas
 
 ## Who else sees it
 
-Everyone, in `docs/legal/subprocessors.md`. It is six parties, one of which (Stripe) never
+Everyone, in `docs/legal/subprocessors.md`. It is five parties, one of which (Stripe) never
 receives brain content at all, and one of which (Pipedream) carries an unresolved question we
 have named rather than answered.
 
 ## Model providers
 
-Inference runs on our keys by default. Two providers receive brain content: one for embeddings,
-which sees every passage, and one for extraction, enrichment and contradiction detection. Every
-other model operation runs on open weights on our infrastructure provider's own hardware and
-goes nowhere else.
+Inference runs on our keys by default. **One outside model lab receives brain content**, for
+extraction, enrichment and contradiction detection; our infrastructure provider bills and
+forwards those calls, so it sees that content too. Every other model operation — embeddings
+included, which is the one that sees every passage — runs on open weights on our infrastructure
+provider's own hardware and goes nowhere else.
 
 **We do not train models on your content, and neither may our providers on our behalf.** Our
 model gateway is configured to record metadata only — operation, model, token counts, cost, brain

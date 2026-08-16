@@ -53,6 +53,8 @@ import { ASYNC_PHASES, SYNC_PHASES } from '../../../src/core/write/phases.ts';
 import { ingestDocument } from '../../../src/core/write/write-path.ts';
 import {
   CALLER,
+  EMBEDDING_DIMENSIONS,
+  SEAT_COLUMN,
   CANARY,
   TENANT,
   countRows,
@@ -166,9 +168,9 @@ describe('the synchronous half is durable before the call returns', () => {
     expect(await countRows(tenant.sql, 'chunk')).toBe(receipt.chunkCount);
     expect(receipt.facts.length).toBeGreaterThan(0);
 
-    const embedded = (await tenant.sql`
-      SELECT count(*)::int AS n FROM fact WHERE embedding IS NOT NULL
-    `) as Array<{ n: number }>;
+    const embedded = (await tenant.sql.unsafe(
+      `SELECT count(*)::int AS n FROM fact WHERE ${SEAT_COLUMN} IS NOT NULL`,
+    )) as Array<{ n: number }>;
     expect(embedded[0]?.n).toBe(receipt.facts.length);
 
     // Link extraction is synchronous per U4 approach step 1: "who did I just
@@ -240,10 +242,10 @@ describe('the asynchronous half is resumable, not promised', () => {
     expect(result.embedded).toBe(before);
     expect(result.remaining).toBe(0);
 
-    const widths = (await tenant.sql`
-      SELECT DISTINCT vector_dims(embedding) AS dims FROM chunk WHERE embedding IS NOT NULL
-    `) as Array<{ dims: number }>;
-    expect(widths.map((row) => row.dims)).toEqual([1536]);
+    const widths = (await tenant.sql.unsafe(
+      `SELECT DISTINCT vector_dims(${SEAT_COLUMN}) AS dims FROM chunk WHERE ${SEAT_COLUMN} IS NOT NULL`,
+    )) as Array<{ dims: number }>;
+    expect(widths.map((row) => row.dims)).toEqual([EMBEDDING_DIMENSIONS]);
   }, TEST_TIMEOUT_MS);
 
   test('the backfill applies the title wrap to what it encodes', async () => {
@@ -411,10 +413,10 @@ describe('the asynchronous half is resumable, not promised', () => {
     const racing: ModelTransport = {
       id: 'racing',
       async invoke(request) {
-        await tenant.sql`
-          UPDATE chunk SET embedding = ${vectorLiteral(winner)}::vector
-           WHERE chunk_id = ${chunkId}::bigint
-        `;
+        await tenant.sql.unsafe(
+          `UPDATE chunk SET ${SEAT_COLUMN} = $1::vector WHERE chunk_id = $2::bigint`,
+          [vectorLiteral(winner), chunkId],
+        );
         return base.invoke(request);
       },
     };
@@ -440,10 +442,10 @@ describe('the asynchronous half is resumable, not promised', () => {
       budget: uncappedBudget('backfill'),
     });
 
-    const rows = (await tenant.sql`
-      SELECT (embedding <=> ${vectorLiteral(winner)}::vector) AS distance
-        FROM chunk WHERE chunk_id = ${chunkId}::bigint
-    `) as Array<{ distance: number }>;
+    const rows = (await tenant.sql.unsafe(
+      `SELECT (${SEAT_COLUMN} <=> $1::vector) AS distance FROM chunk WHERE chunk_id = $2::bigint`,
+      [vectorLiteral(winner), chunkId],
+    )) as Array<{ distance: number }>;
     expect(Number(rows[0]?.distance ?? 1)).toBeLessThan(1e-6);
   }, TEST_TIMEOUT_MS);
 
@@ -670,7 +672,7 @@ describe('the provenance signature records what actually encoded the page', () =
     const page = rows[0];
     expect(page).toBeDefined();
     expect(page?.embedding_model).toBe(embeddingModelFor(harness.gateway.profileName));
-    expect(page?.embedding_dimensions).toBe(1536);
+    expect(page?.embedding_dimensions).toBe(EMBEDDING_DIMENSIONS);
     expect(page?.chunker_version).toBe(CHUNKER_VERSION);
     expect(page?.normalizer_version).toBe(NORMALIZER_VERSION);
     expect(page?.content_sha256).toMatch(/^[0-9a-f]{64}$/);

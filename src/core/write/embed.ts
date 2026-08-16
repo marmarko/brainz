@@ -55,7 +55,7 @@ import {
 import type { CallerIdentity } from '../../control/secrets.ts';
 import {
   ACTIVE_EMBEDDING_SEAT,
-  isSeatColumn,
+  seatColumnSql,
   type EmbeddingSeat,
 } from '../../schema/embedding-seat.ts';
 
@@ -244,7 +244,7 @@ export async function pendingChunkEmbeddings(
     `SELECT c.chunk_id::text AS chunk_id, c.content, p.title
       FROM chunk c
       LEFT JOIN page p ON p.page_id = c.page_id
-     WHERE c.${seatColumn(column)} IS NULL
+     WHERE c.${seatColumnSql(column)} IS NULL
        AND c.deleted_at IS NULL
        AND c.quarantined_at IS NULL
        AND (p.page_id IS NULL OR (p.deleted_at IS NULL AND p.quarantined_at IS NULL))
@@ -336,9 +336,9 @@ export async function runChunkEmbedBacklog(options: {
       if (vector === undefined) continue;
       await options.sql.unsafe(
         `UPDATE chunk
-           SET ${seatColumn(seat.column)} = $1::vector
+           SET ${seatColumnSql(seat.column)} = $1::vector
          WHERE chunk_id = $2::bigint
-           AND ${seatColumn(seat.column)} IS NULL`,
+           AND ${seatColumnSql(seat.column)} IS NULL`,
         [vectorLiteral(vector, seat), chunk.chunkId],
       );
       embedded += 1;
@@ -356,24 +356,8 @@ export async function backlogSize(
     `SELECT count(*)::int AS pending
       FROM chunk c
       LEFT JOIN page p ON p.page_id = c.page_id
-     WHERE c.${seatColumn(column)} IS NULL AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
+     WHERE c.${seatColumnSql(column)} IS NULL AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
        AND (p.page_id IS NULL OR (p.deleted_at IS NULL AND p.quarantined_at IS NULL))`,
   )) as Array<{ pending: number }>;
   return rows[0]?.pending ?? 0;
-}
-
-/**
- * The one place a seat column becomes SQL text.
- *
- * An identifier cannot be a bound parameter, so the value has to come from a
- * closed set — and the check belongs at the point of interpolation rather than
- * at the point the caller was handed a seat object, which is a convention.
- */
-function seatColumn(column: string): string {
-  if (!isSeatColumn(column)) {
-    throw new Error(
-      `'${column}' is not a registered embedding-seat column — the write path interpolates this name into SQL, so it may only ever be one the seat registry owns`,
-    );
-  }
-  return column;
 }

@@ -38,14 +38,22 @@ const ALLOWED_SOURCE_TYPES = new Set(['note', 'document', 'file']);
  * rather than as money: the canonical pricing table is the only place in `src/`
  * that may name a price, and this is a limit on spending rather than a rate.
  *
- * One statement, chunked and embedded through `text-embedding-3-large` at
- * 130,000 µUSD per million input tokens — a 10,000-character statement is 2,500
- * tokens, about 325 µUSD, and the write path embeds the extracted fact beside
- * the chunk, so call the ordinary ceiling ~650 µUSD. This is roughly ten times
- * that: wide enough that no honest write meets it, narrow enough that a caller
- * pasting a book into one tool call gets a typed refusal instead of a bill.
+ * One statement, chunked and embedded through the routed embedding seat at
+ * 11,800 µUSD per million input tokens — a 10,000-character statement is 2,500
+ * tokens, about 30 µUSD, and the write path embeds the extracted fact beside the
+ * chunk, so call the ordinary ceiling ~60 µUSD. This is roughly ten times that:
+ * wide enough that no honest write meets it, narrow enough that a caller pasting
+ * a book into one tool call gets a typed refusal instead of a bill.
+ *
+ * **Re-derived when the seat moved, and that is the maintenance this constant
+ * needs.** It was 6,000 against an embedding seat priced eleven times higher. A
+ * ceiling left at the old number after the price fell is not a safer ceiling —
+ * it is a ceiling that has quietly stopped being ten times ordinary and started
+ * being a hundred, which is the number at which a pasted book becomes an
+ * ordinary write. Exported so the test that exercises it sizes its input against
+ * this rather than against a price, which is the thing that moved.
  */
-const REMEMBER_SPEND_CEILING = 6_000;
+export const REMEMBER_SPEND_CEILING = 600;
 
 export const remember: Handler = async (ctx, args) => {
   const statement = stringArg(args, 'statement');

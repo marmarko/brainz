@@ -52,6 +52,7 @@ import {
   type ModelGatewayOptions,
 } from '../../src/ai/gateway.ts';
 import { CANARY, createFakeTransport } from './fixture.ts';
+import { EMBEDDING_DIMENSIONS } from '../../src/schema/vector-index.ts';
 
 const ALICE = 'alice';
 const BOB = 'bob';
@@ -655,7 +656,7 @@ describe('the shipped transports', () => {
     const meter = createInMemorySpendMeter();
     const gateway = createModelGateway({
       profile: HOSTED_PROFILE,
-      transport: createFakeTransport({ embeddingDimensions: 1024 }),
+      transport: createFakeTransport({ embeddingDimensions: EMBEDDING_DIMENSIONS + 512 }),
       meter,
       keys: { store: emptyKeyStore(), hosted: HOSTED_KEYS },
     });

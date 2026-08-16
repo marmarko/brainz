@@ -59,6 +59,11 @@ import {
   sqlstateOfFailure,
   type SchemaFixture,
 } from './fixture.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
+
+/** The column a seeded vector goes in — the active seat's, so a fixture
+ * cannot outlive the column production writes. */
+const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
 
 const SETUP_TIMEOUT_MS = 120_000;
 const TEST_TIMEOUT_MS = 60_000;
@@ -467,7 +472,7 @@ describe('R15 — the database refuses to let an origin move, on every table tha
       INSERT INTO chunk (origin_context, content) VALUES ('personal', 'immutability fixture');
       INSERT INTO attachment (origin_context, media_type, object_key)
       VALUES ('personal', 'image/png', 'fence/fixture.png');
-      INSERT INTO fact (statement, embedding, origin_contexts)
+      INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts)
       VALUES ('derived fixture', ${embedding}, ARRAY['personal']),
              ('derived fixture, the second', ${embedding}, ARRAY['personal']);
       INSERT INTO entity (canonical_name, entity_type, origin_contexts)
@@ -786,7 +791,7 @@ describe('KTD8 / H2 — every vector column is accounted for', () => {
   );
 
   test(
-    'facts are embedded synchronously — the column cannot be NULL',
+    'facts are embedded synchronously — in one seat or the other, never neither',
     async () => {
       const columns = await listColumns(sql);
       const factEmbedding = columnsOf(columns, 'fact').get('embedding');
@@ -796,14 +801,23 @@ describe('KTD8 / H2 — every vector column is accounted for', () => {
       // before it is embedded and backfilled, so its column is nullable; a fact
       // is embedded on the write path, so an unembedded fact is a bug the
       // database can refuse rather than a row the vector arm silently skips.
-      expect(factEmbedding?.notNull).toBe(true);
+      //
+      // **What rung 14 changed, and what it did not.** `fact.embedding` used to
+      // carry that refusal as its own NOT NULL, which was exactly right while
+      // one model could ever be routed. With two seats registered it says
+      // something stronger and false: that every fact is embedded *at 1536*. So
+      // the NOT NULL went and `fact_embedded_in_some_seat` replaced it. The
+      // invariant is unchanged — the database still refuses an unembedded fact;
+      // the sqlstate is a check violation rather than a null violation, which
+      // is the only thing a caller could notice.
+      expect(factEmbedding?.notNull).toBe(false);
       expect(chunkEmbedding?.notNull).toBe(false);
 
       const state = await sqlstateOfFailure(
         sql,
         `INSERT INTO fact (statement, origin_contexts) VALUES ('unembedded', ARRAY['personal'])`,
       );
-      expect(state).toBe('23502'); // not_null_violation
+      expect(state).toBe('23514'); // check_violation
     },
     TEST_TIMEOUT_MS,
   );

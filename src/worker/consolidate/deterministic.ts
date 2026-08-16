@@ -36,6 +36,7 @@ import { extractFromStatement } from '../../core/write/extract.ts';
 import { impliedEdges, resolveOrCreateEntity } from '../../core/write/links.ts';
 import { normalize } from '../../core/write/normalize.ts';
 import { textArrayLiteral } from '../../core/write/pg-values.ts';
+import { ACTIVE_EMBEDDING_SEAT, seatColumnSql } from '../../schema/embedding-seat.ts';
 import { candidatePoolFor, withVectorScan } from '../../schema/vector-query.ts';
 
 /** What `live` means for a fact, matching `src/core/write/dedup.ts`. */
@@ -549,6 +550,16 @@ export const CLUSTER_POOL = 50;
  * here exactly as they do on the read path: without the `SET LOCAL`, pgvector
  * silently truncates the candidate pool to 40, and every cluster is quietly
  * smaller than it should be with nothing to point at.
+ *
+ * **And it reads one seat's column, resolved through the seat registry.** This
+ * was the fourth statement in the repository naming `embedding` as a literal,
+ * and the only one on a path nobody is watching: a consolidation cycle that
+ * clusters an empty column produces zero clusters, which is indistinguishable
+ * from a corpus with no themes in it. Under a seat move it would have gone on
+ * producing nothing, nightly, with every test green. There is no gateway call
+ * here to report a model, so the seat is the one the tenant is provisioned at —
+ * which is the same thing the chunk backfill fills and the same thing the read
+ * arm scans when the routed model is the shipped one.
  */
 export async function clusterByEmbedding(
   sql: SQL,
@@ -567,13 +578,15 @@ export async function clusterByEmbedding(
   await sql`DELETE FROM cluster_member`;
   await sql`DELETE FROM content_cluster`;
 
-  const seeds = (await sql`
-    SELECT chunk_id::text AS chunk_id
-      FROM chunk
-     WHERE embedding IS NOT NULL AND deleted_at IS NULL AND quarantined_at IS NULL
-     ORDER BY chunk_id
-     LIMIT ${limit}
-  `) as Array<{ chunk_id: string }>;
+  const column = seatColumnSql(ACTIVE_EMBEDDING_SEAT.column);
+
+  const seeds = (await sql.unsafe(
+    `SELECT chunk_id::text AS chunk_id
+       FROM chunk
+      WHERE ${column} IS NOT NULL AND deleted_at IS NULL AND quarantined_at IS NULL
+      ORDER BY chunk_id
+      LIMIT ${Math.max(1, Math.trunc(limit))}`,
+  )) as Array<{ chunk_id: string }>;
 
   const assigned = new Set<string>();
   const pool = candidatePoolFor({ limit: CLUSTER_POOL });
@@ -584,16 +597,17 @@ export async function clusterByEmbedding(
     if (assigned.has(seed.chunk_id)) continue;
 
     const neighbours = await withVectorScan(sql, { candidatePool: pool }, async (tx) => {
-      const rows = (await tx`
-        WITH probe AS (SELECT embedding FROM chunk WHERE chunk_id = ${seed.chunk_id}::bigint)
-        SELECT c.chunk_id::text AS chunk_id,
-               1 - (c.embedding <=> (SELECT embedding FROM probe)) AS similarity
-          FROM chunk c
-         WHERE c.embedding IS NOT NULL AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
-           AND c.chunk_id <> ${seed.chunk_id}::bigint
-         ORDER BY c.embedding <=> (SELECT embedding FROM probe)
-         LIMIT ${pool}
-      `) as Array<{ chunk_id: string; similarity: number }>;
+      const rows = (await tx.unsafe(
+        `WITH probe AS (SELECT ${column} AS v FROM chunk WHERE chunk_id = $1::bigint)
+         SELECT c.chunk_id::text AS chunk_id,
+                1 - (c.${column} <=> (SELECT v FROM probe)) AS similarity
+           FROM chunk c
+          WHERE c.${column} IS NOT NULL AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
+            AND c.chunk_id <> $1::bigint
+          ORDER BY c.${column} <=> (SELECT v FROM probe)
+          LIMIT ${pool}`,
+        [seed.chunk_id],
+      )) as Array<{ chunk_id: string; similarity: number }>;
       return { rows };
     });
 

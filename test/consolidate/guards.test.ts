@@ -40,6 +40,7 @@ import {
   runSynopsisPhase,
 } from '../../src/worker/consolidate/model-phases.ts';
 import { openRun } from '../../src/worker/consolidate/checkpoint.ts';
+import { ACTIVE_EMBEDDING_SEAT, EMBEDDING_SEATS } from '../../src/schema/embedding-seat.ts';
 import {
   CALLER,
   TENANT,
@@ -51,6 +52,9 @@ import {
   uncappedBudget,
   type TenantFixture,
 } from './fixture.ts';
+
+/** Any registered seat that is not the active one — where a misrouted vector would land. */
+const OTHER_SEAT = EMBEDDING_SEATS.find((seat) => seat.id !== ACTIVE_EMBEDDING_SEAT.id)!;
 
 const SETUP_TIMEOUT_MS = 120_000;
 
@@ -526,6 +530,74 @@ describe('4b — R12a on the compiled-truth surface itself', () => {
         // The mailbox: exactly the row a crafted message would want boosted.
         ['personal:mail', false],
       ]);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+});
+
+describe('a consolidation-derived fact lands in the seat that embedded it', () => {
+  test(
+    'the extract phase writes its vector to the active seat’s column and no other',
+    async () => {
+      const { sql } = tenant;
+      await seedPage(sql, {
+        origin: 'personal:mail',
+        sourceType: 'email',
+        title: 'supplier note',
+        body: 'Brackish Supply confirmed the roastery order ships on the fourth.',
+      });
+
+      const { gateway, transport } = createGateway({
+        chat: {
+          extract: () =>
+            JSON.stringify({
+              facts: [
+                {
+                  statement: 'Brackish Supply ships the roastery order on the fourth.',
+                  subject: 'Brackish Supply',
+                  confidence: 0.95,
+                },
+              ],
+            }),
+        },
+      });
+      const run = await openRun(sql, {
+        trigger: 'time_ceiling',
+        tier: 'paid',
+        now: new Date(),
+        estimateMicroUsd: 0,
+      });
+
+      const outcome = await runExtractPhase({
+        sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        runId: run.run.runId,
+        now: new Date(),
+        budget: uncappedBudget('extract'),
+      });
+
+      // The phase has to have written something, or every assertion below is
+      // vacuous — this is the same control the other phases in this file carry.
+      expect(transport.callsFor('extract').length).toBeGreaterThan(0);
+      expect(outcome.applied).toBeGreaterThan(0);
+
+      // **The property.** This phase embeds its own facts, on a path nobody is
+      // watching: a fact written into a column the read arm does not scan is a
+      // claim the brain paid a model call to compute and can never retrieve,
+      // and there is no error, no count and no log line that says so. The
+      // column is resolved from the id the gateway REPORTED having called,
+      // exactly as the synchronous write path resolves it — and it is asserted
+      // in both directions, because "the vector is somewhere" is the half that
+      // passes while the read is empty.
+      const vectors = (await sql.unsafe(
+        `SELECT count(*) FILTER (WHERE ${ACTIVE_EMBEDDING_SEAT.column} IS NOT NULL)::int AS seated,
+                count(*) FILTER (WHERE ${OTHER_SEAT.column} IS NOT NULL)::int AS elsewhere
+           FROM fact WHERE derivation = 'model_derived'`,
+      )) as Array<{ seated: number; elsewhere: number }>;
+      expect(vectors[0]?.seated).toBeGreaterThan(0);
+      expect(vectors[0]?.elsewhere).toBe(0);
     },
     SETUP_TIMEOUT_MS,
   );

@@ -37,6 +37,11 @@ import {
   sqlstateOfFailure,
   type SchemaFixture,
 } from './fixture.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
+
+/** The column a seeded vector goes in — the active seat's, so a fixture
+ * cannot outlive the column production writes. */
+const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
 
 const SETUP_TIMEOUT_MS = 120_000;
 const TEST_TIMEOUT_MS = 60_000;
@@ -96,7 +101,7 @@ describe('R15 — a derived row cannot be narrower than the rows it came from', 
       // The control case, and it has to pass first: a union check that refused
       // the legitimate write would be discovered by the write path, not here.
       const state = await transactionFailure([
-        `INSERT INTO fact (statement, embedding, origin_contexts)
+        `INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts)
          VALUES ('covers both', ${EMBEDDING}, ARRAY['personal','work'])`,
         `INSERT INTO fact_source (fact_id, chunk_id)
          SELECT currval(pg_get_serial_sequence('fact','fact_id')), unnest(ARRAY[${personalChunk}, ${workChunk}])`,
@@ -114,7 +119,7 @@ describe('R15 — a derived row cannot be narrower than the rows it came from', 
       // of its sources is work-fenced, and every read that trusts the fact's
       // origin now leaks the work document's content into a personal scope.
       const state = await transactionFailure([
-        `INSERT INTO fact (statement, embedding, origin_contexts)
+        `INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts)
          VALUES ('claims to be personal only', ${EMBEDDING}, ARRAY['personal'])`,
         `INSERT INTO fact_source (fact_id, chunk_id)
          SELECT currval(pg_get_serial_sequence('fact','fact_id')), unnest(ARRAY[${personalChunk}, ${workChunk}])`,
@@ -133,7 +138,7 @@ describe('R15 — a derived row cannot be narrower than the rows it came from', 
       // is unfenceable besides — there is nothing for the fence to evaluate.
       const state = await sqlstateOfFailure(
         sql,
-        `INSERT INTO fact (statement, embedding, origin_contexts)
+        `INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts)
          VALUES ('no origins', ${EMBEDDING}, ARRAY[]::text[])`,
       );
       expect(state).toBe('23514'); // check_violation
@@ -160,7 +165,7 @@ describe('R15 — a derived row cannot be narrower than the rows it came from', 
 
       expect(
         await transactionFailure([
-          `INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+          `INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
            VALUES ('extracted from a work page, claims personal', ${EMBEDDING}, ARRAY['personal'], ${workPage})`,
         ]),
       ).toBe('BZ002');
@@ -169,7 +174,7 @@ describe('R15 — a derived row cannot be narrower than the rows it came from', 
       // rather than a ban on deriving from pages.
       expect(
         await transactionFailure([
-          `INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+          `INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
            VALUES ('extracted from a work page, says so', ${EMBEDDING}, ARRAY['work'], ${workPage})`,
         ]),
       ).toBeUndefined();
@@ -219,12 +224,12 @@ describe('R15 — a derived row cannot be narrower than the rows it came from', 
   test(
     'a contradiction report cannot be narrower than the two facts it quotes',
     async () => {
-      const rows = await sql<{ fact_id: string }[]>`
-        INSERT INTO fact (statement, embedding, origin_contexts)
-        VALUES ('a personal claim', ${sql.unsafe(EMBEDDING)}, ARRAY['personal']),
-               ('a work claim that contradicts it', ${sql.unsafe(EMBEDDING)}, ARRAY['work'])
-        RETURNING fact_id
-      `;
+      const rows = (await sql.unsafe(
+        `INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts)
+         VALUES ('a personal claim', ${EMBEDDING}, ARRAY['personal']),
+                ('a work claim that contradicts it', ${EMBEDDING}, ARRAY['work'])
+         RETURNING fact_id`,
+      )) as Array<{ fact_id: string }>;
       const [personalFact, workFact] = rows.map((row) => Number(row.fact_id));
       expect(personalFact).toBeGreaterThan(0);
       expect(workFact).toBeGreaterThan(0);
@@ -480,12 +485,12 @@ describe('contradiction reports are stated once and resolved on the record', () 
   let right = 0;
 
   beforeAll(async () => {
-    const rows = await sql<{ fact_id: string }[]>`
-      INSERT INTO fact (statement, embedding, origin_contexts)
-      VALUES ('the round was 2m', ${sql.unsafe(EMBEDDING)}, ARRAY['work']),
-             ('the round was 3m', ${sql.unsafe(EMBEDDING)}, ARRAY['work'])
-      RETURNING fact_id
-    `;
+    const rows = (await sql.unsafe(
+      `INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts)
+       VALUES ('the round was 2m', ${EMBEDDING}, ARRAY['work']),
+              ('the round was 3m', ${EMBEDDING}, ARRAY['work'])
+       RETURNING fact_id`,
+    )) as Array<{ fact_id: string }>;
     left = Number(rows[0]?.fact_id ?? 0);
     right = Number(rows[1]?.fact_id ?? 0);
   });

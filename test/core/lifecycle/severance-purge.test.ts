@@ -40,7 +40,12 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { severOrigin } from '../../../src/core/lifecycle/severance.ts';
 import { purgeExpiredTombstones } from '../../../src/mcp/tombstone.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../../src/schema/vector-index.ts';
+/** The column a seeded vector goes in — the active seat's, so a fixture
+ * cannot outlive the column production writes. */
+const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
+
 import { connect, dropFixtureDatabase, provisionFixture, type SchemaFixture } from '../../schema/fixture.ts';
 
 import type { SQL } from 'bun';
@@ -135,7 +140,7 @@ describe('over the shape that is reachable, nothing severance tombstones outlive
         INSERT INTO chunk (origin_context, content, page_id, ordinal)
         SELECT '${WORK}', 'the migration lands on the twelfth', page_id, 0
           FROM page WHERE external_ref = 'gmail:w1';
-        INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+        INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
         SELECT 'the migration owner is the platform team', ${EMBEDDING}, ARRAY['${WORK}'], page_id
           FROM page WHERE external_ref = 'gmail:w1';
         INSERT INTO commitment (statement, owner_name, trust_level, derivation, origin_contexts)

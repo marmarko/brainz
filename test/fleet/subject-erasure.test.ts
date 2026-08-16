@@ -53,6 +53,11 @@ import {
   writeSecretsFile,
   type RunningService,
 } from './fixture.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
+
+/** The column a seeded vector goes in — the active seat's, so a fixture
+ * cannot outlive the column production writes. */
+const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
 
 const SETUP_TIMEOUT_MS = 180_000;
 const WEB_ORIGIN = 'https://app.brainz.test';
@@ -170,12 +175,12 @@ async function seedBrain(): Promise<void> {
     SELECT '${ORIGIN_CONTEXT}', 'the flight home is on the fourteenth', page_id, 0
       FROM page WHERE external_ref = 'gmail:p1';
 
-    INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+    INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
     SELECT '${SUBJECT} wants the lease renewed', ${EMBEDDING}, ARRAY['${ORIGIN_CONTEXT}'], page_id
       FROM page WHERE external_ref = 'gmail:c1';
 
     -- Somebody else's. Survives, or this was not an erasure of a correspondent.
-    INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+    INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
     SELECT 'the flight home lands on the fourteenth', ${EMBEDDING}, ARRAY['${ORIGIN_CONTEXT}'], page_id
       FROM page WHERE external_ref = 'gmail:p1';
 

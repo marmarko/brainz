@@ -53,6 +53,7 @@ import { SQL } from 'bun';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { createTenantSchemaApplier, readTenantDdl } from '../../src/schema/apply.ts';
+import { readLadderDdl } from '../../src/schema/migrations.ts';
 import { HEAD_SCHEMA_VERSION } from '../../src/schema/migrations.ts';
 import {
   CHUNK_EMBEDDING_COLUMN,
@@ -89,6 +90,21 @@ const THREE_LARGE_NATIVE_DIMENSIONS = 3072;
 
 const tenantDdl = await readTenantDdl();
 
+/**
+ * Every rung's DDL, concatenated.
+ *
+ * The scans below used to read rung one alone, which was the whole schema when
+ * one model could ever be routed. The column the arm reads is now declared by a
+ * later rung, so a scan of the baseline would be checking the dimension of a
+ * column nothing queries — H2's own failure shape, applied to H2's guard. The
+ * migration runner checks each rung at execution
+ * (`src/control/migrate.ts:ddlFor`); this checks the ladder as a whole.
+ */
+const ladderDdl = (await readLadderDdl()).map(({ ddl }) => ddl).join('\n');
+
+/** The index rung 13 built for the active seat, named the way that rung names it. */
+const ACTIVE_INDEX_NAME = `chunk_${CHUNK_EMBEDDING_COLUMN}_hnsw`;
+
 describe('H2 — the declared dimension stays inside the type\'s index ceiling', () => {
   test('the scanner finds the declaration it is supposed to find', () => {
     // First, and load-bearing: a regex that silently matched nothing would make
@@ -101,7 +117,7 @@ describe('H2 — the declared dimension stays inside the type\'s index ceiling',
   });
 
   test('the TypeScript constant and the DDL agree, by parsing rather than by trust', () => {
-    const declared = findVectorDeclarations(tenantDdl).map((d) => d.dimensions);
+    const declared = findVectorDeclarations(ladderDdl).map((d) => d.dimensions);
 
     // If someone changes the column and not the constant — or the reverse — the
     // embedding pipeline and the storage disagree silently.
@@ -109,17 +125,17 @@ describe('H2 — the declared dimension stays inside the type\'s index ceiling',
   });
 
   test('the shipped tenant schema has no unindexable declaration', () => {
-    expect(findIndexableDimensionViolations(tenantDdl)).toEqual([]);
+    expect(findIndexableDimensionViolations(ladderDdl)).toEqual([]);
     expect(EMBEDDING_DIMENSIONS).toBeLessThanOrEqual(HNSW_INDEXABLE_DIMENSIONS.vector);
   });
 
   test('a swap to 3-large at its native width is rejected here, not by production CREATE INDEX', () => {
-    const swapped = tenantDdl.replace(
+    const swapped = ladderDdl.replace(
       `vector(${EMBEDDING_DIMENSIONS})`,
       `vector(${THREE_LARGE_NATIVE_DIMENSIONS})`,
     );
     // The rewrite has to have taken, or this asserts nothing.
-    expect(swapped).not.toBe(tenantDdl);
+    expect(swapped).not.toBe(ladderDdl);
 
     expect(findIndexableDimensionViolations(swapped)).toEqual([
       {
@@ -172,7 +188,7 @@ describe('H2 — a tenant is not handed out without a usable vector index', () =
 
       expect(index.method).toBe('hnsw');
       expect(index.valid).toBe(true);
-      expect(index.indexName).toBe('chunk_embedding_hnsw');
+      expect(index.indexName).toBe(ACTIVE_INDEX_NAME);
     },
     TEST_TIMEOUT_MS,
   );
@@ -211,7 +227,13 @@ describe('H2 — a tenant is not handed out without a usable vector index', () =
         try {
           const rows = await sql.unsafe<{ n: number }[]>('SELECT count(*)::int AS n FROM chunk');
           expect(rows[0]?.n).toBe(0);
-          expect(await findIndexesOnColumn(sql, CHUNK_TABLE, CHUNK_EMBEDDING_COLUMN)).toEqual([]);
+          // Rung one's index is the one this mutation removed — `baselineDdl`
+          // overrides that rung and no other — so it is rung one's column that
+          // has none. Provisioning still fails, above, because
+          // `assertIndexedVectorColumns` walks every registered seat's column
+          // rather than the active one alone: a seat added later must not make
+          // an earlier seat's missing index invisible.
+          expect(await findIndexesOnColumn(sql, CHUNK_TABLE, 'embedding')).toEqual([]);
         } finally {
           await sql.close();
         }
@@ -230,8 +252,8 @@ describe('H2 — a tenant is not handed out without a usable vector index', () =
       const other = await provisionFixtureDatabase('h2_wrong_method');
       const sql = new SQL(other.dsn, { max: 1 });
       try {
-        await sql.unsafe('DROP INDEX chunk_embedding_hnsw');
-        await sql.unsafe('CREATE INDEX chunk_embedding_btree ON chunk (embedding)');
+        await sql.unsafe(`DROP INDEX ${ACTIVE_INDEX_NAME}`);
+        await sql.unsafe(`CREATE INDEX chunk_seat_btree ON chunk (${CHUNK_EMBEDDING_COLUMN})`);
 
         const found = await findIndexesOnColumn(sql, CHUNK_TABLE, CHUNK_EMBEDDING_COLUMN);
         expect(found.map((i) => i.method)).toEqual(['btree']);
@@ -257,13 +279,13 @@ describe('H2 — a tenant is not handed out without a usable vector index', () =
       const sql = new SQL(remnant.dsn, { max: 1 });
       try {
         await sql.unsafe(
-          "UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'chunk_embedding_hnsw'::regclass",
+          `UPDATE pg_index SET indisvalid = false WHERE indexrelid = '${ACTIVE_INDEX_NAME}'::regclass`,
         );
 
         const found = await findIndexesOnColumn(sql, CHUNK_TABLE, CHUNK_EMBEDDING_COLUMN);
         expect(found).toEqual([
           {
-            indexName: 'chunk_embedding_hnsw',
+            indexName: ACTIVE_INDEX_NAME,
             method: 'hnsw',
             valid: false,
             opclass: 'vector_cosine_ops',
@@ -349,15 +371,15 @@ describe('H2 — a tenant is not handed out without a usable vector index', () =
       const wrong = await provisionFixtureDatabase('h2_wrong_opclass');
       const sql = new SQL(wrong.dsn, { max: 1 });
       try {
-        await sql.unsafe('DROP INDEX chunk_embedding_hnsw');
+        await sql.unsafe(`DROP INDEX ${ACTIVE_INDEX_NAME}`);
         await sql.unsafe(
-          'CREATE INDEX chunk_embedding_hnsw ON chunk USING hnsw (embedding vector_l2_ops)',
+          `CREATE INDEX ${ACTIVE_INDEX_NAME} ON chunk USING hnsw (${CHUNK_EMBEDDING_COLUMN} vector_l2_ops)`,
         );
 
         const found = await findIndexesOnColumn(sql, CHUNK_TABLE, CHUNK_EMBEDDING_COLUMN);
         expect(found).toEqual([
           {
-            indexName: 'chunk_embedding_hnsw',
+            indexName: ACTIVE_INDEX_NAME,
             method: 'hnsw',
             valid: true,
             opclass: 'vector_l2_ops',
@@ -373,7 +395,7 @@ describe('H2 — a tenant is not handed out without a usable vector index', () =
           return {
             value: await explainLines(
               tx,
-              `SELECT 1 FROM chunk ORDER BY embedding <=> ('[1' || repeat(',0', ${EMBEDDING_DIMENSIONS - 1}) || ']')::vector(${EMBEDDING_DIMENSIONS}) LIMIT 10`,
+              `SELECT 1 FROM chunk ORDER BY ${CHUNK_EMBEDDING_COLUMN} <=> ('[1' || repeat(',0', ${EMBEDDING_DIMENSIONS - 1}) || ']')::vector(${EMBEDDING_DIMENSIONS}) LIMIT 10`,
             ),
           };
         });

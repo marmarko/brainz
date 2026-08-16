@@ -33,6 +33,10 @@ import { loadEmbeddings } from '../../evals/embeddings.ts';
 import { MANIFEST_PATH } from '../../evals/regenerate-embeddings.ts';
 import { pgTextArray, seedCorpus } from '../../evals/seed-tenant.ts';
 import { connect, dropFixtureDatabase, provisionFixture, type SchemaFixture } from '../schema/fixture.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
+import { EMBEDDING_DIMENSIONS } from '../../src/schema/vector-index.ts';
+
+const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
 
 const manifest = await Bun.file(MANIFEST_PATH).text();
 const embeddings = loadEmbeddings(manifest, corpusTexts(CORPUS));
@@ -70,10 +74,17 @@ describe('the corpus in a real tenant database', () => {
   });
 
   test('the committed vectors survive the round trip at full width', async () => {
-    const [row] = await sql`
-      SELECT vector_dims(embedding) AS dims FROM chunk WHERE embedding IS NOT NULL LIMIT 1`;
-    expect(row?.dims).toBe(1536);
-    const [unembedded] = await sql`SELECT count(*)::int AS n FROM chunk WHERE embedding IS NULL`;
+    const [row] = (await sql.unsafe(
+      `SELECT vector_dims(${SEAT_COLUMN}) AS dims FROM chunk WHERE ${SEAT_COLUMN} IS NOT NULL LIMIT 1`,
+    )) as Array<{ dims: number }>;
+    // The width the active seat declares, read back from the column the seeder
+    // actually filled — not a literal, which would go stale the next time a seat
+    // moves and would go stale silently, since a vector of the wrong width in
+    // the wrong column is a row no read ever returns rather than an error.
+    expect(row?.dims).toBe(EMBEDDING_DIMENSIONS);
+    const [unembedded] = (await sql.unsafe(
+      `SELECT count(*)::int AS n FROM chunk WHERE ${SEAT_COLUMN} IS NULL`,
+    )) as Array<{ n: number }>;
     expect(unembedded?.n).toBe(0);
   });
 

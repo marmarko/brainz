@@ -33,6 +33,7 @@ import { fenceEntity, fenceRow, fenceScalar, visibleOrigins, type Grant } from '
 // `test/core/search/normalize.test.ts` asserts that identity across the seam.
 import { normalize, slugify } from '../core/search/normalize.ts';
 import { textArrayLiteral } from '../core/write/pg-values.ts';
+import { ACTIVE_EMBEDDING_SEAT, seatColumnSql } from '../schema/embedding-seat.ts';
 import type { IndexState } from './envelope.ts';
 import { formatId, type IdKind, type OpaqueId } from './ids.ts';
 
@@ -66,7 +67,12 @@ export async function indexState(sql: SQL, grant: Grant): Promise<IndexState> {
     `SELECT
        (SELECT count(*) FROM page  WHERE deleted_at IS NULL AND quarantined_at IS NULL AND origin_context = ANY($1::text[]))::int AS pages,
        (SELECT count(*) FROM chunk WHERE deleted_at IS NULL AND quarantined_at IS NULL AND origin_context = ANY($1::text[]))::int AS chunks,
-       (SELECT count(*) FROM chunk WHERE deleted_at IS NULL AND quarantined_at IS NULL AND embedding IS NULL AND origin_context = ANY($1::text[]))::int AS pending,
+       -- The active seat's column, not the literal \`embedding\`: "how many
+       -- chunks are still unembedded" is a question about a *space*, and asking
+       -- it of the wrong column answers zero on the day a seat moves — a
+       -- caller told its brain is fully indexed while the arm it will be read
+       -- with scans an empty column.
+       (SELECT count(*) FROM chunk WHERE deleted_at IS NULL AND quarantined_at IS NULL AND ${seatColumnSql(ACTIVE_EMBEDDING_SEAT.column)} IS NULL AND origin_context = ANY($1::text[]))::int AS pending,
        (SELECT count(*) FROM ingest_log WHERE outcome = 'running' AND origin_context = ANY($1::text[]))::int AS running`,
     [grantLiteral],
   )) as Array<{ pages: number; chunks: number; pending: number; running: number }>;

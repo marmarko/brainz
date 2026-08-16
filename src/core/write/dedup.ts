@@ -34,6 +34,18 @@
  * superseded row is retained and `superseded_by` records the chain, so
  * consolidation can undo it with evidence this path does not have.
  *
+ * **And it is scoped to one embedding seat, for a reason one layer below
+ * origin.** The neighbour scan compares this vector against a stored column,
+ * and two models' vectors are not points in the same space whatever their
+ * widths — so the column is the one belonging to the model that produced
+ * {@link classifyStatement}'s vector, resolved by the caller from what the
+ * gateway reported having called, and never a literal. Under the wrong column
+ * the scan does not fail: a same-width pair ranks confidently and wrongly, and
+ * a different-width pair silently matches nothing, so every claim reads as new
+ * and the brain accumulates copies of one fact. Facts embedded under the other
+ * seat carry NULL here and are simply not candidates, which is the honest
+ * answer — they are not comparable.
+ *
  * **Dedup is scoped to the incoming origin, and that is a requirement rather
  * than a refinement.** R15 makes `origin_contexts` immutable, so a fact first
  * written under one credential cannot absorb an attestation arriving under
@@ -47,6 +59,11 @@
 
 import type { SQL } from 'bun';
 
+import {
+  ACTIVE_EMBEDDING_SEAT,
+  seatColumnSql,
+  type EmbeddingSeat,
+} from '../../schema/embedding-seat.ts';
 import { candidatePoolFor, withVectorScan } from '../../schema/vector-query.ts';
 import { vectorLiteral } from './embed.ts';
 import { extractFromStatement } from './extract.ts';
@@ -129,11 +146,20 @@ export async function classifyStatement(
      * them as duplicates would delete the claim rather than carry it forward.
      */
     readonly excludePageId?: string | null;
+    /**
+     * The seat {@link vector} belongs to — the seat of the model the gateway
+     * **reported having called**, which the caller resolved once for the whole
+     * write. Optional only so a caller with no model in hand keeps the shipped
+     * seat; anything holding a vector holds the record of what produced it.
+     */
+    readonly seat?: EmbeddingSeat;
   },
 ): Promise<DedupVerdict> {
   const statement = input.statement.trim();
   const key = normalize(statement);
-  const literal = vectorLiteral(input.vector);
+  const seat = input.seat ?? ACTIVE_EMBEDDING_SEAT;
+  const column = seatColumnSql(seat.column);
+  const literal = vectorLiteral(input.vector, seat);
 
   // The cheap exact case first: a client retrying a write it already made.
   const excluded = input.excludePageId ?? null;
@@ -153,15 +179,17 @@ export async function classifyStatement(
 
   const pool = candidatePoolFor({ limit: DEDUP_RESULT_LIMIT });
   const neighbours = await withVectorScan(sql, { candidatePool: pool }, async (tx) => {
-    const rows = (await tx`
-      SELECT fact_id::text AS fact_id, statement, 1 - (embedding <=> ${literal}::vector) AS similarity
-        FROM fact
-       WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL
-         AND ${input.origin} = ANY (origin_contexts)
-         AND (${excluded}::bigint IS NULL OR page_id IS DISTINCT FROM ${excluded}::bigint)
-       ORDER BY embedding <=> ${literal}::vector
-       LIMIT ${pool}
-    `) as Neighbour[];
+    const rows = (await tx.unsafe(
+      `SELECT fact_id::text AS fact_id, statement, 1 - (${column} <=> $1::vector) AS similarity
+         FROM fact
+        WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL
+          AND ${column} IS NOT NULL
+          AND $2 = ANY (origin_contexts)
+          AND ($3::bigint IS NULL OR page_id IS DISTINCT FROM $3::bigint)
+        ORDER BY ${column} <=> $1::vector
+        LIMIT ${pool}`,
+      [literal, input.origin, excluded],
+    )) as Neighbour[];
     return { rows };
   });
 

@@ -150,17 +150,27 @@ export async function embedQuery(request: {
  *     estimates at 4 characters per token — 45,000 tokens, and
  *     `@cf/baai/bge-reranker-base` is priced at 3,000 µUSD per million input
  *     tokens: **~135 µUSD**;
- *   - the query embedding is one short string through
- *     `text-embedding-3-large` at 130,000 µUSD per million — a generous
- *     4,000-character query is 1,000 tokens: **~130 µUSD**.
+ *   - the query embedding is one short string through the routed embedding seat
+ *     at 11,800 µUSD per million — a generous 4,000-character query is 1,000
+ *     tokens: **~12 µUSD**.
  *
- * So ~265 is the ceiling of ordinary, and this is roughly fifteen times it.
+ * So ~147 is the ceiling of ordinary, and this is roughly fifteen times it.
  * The margin is the point: a cap that fires on a legitimate read is a search
  * outage, and a cap an order of magnitude above the worst legitimate read still
- * turns a pathological one — a caller feeding a megabyte of "query" — into a
- * degraded answer rather than an invoice.
+ * turns a pathological one — a caller feeding a megabyte of "query", a quarter
+ * of a million tokens and past this ceiling — into a degraded answer rather than
+ * an invoice.
+ *
+ * **Re-derived when the embedding seat moved.** The number was 4,000 against a
+ * seat priced eleven times higher, where the embedding leg dominated this sum.
+ * Leaving it there would have kept the same protection against the megabyte and
+ * silently widened everything below it — including queries the model's own
+ * context window would refuse. What changed *behaviourally* is worth stating:
+ * a merely large query (tens of thousands of tokens) is now inside the cap and
+ * gets its vector arm, where before the cost refused it. That is the seat move
+ * paying for itself on the read path, not a weakened guard.
  */
-export const READ_PATH_SPEND_CEILING = 4_000;
+export const READ_PATH_SPEND_CEILING = 2_200;
 
 /**
  * A fresh budget for one read.

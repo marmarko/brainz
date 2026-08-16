@@ -33,6 +33,7 @@ import type {
   TransportResponse,
 } from '../../src/ai/gateway.ts';
 import type { TokenUsage } from '../../src/ai/pricing.ts';
+import { EMBEDDING_DIMENSIONS } from '../../src/schema/vector-index.ts';
 
 export { ADMIN_DSN };
 
@@ -75,7 +76,12 @@ export function createFakeTransport(script: FakeTransportScript = {}): FakeTrans
       if (script.failWith !== undefined) return Promise.reject(script.failWith);
 
       const usage = script.usage === undefined ? DEFAULT_USAGE : script.usage;
-      const width = script.embeddingDimensions ?? 1536;
+      // The routed seat's width by default, so a fake that says nothing about
+      // dimensions produces a vector the gateway accepts. A literal here is the
+      // shape of bug the seat registry exists against: it would make every
+      // embedding call in the suite fail `embedding_dimension_mismatch` the day
+      // a seat moves, which is a suite-wide red for a fixture's opinion.
+      const width = script.embeddingDimensions ?? EMBEDDING_DIMENSIONS;
 
       if (request.kind === 'embedding') {
         const texts = request.input.kind === 'embedding' ? request.input.texts : [];

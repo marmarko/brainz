@@ -24,6 +24,7 @@
 import { SQL } from 'bun';
 
 import { textArrayLiteral } from '../../../src/core/write/pg-values.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../../src/schema/vector-index.ts';
 import {
   connect,
@@ -33,6 +34,14 @@ import {
 } from '../../schema/fixture.ts';
 
 export { EMBEDDING_DIMENSIONS };
+
+/**
+ * The column a seeded vector goes in — the active seat's, never the literal
+ * `embedding`. A fixture pinned to a column the arm no longer scans seeds rows
+ * no read can reach, and every recall assertion built on it measures nothing
+ * while staying green.
+ */
+export const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
 
 export interface SearchFixture {
   readonly schema: SchemaFixture;
@@ -95,15 +104,21 @@ export async function seedPage(sql: SQL, page: SeedPage): Promise<string[]> {
   const chunkIds: string[] = [];
   for (const [ordinal, text] of page.paragraphs.entries()) {
     const t = page.ladder?.[ordinal];
-    const inserted = (await sql`
-      INSERT INTO chunk (origin_context, content, page_id, ordinal, embedding,
-                         deleted_at, quarantined_at)
-      VALUES (${page.origin}, ${text}, ${pageId}::bigint, ${ordinal},
-              ${t === undefined ? null : ladderVector(t)}::vector,
-              ${page.deleted === true ? new Date().toISOString() : null}::timestamptz,
-              ${page.quarantined === true ? new Date().toISOString() : null}::timestamptz)
-      RETURNING chunk_id::text AS chunk_id
-    `) as Array<{ chunk_id: string }>;
+    const inserted = (await sql.unsafe(
+      `INSERT INTO chunk (origin_context, content, page_id, ordinal, ${SEAT_COLUMN},
+                          deleted_at, quarantined_at)
+       VALUES ($1, $2, $3::bigint, $4, $5::vector, $6::timestamptz, $7::timestamptz)
+       RETURNING chunk_id::text AS chunk_id`,
+      [
+        page.origin,
+        text,
+        pageId,
+        ordinal,
+        t === undefined ? null : ladderVector(t),
+        page.deleted === true ? new Date().toISOString() : null,
+        page.quarantined === true ? new Date().toISOString() : null,
+      ],
+    )) as Array<{ chunk_id: string }>;
     const chunkId = inserted[0]?.chunk_id;
     if (chunkId === undefined) throw new Error(`failed to seed chunk ${page.id}#${ordinal}`);
     chunkIds.push(chunkId);
@@ -223,12 +238,18 @@ export async function seedFact(
   },
 ): Promise<string> {
   const zero = `[${new Array<number>(EMBEDDING_DIMENSIONS).fill(0).map((_, i) => (i === 0 ? 1 : 0)).join(',')}]`;
-  const rows = (await sql`
-    INSERT INTO fact (statement, embedding, origin_contexts, page_id, created_at)
-    VALUES (${fact.statement}, ${zero}::vector, ${textArrayLiteral(fact.origins)}::text[],
-            ${fact.pageId ?? null}::bigint, ${fact.createdAt ?? '2026-01-01'}::timestamptz)
-    RETURNING fact_id::text AS fact_id
-  `) as Array<{ fact_id: string }>;
+  const rows = (await sql.unsafe(
+    `INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id, created_at)
+     VALUES ($1, $2::vector, $3::text[], $4::bigint, $5::timestamptz)
+     RETURNING fact_id::text AS fact_id`,
+    [
+      fact.statement,
+      zero,
+      textArrayLiteral(fact.origins),
+      fact.pageId ?? null,
+      fact.createdAt ?? '2026-01-01',
+    ],
+  )) as Array<{ fact_id: string }>;
   const factId = rows[0]?.fact_id;
   if (factId === undefined) throw new Error('failed to seed fact');
 

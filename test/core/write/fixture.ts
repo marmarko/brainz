@@ -45,6 +45,7 @@ import {
 } from '../../../src/ai/keys.ts';
 import { HOSTED_PROFILE } from '../../../src/ai/routing.ts';
 import { fleetIdentity } from '../../../src/control/secrets.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../../src/schema/vector-index.ts';
 import {
   connect,
@@ -54,6 +55,13 @@ import {
 } from '../../schema/fixture.ts';
 
 export { EMBEDDING_DIMENSIONS };
+
+/**
+ * The column the write path actually fills — the active seat's, so a test that
+ * reads a vector back is reading the one production wrote rather than the one
+ * this file was written against.
+ */
+export const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
 
 export const TENANT = 'writer';
 export const CALLER = fleetIdentity(TENANT);

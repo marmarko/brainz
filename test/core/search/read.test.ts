@@ -302,10 +302,13 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
       // unbounded-input hazard on this path and not the one under test here.
       const { gateway, transport } = gatewayThat({ refuse: false });
 
-      // Comfortably past `READ_PATH_SPEND_CEILING` (4,000): 150k chars is ~37.5k
-      // tokens, which the embedder prices near 4,900.
-      const enormous = 'widget '.repeat(21_500);
-      expect(enormous.length).toBeGreaterThan(150_000);
+      // Comfortably past `READ_PATH_SPEND_CEILING`, sized from the ceiling
+      // rather than typed: this is the megabyte of "query" the constant's own
+      // comment is written against, and it has to stay past the cap when the
+      // seat's price moves — which it has, by a factor of eleven, and this
+      // input grew with it.
+      const enormous = 'widget '.repeat(150_000);
+      expect(enormous.length).toBeGreaterThan(1_000_000);
 
       const embedded = await embedQuery({
         gateway,
@@ -362,22 +365,22 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
       // budget refusal has to reach the user as the same event a provider
       // refusal does — a partial answer, flagged — because a cap that turns an
       // expensive read into a 500 is a search outage with a spend rationale.
-      // A cap of one micro-dollar is the cheapest way to observe the exhausted
-      // branch.
+      // A cap of zero is the cheapest way to observe the exhausted branch, and
+      // it is zero rather than one because the embedding seat's price fell by a
+      // factor of eleven: at the old price this query's estimate was two
+      // micro-USD and a cap of one refused it, while the cross-encoder's
+      // estimate of one still fit. Both now round to the same micro-dollar, so
+      // one cap can no longer separate them and a test that kept the old number
+      // would be asserting that a cap fires while quietly measuring that it
+      // does not.
       //
-      // **And the second stage still runs, which this used to claim it did
-      // not.** The note here said the cross-encoder "resolves off before it can
-      // be refused" because the corpus packs fewer candidates than
-      // `RERANK_CANDIDATES_FLOOR`. Both halves were wrong: `recall` reaches
-      // `scoreWithCrossEncoder` whenever the stage resolves `unavailable`, which
-      // is what a caller supplying no scorer gets, and the floor is a *default
-      // candidate count*, not a gate. What actually happens is arithmetic —
-      // `reserve` refuses only what does not fit, the embedding's estimate is
-      // two micro-USD and does not, the cross-encoder's is one and does — so a
-      // cap that stops stage 1 can still be paying for stage 2. That is the
-      // shared budget behaving correctly, and it is asserted here rather than
-      // described, because a comment claiming a call was never made while the
-      // meter shows it billed is the exact failure this file is about.
+      // **Both stages are refused at this cap, and both degradations are
+      // reported.** That is what a shared budget does when nothing fits: the
+      // read loses the vector arm and the rerank stage and still answers from
+      // the arms that never needed a provider. What must not happen — and is
+      // the reason this file exists — is a refusal that reads to the caller as
+      // an outage, or a comment claiming a call was never made while the meter
+      // shows it billed. Both are asserted below rather than described.
       const { gateway, transport, meter } = gatewayThat({ refuse: false });
 
       const response = await recall({
@@ -385,7 +388,7 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
         gateway,
         tenantId: TENANT,
         caller: CALLER,
-        budget: createBudget({ label: 'spent', capMicroUsd: 1 }),
+        budget: createBudget({ label: 'spent', capMicroUsd: 0 }),
         query: 'widget calibration advisory',
         grant: GRANT,
         limit: 5,
@@ -393,17 +396,20 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
       });
 
       expect(response.degraded).toContain('embedding_unavailable');
+      expect(response.degraded).toContain('rerank_unavailable');
       // Still an answer. The FTS arm never needed the provider.
       expect(response.results.length).toBeGreaterThan(0);
       expect(response.armsUsed).toContain('fts');
       expect(response.armsUsed).not.toContain('vector');
 
-      // On the gateway: stage 1 was refused *before* the provider, and stage 2
-      // was not refused at all. Naming both is what keeps the sentence above
-      // from drifting back into "only the embedding call is reached".
-      expect(meter.records().map((record) => record.op)).toEqual(['rerank']);
+      // On the gateway: both stages were refused *before* the provider, and
+      // nothing was billed. Asserted on the meter and on the transport rather
+      // than on the response, because a refusal that arrives after the call is
+      // a record of the money with an apology attached and reads identically
+      // from up here.
+      expect(meter.records()).toEqual([]);
       expect(transport.texts).toEqual([]);
-      expect(transport.rerankCalls).toBe(1);
+      expect(transport.rerankCalls).toBe(0);
     },
     TEST_TIMEOUT_MS,
   );
@@ -562,8 +568,9 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
       const { gateway, transport, meter } = gatewayThat({ refuse: false });
 
       // Each read is comfortably inside the per-request ceiling and each mints
-      // its own, so the ceiling is doing exactly its job every time.
-      const costly = 'widget '.repeat(10_000);
+      // its own, so the ceiling is doing exactly its job every time — and ten of
+      // them together are several times it, which is the unbounded part.
+      const costly = 'widget '.repeat(72_500);
       const reads = 10;
       for (let attempt = 0; attempt < reads; attempt += 1) {
         const embedded = await embedQuery({ gateway, tenantId: TENANT, caller: CALLER, query: costly });

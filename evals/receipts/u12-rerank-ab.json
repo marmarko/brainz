@@ -1,7 +1,7 @@
 {
   "unit": "U12",
   "corpus_queries": 77,
-  "embedding_manifest_digest": "fabb3db916ae4fff239cb6d4cd1d5ceb8b411c75badf4903f6bba72b767e592d",
+  "embedding_manifest_digest": "2e121dbfbdfe4ed5414a7382bcbc4fc71fe2a8e4a46d3e2b01cd92dc5a461b2a",
   "rerank_manifest_digest": "9735847435c3a85d6aaff43c7ac4a2abf0a52df5cf668d753e6eedd647ec9398",
   "score_sources": {
     "synthetic": 77,
@@ -9,35 +9,35 @@
   },
   "off": {
     "ranker": "u5-retrieval-stack",
-    "digest": "18e83e7afa83d008b719d1e1c792b159eaf95065789179e8aa5bd36fde4bcbfd",
-    "aggregate_ndcg10": 0.826939,
+    "digest": "7eab13e89a3d7dc4e6c838210412912a4240f51423c11dfc9d1f764921beb695",
+    "aggregate_ndcg10": 0.815656,
     "by_floor": {
-      "aggregate.ndcg10": 0.826939,
+      "aggregate.ndcg10": 0.815656,
       "family.title_substring.hit1": 1,
-      "family.alias.hit1": 0.857143,
-      "family.dilution.hit3": 0.8,
-      "type.relational.ndcg10": 0.799224,
-      "type.named_entity.ndcg10": 0.900475,
-      "type.temporal.ndcg10": 0.821401,
-      "type.context_fenced.ndcg10": 0.739725
+      "family.alias.hit1": 0.714286,
+      "family.dilution.hit3": 0.7,
+      "type.relational.ndcg10": 0.788213,
+      "type.named_entity.ndcg10": 0.888443,
+      "type.temporal.ndcg10": 0.791621,
+      "type.context_fenced.ndcg10": 0.744623
     }
   },
   "on": {
     "ranker": "u12-shipped-stack",
-    "digest": "360a4585bda3fabad44c728ac144174ca643ea63ed3265e778fe8e493ae5cee5",
-    "aggregate_ndcg10": 0.666178,
+    "digest": "8d4318d72c3fffccb77aef514314d3cf2758ee8e38324280929eda7b278735fb",
+    "aggregate_ndcg10": 0.667338,
     "by_floor": {
-      "aggregate.ndcg10": 0.666178,
+      "aggregate.ndcg10": 0.667338,
       "family.title_substring.hit1": 0.1,
       "family.alias.hit1": 0.285714,
       "family.dilution.hit3": 0.6,
       "type.relational.ndcg10": 0.641925,
-      "type.named_entity.ndcg10": 0.654073,
-      "type.temporal.ndcg10": 0.626235,
+      "type.named_entity.ndcg10": 0.658584,
+      "type.temporal.ndcg10": 0.62359,
       "type.context_fenced.ndcg10": 0.744691
     }
   },
-  "delta_ndcg10": -0.16076,
+  "delta_ndcg10": -0.148318,
   "uplift_status": "deferred",
   "uplift_reason": "every committed (query, candidate) score is synthetic. Stage 12 sorts by the cross-encoder score and nothing else, so an A/B over a stand-in measures the stand-in: the delta below is evidence that a thirty-line lexical function is weaker than the stack it reranks, and is not evidence about `@cf/baai/bge-reranker-base`. Re-run against provider scores and this flips to `measured` with no edit — the switch is `score_sources.provider`, counted from the manifest.",
   "cost": {

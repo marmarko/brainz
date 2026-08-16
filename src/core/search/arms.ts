@@ -37,7 +37,7 @@
 
 import type { SQL, TransactionSQL } from 'bun';
 
-import { isSeatColumn } from '../../schema/embedding-seat.ts';
+import { seatColumnSql } from '../../schema/embedding-seat.ts';
 import { candidatePoolFor, withVectorScan } from '../../schema/vector-query.ts';
 import { textArrayLiteral } from '../write/pg-values.ts';
 import { grantSet, type Grant } from './fence.ts';
@@ -256,16 +256,14 @@ export async function hydrate(
  * *this query*, and a literal here would rank one model's query against another
  * model's vectors — same-width, that computes a full ranking and is wrong with
  * nothing to report it. The value comes from the seat resolved from the
- * gateway's own metering record; {@link isSeatColumn} is asked here anyway,
- * because an identifier cannot be a bound parameter and "it came from a seat
- * object" is a convention rather than a closed set.
+ * gateway's own metering record; `embedding-seat.ts:seatColumnSql` is asked
+ * here anyway, because an identifier cannot be a bound parameter and "it came
+ * from a seat object" is a convention rather than a closed set. It is the same
+ * function the fact write and the chunk backfill go through, which is the
+ * point: one selector, or the two halves of a brain drift into two spaces.
  */
-export function vectorArmSql(column: string): string {
-  if (!isSeatColumn(column)) {
-    throw new Error(
-      `'${column}' is not a registered embedding-seat column — the vector arm interpolates this name into SQL, so it may only ever be one the seat registry owns`,
-    );
-  }
+export function vectorArmSql(name: string): string {
+  const column = seatColumnSql(name);
   return `SELECT ${CHUNK_COLUMNS}
        FROM chunk c
        ${PAGE_JOIN}

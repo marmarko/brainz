@@ -43,7 +43,12 @@ import {
   provisionFixture,
   type SchemaFixture,
 } from './fixture.ts';
-import { FLEET_1_SURFACE, FLEET_SURFACES, runFleetSurface } from './fleet-surface.ts';
+import {
+  FLEET_1_SURFACE,
+  FLEET_13_SURFACE,
+  FLEET_SURFACES,
+  runFleetSurface,
+} from './fleet-surface.ts';
 
 const SETUP_TIMEOUT_MS = 120_000;
 const TEST_TIMEOUT_MS = 120_000;
@@ -82,6 +87,48 @@ describe('every rung is additive, statically', () => {
     expect(
       findExpandContractViolations('ALTER TABLE chunk ADD COLUMN page_id bigint NOT NULL DEFAULT 0;'),
     ).toEqual([]);
+  });
+
+  test('DROP NOT NULL is admitted, and every neighbour it sits beside is not', () => {
+    // The one `ALTER COLUMN` action that widens rather than rewrites. Rung 14
+    // needs it: `fact.embedding` is `vector(1536) NOT NULL` and the 1024 seat
+    // cannot fill it, so without this the seat is blocked on a routing edit
+    // nobody can make.
+    expect(
+      findExpandContractViolations('ALTER TABLE fact ALTER COLUMN embedding DROP NOT NULL;'),
+    ).toEqual([]);
+    // Postgres accepts the short spelling too, and a rule that refused it would
+    // be crying wolf on correct DDL.
+    expect(findExpandContractViolations('ALTER TABLE fact ALTER embedding DROP NOT NULL;')).toEqual([]);
+
+    // Its neighbours are one token away and every one of them breaks the
+    // previous release. This is the whole reason the admission is a shape and
+    // not a family: `ALTER COLUMN` was refused wholesale, and the refusal was
+    // right about these four.
+    for (const action of [
+      'SET NOT NULL',
+      'TYPE vector(1024)',
+      'SET DEFAULT 0',
+      'DROP DEFAULT',
+      'DROP EXPRESSION',
+    ]) {
+      expect(
+        findExpandContractViolations(`ALTER TABLE fact ALTER COLUMN embedding ${action};`),
+      ).toHaveLength(1);
+    }
+
+    // And it cannot be used to launder anything alongside it: actions are
+    // judged one at a time, so a legitimate DROP NOT NULL at the front buys the
+    // rest of the statement nothing.
+    expect(
+      findExpandContractViolations(
+        'ALTER TABLE fact ALTER COLUMN embedding DROP NOT NULL, DROP COLUMN statement;',
+      ),
+    ).toHaveLength(1);
+    // Nor may it carry a trailing clause the anchor would otherwise let through.
+    expect(
+      findExpandContractViolations('ALTER TABLE fact ALTER COLUMN embedding DROP NOT NULL CASCADE;'),
+    ).toHaveLength(1);
   });
 
   test('an unrecognized statement is a finding, not a shrug', () => {
@@ -255,50 +302,60 @@ describe('deploy first, migrate second — as data', () => {
 });
 
 describe('the previous fleet version still serves a tenant migrated to the current one', () => {
-  let atItsOwnVersion: SchemaFixture;
+  /** One database per frozen release, at that release's own rung. */
+  const atOwnVersion = new Map<number, { fixture: SchemaFixture; sql: SQL }>();
   let migratedToHead: SchemaFixture;
-  let own: SQL;
   let head: SQL;
 
   beforeAll(async () => {
-    // The database `fleet-1` was written against...
-    atItsOwnVersion = await provisionFixture('rollout_v1', { targetVersion: FLEET_1_SURFACE.schemaVersion });
-    // ...and one a newer instance has already migrated out from under it.
+    for (const surface of FLEET_SURFACES) {
+      if (atOwnVersion.has(surface.schemaVersion)) continue;
+      // The database each release was written against...
+      const fixture = await provisionFixture(`rollout_v${surface.schemaVersion}`, {
+        targetVersion: surface.schemaVersion,
+      });
+      atOwnVersion.set(surface.schemaVersion, { fixture, sql: connect(fixture) });
+    }
+    // ...and one a newer instance has already migrated out from under them.
     migratedToHead = await provisionFixture('rollout_head');
-    own = connect(atItsOwnVersion);
     head = connect(migratedToHead);
   }, { timeout: SETUP_TIMEOUT_MS });
 
   afterAll(async () => {
-    await own?.close();
+    for (const { fixture, sql } of atOwnVersion.values()) {
+      await sql?.close();
+      await dropFixtureDatabase(fixture);
+    }
     await head?.close();
-    if (atItsOwnVersion !== undefined) await dropFixtureDatabase(atItsOwnVersion);
     if (migratedToHead !== undefined) await dropFixtureDatabase(migratedToHead);
   }, { timeout: SETUP_TIMEOUT_MS });
 
-  test(
-    'the frozen surface is genuinely that release’s SQL — it runs on that release’s schema',
-    async () => {
-      // This is what stops the freeze from rotting. A statement quietly "fixed"
-      // by borrowing a column from a later rung fails here, so the only way to
-      // make the migrated run below pass is to fix the *migration*.
-      const failures = await runFleetSurface(own, FLEET_1_SURFACE);
-      expect(failures).toEqual([]);
-    },
-    TEST_TIMEOUT_MS,
-  );
+  for (const surface of FLEET_SURFACES) {
+    test(
+      `${surface.release}'s surface is genuinely that release’s SQL — it runs on that release’s schema`,
+      async () => {
+        // This is what stops the freeze from rotting. A statement quietly "fixed"
+        // by borrowing a column from a later rung fails here, so the only way to
+        // make the migrated run below pass is to fix the *migration*.
+        const own = atOwnVersion.get(surface.schemaVersion);
+        expect(own).toBeDefined();
+        expect(await runFleetSurface(own!.sql, surface)).toEqual([]);
+      },
+      TEST_TIMEOUT_MS,
+    );
 
-  test(
-    'and it still runs, unchanged, against a database migrated to head',
-    async () => {
-      const failures = await runFleetSurface(head, FLEET_1_SURFACE);
+    test(
+      `and ${surface.release}'s surface still runs, unchanged, against a database migrated to head`,
+      async () => {
+        const failures = await runFleetSurface(head, surface);
 
-      // The named test from U3's scenario list. If this goes red, the rung that
-      // broke it must be reshaped — an old instance cannot be taught anything.
-      expect(failures).toEqual([]);
-    },
-    TEST_TIMEOUT_MS,
-  );
+        // The named test from U3's scenario list. If this goes red, the rung that
+        // broke it must be reshaped — an old instance cannot be taught anything.
+        expect(failures).toEqual([]);
+      },
+      TEST_TIMEOUT_MS,
+    );
+  }
 
   test('the surface is not empty, and covers writes as well as reads', () => {
     // A surface trimmed to selects would pass every migration that ever added a
@@ -315,10 +372,26 @@ describe('the previous fleet version still serves a tenant migrated to the curre
     expect(all.some((statement) => statement.includes('SET LOCAL hnsw.ef_search'))).toBe(true);
   });
 
+  test('the release that rung 14 relaxes a constraint under is frozen, writes included', () => {
+    // Rung 14 drops `fact.embedding`'s NOT NULL. The claim that a fleet-13
+    // instance cannot tell is worth exactly this surface: if it does not write
+    // a fact, it proves nothing about the constraint that replaced it.
+    const facts = FLEET_13_SURFACE.exchanges.flatMap((exchange) => exchange.statements);
+    expect(facts.some((statement) => /^INSERT INTO fact \(page_id, statement, embedding/.test(statement.trim()))).toBe(
+      true,
+    );
+    expect(facts.some((statement) => statement.includes('embedding <=>'))).toBe(true);
+    expect(facts.some((statement) => statement.trim().startsWith('UPDATE chunk SET embedding'))).toBe(true);
+  });
+
   test('one release of promise buys exactly one rung of tolerance', () => {
     // The link the lookahead constant depends on: the frozen surfaces prove
-    // compatibility across one rung, so the fleet tolerates one rung.
-    const proven = HEAD_SCHEMA_VERSION - FLEET_1_SURFACE.schemaVersion;
-    expect(SCHEMA_LOOKAHEAD).toBeLessThanOrEqual(proven);
+    // compatibility across one rung, so the fleet tolerates one rung. Measured
+    // from the NEWEST frozen release, because that is the one an instance
+    // running during the current rollout is actually on — taking the oldest
+    // would let the tolerance grow by one rung every time a rung shipped
+    // without a surface beside it.
+    const newest = Math.max(...FLEET_SURFACES.map((surface) => surface.schemaVersion));
+    expect(HEAD_SCHEMA_VERSION - newest).toBeGreaterThanOrEqual(SCHEMA_LOOKAHEAD);
   });
 });

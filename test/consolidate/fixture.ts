@@ -50,6 +50,7 @@ import {
 } from '../../src/ai/keys.ts';
 import { HOSTED_PROFILE, type ModelOp } from '../../src/ai/routing.ts';
 import { fleetIdentity } from '../../src/control/secrets.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
 import { extractFacts } from '../../src/core/write/extract.ts';
 import { textArrayLiteral } from '../../src/core/write/pg-values.ts';
 import { CORPUS } from '../../evals/corpus.ts';
@@ -253,11 +254,12 @@ export async function seedPage(sql: SQL, input: SeedPageInput): Promise<SeededPa
   const pageId = pageRows[0]?.page_id;
   if (pageId === undefined) throw new Error('page did not insert');
 
-  const chunkRows = (await sql`
-    INSERT INTO chunk (origin_context, content, embedding, page_id, ordinal)
-    VALUES (${input.origin}, ${input.body}, ${vectorLiteralOf(input.body)}::vector, ${pageId}::bigint, 0)
-    RETURNING chunk_id::text AS chunk_id
-  `) as Array<{ chunk_id: string }>;
+  const chunkRows = (await sql.unsafe(
+    `INSERT INTO chunk (origin_context, content, ${ACTIVE_EMBEDDING_SEAT.column}, page_id, ordinal)
+     VALUES ($1, $2, $3::vector, $4::bigint, 0)
+     RETURNING chunk_id::text AS chunk_id`,
+    [input.origin, input.body, vectorLiteralOf(input.body), pageId],
+  )) as Array<{ chunk_id: string }>;
   const chunkId = chunkRows[0]?.chunk_id;
   if (chunkId === undefined) throw new Error('chunk did not insert');
 
@@ -277,14 +279,21 @@ export async function seedFact(
     readonly confidence?: number | null;
   },
 ): Promise<string> {
-  const rows = (await sql`
-    INSERT INTO fact (statement, embedding, origin_contexts, page_id, derivation, trust_level, confidence)
-    VALUES (${input.statement}, ${vectorLiteralOf(input.statement)}::vector,
-            ${textArrayLiteral([...input.origins].sort())}::text[],
-            ${input.pageId ?? null}, ${input.derivation ?? 'ingested'},
-            ${input.trustLevel ?? null}, ${input.confidence ?? null})
-    RETURNING fact_id::text AS fact_id
-  `) as Array<{ fact_id: string }>;
+  const rows = (await sql.unsafe(
+    `INSERT INTO fact (statement, ${ACTIVE_EMBEDDING_SEAT.column}, origin_contexts, page_id,
+                       derivation, trust_level, confidence)
+     VALUES ($1, $2::vector, $3::text[], $4, $5, $6, $7)
+     RETURNING fact_id::text AS fact_id`,
+    [
+      input.statement,
+      vectorLiteralOf(input.statement),
+      textArrayLiteral([...input.origins].sort()),
+      input.pageId ?? null,
+      input.derivation ?? 'ingested',
+      input.trustLevel ?? null,
+      input.confidence ?? null,
+    ],
+  )) as Array<{ fact_id: string }>;
   const factId = rows[0]?.fact_id;
   if (factId === undefined) throw new Error('fact did not insert');
 

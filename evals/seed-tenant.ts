@@ -30,6 +30,11 @@ import type { Corpus } from './corpus.ts';
 import { corpusTexts, type Chunk } from './corpus.ts';
 import { loadEmbeddings, type EmbeddingIndex } from './embeddings.ts';
 import { MANIFEST_PATH } from './regenerate-embeddings.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../src/schema/embedding-seat.ts';
+
+/** The column a seeded vector goes in — the active seat's, so a fixture
+ * cannot outlive the column production writes. */
+const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
 
 /** The committed vectors, read once per process. */
 let cached: EmbeddingIndex | undefined;
@@ -120,13 +125,22 @@ export async function seedCorpusPagesAndChunks(
     const pageId = pageIds.get(chunk.pageId);
     if (pageId === undefined) throw new Error(`chunk ${corpusChunkId} has no page row`);
     const page = corpus.pages.get(chunk.pageId);
-    const rows = (await sql`
-      INSERT INTO chunk (origin_context, content, embedding, page_id, ordinal, created_at, deleted_at, quarantined_at)
-      VALUES (
-        ${chunk.origin}, ${chunk.content}, ${vectorLiteral(embeddings, corpusChunkId)}::vector,
-        ${pageId}::bigint, ${chunk.ordinal},
-        ${chunk.createdAt}, ${page?.deletedAt ?? null}, ${page?.quarantinedAt ?? null}
-      ) RETURNING chunk_id::text AS chunk_id`) as Array<{ chunk_id: string }>;
+    const rows = (await sql.unsafe(
+      `INSERT INTO chunk (origin_context, content, ${SEAT_COLUMN}, page_id, ordinal,
+                          created_at, deleted_at, quarantined_at)
+       VALUES ($1, $2, $3::vector, $4::bigint, $5, $6, $7, $8)
+       RETURNING chunk_id::text AS chunk_id`,
+      [
+        chunk.origin,
+        chunk.content,
+        vectorLiteral(embeddings, corpusChunkId),
+        pageId,
+        chunk.ordinal,
+        chunk.createdAt,
+        page?.deletedAt ?? null,
+        page?.quarantinedAt ?? null,
+      ],
+    )) as Array<{ chunk_id: string }>;
     const row = rows[0];
     if (row === undefined) throw new Error(`chunk ${corpusChunkId} did not insert`);
     chunkIds.set(corpusChunkId, row.chunk_id);
@@ -212,12 +226,17 @@ export async function seedCorpus(
   const factIds = new Map<string, string>();
   await sql.begin(async (tx: SQL) => {
     for (const fact of corpus.facts.values()) {
-      const rows = (await tx`
-        INSERT INTO fact (statement, embedding, origin_contexts, created_at)
-        VALUES (
-          ${fact.statement}, ${vectorLiteral(embeddings, fact.id)}::vector,
-          ${pgTextArray(originUnionFor(corpus, fact.sourceChunks))}::text[], ${fact.validFrom}
-        ) RETURNING fact_id::text AS fact_id`) as Array<{ fact_id: string }>;
+      const rows = (await tx.unsafe(
+        `INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, created_at)
+         VALUES ($1, $2::vector, $3::text[], $4)
+         RETURNING fact_id::text AS fact_id`,
+        [
+          fact.statement,
+          vectorLiteral(embeddings, fact.id),
+          pgTextArray(originUnionFor(corpus, fact.sourceChunks)),
+          fact.validFrom,
+        ],
+      )) as Array<{ fact_id: string }>;
       const row = rows[0];
       if (row === undefined) throw new Error(`fact ${fact.id} did not insert`);
       factIds.set(fact.id, row.fact_id);

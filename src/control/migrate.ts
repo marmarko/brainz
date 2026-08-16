@@ -777,16 +777,44 @@ const EXPAND_ONLY_STATEMENTS: readonly RegExp[] = [
  * int, DROP COLUMN content;` is one statement whose head matches `ADD COLUMN`
  * perfectly, and adversarial review used exactly that to launder a `DROP
  * COLUMN`, an `ALTER COLUMN … TYPE` and a `DROP CONSTRAINT` past the scanner.
+ *
+ * **`DROP NOT NULL` is the third entry, and it is not a waiver.** `ALTER COLUMN`
+ * was refused as a family, and that was right for every action the family had
+ * ever contained: `TYPE` rewrites the table under a release still querying it,
+ * `SET NOT NULL` breaks every INSERT that release issues, `SET DEFAULT` changes
+ * what its writes mean. Dropping a NOT NULL does none of those — it is the one
+ * action here that strictly *widens* what the table accepts, so every statement
+ * the previous release makes keeps working unchanged and unchanged in meaning.
+ * Refusing it was a property of the scanner never having enumerated the family,
+ * not a property of rollouts.
+ *
+ * The shape is anchored end to end for the same reason the family was refused
+ * wholesale: `SET NOT NULL`, `TYPE`, `SET DEFAULT` and `DROP DEFAULT` are one
+ * token away from this and none of them may pass. Postgres accepts `ALTER
+ * COLUMN x` and the bare `ALTER x`, so both spellings are matched — a rule that
+ * only knew the long form would refuse correct DDL, and a guard that cries wolf
+ * is one somebody switches off.
+ *
+ * What this still does NOT license: nulling a column something reads without
+ * saying what now guarantees the value. Rung 14 pays that with a CHECK across
+ * both embedding seats, and the frozen fleet surface proves the previous
+ * release survives both halves.
  */
-const EXPAND_ONLY_ALTER_ACTIONS: readonly RegExp[] = [/^ADD COLUMN\b/i, /^ADD CONSTRAINT\b/i];
+const EXPAND_ONLY_ALTER_ACTIONS: readonly RegExp[] = [
+  /^ADD COLUMN\b/i,
+  /^ADD CONSTRAINT\b/i,
+  /^ALTER (?:COLUMN\s+)?\S+\s+DROP NOT NULL$/i,
+];
 
 /**
  * A rung that a previous fleet version could not survive.
  *
  * Two rules, and the second is the subtle one:
  *
- *   * The statement kind must be additive. `DROP`, `RENAME` and `ALTER COLUMN`
- *     rewrite what the previous release already queries.
+ *   * The statement kind must be additive. `DROP`, `RENAME` and every
+ *     `ALTER COLUMN` action except `DROP NOT NULL` rewrite what the previous
+ *     release already queries — see {@link EXPAND_ONLY_ALTER_ACTIONS} for why
+ *     that one action is different in kind rather than merely in degree.
  *   * `ADD COLUMN ... NOT NULL` must carry a `DEFAULT`. Without one, every
  *     INSERT the previous release issues — which names the old column list —
  *     starts failing the moment the rung commits. That is the exact shape of

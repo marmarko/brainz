@@ -25,7 +25,12 @@ import { docKeyFor } from '../../../src/core/export/reconstruct.ts';
 import { captureSupersededVersions, revertPage } from '../../../src/core/lifecycle/versions.ts';
 import { contentDigest, type WriteContext } from '../../../src/core/write/write-path.ts';
 import { purgeExpiredTombstones } from '../../../src/mcp/tombstone.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../../src/schema/vector-index.ts';
+/** The column a seeded vector goes in — the active seat's, so a fixture
+ * cannot outlive the column production writes. */
+const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
+
 import { connect, dropFixtureDatabase, provisionFixture, type SchemaFixture } from '../../schema/fixture.ts';
 
 import type { SQL } from 'bun';
@@ -100,12 +105,12 @@ async function seed(): Promise<void> {
       FROM entity WHERE canonical_name = '${BYSTANDER}';
 
     -- A fact naming the subject: removed.
-    INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+    INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
     SELECT '${SUBJECT} owns the rollout', ${EMBEDDING}, ARRAY['${ORIGIN}'], page_id
       FROM page WHERE external_ref = 'gmail:a2';
     -- A fact naming nobody, on a surviving page, but derived partly from a
     -- passage that is going: RECOMPUTED, not removed.
-    INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+    INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
     SELECT 'the rollout is owned', ${EMBEDDING}, ARRAY['${ORIGIN}'], page_id
       FROM page WHERE external_ref = 'gmail:a3';
     INSERT INTO fact_source (fact_id, chunk_id)
@@ -118,7 +123,7 @@ async function seed(): Promise<void> {
     -- it is what makes the over-deletion below observable: in a single-origin
     -- brain every fact's origins overlap every edge's origins, so a page
     -- discovery keyed on origin overlap matches this page too.
-    INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+    INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
     SELECT '${BYSTANDER} presented the numbers', ${EMBEDDING}, ARRAY['${ORIGIN}'], page_id
       FROM page WHERE external_ref = 'gmail:a3';
     INSERT INTO fact_source (fact_id, chunk_id)
@@ -163,10 +168,10 @@ async function seedInferredNickname(alias: string): Promise<void> {
 /** Three rows about other people that a substring sweep on `al` would take. */
 async function seedRowsAboutOtherPeople(): Promise<void> {
   await sql.unsafe(`
-    INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+    INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
     SELECT 'the legal review is with Alvarez & Partners', ${EMBEDDING}, ARRAY['${ORIGIN}'], page_id
       FROM page WHERE external_ref = 'gmail:a3';
-    INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+    INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
     SELECT 'renewal terms are final', ${EMBEDDING}, ARRAY['${ORIGIN}'], page_id
       FROM page WHERE external_ref = 'gmail:a3';
     INSERT INTO commitment (statement, owner_name, trust_level, derivation, origin_contexts)
@@ -541,7 +546,7 @@ describe('the text handle matches a name, not a substring', () => {
       // worse failure of the two.
       await seedInferredNickname('al');
       await sql.unsafe(`
-        INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+        INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
         SELECT 'al owns the deployment window', ${EMBEDDING}, ARRAY['${ORIGIN}'], page_id
           FROM page WHERE external_ref = 'gmail:a3';
       `);

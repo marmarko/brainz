@@ -51,7 +51,12 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { previewSeverance } from '../../../src/core/lifecycle/blast-radius.ts';
 import { severOrigin } from '../../../src/core/lifecycle/severance.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../../src/schema/vector-index.ts';
+/** The column a seeded vector goes in — the active seat's, so a fixture
+ * cannot outlive the column production writes. */
+const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
+
 import { connect, dropFixtureDatabase, provisionFixture, type SchemaFixture } from '../../schema/fixture.ts';
 
 import type { SQL } from 'bun';
@@ -88,10 +93,10 @@ beforeAll(async () => {
     INSERT INTO chunk (origin_context, content, page_id, ordinal)
     SELECT '${PERSONAL}', 'a personal passage', page_id, 0 FROM page WHERE title = 'personal mail';
 
-    INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+    INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
     SELECT 'a work-only claim', ${embedding}, ARRAY['${WORK}'], page_id
       FROM page WHERE title = 'work mail';
-    INSERT INTO fact (statement, embedding, origin_contexts)
+    INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts)
     VALUES ('a claim both accounts attested', ${embedding}, ARRAY['${WORK}', '${PERSONAL}']);
 
     -- Attachments. One live, one a previous forget already holds. The second is

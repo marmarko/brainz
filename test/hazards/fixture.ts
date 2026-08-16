@@ -35,7 +35,19 @@
 import { SQL } from 'bun';
 
 import { createTenantSchemaApplier } from '../../src/schema/apply.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../src/schema/vector-index.ts';
+
+/**
+ * The column these guards seed and scan.
+ *
+ * Derived from the active seat rather than written as `embedding`, and that is
+ * H2's own argument turned on this file: the hazard is a fleet answering by
+ * sequential scan with nothing reporting it, and a fixture pinned to a column
+ * production no longer reads would measure the index on a column nobody
+ * queries — green forever, about nothing. It moves when the seat moves.
+ */
+export const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
 
 /**
  * The CI form is the default, per `.github/workflows/ci.yml`, so the same file
@@ -107,11 +119,13 @@ export const PRODUCTION_PREDICATES = `origin_context = 'personal'
  * measuring different queries.
  */
 export function candidateQuery(options: { readonly filtered: boolean; readonly limit: number }): string {
-  const where = options.filtered ? `WHERE ${PRODUCTION_PREDICATES}` : 'WHERE embedding IS NOT NULL';
+  const where = options.filtered
+    ? `WHERE ${PRODUCTION_PREDICATES}`
+    : `WHERE ${SEAT_COLUMN} IS NOT NULL`;
   return `SELECT chunk_id
     FROM chunk
     ${where}
-    ORDER BY embedding <=> ${QUERY_VECTOR_SQL}
+    ORDER BY ${SEAT_COLUMN} <=> ${QUERY_VECTOR_SQL}
     LIMIT ${options.limit}`;
 }
 
@@ -201,7 +215,7 @@ export async function seedCorpus(sql: SQL): Promise<void> {
   // across all three exclusions rather than one, because a brain in its
   // ordinary steady state carries all three at once.
   await sql.unsafe(`
-    INSERT INTO chunk (origin_context, content, embedding, deleted_at, quarantined_at)
+    INSERT INTO chunk (origin_context, content, ${SEAT_COLUMN}, deleted_at, quarantined_at)
     SELECT CASE WHEN i % 3 = 0 THEN 'work' ELSE 'personal' END,
            'decoy ' || i,
            ${embedding('i * 0.001')},
@@ -212,7 +226,7 @@ export async function seedCorpus(sql: SQL): Promise<void> {
 
   // Immediately behind them: the rows that must survive every predicate.
   await sql.unsafe(`
-    INSERT INTO chunk (origin_context, content, embedding)
+    INSERT INTO chunk (origin_context, content, ${SEAT_COLUMN})
     SELECT 'personal',
            'qualifying ' || i,
            ${embedding(`(${NEAR_DECOY_CHUNKS} + i) * 0.001`)}
@@ -221,7 +235,7 @@ export async function seedCorpus(sql: SQL): Promise<void> {
 
   // Far filler, so the graph is not degenerate.
   await sql.unsafe(`
-    INSERT INTO chunk (origin_context, content, embedding)
+    INSERT INTO chunk (origin_context, content, ${SEAT_COLUMN})
     SELECT 'personal',
            'background ' || i,
            ${embedding('5 + i * 0.001')}
@@ -234,7 +248,7 @@ export async function seedCorpus(sql: SQL): Promise<void> {
 /** How many rows in the database actually satisfy every production predicate. */
 export async function countQualifying(sql: SQL): Promise<number> {
   const rows = await sql.unsafe<{ n: number }[]>(
-    `SELECT count(*)::int AS n FROM chunk WHERE ${PRODUCTION_PREDICATES} AND embedding IS NOT NULL`,
+    `SELECT count(*)::int AS n FROM chunk WHERE ${PRODUCTION_PREDICATES} AND ${SEAT_COLUMN} IS NOT NULL`,
   );
   return rows[0]?.n ?? -1;
 }
@@ -242,7 +256,7 @@ export async function countQualifying(sql: SQL): Promise<number> {
 /** How many rows match the query at all, ignoring the production predicates. */
 export async function countEmbedded(sql: SQL): Promise<number> {
   const rows = await sql.unsafe<{ n: number }[]>(
-    'SELECT count(*)::int AS n FROM chunk WHERE embedding IS NOT NULL',
+    `SELECT count(*)::int AS n FROM chunk WHERE ${SEAT_COLUMN} IS NOT NULL`,
   );
   return rows[0]?.n ?? -1;
 }
@@ -268,7 +282,10 @@ export async function explainLines(sql: SQL, query: string): Promise<string[]> {
  * {@link FORCE_INDEX_SCAN}); this is what proves the force took, which is what
  * makes forcing it non-circular.
  */
-export function usesHnswIndexScan(plan: readonly string[], indexName = 'chunk_embedding_hnsw'): boolean {
+export function usesHnswIndexScan(
+  plan: readonly string[],
+  indexName = `chunk_${SEAT_COLUMN}_hnsw`,
+): boolean {
   return plan.some((line) => line.includes(`Index Scan using ${indexName}`));
 }
 

@@ -2,7 +2,7 @@
   "receipt": "R6a upper bound (attainability)",
   "requirement": "R6a: the gold answer key scored through the same metric implementation, plus a hand-audited answerability sample per question type, so a miss cannot be misread as an architecture failure on a corpus that was simply harder than gbrain's.",
   "corpus_digest": "133c861fae5b48ada38247fa759a2fc58b3faea4a60ebda22e9ebdf4f877193a",
-  "embedding_manifest_digest": "fabb3db916ae4fff239cb6d4cd1d5ceb8b411c75badf4903f6bba72b767e592d",
+  "embedding_manifest_digest": "2e121dbfbdfe4ed5414a7382bcbc4fc71fe2a8e4a46d3e2b01cd92dc5a461b2a",
   "oracle": "Returns the gold key, ordered by grade then id. The attainability ceiling.",
   "rows": [
     {

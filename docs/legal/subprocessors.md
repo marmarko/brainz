@@ -17,15 +17,16 @@ makes that cost visible before it is paid.
 
 | Subprocessor | What it does | What it receives | Where |
 |---|---|---|---|
-| **Cloudflare** | Fleet host, container platform, object storage, and — since the seats moved — the billing and transport plane for eight of the nine model operations. The broadest single component: it is substrate for almost everything, and it carries an entry rather than being treated as invisible. | Brain content in transit for every model call except embedding; raw payloads and exported markdown at rest in object storage. | Global |
+| **Cloudflare** | Fleet host, container platform, object storage, and — since the seats moved — the billing and transport plane for **all nine** model operations. The broadest single component: it is substrate for almost everything, and it carries an entry rather than being treated as invisible. | Brain content in transit for every model call, embedding included; raw payloads and exported markdown at rest in object storage. | Global |
 | **Neon** | One Postgres project per user — the brain itself. | All brain content at rest. | Per-project region |
 | **Pipedream** | Connector credential vendor for Gmail, Calendar and Drive. Holds the OAuth grant. **Whether it also proxies message bodies is unresolved** — see below. | At minimum: the OAuth grant and the metadata of what is being fetched. Possibly message bodies. | US |
-| **OpenAI** | Embeddings (`text-embedding-3-large`). The one model seat reached directly, on our own OpenAI credential. | Every chunk of text that enters the brain. | US |
 | **Google** | Fact and entity extraction, entity enrichment, contradiction detection. Reached **through Cloudflare**, not directly — see the next section. | Chunks selected for those consolidation phases. | US |
 | **Stripe** | Subscription billing. | **Account and payment data only. Never brain content.** Email address, subscription state, payment details. | US |
 
-Six parties, which is the number `docs/legal/privacy-policy.md` quotes. If a row is added or
-removed here, that sentence moves in the same change.
+Five parties. **OpenAI was the sixth and is no longer one:** the embedding seat, the one
+operation still reached on an OpenAI credential, moved onto Cloudflare, and nothing in the
+hosted service sends anything to OpenAI any more. If a row is added or removed here, the count
+in `docs/legal/privacy-policy.md` moves in the same change.
 
 ## How a model call actually reaches a party
 
@@ -38,7 +39,7 @@ did not.
 |---|---|---|
 | Fact/entity extraction, entity enrichment, contradiction detection | Cloudflare's Unified Billing endpoint, which **passes the call through to Google** under Cloudflare's own provider relationship | Cloudflare **and** Google |
 | Salience refinement, synopsis wrap, image/PDF transcription, eval judge, rerank | Cloudflare's Unified Billing endpoint, open weights running on Cloudflare's own GPUs | Cloudflare only |
-| Embedding | **Directly to OpenAI**, on our own OpenAI credential — this call does not go through Cloudflare's model plane at all | OpenAI (and Cloudflare as the network the container egresses through, which is the substrate row above, not a model row) |
+| Embedding | Cloudflare's Unified Billing endpoint, open weights running on Cloudflare's own GPUs | Cloudflare only |
 
 Three consequences worth stating plainly, because each one is a thing a reader could otherwise
 get wrong:
@@ -53,13 +54,19 @@ get wrong:
   originally published the weights, so no row is owed to NVIDIA, Z.ai, Moondream or BAAI.
   The register names `cloudflare-models` as a component for the same reason it names any other:
   a reader will look for "the rerank endpoint" by name.
-- **The embedding seat did not move, and that is deliberate.** It is the one seat still on its
-  own vendor credential. OpenAI embeddings cannot ride Unified Billing, and the Cloudflare
-  embedding model returns vectors of a different width than the stored column — with the
-  `dimensions` parameter ignored on that endpoint, so there is nothing to truncate with. Moving
-  it is a schema change plus a re-encode of every chunk in every brain, not a routing row, and
-  even a width-compatible model would be a different vector space. `upstream/concepts.jsonl:gap.cloudflare-embedding-seat`
-  carries what would close it. Until then OpenAI stays on this list.
+- **The embedding seat moved, and dropping OpenAI is what that bought.** It was the one seat
+  still on its own vendor credential, and it was the last one to move because it was never a
+  routing row: the Cloudflare model returns vectors of a different width than the stored column
+  and the `dimensions` parameter is ignored on that endpoint, so there was nothing to truncate
+  with. Closing it took a second stored column beside the first, the removal of a `NOT NULL`
+  that no 1024-dimension model could satisfy, and one selector deciding which column every
+  statement touches — because two vectors of different models are not points in the same space
+  whatever their widths. The reason it was cheap to do now is that no brain holds a corpus yet;
+  the same move against a year of stored vectors is a re-encode of every chunk in every brain.
+- **Google did not move, and no reading of the paragraph above should suggest it did.** Three
+  operations still cross to Google. Cloudflare bills them and passes them through; the content
+  reaches Google either way. "Everything runs on Cloudflare now" is true of the *credential* and
+  false of the *data flow*, and this list is about the data flow.
 
 The self-hosted deployment (AGPL) routes differently — Google directly on the operator's own
 key, the open-weight seats on the operator's own endpoint — and its operator publishes their own
@@ -76,7 +83,7 @@ would settle it is at `docs/vendor/2026-08-12-pipedream-compliance.md`, unsent.
 A subprocessor list that guesses is worse than one that admits, so this one admits. The entry is
 updated — not quietly, with a dated note in this file — when the answer arrives.
 
-## Why Google and OpenAI, and not the models that scored better
+## Why Google, and not the models that scored better
 
 KTD13 rejected three stronger models (Moonshot's `kimi-k3`, Alibaba's `qwen3.5-397b-a17b`,
 xAI's `grok-4.5`) on exactly this test: each would have been a new content processor, and none
@@ -90,8 +97,11 @@ opening a direct relationship with a third lab, and a challenger with no evidenc
 the seat. Both are recorded in `upstream/concepts.jsonl` rather than here, because a model that
 was never routed is not a subprocessor.
 
-**One seat changed model without changing this list, and the reason is a licence rather than a
-price.** Transcription was originally specified on Cloudflare's hosted Llama vision model.
+**Two seats changed model since. One shortened this list and one did not, and the difference is
+worth reading.** The embedding seat moved from OpenAI onto Cloudflare's open weights, which
+removed a party — the only change in this document's history that has. Transcription changed
+model within Cloudflare's own catalog, which removed none, and the reason it changed is a licence
+rather than a price. Transcription was originally specified on Cloudflare's hosted Llama vision model.
 Access to it requires submitting the prompt `agree` to Meta's licence *and representing that the
 user is not domiciled in the EU* — a representation about a person that a hosted service cannot
 make on its users' behalf, since it does not know where they live and they never saw the term.

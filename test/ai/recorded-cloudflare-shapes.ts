@@ -276,3 +276,106 @@ export const MOONDREAM_SCHEMA_SHAPED_ANSWER = {
   errors: [],
   messages: [],
 } as const;
+
+
+/**
+ * The vision seat answering — **over the streaming path**, recorded live on
+ * 2026-08-16 from the same account, the same `/run/` URL and the same body as
+ * {@link MOONDREAM_EMPTY}, differing in exactly one field: `stream: true`.
+ *
+ * This is the whole of `imp.vision-seat-empty-result`. The model is not
+ * broken and the request was not malformed — Cloudflare's **non-streaming
+ * aggregation** for this model is, and it answers `{"result":{}}` with
+ * `success: true` for every input form. Ask the same question with `stream`
+ * set and the answer arrives, with a `metrics` block, and the transcription is
+ * exact: the image was a 640x360 screenshot of a settings panel and every line
+ * of it came back verbatim.
+ *
+ * Three properties of this transcript are load-bearing, and each is a way an
+ * aggregator goes quietly wrong:
+ *
+ *  1. **The `chunk.answer` values are CUMULATIVE, not deltas.** `"Network"`
+ *     then `"Network Sett"` then the whole answer. A reader that concatenates
+ *     them produces a plausible-looking garble that no test asserting
+ *     "contains the password" would catch.
+ *  2. **The terminal event is the authority.** One event carries
+ *     `status: "succeeded"`, and its `output` array's last item is exactly the
+ *     `result` object the non-streaming path was supposed to return —
+ *     `answer`, `reasoning`, `finish_reason` and `metrics` — so the parser
+ *     and the usage reader need to know nothing about streams.
+ *  3. **The usage is real and is in `metrics`.** 749 input tokens, 54 output.
+ *     A stream that ends without the terminal event is therefore a transport
+ *     failure and not an empty answer, or the seat's own worst failure mode
+ *     comes back through the door the fix opened.
+ *
+ * **Truncated in one place, stated here:** the live stream carried 43 `chunk`
+ * events and a 43-element `output` array. Two chunks and the first and last
+ * `output` items are kept — the first because it shows the cumulative shape,
+ * the last because it is what the transport reads. Nothing else is edited; the
+ * `id` values are the provider's own request ids and the account id appears
+ * nowhere (it is in the URL, which is not recorded). The image was generated
+ * for this probe and its contents are invented.
+ */
+export const MOONDREAM_STREAMED_ANSWER = String.raw`data: {"id":"d2e32443-1931-4f56-a470-6660730653c3","status":"processing","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0},"neurons":0}}
+
+data: {"mode":"replace","name":"task","value":"query","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0},"neurons":0}}
+
+data: {"mode":"replace","name":"input_tokens","value":749,"usage":{"prompt_tokens":749,"completion_tokens":0,"total_tokens":749,"prompt_tokens_details":{"cached_tokens":0},"neurons":20.42727279663086}}
+
+data: {"mode":"replace","name":"output_tokens","value":54,"usage":{"prompt_tokens":749,"completion_tokens":54,"total_tokens":803,"prompt_tokens_details":{"cached_tokens":0},"neurons":25.33636474609375}}
+
+data: {"chunk":{"answer":"Network","caption":null,"finish_reason":"","metrics":{"decode_time_ms":0,"input_tokens":0,"output_tokens":0,"prefill_time_ms":0,"ttft_ms":0},"objects":null,"points":null,"reasoning":null},"index":0,"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0},"neurons":0}}
+
+data: {"chunk":{"answer":"Network Sett","caption":null,"finish_reason":"","metrics":{"decode_time_ms":0,"input_tokens":0,"output_tokens":0,"prefill_time_ms":0,"ttft_ms":0},"objects":null,"points":null,"reasoning":null},"index":1,"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0},"neurons":0}}
+
+data: {"id":"d2e32443-1931-4f56-a470-6660730653c3","logs":"","metrics":{"input_tokens":749,"output_tokens":54,"predict_time":0.725636991,"task":"query"},"output":[{"answer":"Network","caption":null,"finish_reason":"","metrics":{"decode_time_ms":0,"input_tokens":0,"output_tokens":0,"prefill_time_ms":0,"ttft_ms":0},"objects":null,"points":null,"reasoning":null},{"answer":"Network Settings\n\nNetwork name: HARBOUR-GUEST\nWi-Fi password: tangerine-42-lamp\nSecurity: WPA2\nRoom 214 - printer code 8891","caption":null,"finish_reason":"stop","metrics":{"decode_time_ms":591.5433469926938,"input_tokens":749,"output_tokens":54,"prefill_time_ms":49.720089067704976,"ttft_ms":54.697179002687335},"objects":null,"points":null,"reasoning":{"grounding":[],"text":"I need to transcribe every word from the image exactly."}}],"status":"succeeded","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0},"neurons":0}}
+
+data: {"response":"","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_tokens_details":{"cached_tokens":0},"neurons":45.76363754272461}}
+
+data: [DONE]`;
+
+/** What {@link MOONDREAM_STREAMED_ANSWER} transcribed, as the assertions read it. */
+export const MOONDREAM_STREAMED_TEXT =
+  'Network Settings\n\nNetwork name: HARBOUR-GUEST\nWi-Fi password: tangerine-42-lamp\nSecurity: WPA2\nRoom 214 - printer code 8891';
+
+/**
+ * `@cf/qwen/qwen3-embedding-0.6b` via `/run/{modelId}`, recorded live on
+ * 2026-08-16. The vectors are elided — 1024 floats say nothing a reader needs —
+ * and `shape` is the provider's own.
+ *
+ * **This is the whole of `imp.cloudflare-embedding-seat-unmetered`.** The same
+ * model on the OpenAI-compatible `/v1/embeddings` path (below) returns a body
+ * whose only keys are `object`, `data` and `model`: no usage block anywhere, so
+ * every call through it is refused `usage_unreported` before the width check
+ * even runs. The native path reports usage in the same place the reranker does
+ * — nested under `result` — and the two paths return **the same vectors**,
+ * component for component, so this is a transport change and not a model
+ * change.
+ */
+export const QWEN_EMBEDDING_RUN = {
+  result: {
+    data: [[-0.014760761521756649, 0.0037299322895705700]],
+    shape: [1, 1024],
+    usage: {
+      prompt_tokens: 3,
+      completion_tokens: 0,
+      total_tokens: 3,
+      prompt_tokens_details: { cached_tokens: 0 },
+      neurons: 0.0032237636062470423,
+    },
+  },
+  success: true,
+  errors: [],
+  messages: [],
+} as const;
+
+/**
+ * The same model on `/v1/embeddings`, same account, same minute. Recorded so
+ * the absence is evidence rather than a claim: three keys, and none of them is
+ * a usage block.
+ */
+export const QWEN_EMBEDDING_COMPAT_UNMETERED = {
+  object: 'list',
+  data: [{ object: 'embedding', embedding: [-0.014760761521756649, 0.0037299322895705700], index: 0 }],
+  model: '@cf/qwen/qwen3-embedding-0.6b',
+} as const;

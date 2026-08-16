@@ -353,14 +353,22 @@ const GOOGLE_DIRECT_ROUTES = {
  * inference through at no markup. One credential, no per-provider keys, one
  * invoice.
  *
- * **The ninth is `embedding`, and it deliberately did not move.** The
- * Cloudflare embedding seat returns 1024 dimensions, the stored column is 1536,
- * and the `dimensions` parameter is ignored — so the move is a schema rung plus
- * a re-encode of every chunk in every brain, not a row in this table. Two
- * vectors of the same width from different models are still not points in the
- * same space, so even a width-compatible swap would silently destroy recall on
- * everything already indexed. `upstream/concepts.jsonl:gap.cloudflare-embedding-seat`
- * carries what would close it; the price is already in the canonical table.
+ * **The ninth is `embedding`, and it took four rungs to move.** It returns 1024
+ * dimensions where the original column is 1536 and its endpoint ignores the
+ * `dimensions` parameter, so this row was never a routing edit: it needed a
+ * second stored column (rung 13), the removal of `fact.embedding`'s NOT NULL
+ * and the CHECK that restates it (rung 14), one selector deciding that column
+ * for `chunk` and `fact` alike (`embedding-seat.ts:seatColumnSql`), and a
+ * transport that calls the model where it reports its usage. It is here now,
+ * which means **no shipped profile reaches OpenAI** and the hosted plane is one
+ * credential end to end.
+ *
+ * **Google is still a processor and this table is why.** Three ops resolve to
+ * `google/gemini-3.5-flash-lite` over Unified Billing — Cloudflare holds the
+ * provider relationship and passes the inference through — so "the models run
+ * on Cloudflare" is a billing statement, not a data-flow one. The register and
+ * the subprocessor list say so; a "Cloudflare only" story would be false the
+ * moment anyone read the extract row.
  */
 const HOSTED_ROUTES: RoutingProfile = {
   extract: {
@@ -446,12 +454,28 @@ const HOSTED_ROUTES: RoutingProfile = {
     pinnedOn: PIN_DATE,
     maxOutputTokens: 0,
   },
+  /**
+   * The seat that moved last, and the one whose move was a schema change.
+   *
+   * 1024 dimensions natively, and the `dimensions` parameter is ignored on this
+   * endpoint — so there is nothing to truncate with and KTD8's "truncation
+   * belongs to the provider's parameter" has nothing to reach for. The width is
+   * the model's, the column is the seat registry's
+   * (`src/schema/embedding-seat.ts`), and the two are bound by model id rather
+   * than by width so that a *same-width* model swap is caught by the same
+   * mechanism as this different-width one.
+   *
+   * Its usage arrives only on `/run/{modelId}`; the OpenAI-compatible path
+   * returns the same vectors and no usage block at all, which the gateway
+   * refuses as `usage_unreported`. That is a transport fact, and it lives in
+   * `gateway.ts` where the paths are chosen.
+   */
   embedding: {
     op: 'embedding',
-    alias: 'text-embedding-3-large',
-    id: 'text-embedding-3-large',
-    provider: 'openai',
-    pinnedOn: PIN_DATE,
+    alias: '@cf/qwen/qwen3-embedding-0.6b',
+    id: '@cf/qwen/qwen3-embedding-0.6b',
+    provider: 'cloudflare',
+    pinnedOn: CLOUDFLARE_PIN_DATE,
     maxOutputTokens: 0,
   },
 };
@@ -508,7 +532,19 @@ const SELF_HOST_ROUTES: RoutingProfile = {
     pinnedOn: PIN_DATE,
     maxOutputTokens: 0,
   },
-  embedding: HOSTED_ROUTES.embedding,
+  // The same open weights on the operator's own hardware, under their own id —
+  // not the `@cf/` one, because price is a property of (weights, who serves
+  // them) and the canonical table must not answer for hardware Cloudflare does
+  // not bill. `embeddingSeatFor` resolves a `self-host/` id to the seat their
+  // tenants were provisioned at, which is this model's own native width.
+  embedding: {
+    op: 'embedding',
+    alias: 'self-host/qwen3-embedding-0.6b',
+    id: 'self-host/qwen3-embedding-0.6b',
+    provider: 'self-host',
+    pinnedOn: CLOUDFLARE_PIN_DATE,
+    maxOutputTokens: 0,
+  },
 };
 
 export const HOSTED_PROFILE: NamedProfile = Object.freeze({

@@ -21,6 +21,10 @@ import { collectBriefing } from '../../src/core/briefing/assemble.ts';
 import { DEBT_THRESHOLDS } from '../../src/core/briefing/prompt.ts';
 import { createMcpFixture, type McpFixture } from '../mcp/fixture.ts';
 import { CALENDAR, MAIL, seedBrain, seedMeeting, warmLayer, type SeededBrain } from './fixture.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
+import { EMBEDDING_DIMENSIONS } from '../../src/schema/vector-index.ts';
+
+const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
 
 const AT = '2026-08-13T09:00:00.000Z';
 const WINDOW = { since: '2026-08-12T00:00:00.000Z', until: '2026-08-14T00:00:00.000Z' };
@@ -55,7 +59,10 @@ describe('the envelope tells the truth in both directions', () => {
     await warmLayer(fixture.sql, brain, AT);
     // Consolidation embeds nothing, so the embedding backlog would keep this
     // response degraded for a reason that has nothing to do with U12's question.
-    await fixture.sql`UPDATE chunk SET embedding = ${`[1${',0'.repeat(1535)}]`}::vector WHERE embedding IS NULL`;
+    await fixture.sql.unsafe(
+      `UPDATE chunk SET ${SEAT_COLUMN} = $1::vector WHERE ${SEAT_COLUMN} IS NULL`,
+      [`[1${',0'.repeat(EMBEDDING_DIMENSIONS - 1)}]`],
+    );
     await fixture.sql`DELETE FROM briefing_cursor`;
 
     const result = await fixture.call('briefing', WINDOW);

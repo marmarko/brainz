@@ -238,47 +238,45 @@ for (const query of CORPUS.queries) {
  * finding somebody fixed and did not delete. Both are the same edit, and both
  * are red until it happens.
  */
+/**
+ * **Re-recorded when the embedding seat moved, and the shape of the change is
+ * the interesting part.** Every committed fixture vector is synthetic — a
+ * hashed lexical projection built at the active seat's width — so a seat of a
+ * different width regenerates all of them and the vector arm's contribution to
+ * each probe shifts. Probes whose ranking the arm now decides became sensitive;
+ * probes it now decides on its own became insensitive to the switches beside
+ * it. Nineteen entries became twenty-four.
+ *
+ * What did NOT change is what this guard is for: no mechanism became inert
+ * everywhere (see {@link INERT_IN_THIS_FIXTURE}), and the count stayed well
+ * inside the bounds asserted below. Re-recording it is the deliberate act the
+ * comment above asks for rather than a number that follows the code around.
+ */
 const KNOWN_INSENSITIVE: Record<string, string[]> = {
+  'q-al-06-sam-email': ['stack.alias-hop', 'stack.shared-normalizer', 'imp.entity-resolution-ladder'],
+  'q-al-08-tosh-wants-changed': ['stack.alias-hop', 'imp.entity-resolution-ladder'],
+  'q-cf-02a-supplier-list-personal': ['stack.keyword-arm', 'stack.title-phrase-boost'],
+  'q-cf-03a-third-september-personal': ['stack.keyword-arm', 'stack.source-type-priors'],
+  'q-cf-03b-third-september-work': ['stack.keyword-arm', 'stack.source-type-priors'],
+  'q-ge-06-saltmarsh-part-of': ['stack.graph-arm', 'stack.title-phrase-boost'],
+  'q-ge-07-sam-collaborator': ['stack.graph-arm', 'imp.entity-resolution-ladder'],
+  'q-ge-10-series-a-sponsor': ['stack.keyword-arm', 'stack.graph-arm', 'stack.corroboration-boost'],
+  'q-ge-13-windbreak-analyst': ['stack.keyword-arm', 'stack.graph-arm'],
+  'q-ge-14-priya-fund': ['stack.graph-arm', 'stack.keyword-arm'],
+  'q-ge-17-sensor-housing': ['stack.keyword-arm', 'stack.title-phrase-boost'],
+  'q-tm-02-saltmarsh-actual-ship': ['stack.recency-decay', 'stack.keyword-arm'],
+  'q-tm-04-sam-still-head-of-eng': ['stack.recency-decay', 'stack.keyword-arm'],
   'q-ts-05-verdant-overview': ['stack.title-phrase-boost', 'stack.keyword-arm'],
   'q-ts-06-tessellate-memo': ['stack.title-phrase-boost', 'stack.keyword-arm'],
-  'q-ts-08-firmware-hotfix': [
-    'stack.title-phrase-boost',
-    'stack.keyword-arm',
-    'stack.read-time-dedup',
-  ],
+  'q-ts-08-firmware-hotfix': ['stack.title-phrase-boost', 'stack.keyword-arm', 'stack.read-time-dedup'],
   'q-ts-09-leadership-change': ['stack.title-phrase-boost', 'stack.keyword-arm'],
   'q-ts-10-brackish-followon': ['stack.title-phrase-boost', 'stack.keyword-arm'],
   'q-ts-11-dana-who-she-is': ['stack.title-phrase-boost', 'stack.keyword-arm'],
   'q-ts-12-membership-renewal': ['stack.title-phrase-boost', 'stack.keyword-arm'],
   'q-ts-13-quarterly-attendees': ['stack.title-phrase-boost', 'stack.keyword-arm'],
-  'q-ts-19-pilot-outcome': [
-    'stack.title-phrase-boost',
-    'stack.recency-decay',
-    'stack.keyword-arm',
-  ],
+  'q-ts-15-priya-introduction': ['stack.title-phrase-boost', 'stack.keyword-arm'],
+  'q-ts-19-pilot-outcome': ['stack.title-phrase-boost', 'stack.recency-decay', 'stack.keyword-arm'],
   'q-ts-20-design-review-notes': ['stack.title-phrase-boost', 'stack.keyword-arm'],
-  'q-al-01-sam-current-title': [
-    'stack.alias-hop',
-    'stack.recency-decay',
-    'imp.entity-resolution-ladder',
-  ],
-  'q-al-06-sam-email': [
-    'stack.alias-hop',
-    'stack.shared-normalizer',
-    'imp.entity-resolution-ladder',
-  ],
-  'q-al-08-tosh-wants-changed': ['stack.alias-hop', 'imp.entity-resolution-ladder'],
-  'q-ge-06-saltmarsh-part-of': ['stack.graph-arm', 'stack.title-phrase-boost'],
-  'q-ge-07-sam-collaborator': ['stack.graph-arm', 'imp.entity-resolution-ladder'],
-  'q-ge-10-series-a-sponsor': [
-    'stack.keyword-arm',
-    'stack.graph-arm',
-    'stack.corroboration-boost',
-  ],
-  'q-tm-04-sam-still-head-of-eng': ['stack.recency-decay', 'stack.keyword-arm'],
-  'q-cf-02a-supplier-list-personal': ['stack.keyword-arm', 'stack.title-phrase-boost'],
-  'q-cf-03a-third-september-personal': ['stack.keyword-arm', 'stack.source-type-priors'],
-  'q-cf-03b-third-september-work': ['stack.keyword-arm', 'stack.source-type-priors'],
 };
 
 /**

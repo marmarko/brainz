@@ -46,6 +46,7 @@ import { candidatePoolFor } from '../../../src/schema/vector-query.ts';
 import {
   EMBEDDING_DIMENSIONS,
   LADDER_QUERY,
+  SEAT_COLUMN,
   createSearchFixture,
   seedDistanceLadder,
   seedEdge,
@@ -101,9 +102,9 @@ afterAll(async () => {
 
 describe('the vector arm asks for a pool, not for a page of results (H1)', () => {
   test('the fixture is large enough for the truncation to be observable', async () => {
-    const rows = (await sql`SELECT count(*)::int AS n FROM chunk WHERE embedding IS NOT NULL`) as Array<{
-      n: number;
-    }>;
+    const rows = (await sql.unsafe(
+      `SELECT count(*)::int AS n FROM chunk WHERE ${SEAT_COLUMN} IS NOT NULL`,
+    )) as Array<{ n: number }>;
     expect(rows[0]?.n).toBe(LADDER_SIZE);
     // Asserted rather than assumed: the whole guard rests on the sought row
     // being outside a limit-sized pool and inside a properly-sized one.

@@ -41,8 +41,9 @@ import { createHash } from 'node:crypto';
 import type { SQL } from 'bun';
 
 import type { Budget, ModelGateway } from '../../ai/gateway.ts';
+import { embeddingSeatFor } from '../../ai/routing.ts';
 import type { CallerIdentity } from '../../control/secrets.ts';
-import { EMBEDDING_DIMENSIONS } from '../../schema/vector-index.ts';
+import { seatColumnSql, type EmbeddingSeat } from '../../schema/embedding-seat.ts';
 import { CHUNKER_VERSION, chunkDocument, type Chunk } from './chunker.ts';
 import { classifyStatement, type DedupVerdict, type WriteStatus } from './dedup.ts';
 import { embedTexts, knownEmbeddingModelFor, vectorLiteral } from './embed.ts';
@@ -88,7 +89,15 @@ export type WriteFailureReason =
    * on exactly that column, so a guess would take a page out of the set that
    * gets fixed. Typed, because every other refusal on this path is.
    */
-  | 'embedding_model_unknown';
+  | 'embedding_model_unknown'
+  /**
+   * A model answered and no registered seat owns its vectors, so there is no
+   * column to put them in and no column a later read could compare against.
+   * Refused rather than written into the shipped column: that would be a
+   * well-formed vector of another space, which every distance computes over and
+   * nothing reports — the exact failure the seat registry exists to prevent.
+   */
+  | 'embedding_seat_unknown';
 
 export interface WriteFailure {
   readonly ok: false;
@@ -294,6 +303,13 @@ interface CommitPlan {
   readonly verdicts: readonly DedupVerdict[];
   readonly settings: TenantSettings;
   readonly modelId: string;
+  /**
+   * Where {@link vectors} may be stored, resolved ONCE from {@link modelId} at
+   * the top of the write and carried down rather than looked up again. Two
+   * lookups is two answers the day an operator's profile routes `embedding`
+   * somewhere the shipped table does not.
+   */
+  readonly seat: EmbeddingSeat;
   readonly replaces: string | null;
 }
 
@@ -316,6 +332,11 @@ async function commitWrite(
   plan: CommitPlan,
   phases: { enter(phase: SyncPhase): void },
 ): Promise<CommitOutcome> {
+  // Interpolated once per write rather than per fact, and through the registry
+  // rather than from the plan's string: an identifier cannot be a bound
+  // parameter, so this is the closure that keeps it a name the schema owns.
+  const seatColumn = seatColumnSql(plan.seat.column);
+
   const outcome = (await sql.begin(async (tx) => {
     const previousStatements =
       plan.replaces === null ? [] : await liveFactStatements(tx, plan.replaces);
@@ -334,7 +355,7 @@ async function commitWrite(
       VALUES (${plan.origin}, ${plan.subject?.context ?? null}, ${plan.subject?.confidence ?? null},
               ${plan.sourceType}, ${plan.externalRef}, ${plan.ingestId}::bigint, ${plan.title},
               ${plan.settings.taxonomyVersion}, ${plan.occurredAt},
-              ${plan.modelId}, ${EMBEDDING_DIMENSIONS},
+              ${plan.modelId}, ${plan.seat.dimensions},
               ${CHUNKER_VERSION}, ${NORMALIZER_VERSION}, ${plan.digest},
               ${plan.quarantined ? new Date() : null})
       RETURNING page_id::text AS page_id
@@ -380,12 +401,23 @@ async function commitWrite(
         continue;
       }
 
-      const rows = (await tx`
-        INSERT INTO fact (page_id, statement, embedding, origin_contexts, confidence, taxonomy_version)
-        VALUES (${pageId}::bigint, ${fact.statement}, ${vectorLiteral(vector)}::vector,
-                ${textArrayLiteral([plan.origin])}::text[], ${fact.confidence}, ${plan.settings.taxonomyVersion})
-        RETURNING fact_id::text AS fact_id
-      `) as Array<{ fact_id: string }>;
+      // The column is the seat's, not the literal `embedding`: a fact written
+      // into the column nobody scans is not an error anywhere — it is a row
+      // that simply never comes back. `seatColumnSql` is the same closure the
+      // read arm and the chunk backfill go through.
+      const rows = (await tx.unsafe(
+        `INSERT INTO fact (page_id, statement, ${seatColumn}, origin_contexts, confidence, taxonomy_version)
+         VALUES ($1::bigint, $2, $3::vector, $4::text[], $5, $6)
+         RETURNING fact_id::text AS fact_id`,
+        [
+          pageId,
+          fact.statement,
+          vectorLiteral(vector, plan.seat),
+          textArrayLiteral([plan.origin]),
+          fact.confidence,
+          plan.settings.taxonomyVersion,
+        ],
+      )) as Array<{ fact_id: string }>;
       const factId = rows[0]?.fact_id;
       if (factId === undefined) throw new Error('fact insert returned no id');
 
@@ -499,6 +531,19 @@ export async function ingestDocument(
   });
   if (!embedded.ok) return fail('embed_failed', embedded.reason);
 
+  // **Resolved once, here, and used by everything below.** What the gateway
+  // says it called, never a re-derivation from its profile's *name*: the two
+  // agree only for the shipped profiles, and the by-name fallback is reached
+  // solely when nothing was encoded (a document that stated no facts), where
+  // there is no vector for the two to disagree about. The seat that model's
+  // vectors belong to then decides one column for the dedup scan, the fact
+  // INSERT and the page's recorded width — a second lookup further down is a
+  // second answer.
+  const modelId = embedded.modelId ?? knownEmbeddingModelFor(ctx.gateway.profileName);
+  if (modelId === null) return fail('embedding_model_unknown');
+  const seat = embeddingSeatFor(modelId);
+  if (seat === undefined) return fail('embedding_seat_unknown');
+
   phases.enter('dedup');
   const verdicts: DedupVerdict[] = [];
   for (const [index, fact] of facts.entries()) {
@@ -509,6 +554,7 @@ export async function ingestDocument(
         statement: fact.statement,
         vector,
         origin,
+        seat,
         // The page being rewritten is not "what the brain already knows": its
         // own previous facts must not make its new ones duplicates of rows this
         // write is about to tombstone.
@@ -516,12 +562,6 @@ export async function ingestDocument(
       }),
     );
   }
-
-  // What the gateway says it called, never a re-derivation from its profile's
-  // *name*: the two agree only for the shipped profiles, and the fallback is
-  // reached solely when nothing was encoded.
-  const modelId = embedded.modelId ?? knownEmbeddingModelFor(ctx.gateway.profileName);
-  if (modelId === null) return fail('embedding_model_unknown');
 
   const outcome = await commitWrite(
     ctx.sql,
@@ -541,6 +581,7 @@ export async function ingestDocument(
       verdicts,
       settings,
       modelId,
+      seat,
       replaces: existing === null ? null : existing.pageId,
     },
     phases,
@@ -630,11 +671,23 @@ export async function remember(
   const vector = embedded.vectors[0];
   if (vector === undefined) return fail('embed_failed', 'embedding_count_mismatch');
 
+  // `remember` always encodes exactly one text, so the gateway always has a
+  // record here and the by-name fallback is unreachable — but it is spelled the
+  // same way as ingestion's, because "unreachable" is a claim about today. The
+  // seat is resolved in the same breath and for the same reason: one lookup
+  // decides the dedup column and the column the fact is written to, so they
+  // cannot be two different columns.
+  const modelId = embedded.modelId ?? knownEmbeddingModelFor(ctx.gateway.profileName);
+  if (modelId === null) return fail('embedding_model_unknown');
+  const seat = embeddingSeatFor(modelId);
+  if (seat === undefined) return fail('embedding_seat_unknown');
+
   phases.enter('dedup');
   const verdict = await classifyStatement(ctx.sql, {
     statement,
     vector,
     origin,
+    seat,
     excludePageId: null,
   });
 
@@ -648,12 +701,6 @@ export async function remember(
       phases: phases.ran,
     };
   }
-
-  // `remember` always encodes exactly one text, so the gateway always has a
-  // record here and the by-name fallback is unreachable — but it is spelled the
-  // same way as ingestion's, because "unreachable" is a claim about today.
-  const modelId = embedded.modelId ?? knownEmbeddingModelFor(ctx.gateway.profileName);
-  if (modelId === null) return fail('embedding_model_unknown');
 
   const outcome = await commitWrite(
     ctx.sql,
@@ -678,6 +725,7 @@ export async function remember(
       verdicts: [verdict],
       settings,
       modelId,
+      seat,
       replaces: null,
     },
     phases,

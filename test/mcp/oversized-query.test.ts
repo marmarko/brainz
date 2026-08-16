@@ -155,14 +155,19 @@ describe('an oversized query degrades the text arm and answers anyway', () => {
 
       // And the read still answers. That is the whole difference between a
       // degradation and a refusal, and it is asserted on the results rather than
-      // on which arm produced them: at this size the vector arm is out too, for
-      // a *different* and equally intended reason — `READ_PATH_SPEND_CEILING`
-      // refuses to spend an embedding call on 37,000 tokens of "query", which is
-      // that constant's stated purpose — so the answer arrives through the alias
-      // ladder. A caller gets a ranked record and a sentence saying which halves
-      // of the search did not run.
+      // on which arm produced them.
       expect(content.results.length).toBeGreaterThan(0);
-      expect(result.envelope.degraded?.reasons ?? []).toContain('embedding_unavailable');
+
+      // **The vector arm survives this query, and it did not always.** At the
+      // previous embedding seat's price, 37,000 tokens of "query" cost more than
+      // `READ_PATH_SPEND_CEILING` allowed and the read lost that arm too — for a
+      // different and equally intended reason. The seat this fleet routes now is
+      // eleven times cheaper, so the same query is inside the same margin and
+      // keeps its vector arm; the ceiling still refuses the megabyte the
+      // constant was written against. Asserted rather than left unstated,
+      // because "which arms ran" is the thing a reader of a degraded answer is
+      // being told, and it changed.
+      expect(result.envelope.degraded?.reasons ?? []).not.toContain('embedding_unavailable');
     },
     TEST_TIMEOUT_MS,
   );

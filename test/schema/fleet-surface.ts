@@ -142,7 +142,92 @@ export const FLEET_1_SURFACE: FleetSurface = {
   ],
 };
 
-export const FLEET_SURFACES: readonly FleetSurface[] = [FLEET_1_SURFACE];
+/**
+ * Release 13: the release that added the 1024 column and did not use it.
+ *
+ * Frozen because rung 14 drops `fact.embedding`'s `NOT NULL` — the one
+ * `ALTER COLUMN` action the expand-only scanner now admits — and the entire
+ * argument for admitting it is that a fleet-13 instance serving a tenant
+ * migrated past it notices nothing. That argument is worth exactly as much as
+ * this surface, which is release 13's own SQL: the synchronous fact write, the
+ * dedup neighbour scan that reads the column back, and the chunk backfill.
+ *
+ * The CHECK rung 14 adds is tested here too, and without a line mentioning it:
+ * every fact this release writes fills `embedding`, so the constraint is
+ * satisfied by construction — which is the property `ADD CONSTRAINT … CHECK`
+ * needs and cannot get from being additive in shape.
+ *
+ * Transcribed from that release's own files, named per exchange. `1` followed
+ * by 1535 zeroes is how `embed.ts:vectorLiteral` spelled a vector then, minus
+ * the 1534 characters of comma-zero nobody needs to read.
+ */
+const V13_VECTOR = "('[1' || repeat(',0', 1535) || ']')::vector";
+
+export const FLEET_13_SURFACE: FleetSurface = {
+  release: 'fleet-13',
+  schemaVersion: 13,
+  exchanges: [
+    {
+      what: 'writes a page, then a fact under it, with rung 13’s column list',
+      from: 'src/core/write/write-path.ts — commitWrite',
+      statements: [
+        `INSERT INTO page (origin_context, source_type, title, embedding_model, embedding_dimensions,
+                           chunker_version, normalizer_version, content_sha256)
+         VALUES ('personal', 'note', 'frozen surface page', 'text-embedding-3-large', 1536, 1, 1, repeat('f', 64))`,
+        `INSERT INTO fact (page_id, statement, embedding, origin_contexts, confidence, taxonomy_version)
+         VALUES ((SELECT max(page_id) FROM page), 'the frozen surface states a fact',
+                 ${V13_VECTOR}, ARRAY['personal']::text[], 0.9, 1)`,
+      ],
+    },
+    {
+      what: 'reads its own fact back by similarity, to decide duplicate or supersede',
+      from: 'src/core/write/dedup.ts — the neighbour scan',
+      statements: [
+        'SET LOCAL hnsw.ef_search = 100',
+        `SELECT fact_id::text AS fact_id, statement, 1 - (embedding <=> ${V13_VECTOR}) AS similarity
+           FROM fact
+          WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL
+            AND 'personal' = ANY (origin_contexts)
+          ORDER BY embedding <=> ${V13_VECTOR}
+          LIMIT 100`,
+      ],
+    },
+    {
+      what: 'drains the chunk embedding backlog into the 1536 column',
+      from: 'src/core/write/embed.ts — pendingChunkEmbeddings + runChunkEmbedBacklog',
+      statements: [
+        `INSERT INTO chunk (origin_context, content) VALUES ('personal', 'frozen surface unembedded chunk')`,
+        `SELECT c.chunk_id::text AS chunk_id, c.content, p.title
+           FROM chunk c
+           LEFT JOIN page p ON p.page_id = c.page_id
+          WHERE c.embedding IS NULL AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
+            AND (p.page_id IS NULL OR (p.deleted_at IS NULL AND p.quarantined_at IS NULL))
+          ORDER BY c.chunk_id
+          LIMIT 32`,
+        `UPDATE chunk SET embedding = ${V13_VECTOR}
+          WHERE content = 'frozen surface unembedded chunk' AND embedding IS NULL`,
+      ],
+    },
+    {
+      what: 'supersedes a fact, which is how a claim goes stale without being rewritten',
+      from: 'src/core/write/write-path.ts — the supersession UPDATE',
+      statements: [
+        // The correction arrives as its own row, embedded like any other:
+        // origin is immutable, so a claim whose value changed is a new fact
+        // pointing back at the old one rather than an edit.
+        `INSERT INTO fact (page_id, statement, embedding, origin_contexts, confidence, taxonomy_version)
+         VALUES ((SELECT max(page_id) FROM page), 'the frozen surface states it differently now',
+                 ${V13_VECTOR}, ARRAY['personal']::text[], 0.9, 1)`,
+        `UPDATE fact
+            SET superseded_by = (SELECT fact_id FROM fact
+                                  WHERE statement = 'the frozen surface states it differently now')
+          WHERE statement = 'the frozen surface states a fact' AND superseded_by IS NULL`,
+      ],
+    },
+  ],
+};
+
+export const FLEET_SURFACES: readonly FleetSurface[] = [FLEET_1_SURFACE, FLEET_13_SURFACE];
 
 export interface SurfaceFailure {
   readonly what: string;

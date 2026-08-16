@@ -230,11 +230,20 @@ describe('the estimate is delta-aware', () => {
     expect(outcome.modelId).toBe('self-host/embed-1');
   });
 
-  test("KTD8's anchor: a 50k-chunk first import is about $2.60", async () => {
+  test("KTD8's anchor: a 50k-chunk first import is about $0.24", async () => {
     // 50,000 chunks at ~400 tokens each is 20M tokens, and 20M tokens through
-    // the canonical embedding price is $2.60. Asserted here rather than in
+    // the canonical embedding price is $0.236. Asserted here rather than in
     // `src/` because the scan that keeps one pricing table forbids the number
     // there — and this is the number the whole gate exists for.
+    //
+    // **It was $2.60, and the eleven-fold drop is the seat move.** The gate is
+    // unchanged and so is its argument — a user's whole mail archive is a bill
+    // they should see before it is charged — but the bill is now small enough
+    // that the approval it asks for is a formality for most first imports and a
+    // real number only for the largest. That is worth stating rather than
+    // quietly re-baselining, because "the estimate almost never bites" is a
+    // reason someone would give for deleting the gate, and the reason not to is
+    // the archive that is ten times this one.
     const outcome = await estimateImport({
       sql: fixture.tenantSql,
       profile: HOSTED_PROFILE,
@@ -250,10 +259,10 @@ describe('the estimate is delta-aware', () => {
     expect(outcome.ok).toBe(true);
     if (!outcome.ok) return;
     expect(outcome.estimate.tokens).toBe(20_000_000);
-    expect(outcome.estimate.microUsd).toBe(2_600_000);
+    expect(outcome.estimate.microUsd).toBe(236_000);
     expect(outcome.estimate.requestedMicroUsd).toBe(
       Math.ceil(
-        ((2_600_000 + outcome.estimate.backlogMicroUsd) * (100 + ESTIMATE_MARGIN_PERCENT)) / 100,
+        ((236_000 + outcome.estimate.backlogMicroUsd) * (100 + ESTIMATE_MARGIN_PERCENT)) / 100,
       ),
     );
   });

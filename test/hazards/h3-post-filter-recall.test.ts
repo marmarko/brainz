@@ -49,6 +49,7 @@ import {
   FORCE_INDEX_SCAN,
   NEAR_DECOY_CHUNKS,
   REQUIRED_YIELD,
+  SEAT_COLUMN,
   candidateQuery,
   countQualifying,
   dropFixtureDatabase,
@@ -102,7 +103,7 @@ describe('H3 — the pool survives the predicates every production read carries'
       const excludedRows = await sql.unsafe<{ n: number }[]>(
         `SELECT count(*)::int AS n
            FROM chunk
-          WHERE embedding IS NOT NULL
+          WHERE ${SEAT_COLUMN} IS NOT NULL
             AND NOT (origin_context = 'personal' AND deleted_at IS NULL AND quarantined_at IS NULL)`,
       );
       expect(excludedRows[0]?.n).toBe(NEAR_DECOY_CHUNKS);

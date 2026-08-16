@@ -31,7 +31,7 @@ import {
   queryEncoding,
   vectorLiteral,
 } from '../../../src/core/write/embed.ts';
-import { CALLER, TENANT, createGateway, uncappedBudget } from './fixture.ts';
+import { CALLER, EMBEDDING_DIMENSIONS, TENANT, createGateway, uncappedBudget } from './fixture.ts';
 
 describe('every embed call is the gateway s embedding op', () => {
   test('it routes by op name, never by model', async () => {
@@ -63,7 +63,7 @@ describe('every embed call is the gateway s embedding op', () => {
       texts: ['one'],
     }).then(() => {
       expect(transport.calls[0]?.embeddingDimensions).toBe(EMBEDDING_PIN.dimensions);
-      expect(EMBEDDING_PIN.dimensions).toBe(1536);
+      expect(EMBEDDING_PIN.dimensions).toBe(1024);
     });
   });
 
@@ -108,7 +108,7 @@ describe('every embed call is the gateway s embedding op', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.vectors).toHaveLength(3);
-    for (const vector of result.vectors) expect(vector).toHaveLength(1536);
+    for (const vector of result.vectors) expect(vector).toHaveLength(EMBEDDING_DIMENSIONS);
   });
 
   test('an empty batch makes no call at all', async () => {
@@ -128,7 +128,7 @@ describe('every embed call is the gateway s embedding op', () => {
 
 describe('a vector reaches SQL at the pinned width or not at all', () => {
   test('a correct vector renders as a pgvector literal', () => {
-    const vector = Array.from({ length: 1536 }, (_, index) => (index === 0 ? 1 : 0));
+    const vector = Array.from({ length: EMBEDDING_DIMENSIONS }, (_, index) => (index === 0 ? 1 : 0));
     const literal = vectorLiteral(vector);
     expect(literal.startsWith('[1,')).toBe(true);
     expect(literal.endsWith(']')).toBe(true);
@@ -146,7 +146,7 @@ describe('a vector reaches SQL at the pinned width or not at all', () => {
   });
 
   test('a non-finite component throws — NaN in a vector poisons every distance', () => {
-    const vector = new Array<number>(1536).fill(0);
+    const vector = new Array<number>(EMBEDDING_DIMENSIONS).fill(0);
     vector[7] = Number.NaN;
     expect(() => vectorLiteral(vector)).toThrow(EmbeddingWidthError);
   });
@@ -184,7 +184,7 @@ describe('contextual wrap: title tier on the write path', () => {
 describe('the model recorded on a page is the model the op routes to', () => {
   test('it comes from the routing table, not from a literal', () => {
     const { gateway } = createGateway();
-    expect(embeddingModelFor(gateway.profileName)).toBe('text-embedding-3-large');
+    expect(embeddingModelFor(gateway.profileName)).toBe('@cf/qwen/qwen3-embedding-0.6b');
   });
 
   test('an unknown profile name is a throw, not a default', () => {

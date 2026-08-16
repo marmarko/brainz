@@ -42,6 +42,7 @@
 
 import type { SQL } from 'bun';
 
+import { HEAD_SCHEMA_VERSION } from './migrations.ts';
 import {
   ACTIVE_EMBEDDING_SEAT,
   EMBEDDING_SEATS,
@@ -621,8 +622,19 @@ export async function assertVectorColumns(
   // file. A tenant provisioned under a seat whose vectors no INSERT can supply
   // is a tenant that accepts reads and fails its first write, under a user,
   // naming a constraint rather than the routing row that caused it.
-  const blockers = findSeatWriteBlockers(seat, present);
-  if (blockers.length > 0) throw new UnservableEmbeddingSeatError(seat, blockers);
+  //
+  // **Asked only of a tenant at head**, for the same reason
+  // {@link assertIndexedVectorColumns} skips a column whose rung has not run:
+  // this seat's blockers are lifted by a *rung*, so a tenant deliberately
+  // stopped below it fails this check for a reason that is not a
+  // misconfiguration — it is a schema version, which `assertServableSchema`
+  // already refuses to serve, with a typed error naming the remedy. Reporting it
+  // here as an unservable seat sends the reader to the routing table for a
+  // migration that simply has not run.
+  if (schemaVersion >= HEAD_SCHEMA_VERSION) {
+    const blockers = findSeatWriteBlockers(seat, present);
+    if (blockers.length > 0) throw new UnservableEmbeddingSeatError(seat, blockers);
+  }
 
   return assertIndexedVectorColumns(sql, schemaVersion);
 }

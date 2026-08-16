@@ -49,6 +49,7 @@ import {
 } from '../../src/ai/routing.ts';
 import { CANONICAL_PRICING } from '../../src/ai/pricing.ts';
 import { fleetIdentity } from '../../src/control/secrets.ts';
+import { EMBEDDING_DIMENSIONS } from '../../src/schema/vector-index.ts';
 
 const ALICE = 'alice';
 
@@ -215,7 +216,7 @@ describe('an empty answer from a reasoning model is its own outcome', () => {
 
   test('an embedding op is untouched by the chat emptiness rule', async () => {
     const { gateway } = gatewayOver({
-      output: { kind: 'embedding', vectors: [Array.from({ length: 1536 }, () => 0)] },
+      output: { kind: 'embedding', vectors: [Array.from({ length: EMBEDDING_DIMENSIONS }, () => 0)] },
       usage: { inputTokens: 10, outputTokens: 0 },
     });
     const result = await gateway.call({

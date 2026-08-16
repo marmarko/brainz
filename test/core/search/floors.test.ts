@@ -91,9 +91,25 @@ const EXPECTED: Readonly<Record<string, FloorStatus>> = {
 };
 
 /** Which probes each deferral rests on, and nothing else. */
+/**
+ * **Re-recorded when the embedding seat moved.** The committed fixture vectors
+ * are synthetic — hashed lexical projections built at the active seat's width —
+ * so a seat change of a different width regenerates every one of them and a
+ * handful of probes cross the line in each direction. The floors' *statuses* did
+ * not move (see {@link EXPECTED}); which probes carry each deferral did.
+ *
+ * That is exactly what this table is for: a deferral is auditable only if the
+ * rows underneath it are written down, so re-recording it is a deliberate act
+ * with a reason attached rather than a number that follows the code around.
+ */
 const EXPECTED_PROBES: Record<string, string[]> = {
-  'family.alias.hit1': ['q-al-03-where-does-sam-work', 'q-al-08-tosh-wants-changed'],
-  'family.dilution.hit3': ['q-di-09-pilot-brief', 'q-di-10-pilot-went'],
+  'family.alias.hit1': [
+    'q-al-01-sam-current-title',
+    'q-al-03-where-does-sam-work',
+    'q-al-08-tosh-wants-changed',
+    'q-al-14-kq-suppliers',
+  ],
+  'family.dilution.hit3': ['q-di-06-dpa-signed', 'q-di-09-pilot-brief', 'q-di-10-pilot-went'],
 };
 
 // Printed once per run, on stdout, the way `test/hazards/registry-consistency.test.ts`

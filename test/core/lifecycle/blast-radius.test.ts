@@ -29,7 +29,12 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { previewForget, previewSeverance } from '../../../src/core/lifecycle/blast-radius.ts';
 import { parseId } from '../../../src/mcp/ids.ts';
 import { forgetRecord } from '../../../src/mcp/tombstone.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../../src/schema/vector-index.ts';
+/** The column a seeded vector goes in — the active seat's, so a fixture
+ * cannot outlive the column production writes. */
+const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
+
 import { connect, dropFixtureDatabase, provisionFixture, type SchemaFixture } from '../../schema/fixture.ts';
 
 import type { SQL } from 'bun';
@@ -62,16 +67,16 @@ beforeAll(async () => {
     SELECT '${PERSONAL}', 'a personal passage', page_id, 0 FROM page WHERE title = 'personal mail';
 
     -- Pure-work: removed by severance.
-    INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+    INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, page_id)
     SELECT 'a work-only claim', ${embedding}, ARRAY['${WORK}'], page_id FROM page WHERE title = 'work mail';
 
     -- MIXED: survives severance and must be re-derived. This row is the entire
     -- point of the file; without it every assertion below is vacuous.
-    INSERT INTO fact (statement, embedding, origin_contexts)
+    INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts)
     VALUES ('a claim both accounts attested', ${embedding}, ARRAY['${WORK}', '${PERSONAL}']);
 
     -- Pure-personal: untouched by severing work.
-    INSERT INTO fact (statement, embedding, origin_contexts)
+    INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts)
     VALUES ('a personal-only claim', ${embedding}, ARRAY['${PERSONAL}']);
 
     INSERT INTO entity (canonical_name, entity_type, origin_contexts)

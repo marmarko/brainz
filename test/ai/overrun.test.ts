@@ -277,9 +277,11 @@ describe('the input estimate is the whole cap for an input-only op', () => {
       op: 'embedding',
       tenantId: ALICE,
       caller: fleetIdentity(ALICE),
-      // ~100_000 tokens at $0.13/M is ~13_000 micro-USD: comfortably over.
+      // ~1.25M tokens at the routed seat's price is ~14,750 micro-USD:
+      // comfortably over. The input grew by an order of magnitude when the seat
+      // did — the cap is what is under test, so the text has to stay past it.
       budget,
-      input: { kind: 'embedding', texts: ['x'.repeat(400_000)] },
+      input: { kind: 'embedding', texts: ['x'.repeat(5_000_000)] },
     });
 
     expect(result).toMatchObject({ ok: false, reason: 'budget_exhausted' });

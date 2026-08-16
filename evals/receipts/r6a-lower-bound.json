@@ -2,7 +2,7 @@
   "receipt": "R6a lower bound (non-triviality)",
   "requirement": "R6a: a naive single-arm baseline scores below each ranking floor by a committed numeric margin, so a later pass proves the stack rather than an easy corpus.",
   "corpus_digest": "133c861fae5b48ada38247fa759a2fc58b3faea4a60ebda22e9ebdf4f877193a",
-  "embedding_manifest_digest": "fabb3db916ae4fff239cb6d4cd1d5ceb8b411c75badf4903f6bba72b767e592d",
+  "embedding_manifest_digest": "2e121dbfbdfe4ed5414a7382bcbc4fc71fe2a8e4a46d3e2b01cd92dc5a461b2a",
   "embedding_source": {
     "kind": "synthetic",
     "synthetic": 332,
@@ -116,14 +116,14 @@
       "type.context_fenced.ndcg10": 0.4686992652175235
     },
     "naive-vector-cosine": {
-      "aggregate.ndcg10": 0.4171553908390306,
+      "aggregate.ndcg10": 0.42939294287545543,
       "family.title_substring.hit1": 0,
       "family.alias.hit1": 0.07142857142857142,
-      "family.dilution.hit3": 0.2,
-      "type.relational.ndcg10": 0.40257700894085624,
-      "type.named_entity.ndcg10": 0.42357968037021815,
-      "type.temporal.ndcg10": 0.4403191499987566,
-      "type.context_fenced.ndcg10": 0.40293410490124953
+      "family.dilution.hit3": 0,
+      "type.relational.ndcg10": 0.41028728992627733,
+      "type.named_entity.ndcg10": 0.4357267173085317,
+      "type.temporal.ndcg10": 0.4644229787721438,
+      "type.context_fenced.ndcg10": 0.410342093840481
     }
   },
   "extraction_rule_coverage": {

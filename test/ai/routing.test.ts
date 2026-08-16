@@ -155,7 +155,7 @@ describe('the table covers KTD13, keyed by op', () => {
       // Passed through, not open weights: the id names the lab that made it.
       expect(routeFor(HOSTED_PROFILE, op).id.startsWith('google/'), op).toBe(true);
     }
-    expect(routeFor(HOSTED_PROFILE, 'embedding').provider).toBe('openai');
+    expect(routeFor(HOSTED_PROFILE, 'embedding').provider).toBe('cloudflare');
   });
 
   test('the self-host profile replaces every Cloudflare row and nothing else', () => {

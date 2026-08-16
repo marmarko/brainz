@@ -279,8 +279,11 @@ describe('R16: the raw payload is preserved, and preservation is not optional', 
 describe('the approved amount is a ceiling that holds', () => {
   test('a run that exhausts its budget stops, rather than refusing 49,999 times', async () => {
     await resetBrain();
-    // Enough headroom for the first provider call and not for the rest.
-    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 0, capMicroUsd: 40 });
+    // Enough headroom for the first provider call and not for the rest. The
+    // number moved with the embedding seat's price — an eleven-fold drop — and
+    // it is the *relationship* that is under test, so the cap tracked it rather
+    // than staying at a figure that now covers the whole import.
+    await setSpend(fixture.controlSql, TENANT, { spentMicroUsd: 0, capMicroUsd: 4 });
 
     const result = await runImport(baseRequest(materialFrom(exportDocument(8))));
 

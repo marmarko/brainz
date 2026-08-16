@@ -190,19 +190,15 @@ embedding seat (`src/schema/embedding-seat.ts`). A second seat is registered, at
 1024 dimensions, and this section records what that does and does not mean for
 the numbers above.
 
-**The committed floors were NOT re-baselined, and that is the honest choice
-rather than the lazy one.** The active seat is still the 1536 one — the 1024 seat
-is refused at provisioning while `fact.embedding` is `vector(1536) NOT NULL`, see
-`upstream/concepts.jsonl:gap.cloudflare-embedding-seat` — so the committed numbers
-are the numbers of the configuration that actually runs. Replacing them with
-numbers from a seat no tenant is provisioned at would be committing a measurement
-that describes nothing.
+**The committed floors WERE re-baselined, because the configuration moved under
+them.** The active seat is the 1024 one: rung 14 removed the `NOT NULL` on
+`fact.embedding` that no 1024-dimension model could satisfy, and the `embedding`
+op now routes to `@cf/qwen/qwen3-embedding-0.6b`. Every synthetic vector is built
+at the active seat's width, so `bun run evals/regenerate-embeddings.ts` rewrote
+all of them and `bun run evals/calibrate.ts` recomputed both R6a receipts. The
+committed numbers are once again the numbers of the configuration that runs.
 
-**What the floors read at 1024 was measured, and it is recorded here rather than
-committed as a receipt**, because a receipt is a claim about a configuration and
-there is no configuration this would be a claim about. Procedure: set the active
-seat's `dimensions` to 1024, run `bun run evals/regenerate-embeddings.ts`, then
-`bun run eval:blocking`. Measured on the corpus at manifest digest `fabb3db916ae`:
+**What moved, measured before and after on the same corpus:**
 
 | floor | at 1536 | at 1024 | status at both |
 |---|---|---|---|
@@ -218,16 +214,25 @@ seat's `dimensions` to 1024, run `bun run evals/regenerate-embeddings.ts`, then
 **No floor changed status, and in particular no deferral became a pass.** That
 was the thing worth checking: the two deferred floors are deferred on the
 provider count being zero, which a width change cannot move, and both got *worse*
-rather than better.
+rather than better. Two recorded tables of *which probes* carry each deferral did
+change and were re-recorded with the reason attached —
+`test/core/search/floors.test.ts:EXPECTED_PROBES` and
+`test/core/search/mechanism-sensitivity.test.ts:KNOWN_INSENSITIVE`.
 
 **What these numbers are not.** They are not a comparison of two models. Every
 vector on both sides is synthetic — a hashed lexical projection at the stated
 width — so the movement is the fixture's own hash spreading over fewer buckets,
-and nothing here has observed `@cf/qwen/qwen3-embedding-0.6b` at all. Reading the
-1024 column as "the new seat is slightly worse" would be reading a property of
-`evals/embeddings.ts` as a property of a model. The A/B that
-`gap.cloudflare-embedding-seat` waits on is a comparison of two *provider*
-manifests, and it stays unowed until step 1 above has been run twice.
+and nothing here has observed `@cf/qwen/qwen3-embedding-0.6b`'s *semantics* at
+all. Reading the 1024 column as "the new seat is slightly worse" would be reading
+a property of `evals/embeddings.ts` as a property of a model. The A/B that would
+settle that is a comparison of two *provider* manifests, and it stays unowed
+until step 1 above has been run twice.
+
+**Why the seat move was cheap here and will not be next time.** Regenerating this
+fixture is a script; re-encoding a real brain is a provider bill and a migration.
+No tenant holds a corpus yet, which is the whole reason the width could change at
+all — `src/schema/migrations/v14-fact-seat-nullable.sql` says the same thing
+about the schema half. The next seat move pays for both.
 
 ## Cross-encoder scores: what U12 committed, and what it refused to claim
 

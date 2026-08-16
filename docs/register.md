@@ -90,14 +90,13 @@ path and cannot prove a deployed container is denied one.
 | `pool-secret-namespace` | Warm-pool connection strings (`pool/` namespace) | platform-credential | no_tenant_data | no |
 | `pipedream` | Pipedream (connector substrate) + the project key | vendor | some_tenants | **yes** |
 | `stripe` | Stripe (subscription billing) — the vendor | vendor | some_tenants | no |
-| `openai` | OpenAI — embeddings | model-provider | all_tenants | **yes** |
 | `google` | Google — extraction, enrichment, contradiction detection | model-provider | all_tenants | **yes** |
 | `cloudflare-models` | Cloudflare Workers AI — open-weight inference and the rerank endpoint | model-provider | all_tenants | **yes** |
 | `self-host-inference` | Self-hosted inference endpoint | model-provider | no_tenant_data | no |
 | `web-app` | Web app and control plane (`app.brainz.*`) | web-app | all_tenants | no |
 | `claude-client` | Claude (the connecting client) | client | some_tenants | **yes** |
 
-**10 of 18 components receive user content**: `cloudflare`, `mcp-fleet`, `worker-fleet`, `neon-platform`, `object-storage-parent-credential`, `pipedream`, `openai`, `google`, `cloudflare-models`, `claude-client`. Everything else exists for a user without their words reaching it, which is a different question from whether it can hurt them.
+**9 of 17 components receive user content**: `cloudflare`, `mcp-fleet`, `worker-fleet`, `neon-platform`, `object-storage-parent-credential`, `pipedream`, `google`, `cloudflare-models`, `claude-client`. Everything else exists for a user without their words reaching it, which is a different question from whether it can hurt them.
 
 ### Blast radius and rotation
 
@@ -249,18 +248,6 @@ path and cannot prove a deployed container is denied one.
 
 **Evidence in the code.** none a scanner can find — this component is named because it exists, not because a sweep reported it.
 
-#### `openai` — OpenAI — embeddings
-
-**Kind.** model-provider · **Shared by.** all_tenants · **Receives user content.** yes
-
-**Blast radius.** The text of every chunk and fact that gets embedded, for every tenant on the hosted profile. One of exactly **two** model-side processors KTD13 admits; the platform API key is a single credential covering all of them.
-
-**Rotation owner.** control-plane operator on call
-
-**Rotation.** Rotated in the OpenAI dashboard and re-put into the control plane’s store. A tenant’s own BYOK key (R22) is a tenant secret rather than this platform credential, and is named separately so the distinction is explicit rather than assumed.
-
-**Evidence in the code.** hosts `api.openai.com`; routing providers `openai`.
-
 #### `google` — Google — extraction, enrichment, contradiction detection
 
 **Kind.** model-provider · **Shared by.** all_tenants · **Receives user content.** yes
@@ -330,7 +317,8 @@ path and cannot prove a deployed container is denied one.
 The host sweep is a literal match, so a URL in a comment counts. Over-reporting is the right direction of error for a blast-radius list; each over-report is answered here, once, in writing.
 
 - `api-docs.neon.tech` — a documentation URL in a comment in `src/control/neon-api.ts`, citing the reference the client was written against and the date it was read. Nothing is sent to it. Its live sibling `console.neon.tech` IS a destination and has its own entry.
-- `developers.openai.com` — a documentation URL in comments in `src/mcp/openai.ts` and `src/ingest/oauth/seam.ts`, citing the `search`/`fetch` contract the `/openai` surface was built against and the date it was read (2026-08-15). Nothing is sent to it, and it is deliberately not deleted from the comment: the citation is the receipt for a shape this repository is conformant to. Its live sibling `api.openai.com` IS a destination — the hosted embedding provider — and has its own register entry.
+- `api.openai.com` — the OpenAI base URL in `PROVIDER_DIRECT_BASES` (`src/ai/gateway.ts`), which is a table of direct endpoints per provider id rather than a route. **No shipped routing profile names the `openai` provider any more** — the embedding seat, the last one that did, moved onto Cloudflare — so nothing resolves this base and nothing is sent to it. It is deliberately not deleted with the register entry it lost: the provider id is still in `PROVIDER_IDS`, so an operator profile could name it, and a base table with a hole in it would send that operator to a `no direct endpoint configured` error rather than to OpenAI. The moment a shipped profile routes `openai` again, `providersReachable()` reports it, `findRegisterGaps` goes red for a provider no entry claims, and this excuse has to be replaced by an entry — which is the direction R10 needs this to fail in.
+- `developers.openai.com` — a documentation URL in comments in `src/mcp/openai.ts` and `src/ingest/oauth/seam.ts`, citing the `search`/`fetch` contract the `/openai` surface was built against and the date it was read (2026-08-15). Nothing is sent to it, and it is deliberately not deleted from the comment: the citation is the receipt for a shape this repository is conformant to. Its live sibling `api.openai.com` is a base URL no shipped profile routes to any more, and is excused directly above.
 
 ### The same register, for a machine
 
@@ -501,24 +489,6 @@ Identical content, so a script auditing the blast radius reads the published doc
       "note": "No host, no provider and no binding: the contact is an inbound webhook verified by HMAC, so none of the three completeness sweeps can find this entry and none of them would go red if it were deleted. It is named because R10 asks for every party user data reaches and `docs/legal/subprocessors.md` publishes Stripe as one — a subprocessor the register does not name is the mismatch R10 exists to prevent, in the direction nothing scans for. `test/register/completeness.test.ts` holds this row and `billing-webhook-secret` in place, and says in as many words what that assertion can and cannot establish."
     },
     {
-      "id": "openai",
-      "name": "OpenAI — embeddings",
-      "kind": "model-provider",
-      "shared_by": "all_tenants",
-      "transmits_user_content": true,
-      "blast_radius": "The text of every chunk and fact that gets embedded, for every tenant on the hosted profile. One of exactly **two** model-side processors KTD13 admits; the platform API key is a single credential covering all of them.",
-      "rotation_owner": "control-plane operator on call",
-      "rotation": "Rotated in the OpenAI dashboard and re-put into the control plane’s store. A tenant’s own BYOK key (R22) is a tenant secret rather than this platform credential, and is named separately so the distinction is explicit rather than assumed.",
-      "evidence": {
-        "hosts": [
-          "api.openai.com"
-        ],
-        "providers": [
-          "openai"
-        ]
-      }
-    },
-    {
       "id": "google",
       "name": "Google — extraction, enrichment, contradiction detection",
       "kind": "model-provider",
@@ -605,8 +575,12 @@ Identical content, so a script auditing the blast radius reads the published doc
       "reason": "a documentation URL in a comment in `src/control/neon-api.ts`, citing the reference the client was written against and the date it was read. Nothing is sent to it. Its live sibling `console.neon.tech` IS a destination and has its own entry."
     },
     {
+      "host": "api.openai.com",
+      "reason": "the OpenAI base URL in `PROVIDER_DIRECT_BASES` (`src/ai/gateway.ts`), which is a table of direct endpoints per provider id rather than a route. **No shipped routing profile names the `openai` provider any more** — the embedding seat, the last one that did, moved onto Cloudflare — so nothing resolves this base and nothing is sent to it. It is deliberately not deleted with the register entry it lost: the provider id is still in `PROVIDER_IDS`, so an operator profile could name it, and a base table with a hole in it would send that operator to a `no direct endpoint configured` error rather than to OpenAI. The moment a shipped profile routes `openai` again, `providersReachable()` reports it, `findRegisterGaps` goes red for a provider no entry claims, and this excuse has to be replaced by an entry — which is the direction R10 needs this to fail in."
+    },
+    {
       "host": "developers.openai.com",
-      "reason": "a documentation URL in comments in `src/mcp/openai.ts` and `src/ingest/oauth/seam.ts`, citing the `search`/`fetch` contract the `/openai` surface was built against and the date it was read (2026-08-15). Nothing is sent to it, and it is deliberately not deleted from the comment: the citation is the receipt for a shape this repository is conformant to. Its live sibling `api.openai.com` IS a destination — the hosted embedding provider — and has its own register entry."
+      "reason": "a documentation URL in comments in `src/mcp/openai.ts` and `src/ingest/oauth/seam.ts`, citing the `search`/`fetch` contract the `/openai` surface was built against and the date it was read (2026-08-15). Nothing is sent to it, and it is deliberately not deleted from the comment: the citation is the receipt for a shape this repository is conformant to. Its live sibling `api.openai.com` is a base URL no shipped profile routes to any more, and is excused directly above."
     }
   ]
 }

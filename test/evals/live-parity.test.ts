@@ -128,7 +128,8 @@ describe('the embedding leg catches what the blocking tier cannot see', () => {
   });
 
   test('a changed `dimensions` value is dimension_mismatch, not a silent shorter compare', () => {
-    const truncated = { ...clean[0]!, vector: [...clean[0]!.vector].slice(0, 1024) };
+    const narrower = EMBEDDING_DIMENSIONS - 512;
+    const truncated = { ...clean[0]!, vector: [...clean[0]!.vector].slice(0, narrower) };
     const result = checkEmbeddingParity({
       samples,
       fresh: [truncated, ...clean.slice(1)],
@@ -136,7 +137,7 @@ describe('the embedding leg catches what the blocking tier cannot see', () => {
       routedModelId: ROUTED,
     });
     expect(kinds(result.violations)).toEqual(['dimension_mismatch']);
-    expect(result.violations[0]?.detail).toContain('1024');
+    expect(result.violations[0]?.detail).toContain(String(narrower));
   });
 
   test('client-side truncation that skips re-normalisation is not_unit_norm — KTD8 pins the mechanism', () => {
@@ -144,7 +145,7 @@ describe('the embedding leg catches what the blocking tier cannot see', () => {
     // longer unit length, which silently changes distance semantics under an
     // inner-product operator and degrades recall with no error anywhere.
     const sliced = [...clean[0]!.vector];
-    for (let i = 1024; i < sliced.length; i += 1) sliced[i] = 0;
+    for (let i = EMBEDDING_DIMENSIONS - 512; i < sliced.length; i += 1) sliced[i] = 0;
     const result = checkEmbeddingParity({
       samples,
       fresh: [{ ...clean[0]!, vector: sliced }, ...clean.slice(1)],

@@ -18,6 +18,11 @@ import type { SQL } from 'bun';
 
 import { textArrayLiteral } from '../../src/core/write/pg-values.ts';
 import { EMBEDDING_DIMENSIONS } from '../../src/schema/vector-index.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
+
+/** The column a seeded vector goes in — the active seat's, so a fixture
+ * cannot outlive the column production writes. */
+const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
 
 export const MAIL = 'personal:mail';
 export const CALENDAR = 'personal:calendar';
@@ -141,13 +146,17 @@ export async function seedBrain(sql: SQL, at: string): Promise<SeededBrain> {
     createdAt: at,
   });
 
-  const fact = (await sql`
-    INSERT INTO fact (statement, embedding, origin_contexts, created_at, derivation, trust_level)
-    VALUES ('Priya Raghavan confirmed the renewal lands in October.',
-            ${`[1${',0'.repeat(EMBEDDING_DIMENSIONS - 1)}]`}::vector,
-            ${textArrayLiteral([MAIL])}::text[], ${at}::timestamptz, 'ingested', 'rule_extracted')
-    RETURNING fact_id::text AS fact_id
-  `) as Array<{ fact_id: string }>;
+  const fact = (await sql.unsafe(
+    `INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts, created_at, derivation, trust_level)
+     VALUES ($1, $2::vector, $3::text[], $4::timestamptz, 'ingested', 'rule_extracted')
+     RETURNING fact_id::text AS fact_id`,
+    [
+      'Priya Raghavan confirmed the renewal lands in October.',
+      `[1${',0'.repeat(EMBEDDING_DIMENSIONS - 1)}]`,
+      textArrayLiteral([MAIL]),
+      at,
+    ],
+  )) as Array<{ fact_id: string }>;
   const factId = fact[0]?.fact_id;
   if (factId === undefined) throw new Error('could not seed the fact');
 

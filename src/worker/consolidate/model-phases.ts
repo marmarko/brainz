@@ -37,8 +37,10 @@ import type { Budget, GatewayResult, ModelGateway } from '../../ai/gateway.ts';
 import type { CallerIdentity } from '../../control/secrets.ts';
 import type { StoredPayloadReader } from '../../core/media/accept.ts';
 import { runTranscribePhase } from '../../core/media/ocr-phase.ts';
+import { embeddingSeatFor } from '../../ai/routing.ts';
 import { documentEncoding, embedTexts, vectorLiteral } from '../../core/write/embed.ts';
 import { textArrayLiteral } from '../../core/write/pg-values.ts';
+import { seatColumnSql } from '../../schema/embedding-seat.ts';
 import {
   MODEL_DERIVED,
   admitToCompiledTruth,
@@ -332,15 +334,32 @@ export async function runExtractPhase(deps: ModelPhaseDeps): Promise<PhaseOutcom
       continue;
     }
 
-    const inserted = (await deps.sql`
-      INSERT INTO fact (statement, embedding, origin_contexts, page_id, confidence,
-                        derivation, trust_level, run_id)
-      VALUES (${statement}, ${vectorLiteral([...vector])}::vector,
-              ${textArrayLiteral([...source.origins].sort())}::text[],
-              ${source.pageId}::bigint, ${score}, ${MODEL_DERIVED}, 'model_extracted',
-              ${deps.runId}::bigint)
-      RETURNING fact_id::text AS fact_id
-    `) as Array<{ fact_id: string }>;
+    // The seat of the model that produced THIS vector, resolved from what the
+    // gateway reported having called — the same rule the write path follows,
+    // for the same reason: a consolidation-derived fact written into a column
+    // the read arm does not scan is a claim the brain paid to compute and can
+    // never retrieve, and nothing anywhere reports it.
+    const seat = embeddingSeatFor(embedded.modelId);
+    if (seat === undefined) {
+      logged += 1;
+      continue;
+    }
+
+    const inserted = (await deps.sql.unsafe(
+      `INSERT INTO fact (statement, ${seatColumnSql(seat.column)}, origin_contexts, page_id,
+                         confidence, derivation, trust_level, run_id)
+       VALUES ($1, $2::vector, $3::text[], $4::bigint, $5, $6, 'model_extracted', $7::bigint)
+       RETURNING fact_id::text AS fact_id`,
+      [
+        statement,
+        vectorLiteral([...vector], seat),
+        textArrayLiteral([...source.origins].sort()),
+        source.pageId,
+        score,
+        MODEL_DERIVED,
+        deps.runId,
+      ],
+    )) as Array<{ fact_id: string }>;
     const factId = inserted[0]?.fact_id;
     if (factId !== undefined) {
       await deps.sql`

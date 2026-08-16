@@ -27,7 +27,12 @@ import { planTree, treeDigest, type ExportTree } from '../../../src/core/export/
 import { reconstructLivePages } from '../../../src/core/export/reconstruct.ts';
 import { externalRefFor } from '../../../src/ingest/import/folder.ts';
 import { runImport, type ImportMaterial } from '../../../src/ingest/import/run.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../../src/schema/vector-index.ts';
+/** The column a seeded vector goes in — the active seat's, so a fixture
+ * cannot outlive the column production writes. */
+const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
+
 import {
   HOSTED_PROFILE,
   ORIGIN,
@@ -213,7 +218,7 @@ describe('file parity is green while the knowledge is gone — which is why it i
         SELECT entity_id, 'what consolidation knew about them', 'model_inferred', 'model_derived',
                ARRAY['${ORIGIN}']
           FROM entity WHERE canonical_name = 'roundtrip-subject';
-        INSERT INTO fact (statement, embedding, origin_contexts)
+        INSERT INTO fact (statement, ${SEAT_COLUMN}, origin_contexts)
         VALUES ('roundtrip commitment source', ${embedding}, ARRAY['${ORIGIN}']);
         INSERT INTO commitment (fact_id, statement, trust_level, derivation, origin_contexts)
         SELECT fact_id, 'send the deck by Friday', 'model_extracted', 'model_derived', ARRAY['${ORIGIN}']

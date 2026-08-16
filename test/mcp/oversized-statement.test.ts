@@ -26,6 +26,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { CANONICAL_PRICE_BOOK, costMicroUsd } from '../../src/ai/pricing.ts';
 import { HOSTED_PROFILE, routeFor } from '../../src/ai/routing.ts';
+import { REMEMBER_SPEND_CEILING } from '../../src/mcp/tools/write.ts';
 import { createMcpFixture, type McpFixture } from './fixture.ts';
 
 const SETUP_TIMEOUT_MS = 180_000;
@@ -79,18 +80,18 @@ describe('a `remember` too expensive to embed never reaches the provider', () =>
       const route = routeFor(HOSTED_PROFILE, 'embedding');
       const price = CANONICAL_PRICE_BOOK.lookup(route.id);
       if (price === undefined) throw new Error(`${route.id} must be priced for this test to mean anything`);
-      const statement = pastedBook(400_000);
+      const statement = pastedBook(700_000);
       const wouldCost = costMicroUsd(
         { inputTokens: Math.ceil(statement.length / 4), outputTokens: 0 },
         price,
       );
-      // 400,000 characters is 100,000 tokens, which `text-embedding-3-large`
-      // prices near 13,000 µUSD — twice over any ceiling this handler could
-      // carry and still be called a ceiling, so the refusal below cannot be a
-      // rounding accident at a boundary. Asserted rather than assumed because a
-      // price change is exactly what would quietly make this input legitimate
-      // again and leave the test green having proved nothing.
-      expect(wouldCost).toBeGreaterThan(12_000);
+      // Asserted against the ceiling itself rather than against a number,
+      // because a price change is exactly what would quietly make this input
+      // legitimate again and leave the test green having proved nothing — and
+      // the embedding seat's price has since fallen by a factor of eleven. Twice
+      // the ceiling, so the refusal below cannot be a rounding accident at a
+      // boundary; the input grows if the seat ever gets cheap enough to need it.
+      expect(wouldCost).toBeGreaterThan(2 * REMEMBER_SPEND_CEILING);
 
       const before = {
         calls: fixture.gateway.transport.calls.length,
