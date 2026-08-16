@@ -17,6 +17,13 @@
 export type Page =
   | { readonly kind: 'login' }
   | {
+      readonly kind: 'signup';
+      readonly languages: readonly { readonly value: string; readonly label: string }[];
+    }
+  | { readonly kind: 'reset_request' }
+  | { readonly kind: 'reset_sent' }
+  | { readonly kind: 'reset_complete'; readonly token: string }
+  | {
       readonly kind: 'dashboard';
       readonly tier: string;
       readonly status: string;
@@ -77,7 +84,72 @@ export function renderPage(page: Page): string {
   <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
   <button type="submit">Sign in</button>
 </form>
-<p class="note"><a href="/password/reset">Forgotten your password?</a></p>`,
+<p class="note"><a href="/password/reset">Forgotten your password?</a> &middot; <a href="/signup">Create an account</a></p>`,
+      );
+
+    case 'signup': {
+      // KTD9's choice, made by the person it is about. The API refuses a signup
+      // without it rather than defaulting to English, so a page with no field
+      // for it would make the product unusable through its own front door.
+      const options = page.languages
+        .map(
+          (language) =>
+            `<option value="${escapeHtml(language.value)}">${escapeHtml(language.label)}</option>`,
+        )
+        .join('');
+      return shell(
+        'Create an account — brainz',
+        `<h1>Create your brain</h1>
+<form method="post" action="/api/signup">
+  <label for="email">Email</label><input id="email" name="email" type="email" autocomplete="username" required>
+  <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="new-password" minlength="12" required>
+  <p class="note">Twelve characters or more. A phrase is easier to remember and harder to guess than a
+  short password with punctuation in it.</p>
+  <label for="fts_language">What language is most of your mail and your notes in?</label>
+  <select id="fts_language" name="fts_language" required>${options}</select>
+  <p class="note">This decides how your brain indexes words, and it is set once when the brain is built.
+  We do not guess it, because guessing wrong is invisible — everything would still work, and search
+  would quietly be worse forever.</p>
+  <button type="submit">Create account</button>
+</form>
+<p class="note"><a href="/login">Already have an account?</a></p>`,
+      );
+    }
+
+    case 'reset_request':
+      return shell(
+        'Reset your password — brainz',
+        `<h1>Reset your password</h1>
+<form method="post" action="/api/password/reset">
+  <label for="email">Email</label><input id="email" name="email" type="email" autocomplete="username" required>
+  <button type="submit">Send a reset link</button>
+</form>
+<p class="note">We answer the same way whether or not that address has an account here. That is
+deliberate: an endpoint that said "no such account" would tell anyone who asked which addresses are
+registered.</p>`,
+      );
+
+    case 'reset_sent':
+      return shell(
+        'Check your mail — brainz',
+        `<h1>Check your mail</h1>
+<p>If that address has an account, a reset link is on its way. It works once and expires in thirty
+minutes.</p>
+<p class="note">Resetting your password signs out every session on every device — including this one.</p>
+<p><a href="/login">Back to sign in</a></p>`,
+      );
+
+    case 'reset_complete':
+      return shell(
+        'Choose a new password — brainz',
+        `<h1>Choose a new password</h1>
+<form method="post" action="/api/password/complete">
+  <input type="hidden" name="token" value="${escapeHtml(page.token)}">
+  <label for="password">New password</label><input id="password" name="password" type="password" autocomplete="new-password" minlength="12" required>
+  <button type="submit">Set password</button>
+</form>
+<p class="note">This signs out every other session, and it does not confirm your email address —
+that is a separate step, on purpose.</p>`,
       );
 
     case 'dashboard': {

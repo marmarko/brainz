@@ -187,6 +187,45 @@ export const SHARED_COMPONENTS: readonly RegisterEntry[] = [
     evidence: {},
   },
   {
+    id: 'billing-webhook-secret',
+    name: 'Billing webhook endpoint signing secret (Stripe)',
+    kind: 'platform-credential',
+    shared_by: 'all_tenants',
+    transmits_user_content: false,
+    blast_radius:
+      'Paid capability on every tenant. This secret is the only thing standing between an arbitrary POST and `src/control/billing.ts`, which is the only module allowed to move `control.tenant.tier` — and the tier is what decides whether the consolidation cycle runs its model phases. Whoever holds it can forge an upgrade for any customer (granting themselves metered model spend on our account) or forge a downgrade for any customer (silently stopping their consolidation). It reads no user content and can write no row outside the subscription and tier columns, which is why the radius is capability rather than data.',
+    rotation_owner: 'control-plane operator on call',
+    rotation:
+      'Rotated at the vendor, which serves both the old and the new secret during the overlap; the verifier accepts any matching `v1` in the header for exactly that reason, so a rotation needs no coordinated deploy. Injected at construction from the secret store and never read from a request — an empty secret refuses every delivery rather than verifying a deterministic HMAC an attacker could compute.',
+    evidence: {},
+  },
+  {
+    id: 'identity-store',
+    name: 'Identity and billing database (accounts, sessions, subscriptions)',
+    kind: 'platform-credential',
+    shared_by: 'all_tenants',
+    transmits_user_content: false,
+    blast_radius:
+      'Every account’s email address, and the ability to mint a session for any of them. It is a separate database from the control plane on purpose — `src/control/schema.sql` says identity lives in U15’s own store, and the control plane’s content-free claim reads better when it is literally true of the database the register names. It holds no brain content, no plaintext password (argon2id only) and no usable session or reset token (SHA-256 digests only), so a copy of it contains nothing anyone can sign in with; what it does contain is the user list, which is why it carries its own entry rather than being folded into the web app’s.',
+    rotation_owner: 'control-plane operator on call',
+    rotation:
+      'Database role credential rotated at the provider and re-put into the secret store. Compromise is answered by rotating the role and revoking every session (`account.session` is a delete), which signs every user out rather than trusting a bounded TTL.',
+    evidence: {},
+  },
+  {
+    id: 'pool-secret-namespace',
+    name: 'Warm-pool connection strings (`pool/` namespace)',
+    kind: 'platform-credential',
+    shared_by: 'no_tenant_data',
+    transmits_user_content: false,
+    blast_radius:
+      'Every unclaimed Neon project in the warm pool — databases that have been created and handed to nobody, so they hold no user’s data and no user’s schema. The reason it is a register entry rather than a footnote is that it is the one place the control-plane identity may *resolve* a secret at all: `src/control/secrets.ts` gives it a separate predicate on a separate `pool/` prefix, so the widening is exactly one namespace wide and provisioning still cannot read any tenant entry. The moment a project is claimed its string is rewritten under the tenant’s own namespace and the pool entry is revoked, which is where this credential class stops applying to it.',
+    rotation_owner: 'control-plane operator on call',
+    rotation:
+      'Not rotated — retired. A suspect pool project is moved to `retired` and a fresh one filled; there is no user to migrate, which is the whole advantage of a credential that only ever addresses unclaimed resources.',
+    evidence: {},
+  },
+  {
     id: 'pipedream',
     name: 'Pipedream (connector substrate) + the project key',
     kind: 'vendor',

@@ -13,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { createHmac } from 'node:crypto';
 import type { SQL } from 'bun';
 
-import { attachBrain } from '../../src/control/accounts.ts';
+import { ABSOLUTE_SESSION_MS, attachBrain } from '../../src/control/accounts.ts';
 import type { ProviderId } from '../../src/ai/keys.ts';
 import {
   SESSION_COOKIE,
@@ -519,5 +519,109 @@ describe('/admin over HTTP', () => {
     // admin surface open to everybody, and the fail-closed direction is to not
     // be there.
     expect(response.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The pages have to be able to drive the API they post to.
+//
+// Every test above sends `application/json`, which is what a fetch() would send
+// and is not what `pages.ts` sends: an HTML form posts
+// `application/x-www-form-urlencoded`. A suite that only ever speaks JSON would
+// stay green with the login form permanently broken, which is exactly the shape
+// of bug that ships when the deliverable is an API and the pages are an
+// afterthought.
+// ---------------------------------------------------------------------------
+
+function form(path: string, fields: Record<string, string>, options: { cookie?: string } = {}) {
+  const headers: Record<string, string> = {
+    'content-type': 'application/x-www-form-urlencoded',
+    origin: ORIGIN,
+  };
+  if (options.cookie !== undefined) headers['cookie'] = options.cookie;
+  return new Request(`${ORIGIN}${path}`, {
+    method: 'POST',
+    headers,
+    body: new URLSearchParams(fields).toString(),
+  });
+}
+
+describe('the rendered forms can drive the API they post to', () => {
+  test('every form on every page posts to a route that exists', async () => {
+    await reset();
+    const cookie = await signedIn();
+    const pages = [
+      await (await app()(get('/login'))).text(),
+      await (await app()(get('/signup'))).text(),
+      await (await app()(get('/dashboard', { cookie }))).text(),
+      await (await app()(get('/password/reset'))).text(),
+    ];
+
+    const actions = new Set<string>();
+    for (const page of pages) {
+      for (const match of page.matchAll(/<form[^>]*action="([^"]+)"/g)) actions.add(match[1] ?? '');
+      for (const match of page.matchAll(/href="(\/[^"]*)"/g)) actions.add(match[1] ?? '');
+    }
+    expect(actions.size).toBeGreaterThan(3);
+
+    for (const action of actions) {
+      if (action.startsWith('/api/')) continue;
+      const response = await app()(get(action, { cookie }));
+      // A page a link points at must not be the 404 the router falls through to.
+      expect(`${action} -> ${response.status}`).not.toContain('-> 404');
+    }
+  });
+
+  test('a form-encoded signup is accepted and lands the user somewhere', async () => {
+    await reset();
+    const response = await app()(
+      form('/api/signup', {
+        email: 'alice@example.com',
+        password: 'correct horse battery staple',
+        fts_language: 'simple',
+      }),
+    );
+    expect([201, 303]).toContain(response.status);
+    expect(response.headers.get('set-cookie') ?? '').toContain('HttpOnly');
+  });
+
+  test('a form-encoded login signs in — the JSON-only parser returned invalid_credentials', async () => {
+    await reset();
+    await signedIn();
+    await app()(post('/api/logout', {}, {}));
+
+    const response = await app()(
+      form('/api/login', { email: 'alice@example.com', password: 'correct horse battery staple' }),
+    );
+    expect([200, 303]).toContain(response.status);
+    expect(response.headers.get('set-cookie') ?? '').toContain(SESSION_COOKIE);
+  });
+
+  test('the signup page offers the language choice the API requires', async () => {
+    // The API refuses a signup with no language, per KTD9. A page with no field
+    // for it would make the product unusable through its own front door.
+    const page = await (await app()(get('/signup'))).text();
+    expect(page).toContain('name="fts_language"');
+    expect(page).toContain('action="/api/signup"');
+  });
+});
+
+describe('the session cookie outlives the idle window', () => {
+  test('Max-Age is the absolute window, not the idle one', async () => {
+    // The server enforces idle expiry on every read. If the cookie's own Max-Age
+    // were the idle window, the browser would delete it at seven days however
+    // active the user was, and the thirty-day absolute window would be
+    // unreachable — a session policy that never applies.
+    await reset();
+    const response = await app()(
+      post('/api/signup', {
+        email: 'alice@example.com',
+        password: 'correct horse battery staple',
+        fts_language: 'simple',
+      }),
+    );
+    const cookie = response.headers.get('set-cookie') ?? '';
+    const maxAge = Number(/Max-Age=(\d+)/.exec(cookie)?.[1] ?? '0');
+    expect(maxAge).toBe(Math.floor(ABSOLUTE_SESSION_MS / 1000));
   });
 });

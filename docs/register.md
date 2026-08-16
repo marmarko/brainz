@@ -61,6 +61,9 @@ path and cannot prove a deployed container is denied one.
 | `object-storage-parent-credential` | Object storage (R2) — the parent credential | platform-credential | all_tenants | **yes** |
 | `attestation-signing-key` | Attestation signing key | platform-credential | all_tenants | no |
 | `tenant-secret-store` | Tenant secret store (connection strings + bearers) | platform-credential | all_tenants | no |
+| `billing-webhook-secret` | Billing webhook endpoint signing secret (Stripe) | platform-credential | all_tenants | no |
+| `identity-store` | Identity and billing database (accounts, sessions, subscriptions) | platform-credential | all_tenants | no |
+| `pool-secret-namespace` | Warm-pool connection strings (`pool/` namespace) | platform-credential | no_tenant_data | no |
 | `pipedream` | Pipedream (connector substrate) + the project key | vendor | some_tenants | **yes** |
 | `openai` | OpenAI — embeddings | model-provider | all_tenants | **yes** |
 | `google` | Google — extraction, enrichment, contradiction detection | model-provider | all_tenants | **yes** |
@@ -69,7 +72,7 @@ path and cannot prove a deployed container is denied one.
 | `web-app` | Web app and control plane (`app.brainz.*`) | web-app | all_tenants | no |
 | `claude-client` | Claude (the connecting client) | client | some_tenants | **yes** |
 
-**10 of 14 components receive user content**: `cloudflare`, `mcp-fleet`, `worker-fleet`, `neon-platform`, `object-storage-parent-credential`, `pipedream`, `openai`, `google`, `cloudflare-models`, `claude-client`. Everything else exists for a user without their words reaching it, which is a different question from whether it can hurt them.
+**10 of 17 components receive user content**: `cloudflare`, `mcp-fleet`, `worker-fleet`, `neon-platform`, `object-storage-parent-credential`, `pipedream`, `openai`, `google`, `cloudflare-models`, `claude-client`. Everything else exists for a user without their words reaching it, which is a different question from whether it can hurt them.
 
 ### Blast radius and rotation
 
@@ -156,6 +159,42 @@ path and cannot prove a deployed container is denied one.
 **Rotation owner.** control-plane operator on call
 
 **Rotation.** A `put` through `src/control/secrets.ts`, which invalidates the cached entry in the same operation. A rotation performed out of band is bounded by the cache TTL.
+
+**Evidence in the code.** none a scanner can find — this component is named because it exists, not because a sweep reported it.
+
+#### `billing-webhook-secret` — Billing webhook endpoint signing secret (Stripe)
+
+**Kind.** platform-credential · **Shared by.** all_tenants · **Receives user content.** no
+
+**Blast radius.** Paid capability on every tenant. This secret is the only thing standing between an arbitrary POST and `src/control/billing.ts`, which is the only module allowed to move `control.tenant.tier` — and the tier is what decides whether the consolidation cycle runs its model phases. Whoever holds it can forge an upgrade for any customer (granting themselves metered model spend on our account) or forge a downgrade for any customer (silently stopping their consolidation). It reads no user content and can write no row outside the subscription and tier columns, which is why the radius is capability rather than data.
+
+**Rotation owner.** control-plane operator on call
+
+**Rotation.** Rotated at the vendor, which serves both the old and the new secret during the overlap; the verifier accepts any matching `v1` in the header for exactly that reason, so a rotation needs no coordinated deploy. Injected at construction from the secret store and never read from a request — an empty secret refuses every delivery rather than verifying a deterministic HMAC an attacker could compute.
+
+**Evidence in the code.** none a scanner can find — this component is named because it exists, not because a sweep reported it.
+
+#### `identity-store` — Identity and billing database (accounts, sessions, subscriptions)
+
+**Kind.** platform-credential · **Shared by.** all_tenants · **Receives user content.** no
+
+**Blast radius.** Every account’s email address, and the ability to mint a session for any of them. It is a separate database from the control plane on purpose — `src/control/schema.sql` says identity lives in U15’s own store, and the control plane’s content-free claim reads better when it is literally true of the database the register names. It holds no brain content, no plaintext password (argon2id only) and no usable session or reset token (SHA-256 digests only), so a copy of it contains nothing anyone can sign in with; what it does contain is the user list, which is why it carries its own entry rather than being folded into the web app’s.
+
+**Rotation owner.** control-plane operator on call
+
+**Rotation.** Database role credential rotated at the provider and re-put into the secret store. Compromise is answered by rotating the role and revoking every session (`account.session` is a delete), which signs every user out rather than trusting a bounded TTL.
+
+**Evidence in the code.** none a scanner can find — this component is named because it exists, not because a sweep reported it.
+
+#### `pool-secret-namespace` — Warm-pool connection strings (`pool/` namespace)
+
+**Kind.** platform-credential · **Shared by.** no_tenant_data · **Receives user content.** no
+
+**Blast radius.** Every unclaimed Neon project in the warm pool — databases that have been created and handed to nobody, so they hold no user’s data and no user’s schema. The reason it is a register entry rather than a footnote is that it is the one place the control-plane identity may *resolve* a secret at all: `src/control/secrets.ts` gives it a separate predicate on a separate `pool/` prefix, so the widening is exactly one namespace wide and provisioning still cannot read any tenant entry. The moment a project is claimed its string is rewritten under the tenant’s own namespace and the pool entry is revoked, which is where this credential class stops applying to it.
+
+**Rotation owner.** control-plane operator on call
+
+**Rotation.** Not rotated — retired. A suspect pool project is moved to `retired` and a fresh one filled; there is no user to migrate, which is the whole advantage of a credential that only ever addresses unclaimed resources.
 
 **Evidence in the code.** none a scanner can find — this component is named because it exists, not because a sweep reported it.
 
@@ -355,6 +394,39 @@ Identical content, so a script auditing the blast radius reads the published doc
       "blast_radius": "Every tenant’s database and every tenant’s bearer, if resolved without scope. R11 is decided here rather than at the tool surface: resolution bypasses tool dispatch entirely, so entries are namespaced per tenant and resolvable only by the fleet request-path identity serving that tenant’s own authenticated bearer. The `/admin` and web-app identities hold no resolve permission on any tenant namespace — a `scope_denied` on `recall` proves nothing if the same credential can read the connection string and connect directly.",
       "rotation_owner": "control-plane operator on call",
       "rotation": "A `put` through `src/control/secrets.ts`, which invalidates the cached entry in the same operation. A rotation performed out of band is bounded by the cache TTL.",
+      "evidence": {}
+    },
+    {
+      "id": "billing-webhook-secret",
+      "name": "Billing webhook endpoint signing secret (Stripe)",
+      "kind": "platform-credential",
+      "shared_by": "all_tenants",
+      "transmits_user_content": false,
+      "blast_radius": "Paid capability on every tenant. This secret is the only thing standing between an arbitrary POST and `src/control/billing.ts`, which is the only module allowed to move `control.tenant.tier` — and the tier is what decides whether the consolidation cycle runs its model phases. Whoever holds it can forge an upgrade for any customer (granting themselves metered model spend on our account) or forge a downgrade for any customer (silently stopping their consolidation). It reads no user content and can write no row outside the subscription and tier columns, which is why the radius is capability rather than data.",
+      "rotation_owner": "control-plane operator on call",
+      "rotation": "Rotated at the vendor, which serves both the old and the new secret during the overlap; the verifier accepts any matching `v1` in the header for exactly that reason, so a rotation needs no coordinated deploy. Injected at construction from the secret store and never read from a request — an empty secret refuses every delivery rather than verifying a deterministic HMAC an attacker could compute.",
+      "evidence": {}
+    },
+    {
+      "id": "identity-store",
+      "name": "Identity and billing database (accounts, sessions, subscriptions)",
+      "kind": "platform-credential",
+      "shared_by": "all_tenants",
+      "transmits_user_content": false,
+      "blast_radius": "Every account’s email address, and the ability to mint a session for any of them. It is a separate database from the control plane on purpose — `src/control/schema.sql` says identity lives in U15’s own store, and the control plane’s content-free claim reads better when it is literally true of the database the register names. It holds no brain content, no plaintext password (argon2id only) and no usable session or reset token (SHA-256 digests only), so a copy of it contains nothing anyone can sign in with; what it does contain is the user list, which is why it carries its own entry rather than being folded into the web app’s.",
+      "rotation_owner": "control-plane operator on call",
+      "rotation": "Database role credential rotated at the provider and re-put into the secret store. Compromise is answered by rotating the role and revoking every session (`account.session` is a delete), which signs every user out rather than trusting a bounded TTL.",
+      "evidence": {}
+    },
+    {
+      "id": "pool-secret-namespace",
+      "name": "Warm-pool connection strings (`pool/` namespace)",
+      "kind": "platform-credential",
+      "shared_by": "no_tenant_data",
+      "transmits_user_content": false,
+      "blast_radius": "Every unclaimed Neon project in the warm pool — databases that have been created and handed to nobody, so they hold no user’s data and no user’s schema. The reason it is a register entry rather than a footnote is that it is the one place the control-plane identity may *resolve* a secret at all: `src/control/secrets.ts` gives it a separate predicate on a separate `pool/` prefix, so the widening is exactly one namespace wide and provisioning still cannot read any tenant entry. The moment a project is claimed its string is rewritten under the tenant’s own namespace and the pool entry is revoked, which is where this credential class stops applying to it.",
+      "rotation_owner": "control-plane operator on call",
+      "rotation": "Not rotated — retired. A suspect pool project is moved to `retired` and a fresh one filled; there is no user to migrate, which is the whole advantage of a credential that only ever addresses unclaimed resources.",
       "evidence": {}
     },
     {

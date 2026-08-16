@@ -40,7 +40,7 @@
 import type { SQL } from 'bun';
 
 import {
-  IDLE_SESSION_MS,
+  ABSOLUTE_SESSION_MS,
   attachBrain,
   beginPasswordReset,
   brainOf,
@@ -133,6 +133,14 @@ export function readCookie(header: string | null, name: string): string | null {
   return null;
 }
 
+/**
+ * **`Max-Age` is the ABSOLUTE window, not the idle one.** The server enforces
+ * idle expiry on every read (`resolveSession` has both bounds in its `WHERE`),
+ * so a cookie whose own lifetime were the idle window would be deleted by the
+ * browser at seven days however active the user had been — and the thirty-day
+ * absolute bound would be a policy that never applies. The cookie carries the
+ * outer bound; the server carries the inner one.
+ */
 export function sessionCookie(token: string, maxAgeSeconds: number): string {
   // `Lax` rather than `Strict`: the OAuth consent redirect and the billing
   // checkout return are both top-level cross-site navigations that have to
@@ -146,6 +154,32 @@ export function clearedSessionCookie(): string {
 }
 
 const STATE_CHANGING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+const FORM_CONTENT_TYPE = 'application/x-www-form-urlencoded';
+
+export function isFormPost(request: Request): boolean {
+  return (request.headers.get('content-type') ?? '').startsWith(FORM_CONTENT_TYPE);
+}
+
+/**
+ * The languages the signup form offers.
+ *
+ * A short list rather than every Postgres text-search configuration: the field
+ * is a choice a non-technical user makes about their own mail, and `pg_catalog`
+ * names are not that. `simple` is offered last and honestly — it stems nothing,
+ * which is the right answer for a brain in a language the others do not cover.
+ */
+export const FTS_LANGUAGE_CHOICES: readonly { readonly value: string; readonly label: string }[] = [
+  { value: 'english', label: 'English' },
+  { value: 'spanish', label: 'Spanish' },
+  { value: 'french', label: 'French' },
+  { value: 'german', label: 'German' },
+  { value: 'portuguese', label: 'Portuguese' },
+  { value: 'italian', label: 'Italian' },
+  { value: 'dutch', label: 'Dutch' },
+  { value: 'russian', label: 'Russian' },
+  { value: 'simple', label: 'Something else (no word-stemming)' },
+];
 
 /**
  * The origin check. Returns a reason when the request must be refused.
@@ -203,13 +237,43 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     return brain?.tenantId ?? null;
   }
 
+  /**
+   * Read a request body in either shape the app actually receives.
+   *
+   * A `fetch` sends JSON; an HTML form in `pages.ts` sends
+   * `application/x-www-form-urlencoded`. A parser that only did the first
+   * returned `{}` for every form post, so the login form answered
+   * `invalid_credentials` forever — and a suite that only ever spoke JSON stayed
+   * green through all of it. The pages are the product's front door, so the
+   * router has to be able to read what they send.
+   */
   async function body(request: Request): Promise<Record<string, unknown>> {
+    if (isFormPost(request)) {
+      try {
+        return Object.fromEntries(new URLSearchParams(await request.text()).entries());
+      } catch {
+        return {};
+      }
+    }
     try {
       const parsed: unknown = await request.json();
       return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
     } catch {
       return {};
     }
+  }
+
+  /**
+   * A browser that posted a form wants a page, not a JSON body it will render as
+   * text. 303 rather than 302 so the redirect is followed with GET.
+   */
+  function afterForm(
+    request: Request,
+    location: string,
+    headers: Record<string, string>,
+  ): Response | null {
+    if (!isFormPost(request)) return null;
+    return new Response(null, { status: 303, headers: { location, ...headers } });
   }
 
   function stringOf(source: Record<string, unknown>, name: string): string {
@@ -247,6 +311,17 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     if (path.startsWith('/admin')) return handleAdmin(request);
 
     // ---- Unauthenticated. -------------------------------------------------
+    // These four render whether or not a session is present. A signed-in user
+    // who follows "forgotten your password?" from a bookmark must reach the
+    // page, not the router's 404 — and a reset link arrives in mail, which is
+    // exactly where a stale session is likely to be sitting.
+    if (path === '/login') return html(renderPage({ kind: 'login' }));
+    if (path === '/signup') return html(renderPage({ kind: 'signup', languages: [...FTS_LANGUAGE_CHOICES] }));
+    if (path === '/password/reset') return html(renderPage({ kind: 'reset_request' }));
+    if (path === '/password/sent') return html(renderPage({ kind: 'reset_sent' }));
+    if (path === '/password/complete') {
+      return html(renderPage({ kind: 'reset_complete', token: url.searchParams.get('token') ?? '' }));
+    }
     if (path === '/api/signup' && request.method === 'POST') return handleSignup(request);
     if (path === '/api/login' && request.method === 'POST') return handleLogin(request);
     if (path === '/api/password/reset' && request.method === 'POST') return handleBeginReset(request);
@@ -332,10 +407,10 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
 
       await openFreeSubscription(deps.sql, { accountId: created.accountId, now: now() });
       const session = await createSession(deps.sql, { accountId: created.accountId, now: now() });
-      return json(
-        { ok: true, account_id: created.accountId, fts_language: ftsLanguage },
-        201,
-        { 'set-cookie': sessionCookie(session.token, Math.floor(IDLE_SESSION_MS / 1000)) },
+      const cookie = { 'set-cookie': sessionCookie(session.token, Math.floor(ABSOLUTE_SESSION_MS / 1000)) };
+      return (
+        afterForm(request, '/connect', cookie) ??
+        json({ ok: true, account_id: created.accountId, fts_language: ftsLanguage }, 201, cookie)
       );
     }
 
@@ -352,15 +427,15 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       // A fresh session id on every login. Session fixation is the attack, and a
       // login that reused a caller-supplied cookie is how it lands.
       const session = await createSession(deps.sql, { accountId: outcome.accountId, now: now() });
-      return json({ ok: true }, 200, {
-        'set-cookie': sessionCookie(session.token, Math.floor(IDLE_SESSION_MS / 1000)),
-      });
+      const cookie = { 'set-cookie': sessionCookie(session.token, Math.floor(ABSOLUTE_SESSION_MS / 1000)) };
+      return afterForm(request, '/dashboard', cookie) ?? json({ ok: true }, 200, cookie);
     }
 
     async function handleLogout(request: Request): Promise<Response> {
       const token = readCookie(request.headers.get('cookie'), SESSION_COOKIE);
       if (token !== null) await revokeSession(deps.sql, token);
-      return json({ ok: true }, 200, { 'set-cookie': clearedSessionCookie() });
+      const cleared = { 'set-cookie': clearedSessionCookie() };
+      return afterForm(request, '/login', cleared) ?? json({ ok: true }, 200, cleared);
     }
 
     async function handleBeginReset(request: Request): Promise<Response> {
@@ -379,7 +454,10 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       // **Identical either way.** A reset endpoint that answered differently for
       // an unknown address is a free account-enumeration oracle, reachable
       // without the account holder doing anything.
-      return json({ ok: true, message: 'If that address has an account, a reset link is on its way.' });
+      return (
+        afterForm(request, '/password/sent', {}) ??
+        json({ ok: true, message: 'If that address has an account, a reset link is on its way.' })
+      );
     }
 
     async function handleCompleteReset(request: Request): Promise<Response> {
