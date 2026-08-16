@@ -33,10 +33,19 @@
  * queryable trace" is false. If brainz starts holding its own refresh tokens,
  * that leg has to cover them **on the day the swap happens**, not in a follow-up.
  *
- * So the runbook's leg calls this port rather than Pipedream directly: one leg,
- * two implementations, **no sixth store**. A design where own-OAuth tokens lived
- * somewhere the runbook did not know about would be the same failure U17 already
- * paid for once, with a different vendor name on it.
+ * So this port is **shaped** so that the runbook's leg calls it rather than
+ * Pipedream directly on the day of the swap: one leg, two implementations, **no
+ * sixth store**. A design where own-OAuth tokens lived somewhere the runbook did
+ * not know about would be the same failure U17 already paid for once, with a
+ * different vendor name on it.
+ *
+ * **It is not wired yet, and saying otherwise here would be the same defect one
+ * layer down.** `src/core/lifecycle/erasure.ts` still consumes its own
+ * Pipedream-shaped interface (`deleteExternalUser({ externalUserId })`) and
+ * nothing adapts between the two signatures. Rewiring it today would change
+ * U17's landed code for no property anything can prove until an own-OAuth client
+ * exists — so the rewiring belongs to the swap commit, and this paragraph is
+ * what stops a reader from believing it already happened.
  *
  * ============================================================================
  * THE SWAP PATH, AND WHY IT IS ORDERED THIS WAY
