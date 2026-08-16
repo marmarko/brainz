@@ -29,10 +29,13 @@
  * the gap.
  *
  * **What a disposition survives as.** The table's `outcome` has four values and
- * this module's dispositions have five, so the mapping is lossy in exactly one
- * place and it is written down: `tombstoned` and `unchanged` both land as `ok`
- * with `items_written = 0`, and the two are told apart by the page's own
- * `deleted_at`. Nothing here pretends otherwise.
+ * this module's dispositions have six, so the mapping is lossy in exactly one
+ * place and it is written down: `tombstoned`, `unchanged` and `suppressed` all
+ * land as `ok` with `items_written = 0`, and the three are told apart by the
+ * page the ref does or does not have — a tombstoned item's page carries
+ * `deleted_at`, an unchanged item's page is live, and a **suppressed** item has
+ * no page at all, because an erased subject's mail is never written in the first
+ * place (`src/ingest/erased-subjects.ts`). Nothing here pretends otherwise.
  *
  * **Staleness is derived, never stored.** "Nothing new from this source in 23
  * days" is `now - max(finished_at where items_written > 0)`, and the reason the
@@ -61,14 +64,21 @@ export const INGEST_FAILURE_CODES = [
 export type IngestFailureCode = (typeof INGEST_FAILURE_CODES)[number];
 
 /**
- * What happened to one item. Five values over the table's four outcomes; see
+ * What happened to one item. Six values over the table's four outcomes; see
  * the header for the one place the mapping is lossy and how it is recovered.
+ *
+ * `suppressed` is the R12 one: the item was fetched and then refused, because an
+ * erasure instruction forbids this brain from holding anything about somebody it
+ * names. It is a disposition rather than a silence for the reason every other
+ * one is — a poll that dropped items without saying so is indistinguishable from
+ * a provider that stopped offering them.
  */
 export const ITEM_DISPOSITIONS = [
   'written',
   'unchanged',
   'quarantined',
   'tombstoned',
+  'suppressed',
   'failed',
 ] as const;
 export type ItemDisposition = (typeof ITEM_DISPOSITIONS)[number];
@@ -169,7 +179,10 @@ export function itemRowFor(disposition: ItemDisposition): {
       return { outcome: 'ok', written: 0, quarantined: 1 };
     case 'failed':
       return { outcome: 'failed', written: 0, quarantined: 0 };
-    // `unchanged` and `tombstoned`: handled, and both cost nothing.
+    // `unchanged`, `tombstoned` and `suppressed`: handled, and none cost
+    // anything. A suppression is deliberately not `failed` — nothing failed;
+    // the brain refused, and a failure code would put a red row on the
+    // staleness display for a connector that is working exactly as instructed.
     default:
       return { outcome: 'ok', written: 0, quarantined: 0 };
   }

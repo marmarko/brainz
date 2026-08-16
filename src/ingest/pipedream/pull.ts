@@ -32,6 +32,13 @@
  *      `quarantine` seam, which contributes no facts and keeps their chunks out
  *      of the embedding backlog — and, because their characters are zeroed
  *      before the estimate, they do not inflate the approval either.
+ *   4. **An erasure tombstone in front of everything.** R12's subject erasure is
+ *      only real if the next poll cannot undo it, and it *would*: the erasure
+ *      soft-deletes her pages and U4's replacement lookup only finds live ones,
+ *      so an unconsulted poll writes a brand-new page about the correspondent
+ *      whose receipt says this brain holds nothing about her — on a five-minute
+ *      cadence. `src/ingest/erased-subjects.ts` is the question this runner asks
+ *      before the meter, and states what a digest-only tombstone can reach.
  *
  * **The gate is U8's, reused, with one adapter.** `gateFirstImport` defers into
  * the `import` job lane; the database's `job_target_suits_its_kind` admits only
@@ -114,6 +121,7 @@ import {
   type ImportTarget,
   type ImportWindow,
 } from '../first-import.ts';
+import { partitionErasedSubjects } from '../erased-subjects.ts';
 import { gateJunk } from '../junk.ts';
 import { countRunItem, finishRun, openRun, recordItem, type IngestFailureCode } from '../log.ts';
 import { mediaFailureFor, type TenantRuntime } from '../import/run.ts';
@@ -249,6 +257,15 @@ export interface PullCounts {
   readonly failed: number;
   readonly tombstoned: number;
   /**
+   * Items an erasure instruction forbids this brain from holding (R12).
+   *
+   * Its own counter, and not folded into `failed`: nothing failed. The provider
+   * offered the message, the fetch worked, and the brain declined to write it —
+   * a number an operator reading a connector's health has to be able to tell
+   * apart from mail that went missing.
+   */
+  readonly suppressed: number;
+  /**
    * Objects preserved and queued for transcription — stored, replaced or
    * already held. Apart from `written` because an attachment is not a page: it
    * becomes one later, in U11's cycle, if there is anything written on it.
@@ -282,6 +299,7 @@ const EMPTY_COUNTS: PullCounts = {
   warned: 0,
   failed: 0,
   tombstoned: 0,
+  suppressed: 0,
   attachments: 0,
 };
 
@@ -292,6 +310,7 @@ interface MutableCounts {
   warned: number;
   failed: number;
   tombstoned: number;
+  suppressed: number;
   attachments: number;
 }
 
@@ -626,7 +645,41 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     // other about what junk is or about what a hidden item costs.
     const classified = gateJunk(listed.items);
 
-    const candidates: ImportCandidate[] = classified.map((entry) => ({
+    // ------------------------------------------------------------------
+    // 2a. **The erasure tombstone — before the estimate, for the same reason
+    //     the junk gate is.**
+    //
+    //     R12's subject erasure owes four properties and the fourth is
+    //     "tombstoned against re-ingestion". Without this consult it is false on
+    //     a cadence: the erasure *soft*-deletes her pages, U4's replacement
+    //     lookup only finds live ones, so the next tick writes a brand-new page
+    //     about the correspondent whose receipt says this brain holds nothing
+    //     about her — within the hour, and with the receipt already handed to a
+    //     third party.
+    //
+    //     Ahead of the meter because an item that will never be written must not
+    //     price the approval. `src/ingest/erased-subjects.ts` states what the
+    //     digest-only tombstone can and cannot reach.
+    // ------------------------------------------------------------------
+    const suppression = await partitionErasedSubjects(tenant.sql, classified);
+    for (const entry of suppression.suppressed) {
+      counts.suppressed += 1;
+      await countRunItem(tenant.sql, run.ingestId, { written: 0, quarantined: 0 });
+      await recordItem(tenant.sql, {
+        originContext,
+        sourceType,
+        externalRef: entry.item.externalRef,
+        disposition: 'suppressed',
+      });
+    }
+    // **Not `incomplete`.** A suppression is a stable fact about the item — the
+    // same class as an empty document — so the cursor moves past it. Holding it
+    // would wedge the source forever on a message that is never going to become
+    // ingestable, and the provider would offer it again on every tick for as
+    // long as the erasure stands.
+    const admitted = suppression.kept;
+
+    const candidates: ImportCandidate[] = admitted.map((entry) => ({
       externalRef: entry.item.externalRef,
       contentSha256: contentDigest(entry.item.title, entry.item.body),
       occurredAt: entry.item.occurredAt,
@@ -645,7 +698,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     };
 
     const selected = new Set(selection.selected.map((candidate) => candidate.externalRef));
-    const items = classified.filter((entry) => selected.has(entry.item.externalRef));
+    const items = admitted.filter((entry) => selected.has(entry.item.externalRef));
 
     // ------------------------------------------------------------------
     // 4. Deletions, **before the gate**.
