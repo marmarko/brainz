@@ -143,6 +143,14 @@ const EXPECTED_TABLES: ReadonlyMap<string, TableClass> = new Map([
   // derived from this row and each row's own origins rather than stored as a
   // per-row flag that could go stale.
   ['severance', 'operational'],
+
+  // Rung 12's holding pen. Aliases a severance took, held for the same 72h
+  // `forget` promises — `entity_alias` is the one derived table this schema lets
+  // be narrower than its parent, so it is the one table with an exact-origin
+  // residue no cascade reaches, and it carries no `deleted_at` to flag. The rows
+  // are user vocabulary rather than a derivation, and the table is a lifecycle
+  // mechanism, so it classifies with the other retraction bookkeeping.
+  ['severed_alias', 'operational'],
 ]);
 
 const SHARED_ORIGIN_TRIGGER_FUNCTION = 'refuse_origin_change';
@@ -439,6 +447,13 @@ const ORIGIN_FIXTURES: ReadonlyMap<string, { readonly where: string; readonly ta
     // U18. The audit record of a destructive operation: an origin that could be
     // edited afterwards is a trail that can be made to describe a different event.
     ['severance', { where: `origin_context = 'personal'`, tamper: `origin_context = 'work'` }],
+    // Rung 12. An archived alias is restored verbatim, so its origins must be as
+    // unwritable in the holding pen as they were in `entity_alias` — otherwise
+    // the undo is a re-derivation wearing a restore's name.
+    [
+      'severed_alias',
+      { where: `alias = 'fence archived alias'`, tamper: `origin_contexts = ARRAY['personal','work']` },
+    ],
   ]);
 
 describe('R15 — the database refuses to let an origin move, on every table that has one', () => {
@@ -485,6 +500,9 @@ describe('R15 — the database refuses to let an origin move, on every table tha
               repeat('d', 64), 'live');
       INSERT INTO severance (origin_context, severed_at, removed, recomputed, surviving_origins)
       VALUES ('personal', now(), '{}'::jsonb, '{}'::jsonb, ARRAY['work']);
+      INSERT INTO severed_alias (entity_id, alias, alias_source, origin_contexts, created_at, severed_at)
+      SELECT (SELECT entity_id FROM entity WHERE canonical_name = 'fence-subject'),
+             'fence archived alias', 'user', ARRAY['personal'], now(), now();
     `);
   });
 

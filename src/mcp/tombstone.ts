@@ -73,9 +73,10 @@ export interface TombstonedTable {
  * ONE list, iterated by {@link restoreForgotten} and {@link purgeExpiredTombstones}
  * both, and that is the whole point of its existing. Three executors write these
  * tombstones and they do not write the same set: `forgetRecord` below reaches
- * four tables, `lifecycle/severance.ts:severOrigin` reaches two more
- * (`entity_card`, `commitment`), and `lifecycle/subject-erasure.ts:eraseSubject`
- * a seventh (`attachment`). The restore knew about the first four. So a user who
+ * four tables, `lifecycle/severance.ts:severOrigin` reaches three more
+ * (`entity_card`, `commitment` and — since the removal class was audited against
+ * the preview column by column — `attachment`), and
+ * `lifecycle/subject-erasure.ts:eraseSubject` that same seventh. The restore knew about the first four. So a user who
  * disconnected the wrong account, or erased the wrong correspondent, pressed
  * undo, got `ok: true`, and got a brain with its entity cards, its commitments
  * and its attachments still deleted — no error and no partial flag, which is
@@ -131,6 +132,75 @@ export const DELETED_AT_IS_NOT_A_TOMBSTONE: readonly { readonly table: string; r
   },
 ];
 
+/**
+ * The tables a retraction takes by **moving the row out**, with the archive it
+ * moves into.
+ *
+ * A third list beside {@link TOMBSTONED_TABLES} and
+ * {@link DELETED_AT_IS_NOT_A_TOMBSTONE}, and it exists for exactly one shape:
+ * a table with rows in severance's removal class and **no `deleted_at` to write
+ * to**. `entity_alias` is the only one, and it is the only one for a reason the
+ * schema states — rung 11 deliberately allows an alias's origins to be *narrower*
+ * than its entity's, where `entity_card`, `entity_edge` and `commitment` all
+ * carry covering constraints that force an exact-origin row to have an
+ * exactly-severed parent. So the residue exists here and nowhere else.
+ *
+ * Why a move rather than a new `deleted_at` column: nine sites in this repo read
+ * aliases, and a tombstone is only honoured by the sites that remember its
+ * predicate. A row that is not in `entity_alias` cannot be returned by a query
+ * against `entity_alias`. And `entity_alias_is_unique_per_entity` is a **total**
+ * unique constraint, so a tombstoned alias would hold its own spelling's slot
+ * against re-creation; an archived one holds nothing.
+ *
+ * Walked by {@link restoreForgotten} and {@link purgeExpiredTombstones} both, for
+ * the same reason {@link TOMBSTONED_TABLES} is: what one retraction mechanism
+ * takes, both sweeps must reach.
+ */
+export interface ArchivedTable {
+  /** Where the row lives while it is retracted. */
+  readonly archive: string;
+  /** Where it goes back to. */
+  readonly live: string;
+  /** The archive's own key, for counting what moved. */
+  readonly key: string;
+  /** The field these counts appear under on a receipt. */
+  readonly field: string;
+  /** The columns copied back, in order. Identical on both tables by construction. */
+  readonly columns: readonly string[];
+  /**
+   * What must NOT already exist in the live table for the row to come back.
+   *
+   * The archive's counterpart to {@link TombstonedTable.restorableWhen}, and the
+   * same schema fact one step further along: the slot an archived row vacated is
+   * free, so anything may have taken it while the row was away. Un-archiving into
+   * an occupied slot raises `23505` and aborts the whole restore transaction —
+   * every other table's rows with it — so the row that cannot come back is left
+   * archived and counted rather than raised.
+   */
+  readonly blockedWhen: string;
+}
+
+export const ARCHIVED_TABLES: readonly ArchivedTable[] = [
+  {
+    archive: 'severed_alias',
+    live: 'entity_alias',
+    key: 'severed_alias_id',
+    field: 'aliases',
+    columns: ['entity_id', 'alias', 'alias_source', 'confidence', 'origin_contexts', 'created_at'],
+    // `entity_alias_is_unique_per_entity UNIQUE (entity_id, alias)` — total, not
+    // partial, which is the whole reason this table is archived rather than
+    // flagged.
+    blockedWhen:
+      'EXISTS (SELECT 1 FROM entity_alias live ' +
+      'WHERE live.entity_id = severed_alias.entity_id AND live.alias = severed_alias.alias)',
+  },
+];
+
+/** Counts per archive, keyed by the field names {@link ARCHIVED_TABLES} declares. */
+export interface ArchiveCounts {
+  readonly aliases: number;
+}
+
 /** Counts per table, keyed by the field names {@link TOMBSTONED_TABLES} declares. */
 export interface TombstoneCounts {
   readonly pages: number;
@@ -144,6 +214,10 @@ export interface TombstoneCounts {
 
 function noCounts(): Record<string, number> {
   return Object.fromEntries(TOMBSTONED_TABLES.map((entry) => [entry.field, 0]));
+}
+
+function noArchiveCounts(): Record<string, number> {
+  return Object.fromEntries(ARCHIVED_TABLES.map((entry) => [entry.field, 0]));
 }
 
 export interface CascadeCounts {
@@ -308,6 +382,28 @@ export type RestoreOutcome =
       readonly ok: true;
       readonly restored: TombstoneCounts;
       /**
+       * Rows moved back out of an archive — {@link ARCHIVED_TABLES}.
+       *
+       * Reported beside `restored` rather than folded into it because the two
+       * are different operations: one clears a flag, the other re-inserts a row
+       * into a table that may have moved on without it.
+       */
+      readonly unarchived: ArchiveCounts;
+      /**
+       * Aliases left archived because the spelling is live again for that entity.
+       *
+       * The archive vacates the slot — that is the point of it — so a
+       * consolidation merge, a re-ingest, or the user re-connecting the account
+       * can write the same `(entity_id, alias)` while the row is away. An
+       * unguarded re-insert then raises `23505` on
+       * `entity_alias_is_unique_per_entity` and takes the whole restore
+       * transaction with it. The live spelling is the current one; the archived
+       * row stays archived and the purge takes it at the TTL. What must not
+       * happen is that being silent — the same rule `supersededCards` states one
+       * table over.
+       */
+      readonly supersededAliases: number;
+      /**
        * Cards left deleted because the entity has a live one again.
        *
        * `entity_card_one_live_per_entity` is a UNIQUE index over live cards and
@@ -356,14 +452,65 @@ export async function restoreForgotten(
         blocked += (await tombstonedAt(tx, entry.table, request.deletedAt)) - restored;
       }
     }
-    return { counts, blocked };
+
+    // The second mechanism, walked from its own declaration for the same reason:
+    // a row severance took by moving must be reachable by the same undo as the
+    // rows it took by flagging, or the receipt's `archived` count is a promise
+    // the undo does not keep.
+    const archives = noArchiveCounts();
+    let squatted = 0;
+    for (const entry of ARCHIVED_TABLES) {
+      const moved = await unarchived(tx, entry, request.deletedAt);
+      archives[entry.field] = moved;
+      squatted += (await archivedAt(tx, entry.archive, request.deletedAt)) - moved;
+    }
+    return { counts, blocked, archives, squatted };
   });
 
   return {
     ok: true,
     restored: outcome.counts as unknown as TombstoneCounts,
+    unarchived: outcome.archives as unknown as ArchiveCounts,
+    supersededAliases: outcome.squatted,
     supersededCards: outcome.blocked,
   };
+}
+
+/**
+ * Move one archive's rows for this instant back into their live table.
+ *
+ * `INSERT … SELECT` then `DELETE`, in one transaction and in that order, so a
+ * row blocked by {@link ArchivedTable.blockedWhen} stays in the archive for the
+ * purge to take at the TTL rather than being deleted by an undo that could not
+ * complete it. Identifiers and the guard predicate are module constants, never
+ * input.
+ */
+async function unarchived(tx: SQL, entry: ArchivedTable, severedAt: string): Promise<number> {
+  const columns = entry.columns.join(', ');
+  const rows = (await tx.unsafe(
+    `WITH restorable AS (
+       SELECT ${entry.key}, ${columns} FROM ${entry.archive}
+        WHERE severed_at = $1::timestamptz AND NOT (${entry.blockedWhen})
+     ),
+     put_back AS (
+       INSERT INTO ${entry.live} (${columns})
+       SELECT ${columns} FROM restorable
+     )
+     DELETE FROM ${entry.archive}
+      WHERE ${entry.key} IN (SELECT ${entry.key} FROM restorable)
+     RETURNING ${entry.key}`,
+    [severedAt],
+  )) as Array<Record<string, unknown>>;
+  return rows.length;
+}
+
+/** Rows still archived at this instant — the denominator for a guarded un-archive. */
+async function archivedAt(tx: SQL, archive: string, severedAt: string): Promise<number> {
+  const rows = (await tx.unsafe(
+    `SELECT count(*)::int AS n FROM ${archive} WHERE severed_at = $1::timestamptz`,
+    [severedAt],
+  )) as Array<{ n: number }>;
+  return Number(rows[0]?.n ?? 0);
 }
 
 async function touched(tx: SQL, entry: TombstonedTable, deletedAt: string): Promise<number> {
@@ -390,7 +537,10 @@ async function tombstonedAt(tx: SQL, table: string, deletedAt: string): Promise<
  * What a purge removed. A superset of {@link CascadeCounts}, because the purge
  * reaches two tables no single `forget` cascade writes to.
  */
-export interface PurgeCounts extends TombstoneCounts {}
+export interface PurgeCounts extends TombstoneCounts {
+  /** Rows hard-deleted out of {@link ARCHIVED_TABLES}, by their `severed_at`. */
+  readonly aliases: number;
+}
 
 /**
  * Hard-delete every tombstone past the TTL.
@@ -403,7 +553,10 @@ export interface PurgeCounts extends TombstoneCounts {}
  *   3. facts, whose `fact_source` rows cascade with them;
  *   4. chunks;
  *   5. pages, which cascade to any chunk or fact still referencing them;
- *   6. entities, whose slugs, aliases and cards cascade.
+ *   6. entities, whose slugs, aliases and cards cascade;
+ *   7. the archives ({@link ARCHIVED_TABLES}), by their own `severed_at` — last,
+ *      so an archived alias whose entity step 6 already took is counted as that
+ *      cascade's rather than as this step's.
  *
  * **Why steps 2 exists rather than being left to the cascades.** A commitment
  * cascades from its fact and its page, and an attachment from its page — so for
@@ -440,6 +593,17 @@ export async function purgeExpiredTombstones(
     const counts = noCounts();
     for (const entry of TOMBSTONED_TABLES) {
       counts[entry.field] = await deleted(tx, entry.table, entry.key, cutoff);
+    }
+
+    // The archives, on the same cutoff and after the tables they hang off, so an
+    // archive row whose entity the loop above already took is counted as the
+    // cascade's rather than raising on a row that is no longer there.
+    for (const entry of ARCHIVED_TABLES) {
+      const rows = (await tx.unsafe(
+        `DELETE FROM ${entry.archive} WHERE severed_at <= $1::timestamptz RETURNING ${entry.key}`,
+        [cutoff],
+      )) as Array<Record<string, unknown>>;
+      counts[entry.field] = rows.length;
     }
     return counts as unknown as PurgeCounts;
   });

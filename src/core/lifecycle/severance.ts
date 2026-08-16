@@ -23,6 +23,17 @@
  * hard purge that follows is the one that already exists
  * (`src/mcp/tombstone.ts:purgeExpiredTombstones`), on the same clock.
  *
+ * **Two mechanisms, because one table cannot use the first.** Seven tables carry
+ * a `deleted_at` a user retraction may write, and the first class is tombstoned
+ * in place. `entity_alias` carries none — and is the one derived table this
+ * schema deliberately allows to be *narrower* than its parent (rung 11), so it
+ * is also the only one where an exact-origin row can outlive a severance that
+ * keeps the parent. Those rows are **moved** into rung 12's `severed_alias`,
+ * carrying the same instant, so the same undo and the same purge reach them. The
+ * receipt reports the two separately (`tombstoned`, `archived`) rather than
+ * summing them, because a caller that could not tell which happened could not
+ * tell what an undo would do.
+ *
  * **It does not re-derive.** Re-derivation is a consolidation cycle and belongs
  * to U11. What this unit owes is that the *need* for it is recorded honestly and
  * is discoverable, which is what the `severance` row (rung 10) is for, and that
@@ -89,6 +100,16 @@ export interface SeveranceReceipt {
   readonly survivingOrigins: readonly string[];
   /** Rows actually tombstoned, per table. Compared against `removed` by the suite. */
   readonly tombstoned: TombstonedCounts;
+  /**
+   * Rows severance took by **moving** them, because they have no `deleted_at` to
+   * write and no cascade to ride.
+   *
+   * Separate from {@link tombstoned} rather than folded into it, because the two
+   * are different mechanisms with different failure modes and a caller reading
+   * one number could not tell which happened. Same clock, same undo key: see
+   * {@link archiveExactOriginAliases}.
+   */
+  readonly archived: ArchivedCounts;
   /** True when this origin had already been severed and nothing was left to take. */
   readonly alreadySevered: boolean;
 }
@@ -96,10 +117,26 @@ export interface SeveranceReceipt {
 export interface TombstonedCounts {
   readonly pages: number;
   readonly chunks: number;
+  /**
+   * **Counted by the preview since U17 and taken by nothing until now.**
+   *
+   * An attachment is scalar-origin like a page, carries its own `deleted_at`,
+   * and is already swept by `purgeExpiredTombstones` — it was simply absent from
+   * the executor, so `removed.attachments` was a number the user consented to
+   * that did not happen and the stored object outlived the disconnect. It is not
+   * covered by the page cascade either: `attachment.page_id` is **nullable** and
+   * carries no origin-union constraint against its page, so a work attachment
+   * can hang off nothing at all or off a page that survives.
+   */
+  readonly attachments: number;
   readonly facts: number;
   readonly entities: number;
   readonly entityCards: number;
   readonly commitments: number;
+}
+
+export interface ArchivedCounts {
+  readonly aliases: number;
 }
 
 export type SeveranceOutcome =
@@ -132,6 +169,7 @@ export async function severOrigin(sql: SQL, request: SeveranceRequest): Promise<
     const preview = await previewSeverance(tx as unknown as SQL, { origin: request.origin });
 
     const tombstoned = await tombstoneExactOrigin(tx, request.origin, at);
+    const archived = await archiveExactOriginAliases(tx, request.origin, at);
 
     const rows = (await tx`
       INSERT INTO severance (origin_context, severed_at, removed, recomputed, surviving_origins)
@@ -151,11 +189,18 @@ export async function severOrigin(sql: SQL, request: SeveranceRequest): Promise<
         recomputed: preview.recomputed,
         survivingOrigins: preview.survivingOrigins,
         tombstoned,
+        archived,
         // Idempotency, reported rather than hidden: a second severance of the
         // same origin is a no-op that still writes a record, and the caller can
         // tell the two apart.
-        alreadySevered:
-          tombstoned.pages + tombstoned.chunks + tombstoned.facts + tombstoned.entities === 0,
+        //
+        // **Every take, not four of them.** The sum used to name `pages`,
+        // `chunks`, `facts` and `entities`, which reported "nothing left" over a
+        // severance that took a parentless attachment or an alias off a
+        // surviving mixed entity — the two rows that have no parent to have gone
+        // with the first four. Derived from the objects so a table added to
+        // either mechanism joins the sum without anyone remembering to.
+        alreadySevered: totalOf(tombstoned) + totalOf(archived) === 0,
       },
     };
   });
@@ -176,6 +221,21 @@ export async function severOrigin(sql: SQL, request: SeveranceRequest): Promise<
  * tombstone every mixed row: the user disconnects work and loses their shared
  * history with everyone they know through both accounts, silently, having been
  * shown a preview that said those rows would survive.
+ *
+ * **`entity_edge` is the one column of `removed` with no statement here, and the
+ * omission is a schema fact rather than an oversight.** `entity_edge_origin_union`
+ * (rung 2) refuses any edge that does not carry the origins of both entities it
+ * connects, so an edge whose origins are exactly the severed one has two
+ * exactly-severed endpoints — both tombstoned by the `entities` statement below,
+ * both hard-deleted by the purge, and the edge leaves with them through
+ * `entity_edge_subject_fkey ... ON DELETE CASCADE`. Until then it has no live
+ * endpoint to be reached from, which is what `search/arms.ts:graphArm` seeds its
+ * neighbourhood off. Writing a `deleted_at` here instead would overload the one
+ * column `tombstone.ts:DELETED_AT_IS_NOT_A_TOMBSTONE` reserves for a
+ * *reconciliation* retraction, and would leave a tombstone no sweep reaches.
+ * `test/core/lifecycle/severance-removal-class.test.ts` asserts the constraint
+ * refuses the shape that would make this wrong, rather than trusting this
+ * paragraph.
  */
 async function tombstoneExactOrigin(
   tx: TransactionSQL,
@@ -196,6 +256,17 @@ async function tombstoneExactOrigin(
       `UPDATE chunk SET deleted_at = $2::timestamptz
         WHERE origin_context = $1 AND deleted_at IS NULL RETURNING chunk_id`,
     ),
+    // `deleted_at IS NULL`, like every statement here, and here it is doing more
+    // than skipping work: re-stamping a row a `forget` already retracted would
+    // move it onto *this* instant and quietly detach it from the undo of the
+    // call that took it. (`previewSeverance`'s attachment arm carries no such
+    // filter, so `removed.attachments` over-counts by any attachment a prior
+    // retraction already holds — reported rather than repaired, since the
+    // preview is not this module's.)
+    attachments: await count(
+      `UPDATE attachment SET deleted_at = $2::timestamptz
+        WHERE origin_context = $1 AND deleted_at IS NULL RETURNING attachment_id`,
+    ),
     facts: await count(
       `UPDATE fact SET deleted_at = $2::timestamptz
         WHERE origin_contexts <@ ARRAY[$1]::text[] AND deleted_at IS NULL RETURNING fact_id`,
@@ -213,6 +284,90 @@ async function tombstoneExactOrigin(
         WHERE origin_contexts <@ ARRAY[$1]::text[] AND deleted_at IS NULL RETURNING commitment_id`,
     ),
   };
+}
+
+/**
+ * Move every alias whose origins are exactly the severed one into rung 12's
+ * holding pen.
+ *
+ * **Why this table needs a statement of its own.** Every other derived table in
+ * this schema is protected from the exact-origin residue by a covering
+ * constraint — a card must carry its entity's origins, an edge both its
+ * endpoints', a commitment its fact's and page's — so an exact-origin row of
+ * those kinds always has an exactly-severed parent that the statements above
+ * tombstone. `entity_alias` has no such constraint **on purpose**: rung 11's
+ * whole argument is that a spelling one sender used in one mailbox must be
+ * allowed to be narrower than the person it names. That is what makes a
+ * work-only alias on a *mixed* entity reachable, and what leaves it with no
+ * `deleted_at` to be written and no cascade to ride.
+ *
+ * **Moved rather than flagged.** Nine sites in this repository read aliases; a
+ * tombstone is only honoured by the ones that remember its predicate, and the
+ * one that forgets keeps serving the spelling the user disconnected. A row that
+ * is not in `entity_alias` is invisible to a query against `entity_alias`
+ * whether or not its author has heard of severance. It also occupies no slot,
+ * which matters because `entity_alias_is_unique_per_entity` is a **total**
+ * unique constraint — a tombstoned alias would block its own respelling until
+ * the purge, and making that index partial is a contracting change.
+ *
+ * **`coalesce(a.origin_contexts, e.origin_contexts)`, the read fence's own
+ * expression.** `reads.ts:entityCard` admits an alias when that value is a
+ * subset of the grant; this takes it when that value is a subset of the severed
+ * singleton. So what leaves is exactly the set of spellings only a grant holding
+ * the severed origin could ever have been shown — the same rule read forwards
+ * and backwards, rather than a second definition free to disagree. The
+ * `coalesce` also decides the pre-rung-11 rows: an unstamped alias is judged by
+ * its entity's whole union, so it is taken only when the entity itself is
+ * exactly severed (and would have cascaded anyway), never on a guess about
+ * provenance nobody recorded.
+ *
+ * **Same clock, same key.** `severed_at` is the severance instant every other
+ * row in this transaction carries, so `restoreForgotten` un-does all of them
+ * together and `purgeExpiredTombstones` sweeps them on the same 72-hour cutoff.
+ * Severance stays no more final than `forget`, which is the guarantee that ruled
+ * out a hard delete here.
+ */
+async function archiveExactOriginAliases(
+  tx: TransactionSQL,
+  origin: string,
+  at: string,
+): Promise<ArchivedCounts> {
+  // One statement, so the row cannot exist in both tables or in neither: the
+  // DELETE's output is the INSERT's input rather than two statements agreeing.
+  const rows = (await tx.unsafe(
+    `WITH taken AS (
+       DELETE FROM entity_alias a
+        USING entity e
+        WHERE e.entity_id = a.entity_id
+          AND coalesce(a.origin_contexts, e.origin_contexts) <@ ARRAY[$1]::text[]
+       RETURNING a.entity_id, a.alias, a.alias_source, a.confidence,
+                 a.origin_contexts, a.created_at
+     )
+     INSERT INTO severed_alias (entity_id, alias, alias_source, confidence,
+                                origin_contexts, created_at, severed_at)
+     SELECT entity_id, alias, alias_source, confidence, origin_contexts,
+            created_at, $2::timestamptz
+       FROM taken
+     RETURNING severed_alias_id`,
+    [origin, at],
+  )) as Array<unknown>;
+
+  return { aliases: rows.length };
+}
+
+/**
+ * Every take in one object's worth of counts, summed.
+ *
+ * Takes the object rather than a list of field names, so a table added to either
+ * mechanism is counted by construction. `interface` types carry no index
+ * signature, hence `object` and the runtime narrowing rather than
+ * `Record<string, number>`.
+ */
+function totalOf(counts: object): number {
+  return Object.values(counts).reduce<number>(
+    (sum, value) => sum + (typeof value === 'number' ? value : 0),
+    0,
+  );
 }
 
 /**

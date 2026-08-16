@@ -106,6 +106,42 @@ export async function inventory(
  * grant and nothing else — and the agent write origin is added unconditionally so
  * that a brand-new tenant, which holds no rows at all, can still store its first
  * memory and read it back (R2a's activation loop).
+ *
+ * ---------------------------------------------------------------------------
+ * **A SEVERED ORIGIN KEEPS RESOLVING HERE, AND THAT IS NOT A LEAK. DO NOT
+ * "FIX" IT BY SUBTRACTING THE SEVERANCE LOG.**
+ *
+ * `origin_contexts` is immutable by trigger (R15), and the rows a severance
+ * deliberately *keeps* — the mixed ones, whose origins include the severed one
+ * and others — carry it for as long as they live. So after
+ * `lifecycle/severance.ts:severOrigin` **and** after
+ * `tombstone.ts:purgeExpiredTombstones`, the census still reports `work:mail`
+ * and a whole-brain grant still expands to include it.
+ *
+ * That reads like a residue and it is the opposite: it is what keeps the other
+ * half of severance's promise. `fence.ts:fenceRow` is a **subset** rule, so the
+ * instant `work:mail` leaves the grant, every mixed fact, every mixed card and
+ * every shared alias in the brain stops being readable — reversing
+ * `severance.ts`'s "rows whose origins **include** it and others — these stay",
+ * which `test/core/lifecycle/severance.test.ts` pins as "the surviving halves
+ * are still there — severance is not a purge of the brain". Subtracting severed
+ * origins from this census and keeping the mixed rows readable are the same
+ * knob turned two ways; there is no setting that does both.
+ *
+ * What makes the origin harmless to resolve is that nothing in severance's
+ * removal class survives to be reached through it: six tables are tombstoned,
+ * `attachment` with them, and `entity_alias` — the one derived table this schema
+ * lets be narrower than its parent, and therefore the only one whose
+ * exact-origin rows can outlive an entity that survives — is moved to rung 12's
+ * `severed_alias`. `test/core/lifecycle/severance-alias-residue.test.ts` asserts
+ * both halves: the census still contains the severed origin, and every live row
+ * that carries it is a mixed one.
+ *
+ * The residual, named rather than rounded up: a connector that keeps *writing*
+ * under a severed origin re-enters this census through the `page` arm on its
+ * next poll. That is the revocation leg's problem — `severance.ts:grantsEmptiedBy`
+ * names the credentials a severance emptied — not the census's, because a census
+ * that hid live rows would be lying about what the brain holds.
  */
 export async function brainOrigins(sql: SQL): Promise<string[]> {
   const rows = (await sql.unsafe(
