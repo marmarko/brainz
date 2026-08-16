@@ -123,17 +123,80 @@ export function verifyReconstruction(request: VerifyRequest): VerifyOutcome {
 }
 
 /**
- * The document's stable identity across replacement.
+ * The separator between a document key's origin and its ref.
+ *
+ * A character the origin grammar (`src/mcp/grant-scope.ts`) cannot produce:
+ * origins are `[a-z][a-z0-9_-]*:[a-z0-9][a-z0-9_.-]*`, so the **first** `|` in a
+ * key is always the separator even when the provider's own id contains one. That
+ * is what makes {@link parseDocKey} a split rather than a guess.
+ */
+export const DOC_KEY_SEPARATOR = '|';
+
+/**
+ * The document's stable identity across replacement: **its origin and its ref**.
  *
  * U4 replaces a changed document by tombstoning the previous page and writing a
  * new one, so the page id moves and the `external_ref` does not. A history or an
  * export path keyed on the page id fragments at exactly the moment there is
  * something to remember. Pages with no upstream id — a `remember` note — fall
  * back to their own id, which is stable because nothing replaces them.
+ *
+ * **The origin is half of the identity, not decoration.** `external_ref` is the
+ * provider's own id and carries no cross-origin uniqueness: a shared calendar
+ * event pulled by a work connector and a personal one is two live pages at one
+ * ref, which is exactly why `write-path.ts:livePageByRef` narrows its
+ * replacement lookup to `(external_ref, origin_context)`. Keyed on the ref
+ * alone, `page_version`'s unique index `(doc_key, version)` made the two copies
+ * share **one sequence**: each origin's fenced history then showed `[1, 3]`
+ * where the other held `2` — a number the caller can see referenced and cannot
+ * use — and "revert to version 2" named a row the caller was refused. Folding
+ * the origin in gives each copy its own contiguous sequence, which is what the
+ * rung's own DDL says a version number is.
  */
-export function docKeyFor(page: { readonly pageId: string; readonly externalRef: string | null }): string {
+export function docKeyFor(page: {
+  readonly originContext: string;
+  readonly pageId: string;
+  readonly externalRef: string | null;
+}): string {
   const ref = page.externalRef?.trim() ?? '';
-  return ref.length > 0 ? ref : `page:${page.pageId}`;
+  const identity = ref.length > 0 ? ref : `page:${page.pageId}`;
+  return `${page.originContext}${DOC_KEY_SEPARATOR}${identity}`;
+}
+
+export interface ParsedDocKey {
+  /**
+   * The origin half, or `null` for a key written before the fold.
+   *
+   * Legacy keys are not an edge case invented here: the fold is a change in what
+   * this function *writes*, and rewriting the rows already banked under bare
+   * keys is a contracting migration the ladder's own expand-only rule refuses
+   * (`src/control/migrate.ts:findExpandContractViolations` — the previous fleet
+   * version still reads those rows by the bare key). So old keys keep resolving
+   * the way they always did, and `versions.ts` states the residue.
+   */
+  readonly originContext: string | null;
+  /** `external_ref` where there is one, and `page:<id>` where there is not. */
+  readonly ref: string;
+  /** The ref as U4 knows it: `null` for a page with no upstream id. */
+  readonly externalRef: string | null;
+}
+
+/**
+ * The inverse of {@link docKeyFor}, so the two directions cannot disagree.
+ *
+ * A revert needs the ref back — to find the live page it is replacing and to
+ * hand `ingestDocument` the id it keys replacement on — and a second parser
+ * somewhere else is a second opinion about what a document key means.
+ */
+export function parseDocKey(docKey: string): ParsedDocKey {
+  const separator = docKey.indexOf(DOC_KEY_SEPARATOR);
+  const originContext = separator > 0 ? docKey.slice(0, separator) : null;
+  const ref = separator > 0 ? docKey.slice(separator + DOC_KEY_SEPARATOR.length) : docKey;
+  return {
+    originContext,
+    ref,
+    externalRef: ref.startsWith('page:') ? null : ref,
+  };
 }
 
 export interface ReconstructedPage {
@@ -265,7 +328,11 @@ async function rebuild(
 
   return {
     pageId: row.page_id,
-    docKey: docKeyFor({ pageId: row.page_id, externalRef: row.external_ref }),
+    docKey: docKeyFor({
+      originContext: row.origin_context,
+      pageId: row.page_id,
+      externalRef: row.external_ref,
+    }),
     originContext: row.origin_context,
     subjectContext: row.subject_context,
     subjectConfidence: row.subject_confidence,

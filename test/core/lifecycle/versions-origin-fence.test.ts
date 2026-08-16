@@ -46,19 +46,29 @@
  * fixed while the reason is fresh rather than when a caller lands.
  *
  * ============================================================================
- * WHAT THIS FILE DOES NOT CLAIM
+ * AND THE SEQUENCE, WHICH USED TO BE THE HALF THIS FILE ONLY PINNED
  * ============================================================================
  *
- * **`doc_key` is still the bare `external_ref`, so one version *sequence* spans
- * both origins.** After the fences below, no row is banked from the wrong
- * origin and no digest is compared against the wrong origin's — but the numbers
- * are still allocated from a chain both share, so a fenced `listVersions` shows
- * `[1, 3]` where the other origin holds `2`. Closing that means folding the
- * origin into `doc_key`, which is a new rung (the unique index is
- * `(doc_key, version)`), a renumbering of existing rows, and a matching change
- * in `export/reconstruct.ts:docKeyFor` and `subject-erasure.ts:docKeyOf`. The
- * last test below pins the gap as an observed fact rather than leaving it to be
- * rediscovered, and the ledger row names it.
+ * `doc_key` was the bare `external_ref`, so after the three fences above no row
+ * was banked from the wrong origin and no digest was compared against the wrong
+ * origin's — but the *numbers* still came from a chain both mailboxes shared,
+ * and a fenced `listVersions` showed `[1, 3]` where the other origin held `2`.
+ * Not a disclosure, since every row is fenced; a history with a hole in it, and
+ * a "revert to version 2" naming a row the caller is then refused.
+ *
+ * `docKeyFor` now folds the origin in (`src/core/export/reconstruct.ts`), so
+ * each copy has its own contiguous sequence and section 4 below asserts the
+ * closed property rather than pinning the open one.
+ *
+ * **What that did NOT do is renumber the rows already banked.** A key written
+ * before the fold stays bare, because `UPDATE page_version SET doc_key = …` is a
+ * contracting migration and the ladder refuses one:
+ * `src/control/migrate.ts:findExpandContractViolations` admits `CREATE`,
+ * `COMMENT`, `INSERT` and additive `ALTER`, and its header says there is no
+ * waiver list on purpose — the previous fleet version still reads those rows by
+ * the bare key. So a pre-fold brain has a document whose history sits in two
+ * sequences. In production that set is empty, because `versions.ts` still has no
+ * caller; doing the fold before one lands is what keeps it empty.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
@@ -116,13 +126,25 @@ async function livePageId(origin: string, ref: string): Promise<string> {
   return row.page_id;
 }
 
+/**
+ * Every snapshot of one ref, **across both origins** — which is now two document
+ * keys rather than one, and is deliberately queried on the ref rather than on
+ * either key. A helper that asked for one origin's key could not observe the
+ * cross-origin defects this file exists to catch.
+ */
 async function versionRows(
   ref: string,
 ): Promise<Array<{ version: number; origin_context: string; body: string; captured_from: string }>> {
   return (await fixture.tenantSql`
     SELECT version, origin_context, body, captured_from FROM page_version
-     WHERE doc_key = ${ref} ORDER BY version
+     WHERE doc_key LIKE ${`%|${ref}`} OR doc_key = ${ref}
+     ORDER BY origin_context, version
   `) as never;
+}
+
+/** The document key one origin's copy of a ref is banked under. */
+function docKey(origin: string, ref: string): string {
+  return `${origin}|${ref}`;
 }
 
 beforeAll(async () => {
@@ -231,7 +253,10 @@ describe('the capture compares a digest against its own origin', () => {
 
       // And each origin can actually read its own, which is the user-visible
       // half: a grant on one mailbox has a history for its own document.
-      const personalOnly = await listVersions(fixture.tenantSql, { docKey: REF, grant: [PERSONAL] });
+      const personalOnly = await listVersions(fixture.tenantSql, {
+        docKey: docKey(PERSONAL, REF),
+        grant: [PERSONAL],
+      });
       expect(personalOnly).toHaveLength(1);
       expect(personalOnly[0]?.originContext).toBe(PERSONAL);
     },
@@ -285,7 +310,7 @@ describe('revert resolves the live page inside the fence', () => {
 
       const outcome = await revertPage(
         { ...fixture.runtime, budget: uncappedBudget('versions-fence') },
-        { docKey: REF, version: workVersion.version, grant: [WORK], now: new Date() },
+        { docKey: docKey(WORK, REF), version: workVersion.version, grant: [WORK], now: new Date() },
       );
       expect(outcome.ok).toBe(true);
       if (!outcome.ok) return;
@@ -304,7 +329,10 @@ describe('revert resolves the live page inside the fence', () => {
       const undo = outcome.undoVersion;
       expect(undo).not.toBeNull();
       if (undo === null) return;
-      const readable = await listVersions(fixture.tenantSql, { docKey: REF, grant: [WORK] });
+      const readable = await listVersions(fixture.tenantSql, {
+        docKey: docKey(WORK, REF),
+        grant: [WORK],
+      });
       expect(readable.map((version) => version.version)).toContain(undo);
 
       // The personal page is untouched throughout: a revert in one mailbox is
@@ -320,12 +348,13 @@ describe('revert resolves the live page inside the fence', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. The half this change does NOT close, pinned rather than described.
+// 4. The sequence itself: one per origin's copy, so a fenced history has no
+//    gaps and no number a caller can see referenced and cannot use.
 // ---------------------------------------------------------------------------
 
-describe('what is still shared across origins', () => {
+describe('the version sequence belongs to one origin', () => {
   test(
-    'the version SEQUENCE is one per external_ref, so a fenced history has gaps',
+    'two origins holding one ref each number their own copy from 1',
     async () => {
       const REF = 'gcal:evt-sequence';
       await write(WORK, REF, 'work only');
@@ -340,24 +369,78 @@ describe('what is still shared across origins', () => {
         capturedFrom: 'live',
       });
 
-      // Both banked — that is the fix above. What is NOT fixed is the numbering:
-      // `doc_key` is the bare `external_ref` and the unique index is
-      // `(doc_key, version)`, so the two origins allocate from one sequence.
+      // The closed property. `doc_key` folds the origin in, so the two copies
+      // allocate from two sequences and each is contiguous from 1 — which is
+      // what `page_version`'s own DDL says a version number is ("Contiguous
+      // from 1 per doc_key, oldest first") and what it could not be while the
+      // key was the bare ref.
       const all = await versionRows(REF);
-      expect(all.map((row) => row.version)).toEqual([1, 2]);
+      expect(all.map((row) => `${row.origin_context}#${row.version}`)).toEqual([
+        `${PERSONAL}#1`,
+        `${WORK}#1`,
+      ]);
 
-      // A grant on one mailbox therefore sees a history whose numbers skip. It
-      // is not a disclosure — every row is fenced, and the bodies are not
-      // readable — but "revert to version 2" is a number this caller can see
-      // referenced and cannot use. Closing it is a rung, not an edit; see the
-      // header and `upstream/concepts.jsonl:gap.data-lifecycle`.
-      const workOnly = await listVersions(fixture.tenantSql, { docKey: REF, grant: [WORK] });
-      expect(workOnly).toHaveLength(1);
-      expect(workOnly[0]?.version).toBe(1);
+      // And the user-visible half: a grant on one mailbox reads a history whose
+      // numbers start at 1 and skip nothing. Before the fold this pair was
+      // `[1]` and `[2]` — not a disclosure, since every row was fenced, but a
+      // history with a hole where another credential's snapshot sat, and a
+      // "version 2" this caller could see referenced and never use.
+      const workOnly = await listVersions(fixture.tenantSql, {
+        docKey: docKey(WORK, REF),
+        grant: [WORK],
+      });
+      expect(workOnly.map((version) => version.version)).toEqual([1]);
 
-      const personalOnly = await listVersions(fixture.tenantSql, { docKey: REF, grant: [PERSONAL] });
-      expect(personalOnly).toHaveLength(1);
-      expect(personalOnly[0]?.version).toBe(2);
+      const personalOnly = await listVersions(fixture.tenantSql, {
+        docKey: docKey(PERSONAL, REF),
+        grant: [PERSONAL],
+      });
+      expect(personalOnly.map((version) => version.version)).toEqual([1]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'and one origin editing twice numbers 1 then 2, so the fold did not stop the sequence',
+    async () => {
+      const REF = 'gcal:evt-sequence-2';
+      await write(WORK, REF, 'work v1');
+      await capturePageVersion(fixture.tenantSql, {
+        pageId: await livePageId(WORK, REF),
+        capturedFrom: 'live',
+      });
+      // An edit in the same mailbox: U4 tombstones the predecessor and writes a
+      // new page at the same ref and origin, so the next snapshot is version 2
+      // of the same document rather than version 1 of a new one.
+      await write(WORK, REF, 'work v2');
+      const second = await capturePageVersion(fixture.tenantSql, {
+        pageId: await livePageId(WORK, REF),
+        capturedFrom: 'live',
+      });
+      expect(second.ok).toBe(true);
+      if (!second.ok) return;
+      expect(second.version).toBe(2);
+      expect(second.docKey).toBe(docKey(WORK, REF));
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a key from one origin cannot be used to revert another origin`s document',
+    async () => {
+      // The key now carries the origin, so a work grant naming the personal
+      // key is refused by the fence rather than resolving to a row it may not
+      // read. The fence was already the control; what the fold adds is that the
+      // *name* of the other origin's history is not a number away from this
+      // caller's own.
+      const REF = 'gcal:evt-sequence';
+      const refused = await revertPage(
+        { ...fixture.runtime, budget: uncappedBudget('versions-fence') },
+        { docKey: docKey(PERSONAL, REF), version: 1, grant: [WORK], now: new Date() },
+      );
+      expect(refused.ok).toBe(false);
+      if (refused.ok) return;
+      expect(refused.reason).toBe('scope_denied');
     },
     TEST_TIMEOUT_MS,
   );

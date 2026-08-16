@@ -41,6 +41,12 @@ import {
 const SETUP_TIMEOUT_MS = 180_000;
 const TEST_TIMEOUT_MS = 120_000;
 const REF = 'gmail:thread-1';
+/**
+ * The document key, which folds the origin in: `external_ref` carries no
+ * cross-origin uniqueness, so a document is `(origin, ref)` and its version
+ * sequence belongs to that pair rather than to the ref both mailboxes share.
+ */
+const DOC_KEY = `${ORIGIN}|${REF}`;
 const GRANT = [ORIGIN];
 
 let fixture: IngestFixture;
@@ -103,7 +109,7 @@ describe('history is captured, and it is more than one deep', () => {
   test(
     'the document has three versions, oldest first',
     async () => {
-      const versions = await listVersions(fixture.tenantSql, { docKey: REF, grant: GRANT });
+      const versions = await listVersions(fixture.tenantSql, { docKey: DOC_KEY, grant: GRANT });
       expect(versions.map((version) => version.version)).toEqual([1, 2, 3]);
       expect(versions[0]?.body).toContain('one');
       expect(versions[1]?.body).toContain('two');
@@ -115,7 +121,7 @@ describe('history is captured, and it is more than one deep', () => {
   test(
     'every captured body verifies against the digest it was captured at',
     async () => {
-      const versions = await listVersions(fixture.tenantSql, { docKey: REF, grant: GRANT });
+      const versions = await listVersions(fixture.tenantSql, { docKey: DOC_KEY, grant: GRANT });
       for (const version of versions) {
         expect(contentDigest(version.title, version.body)).toBe(version.contentSha256);
       }
@@ -126,14 +132,14 @@ describe('history is captured, and it is more than one deep', () => {
   test(
     'capturing the same content twice does not grow the history',
     async () => {
-      const before = await listVersions(fixture.tenantSql, { docKey: REF, grant: GRANT });
+      const before = await listVersions(fixture.tenantSql, { docKey: DOC_KEY, grant: GRANT });
       const outcome = await capturePageVersion(fixture.tenantSql, {
         pageId: await livePageId(),
         capturedFrom: 'live',
       });
       expect(outcome.ok).toBe(true);
       if (outcome.ok) expect(outcome.status).toBe('unchanged');
-      const after = await listVersions(fixture.tenantSql, { docKey: REF, grant: GRANT });
+      const after = await listVersions(fixture.tenantSql, { docKey: DOC_KEY, grant: GRANT });
       expect(after).toHaveLength(before.length);
     },
     TEST_TIMEOUT_MS,
@@ -142,7 +148,7 @@ describe('history is captured, and it is more than one deep', () => {
   test(
     'a grant that cannot read the origin cannot read its history',
     async () => {
-      expect(await listVersions(fixture.tenantSql, { docKey: REF, grant: ['work'] })).toEqual([]);
+      expect(await listVersions(fixture.tenantSql, { docKey: DOC_KEY, grant: ['work'] })).toEqual([]);
     },
     TEST_TIMEOUT_MS,
   );
@@ -184,7 +190,7 @@ describe('history is captured, and it is more than one deep', () => {
       const { purgeExpiredTombstones } = await import('../../../src/mcp/tombstone.ts');
       await purgeExpiredTombstones(fixture.tenantSql, { now: new Date() });
 
-      const survivors = await listVersions(fixture.tenantSql, { docKey: REF, grant: GRANT });
+      const survivors = await listVersions(fixture.tenantSql, { docKey: DOC_KEY, grant: GRANT });
       expect(survivors.map((version) => version.version)).toEqual([1, 2, 3]);
       // And the rows they came from really are gone, or the test proves nothing.
       const remaining = (await fixture.tenantSql`
@@ -202,7 +208,7 @@ describe('revert', () => {
     async () => {
       const outcome = await revertPage(
         { ...fixture.runtime, budget: uncappedBudget('revert') },
-        { docKey: REF, version: 1, grant: GRANT, now: new Date() },
+        { docKey: DOC_KEY, version: 1, grant: GRANT, now: new Date() },
       );
       expect(outcome.ok).toBe(true);
       if (!outcome.ok) return;
@@ -224,14 +230,14 @@ describe('revert', () => {
       // The property is that the state the user was on is still reachable and
       // that going back to it restores what they had.
       expect(undoVersion).not.toBeNull();
-      const banked = (await listVersions(fixture.tenantSql, { docKey: REF, grant: GRANT })).find(
+      const banked = (await listVersions(fixture.tenantSql, { docKey: DOC_KEY, grant: GRANT })).find(
         (version) => version.version === undoVersion,
       );
       expect(banked?.body).toContain('three');
 
       const undone = await revertPage(
         { ...fixture.runtime, budget: uncappedBudget('revert') },
-        { docKey: REF, version: undoVersion!, grant: GRANT, now: new Date() },
+        { docKey: DOC_KEY, version: undoVersion!, grant: GRANT, now: new Date() },
       );
       expect(undone.ok).toBe(true);
 
@@ -248,7 +254,7 @@ describe('revert', () => {
     async () => {
       const outcome = await revertPage(
         { ...fixture.runtime, budget: uncappedBudget('revert') },
-        { docKey: REF, version: 2, grant: ['work'], now: new Date() },
+        { docKey: DOC_KEY, version: 2, grant: ['work'], now: new Date() },
       );
       expect(outcome.ok).toBe(false);
       if (!outcome.ok) expect(outcome.reason).toBe('scope_denied');
@@ -261,7 +267,7 @@ describe('revert', () => {
     async () => {
       const outcome = await revertPage(
         { ...fixture.runtime, budget: uncappedBudget('revert') },
-        { docKey: REF, version: 99, grant: GRANT, now: new Date() },
+        { docKey: DOC_KEY, version: 99, grant: GRANT, now: new Date() },
       );
       expect(outcome.ok).toBe(false);
       if (!outcome.ok) expect(outcome.reason).toBe('not_found');

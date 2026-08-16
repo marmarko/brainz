@@ -10,11 +10,35 @@
  *
  * So `page_version` (rung 9) is an explicit snapshot, and three things follow:
  *
- *   1. **Keyed on the document, not the page row.** `docKey` is the
- *      `external_ref` where there is one and `page:<id>` where there is not,
- *      because a replaced document is a *new* page row and a history keyed on
- *      the page id fragments at exactly the moment there is something to
- *      remember.
+ *   1. **Keyed on the document, not the page row.** `docKey` is
+ *      `<origin>|<external_ref>` — or `<origin>|page:<id>` where there is no
+ *      upstream id — because a replaced document is a *new* page row and a
+ *      history keyed on the page id fragments at exactly the moment there is
+ *      something to remember.
+ *
+ *      **The origin is in the key**, and it is what makes the number mean
+ *      something. `external_ref` is the provider's id and carries no
+ *      cross-origin uniqueness: a shared calendar event pulled by a work
+ *      connector and a personal one is two live pages at one ref, which is why
+ *      `write-path.ts:livePageByRef` narrows replacement to
+ *      `(external_ref, origin_context)`. Keyed on the ref alone, the unique
+ *      index `(doc_key, version)` made both copies allocate from one sequence,
+ *      so each fenced history showed `[1, 3]` where the other origin held `2` —
+ *      not a disclosure, since every row is fenced, but a history with a hole in
+ *      it and a "revert to version 2" naming a row the caller is refused.
+ *
+ *      **Rows banked before the fold keep their bare keys, and that is the rule
+ *      rather than an oversight.** Rewriting them is a contracting migration:
+ *      `UPDATE page_version SET doc_key = …` is refused by the ladder's own
+ *      expand-only scanner (`src/control/migrate.ts:findExpandContractViolations`)
+ *      because the previous fleet version still reads those rows by the bare
+ *      key, and the repo has no waiver list on purpose. A legacy key still
+ *      resolves — `parseDocKey` reads a key with no origin half as its own ref,
+ *      and `revertPage` fences on the snapshot row's `origin_context` either way
+ *      — so what a pre-fold brain has is a document whose history is in two
+ *      sequences rather than one. In production that set is empty, because this
+ *      module has no caller yet; doing the fold *before* one lands is what keeps
+ *      it empty.
  *   2. **The snapshot's foreign key to `page` is ON DELETE SET NULL**, so the
  *      TTL purge cannot take the history with it. That is the whole property,
  *      and `test/core/lifecycle/versions.test.ts` purges for real to prove it.
@@ -39,7 +63,7 @@
 
 import type { SQL } from 'bun';
 
-import { reconstructPage, type ReconstructedPage } from '../export/reconstruct.ts';
+import { parseDocKey, reconstructPage, type ReconstructedPage } from '../export/reconstruct.ts';
 import { fenceScalar, type Grant } from '../search/fence.ts';
 import { textArrayLiteral } from '../write/pg-values.ts';
 import { ingestDocument, type SourceType, type WriteContext } from '../write/write-path.ts';
@@ -102,27 +126,22 @@ async function captureReconstructed(
   if (!page.verified) return { ok: false, reason: 'unverifiable' };
 
   return sql.begin(async (tx) => {
-    // **The head is this page's own origin's head, and the next number is the
-    // whole document's.** Two different questions that `doc_key` alone answers
-    // as one, because `doc_key` is the bare `external_ref` and two credentials
-    // legitimately hold the same provider object (`write-path.ts:livePageByRef`).
+    // **One question, because `doc_key` is one document.** "Has this document
+    // changed?" and "what number does the next snapshot get?" used to be two
+    // queries with two different scopes, and the reason was that `doc_key` was
+    // the bare `external_ref`: two credentials legitimately hold the same
+    // provider object (`write-path.ts:livePageByRef`), so the digest had to be
+    // compared within one origin while the number had to be allocated across
+    // both — the unique index is `(doc_key, version)` and allocating per origin
+    // collided on the first snapshot of the second copy. The residue was a
+    // sequence shared by two mailboxes, so each fenced history showed gaps.
     //
-    //   * *Has this document changed?* is a question about one origin's copy. A
-    //     shared calendar event is byte-identical in both mailboxes by
-    //     construction, so comparing against the other origin's head answers
-    //     "unchanged" to a document that has no snapshot at all — and returns a
-    //     version number its owner is fenced out of reading.
-    //   * *What number does the next snapshot get?* is a question about the
-    //     unique index, which is `(doc_key, version)`. Allocating per origin
-    //     would collide on the first snapshot of the second copy.
-    //
-    // The residue is that one sequence spans both origins, so a fenced history
-    // has gaps. That is a rung (fold the origin into `doc_key`) rather than an
-    // edit here; `test/core/lifecycle/versions-origin-fence.test.ts` pins it as
-    // an observed fact and the ledger row names it.
+    // `docKeyFor` folds the origin in, so the key names one origin's copy and
+    // the head of that key answers both questions at once. Contiguous from 1,
+    // which is what the rung's DDL says a version number is.
     const latest = (await tx`
       SELECT version, content_sha256 FROM page_version
-       WHERE doc_key = ${page.docKey} AND origin_context = ${page.originContext}
+       WHERE doc_key = ${page.docKey}
        ORDER BY version DESC LIMIT 1
     `) as Array<{ version: number; content_sha256: string }>;
 
@@ -131,11 +150,7 @@ async function captureReconstructed(
       return { ok: true as const, status: 'unchanged' as const, version: head.version, docKey: page.docKey };
     }
 
-    const highest = (await tx`
-      SELECT max(version) AS version FROM page_version WHERE doc_key = ${page.docKey}
-    `) as Array<{ version: number | null }>;
-
-    const next = Number(highest[0]?.version ?? 0) + 1;
+    const next = Number(head?.version ?? 0) + 1;
     await tx`
       INSERT INTO page_version (doc_key, version, page_id, origin_context, subject_context,
                                 subject_confidence, source_type, title, body, content_sha256, captured_from)
@@ -307,13 +322,21 @@ export async function revertPage(
   // revert then banks a `pre_revert` snapshot of the *personal* page: a
   // cross-origin read turned into a row by a credential that may not read it,
   // and an `undoVersion` on the receipt that the same credential is refused.
+  //
+  // The ref comes from the key rather than *being* the key: `doc_key` now folds
+  // the origin in, and `parseDocKey` is the one inverse of the one constructor.
+  // A key written before the fold has no origin half and parses to itself, so a
+  // legacy snapshot still resolves its live page exactly as it always did —
+  // `origin_context` above is the authority either way, since it is read off the
+  // snapshot row rather than off the caller's string.
+  const identity = parseDocKey(request.docKey);
   const live = (await ctx.sql`
     SELECT page_id::text AS page_id, external_ref
       FROM page
      WHERE deleted_at IS NULL
        AND origin_context = ${snapshot.origin_context}
-       AND (external_ref = ${request.docKey}
-            OR (external_ref IS NULL AND ${request.docKey} = 'page:' || page_id::text))
+       AND (external_ref = ${identity.ref}
+            OR (external_ref IS NULL AND ${identity.ref} = 'page:' || page_id::text))
      ORDER BY page_id DESC LIMIT 1
   `) as Array<{ page_id: string; external_ref: string | null }>;
 
@@ -344,7 +367,7 @@ export async function revertPage(
     sourceType: snapshot.source_type as SourceType,
     title: snapshot.title,
     body: snapshot.body,
-    externalRef: request.docKey.startsWith('page:') ? null : request.docKey,
+    externalRef: identity.externalRef,
   });
   if (!receipt.ok) return { ok: false, reason: 'write_failed', detail: receipt.reason };
 

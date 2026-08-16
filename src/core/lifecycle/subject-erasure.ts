@@ -23,11 +23,14 @@
  *      correspondent's mail.
  *   4. **Tombstoned against re-ingestion.** {@link eraseSubject} writes an
  *      `erased_subject` row, and {@link isErasedSubject} is what a pull path
- *      consults before writing a page. **The consulting half is not wired** —
- *      `src/ingest/pipedream/pull.ts` is another unit's file — and that is
- *      recorded in the ledger rather than assumed, because without it the next
- *      poll undoes the erasure on a cadence and the receipt handed to a third
- *      party becomes false within the hour.
+ *      consults before writing a page. **The consulting half is wired**:
+ *      `src/ingest/pipedream/pull.ts` asks through `src/ingest/erased-subjects.ts`
+ *      before the estimate, so the next poll cannot undo the erasure on a
+ *      cadence and make the receipt handed to a third party false within the
+ *      hour. That module states the bound the digest imposes — a pull can only
+ *      ask about identifiers it can *name*, so a prose mention carrying no
+ *      address is not suppressed, and the manual import paths do not consult it
+ *      at all.
  *
  * ============================================================================
  * TWO HANDLES, AND THE LIMIT BETWEEN THEM
@@ -136,6 +139,7 @@
 import { createHash } from 'node:crypto';
 import type { SQL } from 'bun';
 
+import { docKeyFor } from '../export/reconstruct.ts';
 import { normalize, slugify } from '../write/normalize.ts';
 import { textArrayLiteral } from '../write/pg-values.ts';
 
@@ -174,6 +178,15 @@ const NOTHING: SubjectCounts = {
 export interface SubjectMatch {
   readonly pageId: string;
   readonly externalRef: string | null;
+  /**
+   * The page's own origin, which is half of its document key.
+   *
+   * `external_ref` carries no cross-origin uniqueness, so `page_version` keys on
+   * `<origin>|<ref>` (`src/core/export/reconstruct.ts:docKeyFor`). Without the
+   * origin here, this module could not name the snapshot rows belonging to the
+   * page it is about to take.
+   */
+  readonly originContext: string;
   /** Which handle found it: the entity graph, or the identifier as text. */
   readonly handle: 'derivation' | 'text';
 }
@@ -534,16 +547,22 @@ async function matchingPages(
   // drift into disagreeing about what "names her" means.
   const literal = textArrayLiteral([...patterns]);
   const rows = (await sql`
-      SELECT DISTINCT p.page_id::text AS page_id, p.external_ref
+      SELECT DISTINCT p.page_id::text AS page_id, p.external_ref, p.origin_context
         FROM page p
         LEFT JOIN chunk c ON c.page_id = p.page_id AND c.deleted_at IS NULL
        WHERE p.deleted_at IS NULL
          AND (coalesce(p.title, '') ~* ANY(${literal}::text[])
               OR c.content ~* ANY(${literal}::text[]))
-    `) as Array<{ page_id: string; external_ref: string | null }>;
+    `) as Array<{ page_id: string; external_ref: string | null; origin_context: string }>;
   for (const row of rows) {
     if (!matches.has(row.page_id)) {
-      matches.set(row.page_id, { pageId: row.page_id, externalRef: row.external_ref, handle: 'text' });
+      matches.set(row.page_id, {
+        pageId: row.page_id,
+        externalRef: row.external_ref,
+        // Carried because a document key folds the origin in — see `docKeysOf`.
+        originContext: row.origin_context,
+        handle: 'text',
+      });
     }
   }
 
@@ -572,15 +591,33 @@ async function matchingPages(
 }
 
 /**
- * The document key a snapshot would have been banked under, for one page.
+ * The document keys a snapshot of this page could have been banked under.
  *
- * `external_ref` where there is one and `page:<id>` where there is not — the
- * same rule `versions.ts` writes them with, imported by shape rather than by
- * import because this module must be able to sweep a snapshot whose `page_id`
- * an earlier purge already nulled.
+ * **Two, and the second one is compatibility rather than belt-and-braces.**
+ * `docKeyFor` is the constructor — `<origin>|<external_ref>`, or
+ * `<origin>|page:<id>` for a page with no upstream id — and it is *imported*
+ * rather than restated, so this module and `versions.ts` cannot come to disagree
+ * about what a document key is. The bare ref is the shape keys had before the
+ * origin was folded in, and those rows cannot be rewritten: the ladder's
+ * expand-only rule refuses a contracting `UPDATE` (`src/control/migrate.ts`),
+ * so a pre-fold snapshot is still sitting under the bare key. Dropping it from
+ * this list would leave that snapshot behind on an erasure — a copy of her mail
+ * in the one table the 72h purge cannot reach — which is the worst possible
+ * place to be precise at the cost of being complete.
+ *
+ * The bare arm inherits the reach the whole sweep had before the fold: it also
+ * matches another origin's snapshot of the same ref. That is unchanged behaviour
+ * rather than new, and it errs toward removing more of an erased correspondent
+ * rather than less.
  */
-function docKeyOf(match: SubjectMatch): string {
-  return match.externalRef === null ? `page:${match.pageId}` : match.externalRef;
+function docKeysOf(match: SubjectMatch): string[] {
+  const folded = docKeyFor({
+    originContext: match.originContext,
+    pageId: match.pageId,
+    externalRef: match.externalRef,
+  });
+  const legacy = match.externalRef === null ? `page:${match.pageId}` : match.externalRef;
+  return [folded, legacy];
 }
 
 /**
@@ -597,7 +634,7 @@ async function matchingRows(
   patterns: readonly string[],
 ): Promise<SubjectRowMatch[]> {
   const pages = textArrayLiteral(matches.map((match) => match.pageId));
-  const docKeys = textArrayLiteral(matches.map(docKeyOf));
+  const docKeys = textArrayLiteral(matches.flatMap(docKeysOf));
   const pats = textArrayLiteral([...patterns]);
   const found: SubjectRowMatch[] = [];
 

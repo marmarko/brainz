@@ -33,10 +33,13 @@ import { docKeyFor, type ReconstructedPage } from '../../../src/core/export/reco
 function page(overrides: Partial<ReconstructedPage> = {}): ReconstructedPage {
   const pageId = overrides.pageId ?? '1';
   const externalRef = overrides.externalRef ?? null;
+  const originContext = overrides.originContext ?? 'personal';
   return {
     pageId,
-    docKey: docKeyFor({ pageId, externalRef }),
-    originContext: 'personal',
+    // The key folds the origin in: `external_ref` carries no cross-origin
+    // uniqueness, so a document is `(origin, ref)` rather than `ref`.
+    docKey: docKeyFor({ originContext, pageId, externalRef }),
+    originContext,
     subjectContext: null,
     subjectConfidence: null,
     sourceType: 'note',
@@ -63,7 +66,7 @@ function reimport(files: readonly ExportedFile[], rootId = 'restore'): Reconstru
   return files.map((file, index) =>
     page({
       pageId: String(100 + index),
-      docKey: `folder:${rootId}/${file.path}`,
+      docKey: `personal|folder:${rootId}/${file.path}`,
       sourceType: 'file',
       externalRef: `folder:${rootId}/${file.path}`,
       title: file.path,
@@ -203,7 +206,7 @@ describe('the manifest tells the truth about what could not be verified', () => 
 
     expect(tree.files).toHaveLength(2);
     expect(tree.manifest.unverified).toHaveLength(1);
-    expect(tree.manifest.unverified[0]?.docKey).toBe('page:2');
+    expect(tree.manifest.unverified[0]?.docKey).toBe('personal|page:2');
     expect(tree.manifest.pages).toBe(2);
   });
 

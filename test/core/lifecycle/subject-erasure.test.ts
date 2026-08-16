@@ -21,6 +21,7 @@ import {
   previewSubjectErasure,
   subjectDigest,
 } from '../../../src/core/lifecycle/subject-erasure.ts';
+import { docKeyFor } from '../../../src/core/export/reconstruct.ts';
 import { captureSupersededVersions, revertPage } from '../../../src/core/lifecycle/versions.ts';
 import { contentDigest, type WriteContext } from '../../../src/core/write/write-path.ts';
 import { purgeExpiredTombstones } from '../../../src/mcp/tombstone.ts';
@@ -678,7 +679,7 @@ describe('a document edited after its snapshot was banked', () => {
     'the snapshot naming the correspondent goes, though no live page names her',
     async () => {
       await seedEditedDocument();
-      const banked = (await sql`SELECT body FROM page_version WHERE doc_key = ${DOC}`) as Array<{
+      const banked = (await sql`SELECT body FROM page_version WHERE doc_key = ${`${ORIGIN}|${DOC}`}`) as Array<{
         body: string;
       }>;
       expect(banked[0]?.body).toContain(SUBJECT);
@@ -712,12 +713,88 @@ describe('a document edited after its snapshot was banked', () => {
       // closes it is upstream: the snapshot is gone, so the revert refuses at
       // its first statement and never reaches `ingestDocument`.
       const outcome = await revertPage({ sql } as unknown as WriteContext, {
-        docKey: DOC,
+        docKey: `${ORIGIN}|${DOC}`,
         version: 1,
         grant: [ORIGIN],
         now: new Date(),
       });
       expect(outcome).toEqual({ ok: false, reason: 'not_found' });
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe('a snapshot of her page that does not itself name her', () => {
+  const DOC = 'drive:doc2';
+  const EARLIER_TITLE = 'Rollout plan, first pass';
+  const EARLIER_BODY = 'the plan covers hiring, runway and the migration schedule';
+
+  /**
+   * The live page names her; the snapshot banked from an earlier state does not.
+   *
+   * This is the case the **document-key** arm exists for, and it is not exotic:
+   * a version history is a record of a document *before* it said what it says
+   * now, so the first snapshot of a page that later came to name a correspondent
+   * says nothing about her at all. The text arm cannot reach it — there is
+   * nothing in it to match — so if the key arm does not name it, her page is
+   * removed and a copy of that document stays in the one table the 72h purge
+   * cannot reach, forever.
+   */
+  async function seedEarlierSnapshot(): Promise<void> {
+    await sql.unsafe(`
+      INSERT INTO page (origin_context, source_type, title, external_ref, embedding_model,
+                        embedding_dimensions, chunker_version, normalizer_version, content_sha256)
+      VALUES ('${ORIGIN}', 'document', ${quoted(`Rollout plan reviewed by ${SUBJECT}`)}, '${DOC}',
+              'text-embedding-3-small', ${EMBEDDING_DIMENSIONS}, 1, 1, repeat('c', 64));
+      INSERT INTO chunk (origin_context, content, page_id, ordinal)
+      SELECT '${ORIGIN}', ${quoted(`the rollout was reviewed by ${SUBJECT} in March`)}, page_id, 0
+        FROM page WHERE external_ref = '${DOC}' AND deleted_at IS NULL;
+    `);
+
+    const pageId = (
+      (await sql`
+        SELECT page_id::text AS page_id FROM page
+         WHERE external_ref = ${DOC} AND deleted_at IS NULL
+      `) as Array<{ page_id: string }>
+    )[0]?.page_id;
+    if (pageId === undefined) throw new Error('fixture page missing');
+
+    // Banked under the key `versions.ts` would write, through the *constructor*
+    // rather than a literal: a fixture that spelled the key by hand would keep
+    // passing on the day the two sides stopped agreeing about what one is.
+    const key = docKeyFor({ originContext: ORIGIN, pageId, externalRef: DOC });
+    await sql`
+      INSERT INTO page_version (doc_key, version, page_id, origin_context, source_type,
+                                title, body, content_sha256, captured_from)
+      VALUES (${key}, 1, ${pageId}::bigint, ${ORIGIN}, 'document',
+              ${EARLIER_TITLE}, ${EARLIER_BODY}, ${'d'.repeat(64)}, 'live')
+    `;
+  }
+
+  test(
+    'goes with the page, because the sweep names the key the page would have been banked under',
+    async () => {
+      await seedEarlierSnapshot();
+
+      const preview = await previewSubjectErasure(sql, { identifier: SUBJECT });
+
+      // The page is reached by the text arm, as any page naming her is.
+      expect(preview.matches.map((match) => match.externalRef)).toContain(DOC);
+
+      // And the snapshot is reached by the **page** handle rather than the text
+      // one, which is the whole assertion: its own body says nothing about her.
+      const snapshot = preview.rows.find(
+        (row) => row.kind === 'page_version' && row.excerpt.includes(EARLIER_TITLE),
+      );
+      expect(snapshot).toBeDefined();
+      expect(snapshot?.handle).toBe('page');
+
+      await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app' });
+
+      const left = (await sql`
+        SELECT count(*)::int AS n FROM page_version WHERE title = ${EARLIER_TITLE}
+      `) as Array<{ n: number }>;
+      expect(left[0]?.n).toBe(0);
     },
     TEST_TIMEOUT_MS,
   );
