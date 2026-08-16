@@ -125,3 +125,101 @@ describe('a capability is not covered by the measurement that says it hurts', ()
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// The second thing `covered` may not mean: a capability nothing in production
+// can reach.
+// ---------------------------------------------------------------------------
+
+/**
+ * The rule above is about a measurement. This one is about a caller.
+ *
+ * `gap.data-lifecycle` covers four legs, and three of them are wired: `forget`
+ * is a tool, the purge runs on the tombstone clock, and U18 gave the severance
+ * preview its executor and `src/web/serve.ts` gave *that* its route. The fourth
+ * — page versioning and revert — is a complete module (`versions.ts`: capture,
+ * the superseded sweep, list, revert) that **no file under `src/` imports**. No
+ * scheduled sweep banks a version, no surface lists one, and nothing can revert
+ * to one. Every caller it has is a test.
+ *
+ * A `covered` row retires a capability from every list an operator reads, which
+ * is precisely the wrong thing to do to a module whose only callers assert that
+ * it works. `not-yet` keeps it visible and costs nothing but honesty.
+ *
+ * **This is a rule, not a snapshot.** It resolves the importer set from the
+ * source tree on every run, so the day a production caller lands the rule stops
+ * binding with no edit here — and no edit possible that hides the intervening
+ * state, because both branches are asserted.
+ */
+const VERSIONS_MODULE = 'core/lifecycle/versions.ts';
+const SRC_DIR = `${import.meta.dir}/../../src`;
+
+/**
+ * An import of the versions module, however the relative path is spelled.
+ *
+ * The `from '…'` clause is required, so the module's own header — which names
+ * its test file — and every prose mention elsewhere are not importers. Declared
+ * once and asserted below on both a positive and two negatives, because a
+ * pattern that matched everything would make the rule pass by reporting a
+ * caller that is not there, which is the same lie the rule is about.
+ */
+const IMPORTS_VERSIONS = /from\s+'[^']*lifecycle\/versions\.ts'/;
+
+/** Files under `src/` — other than the module itself — that import it. */
+async function productionImportersOfVersions(): Promise<string[]> {
+  const found: string[] = [];
+  for (const relative of new Bun.Glob('**/*.ts').scanSync({ cwd: SRC_DIR })) {
+    if (relative.endsWith('lifecycle/versions.ts')) continue;
+    const text = await Bun.file(`${SRC_DIR}/${relative}`).text();
+    if (IMPORTS_VERSIONS.test(text)) found.push(relative);
+  }
+  return found;
+}
+
+describe('a capability is not covered while nothing but a test can call it', () => {
+  test('the scan reads the source tree — a glob that matched nothing would pass everything below', async () => {
+    const files = [...new Bun.Glob('**/*.ts').scanSync({ cwd: SRC_DIR })];
+    expect(files.length).toBeGreaterThan(50);
+    expect(files).toContain(VERSIONS_MODULE);
+    // And the module it is about is real, so the rule is about a caller rather
+    // than about a path somebody renamed.
+    const text = await Bun.file(`${SRC_DIR}/${VERSIONS_MODULE}`).text();
+    expect(text).toContain('export async function revertPage');
+    expect(text).toContain('export async function capturePageVersion');
+
+    // And the pattern discriminates. A regex loosened until it matched every
+    // import would report a caller for a module nobody calls, and the rule
+    // below would fall into its "somebody wired it" branch and pass.
+    expect(IMPORTS_VERSIONS.test("import { revertPage } from '../lifecycle/versions.ts';")).toBe(true);
+    expect(IMPORTS_VERSIONS.test('// see `src/core/lifecycle/versions.ts` for the snapshot rule')).toBe(false);
+    expect(IMPORTS_VERSIONS.test("import { reconstructPage } from '../export/reconstruct.ts';")).toBe(false);
+  });
+
+  test('`gap.data-lifecycle` does not claim coverage while page versioning has no production caller', async () => {
+    const importers = await productionImportersOfVersions();
+    const row = ledgerById.get('gap.data-lifecycle');
+    expect(row).toBeDefined();
+
+    if (importers.length > 0) {
+      // The other branch, spelled out: once something in `src/` reaches the
+      // module, whether the row is covered is a question about the whole
+      // capability again rather than about reachability.
+      expect(row?.status).toBeDefined();
+      return;
+    }
+
+    expect(row?.status).toBe('not-yet');
+    expect(row?.priority).toBe('p0');
+    // The unit stays: `test/evals/answerability.test.ts` resolves a mechanism's
+    // owning unit from this field, and a row that lost it would silently stop
+    // being resolvable.
+    expect(row?.unit).toBe('U17');
+  });
+
+  test('and the row says which half is unreachable, rather than deferring the whole thing vaguely', () => {
+    const notes = ledgerById.get('gap.data-lifecycle')?.notes ?? '';
+    // The named half, and the evidence a reader can check for themselves.
+    expect(notes).toContain('src/core/lifecycle/versions.ts');
+    expect(notes).toContain('no caller');
+  });
+});
