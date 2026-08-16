@@ -41,6 +41,7 @@ import {
   senderKeyFor,
   vectorArm,
 } from '../../../src/core/search/arms.ts';
+import { ACTIVE_EMBEDDING_SEAT } from '../../../src/schema/embedding-seat.ts';
 import { candidatePoolFor } from '../../../src/schema/vector-query.ts';
 import {
   EMBEDDING_DIMENSIONS,
@@ -118,6 +119,7 @@ describe('the vector arm asks for a pool, not for a page of results (H1)', () =>
 
       const armed = await vectorArm(sql, {
         queryVector: LADDER_QUERY,
+        column: ACTIVE_EMBEDDING_SEAT.column,
         grant: PERSONAL,
         limit: 10,
       });
@@ -137,7 +139,12 @@ describe('the vector arm asks for a pool, not for a page of results (H1)', () =>
       const sought = ladderIds[SOUGHT_RANK - 1];
       const truncated = await runVectorScan(
         sql,
-        { queryVector: LADDER_QUERY, grant: PERSONAL, limit: 10 },
+        {
+          queryVector: LADDER_QUERY,
+          column: ACTIVE_EMBEDDING_SEAT.column,
+          grant: PERSONAL,
+          limit: 10,
+        },
         10,
       );
 
@@ -158,6 +165,7 @@ describe('the fence is in the statement, not applied afterwards', () => {
     async () => {
       const armed = await vectorArm(sql, {
         queryVector: LADDER_QUERY,
+        column: ACTIVE_EMBEDDING_SEAT.column,
         grant: WORK,
         limit: 10,
       });
@@ -167,7 +175,12 @@ describe('the fence is in the statement, not applied afterwards', () => {
   );
 
   test('an empty grant reads nothing rather than everything', async () => {
-    const armed = await vectorArm(sql, { queryVector: LADDER_QUERY, grant: [], limit: 10 });
+    const armed = await vectorArm(sql, {
+      queryVector: LADDER_QUERY,
+      column: ACTIVE_EMBEDDING_SEAT.column,
+      grant: [],
+      limit: 10,
+    });
     expect(armed.ranked).toEqual([]);
     expect(await hydrate(sql, ladderIds.slice(0, 3), [])).toEqual(new Map());
   });
@@ -317,7 +330,12 @@ describe('soft-deleted and quarantined rows never surface', () => {
       await sql.unsafe('ANALYZE chunk');
 
       const grant = [...PERSONAL];
-      const vector = await vectorArm(sql, { queryVector: LADDER_QUERY, grant, limit: 10 });
+      const vector = await vectorArm(sql, {
+        queryVector: LADDER_QUERY,
+        column: ACTIVE_EMBEDDING_SEAT.column,
+        grant,
+        limit: 10,
+      });
       const fts = await ftsArm(sql, {
         query: 'widget calibration advisory',
         grant,

@@ -42,13 +42,30 @@
 
 import type { SQL } from 'bun';
 
+import {
+  ACTIVE_EMBEDDING_SEAT,
+  EMBEDDING_SEATS,
+  UnservableEmbeddingSeatError,
+  findSeatWriteBlockers,
+  type EmbeddingSeat,
+} from './embedding-seat.ts';
+
 /**
- * KTD8's stored dimension, and the single place it is written down in
- * TypeScript. `test/hazards/h2-missing-vector-index.test.ts` parses
- * `tenant.sql` and asserts the DDL agrees, rather than trusting this constant
- * to have been updated alongside it.
+ * The stored dimension of the seat a tenant is provisioned at.
+ *
+ * It used to be the literal 1536, and it was true because exactly one model was
+ * ever routed to the `embedding` op. It is now derived, because a second seat
+ * exists at 1024 and a constant cannot be right for both — see
+ * `src/schema/embedding-seat.ts` for which column a given model's vectors go in
+ * and why the active seat is the one it is.
+ *
+ * Anything that has a *specific* model in hand must ask the seat registry rather
+ * than read this: this is the schema's default, not a statement about any
+ * particular call. `test/hazards/h2-missing-vector-index.test.ts` parses the
+ * ladder and asserts the DDL agrees, rather than trusting this to have been
+ * updated alongside it.
  */
-export const EMBEDDING_DIMENSIONS = 1536;
+export const EMBEDDING_DIMENSIONS = ACTIVE_EMBEDDING_SEAT.dimensions;
 
 /**
  * How many dimensions each pgvector type can be HNSW-indexed at. These are the
@@ -63,9 +80,17 @@ export const HNSW_INDEXABLE_DIMENSIONS = {
 
 export type VectorTypeName = keyof typeof HNSW_INDEXABLE_DIMENSIONS;
 
-/** The table and column every read's vector arm goes through. */
+/** The table every read's vector arm goes through. */
 export const CHUNK_TABLE = 'chunk';
-export const CHUNK_EMBEDDING_COLUMN = 'embedding';
+
+/**
+ * The column it goes through **under the active seat**. Derived for the same
+ * reason {@link EMBEDDING_DIMENSIONS} is: with two seats registered, the column
+ * a statement touches is a property of the model that produced the vector, and
+ * a caller holding a model id must resolve it through
+ * `embedding-seat.ts:seatForModel` instead of reading this.
+ */
+export const CHUNK_EMBEDDING_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
 
 /**
  * The distance operators pgvector's vector-family opclasses provide, spelled the
@@ -94,6 +119,33 @@ export interface VectorColumn {
   readonly why: string;
 }
 
+/**
+ * The tables that carry one column per embedding seat, and the rung each table
+ * arrived at.
+ *
+ * Both are read by similarity and both therefore need an index per seat. They
+ * are listed rather than derived because "which tables hold embeddings" is a
+ * fact about the schema, while "which columns hold them" is a fact about the
+ * seat registry — keeping the two separate is what lets a new seat register
+ * itself into this file without a second edit.
+ */
+const EMBEDDING_BEARING_TABLES: ReadonlyArray<{
+  readonly table: string;
+  readonly since: number;
+  readonly why: string;
+}> = [
+  {
+    table: CHUNK_TABLE,
+    since: 1,
+    why: "the vector arm of every read; H1 and H3's fixture measures this table",
+  },
+  {
+    table: 'fact',
+    since: 2,
+    why: 'facts are embedded on the write path and retrieved by similarity alongside chunks',
+  },
+];
+
 export interface IndexedVectorColumn extends VectorColumn {
   /**
    * The distance operator the arm that reads this column issues. Asserted
@@ -114,25 +166,35 @@ export interface IndexedVectorColumn extends VectorColumn {
  * closes the loop by enumerating the vector columns the database actually has
  * and failing on any that appears in neither list.
  *
- * Ordered with `chunk.embedding` first: it is the column the whole retrieval
- * stack reads, so a tenant missing it should fail provisioning naming *that*.
+ * Ordered with `chunk`'s columns first: it is the table the whole retrieval
+ * stack reads, so a tenant missing one of its indexes should fail provisioning
+ * naming *that*.
+ *
+ * **Derived from the seat registry rather than listed.** Every registered
+ * embedding seat owns a column on both embedding-bearing tables, so a seat added
+ * to `embedding-seat.ts` without a matching entry here is not a thing that can
+ * happen — which matters because the failure it would cause (an unindexed
+ * column the arm scans under one configuration) is H2 exactly, and H2's whole
+ * character is that nothing reports it.
  */
-export const INDEXED_VECTOR_COLUMNS: readonly IndexedVectorColumn[] = [
-  {
-    table: CHUNK_TABLE,
-    column: CHUNK_EMBEDDING_COLUMN,
-    since: 1,
-    operator: '<=>',
-    why: "the vector arm of every read; H1 and H3's fixture measures this column",
-  },
-  {
-    table: 'fact',
-    column: 'embedding',
-    since: 2,
-    operator: '<=>',
-    why: 'facts are embedded on the write path and retrieved by similarity alongside chunks',
-  },
-];
+export const INDEXED_VECTOR_COLUMNS: readonly IndexedVectorColumn[] =
+  EMBEDDING_BEARING_TABLES.flatMap((table) =>
+    EMBEDDING_SEATS.map(
+      (seat): IndexedVectorColumn => ({
+        table: table.table,
+        column: seat.column,
+        // A column exists once BOTH its table and its seat exist. Taking the
+        // seat's rung alone would assert an index on `fact` at version 1, where
+        // there is no `fact`; taking the table's alone would assert one on a
+        // column no rung has added yet. Either produces a provisioning failure
+        // that names H2 for a tenant whose schema is simply older than the
+        // claim.
+        since: Math.max(table.since, seat.since),
+        operator: '<=>',
+        why: `${table.why} (seat '${seat.id}', ${seat.dimensions}d)`,
+      }),
+    ),
+  );
 
 /**
  * Vector columns that exist and are not yet queried by anything.
@@ -532,6 +594,7 @@ export function findVectorRegistryViolations(
 export async function assertVectorColumns(
   sql: SQL,
   schemaVersion: number,
+  seat: EmbeddingSeat = ACTIVE_EMBEDDING_SEAT,
 ): Promise<VectorIndexRecord[]> {
   const present = await listVectorColumns(sql);
   const findings = findVectorRegistryViolations(present);
@@ -551,6 +614,15 @@ export async function assertVectorColumns(
   }
 
   if (findings.length > 0) throw new VectorColumnRegistryError(findings);
+
+  // Whether the tenant *can be written* under the seat this fleet is configured
+  // for, asked before any index assertion because an unwritable seat is not a
+  // missing-index problem and reporting it as one sends the reader to the wrong
+  // file. A tenant provisioned under a seat whose vectors no INSERT can supply
+  // is a tenant that accepts reads and fails its first write, under a user,
+  // naming a constraint rather than the routing row that caused it.
+  const blockers = findSeatWriteBlockers(seat, present);
+  if (blockers.length > 0) throw new UnservableEmbeddingSeatError(seat, blockers);
 
   return assertIndexedVectorColumns(sql, schemaVersion);
 }

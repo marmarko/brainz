@@ -182,6 +182,53 @@ probes must therefore be reached by the alias hop and the graph arm.
 4. Re-run `test/evals/` — the freshness and drift guards are what make steps 1–3
    impossible to forget.
 
+## The floors and the embedding seat
+
+The fixture's vector width is not a constant: `evals/embeddings.ts` builds every
+synthetic vector at `EMBEDDING_DIMENSIONS`, which is now derived from the active
+embedding seat (`src/schema/embedding-seat.ts`). A second seat is registered, at
+1024 dimensions, and this section records what that does and does not mean for
+the numbers above.
+
+**The committed floors were NOT re-baselined, and that is the honest choice
+rather than the lazy one.** The active seat is still the 1536 one — the 1024 seat
+is refused at provisioning while `fact.embedding` is `vector(1536) NOT NULL`, see
+`upstream/concepts.jsonl:gap.cloudflare-embedding-seat` — so the committed numbers
+are the numbers of the configuration that actually runs. Replacing them with
+numbers from a seat no tenant is provisioned at would be committing a measurement
+that describes nothing.
+
+**What the floors read at 1024 was measured, and it is recorded here rather than
+committed as a receipt**, because a receipt is a claim about a configuration and
+there is no configuration this would be a claim about. Procedure: set the active
+seat's `dimensions` to 1024, run `bun run evals/regenerate-embeddings.ts`, then
+`bun run eval:blocking`. Measured on the corpus at manifest digest `fabb3db916ae`:
+
+| floor | at 1536 | at 1024 | status at both |
+|---|---|---|---|
+| aggregate.ndcg10 | 0.8269 | 0.8157 | MET |
+| family.title_substring.hit1 | 1.0000 | 1.0000 | MET |
+| family.alias.hit1 | 0.8571 | 0.7143 | DEFERRED |
+| family.dilution.hit3 | 0.8000 | 0.7000 | DEFERRED |
+| type.relational.ndcg10 | 0.7992 | 0.7882 | MET |
+| type.named_entity.ndcg10 | 0.9005 | 0.8884 | MET |
+| type.temporal.ndcg10 | 0.8214 | 0.7916 | MET |
+| type.context_fenced.ndcg10 | 0.7397 | 0.7446 | MET |
+
+**No floor changed status, and in particular no deferral became a pass.** That
+was the thing worth checking: the two deferred floors are deferred on the
+provider count being zero, which a width change cannot move, and both got *worse*
+rather than better.
+
+**What these numbers are not.** They are not a comparison of two models. Every
+vector on both sides is synthetic — a hashed lexical projection at the stated
+width — so the movement is the fixture's own hash spreading over fewer buckets,
+and nothing here has observed `@cf/qwen/qwen3-embedding-0.6b` at all. Reading the
+1024 column as "the new seat is slightly worse" would be reading a property of
+`evals/embeddings.ts` as a property of a model. The A/B that
+`gap.cloudflare-embedding-seat` waits on is a comparison of two *provider*
+manifests, and it stays unowed until step 1 above has been run twice.
+
 ## Cross-encoder scores: what U12 committed, and what it refused to claim
 
 The other half of U7 step 1 landed at U12, and the objection U7 recorded against

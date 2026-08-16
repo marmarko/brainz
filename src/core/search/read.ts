@@ -27,6 +27,7 @@
 import type { SQL } from 'bun';
 
 import { createBudget, type Budget, type ModelGateway } from '../../ai/gateway.ts';
+import { embeddingSeatFor } from '../../ai/routing.ts';
 import type { CallerIdentity } from '../../control/secrets.ts';
 import { embedTexts, queryEncoding } from '../write/embed.ts';
 import { textArrayLiteral } from '../write/pg-values.ts';
@@ -81,7 +82,22 @@ export async function embedQuery(request: {
   readonly caller: CallerIdentity;
   readonly budget?: Budget;
   readonly query: string;
-}): Promise<{ readonly vector: readonly number[] | null; readonly degraded: Degradation[] }> {
+}): Promise<{
+  readonly vector: readonly number[] | null;
+  /**
+   * The column this vector may be compared against — the seat of the model the
+   * gateway **reported having called**, not of the model the shipped routing
+   * table names. An operator hands the gateway a profile, so those two are not
+   * the same claim, and only the first one is a record of what happened.
+   *
+   * `null` whenever there is no vector, and also when there is a vector from a
+   * model no seat is registered for: a vector with nowhere to be compared is
+   * not a usable query embedding, and scanning the shipped column anyway would
+   * rank this query against another model's space.
+   */
+  readonly column: string | null;
+  readonly degraded: Degradation[];
+}> {
   const budget = request.budget ?? readPathBudget();
 
   let outcome: Awaited<ReturnType<typeof embedTexts>>;
@@ -99,13 +115,24 @@ export async function embedQuery(request: {
     // those are the same event to a user: no vector. Catching here rather than
     // letting one class through is deliberate; a read that 500s because a key
     // rotated is the outage this contract exists to prevent.
-    return { vector: null, degraded: ['embedding_unavailable'] };
+    return { vector: null, column: null, degraded: ['embedding_unavailable'] };
   }
 
-  if (!outcome.ok) return { vector: null, degraded: ['embedding_unavailable'] };
+  if (!outcome.ok) return { vector: null, column: null, degraded: ['embedding_unavailable'] };
   const vector = outcome.vectors[0];
-  if (vector === undefined) return { vector: null, degraded: ['embedding_unavailable'] };
-  return { vector, degraded: [] };
+  if (vector === undefined) return { vector: null, column: null, degraded: ['embedding_unavailable'] };
+
+  // **`embedding_unavailable`, deliberately, for a model that answered.** The
+  // vector exists and was paid for; what does not exist is a column it can be
+  // compared against, and to every stage downstream those are the same event —
+  // this read has no usable vector arm. A new degradation label would ripple
+  // through U6's envelope and every test that asserts the whole array, to say
+  // something only an operator reading a configuration can act on. The
+  // distinction belongs in the seat registry's error, not on the wire.
+  const seat = embeddingSeatFor(outcome.modelId);
+  if (seat === undefined) return { vector: null, column: null, degraded: ['embedding_unavailable'] };
+
+  return { vector, column: seat.column, degraded: [] };
 }
 
 /**
@@ -291,6 +318,7 @@ export async function recallArms(request: RecallRequest): Promise<RecallOutcome>
     relations: plan.relations,
     seedFirst: plan.intent === 'entity_lookup',
     queryVector: embedded.vector,
+    vectorColumn: embedded.column,
   });
 
   // The ladder injects ids no arm returned, so its candidates have to be

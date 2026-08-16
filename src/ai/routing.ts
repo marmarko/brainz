@@ -43,6 +43,7 @@
  * validator refuses it.
  */
 
+import { ACTIVE_EMBEDDING_SEAT, seatById, type EmbeddingSeat } from '../schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../schema/vector-index.ts';
 import { CANONICAL_PRICE_BOOK, billsOutput, type PriceBook } from './pricing.ts';
 
@@ -231,6 +232,57 @@ export const EMBEDDING_PIN = Object.freeze({
   /** Query and document are encoded differently; they share one space. */
   encoding: 'asymmetric' as const,
 });
+
+/**
+ * Which stored embedding space each embedding model's vectors belong to.
+ *
+ * **This table is here and not in `src/schema/` because of KTD13's boundary.**
+ * `test/ai/boundary.test.ts` fails any file outside this directory that names a
+ * model id — a caller that can name a model is a caller that can pick one — so
+ * the seats themselves (a column, a width, the rung that created them) live in
+ * `src/schema/embedding-seat.ts` and the binding lives here, in the one file
+ * whose job is model identity.
+ *
+ * **A model absent from this table cannot be routed to the `embedding` op**, and
+ * {@link findRoutingFaults} refuses the profile at construction rather than at
+ * first call. That is the same discipline as the unpriced-model rule beside it:
+ * a vector with no seat has no column to be written to and no column to be read
+ * from, so a call producing one is a call that is paid for and cannot be used.
+ */
+const EMBEDDING_SEAT_BY_MODEL: Readonly<Record<string, string>> = Object.freeze({
+  'text-embedding-3-large': 'openai-3-large-1536',
+  '@cf/qwen/qwen3-embedding-0.6b': 'cf-qwen3-embedding-0.6b-1024',
+});
+
+/**
+ * The stored space a routed embedding model's vectors live in, or `undefined`.
+ *
+ * The read path calls this with the id the gateway **reported having called**,
+ * not with a routed id it looked up itself: an operator supplies the profile, so
+ * those are two different claims and only the first one is a record of what
+ * happened.
+ */
+export function embeddingSeatFor(modelId: string | null | undefined): EmbeddingSeat | undefined {
+  if (typeof modelId !== 'string') return undefined;
+  const registered = seatById(EMBEDDING_SEAT_BY_MODEL[modelId]);
+  if (registered !== undefined) return registered;
+
+  // **An operator's own endpoint, which no shipped table can enumerate.** A
+  // `self-host/` id is the operator's own name for their own weights, so
+  // requiring it in the table above would forbid the case the whole self-host
+  // profile exists for. It resolves to the seat their tenants were provisioned
+  // at, because that is the only column their fleet has — and the width check
+  // in the gateway still holds their model to that column's width, which is the
+  // failure that would otherwise reach the database.
+  //
+  // The residual, stated rather than hidden: two *different* operator models
+  // both resolve here, so swapping one for the other is not caught by this
+  // function. It is caught by nothing else either — the remedy is to register
+  // the second one as its own seat, which is an edit an AGPL self-hoster can
+  // make and a hosted user cannot need.
+  if (modelId.startsWith(SELF_HOST_PREFIX)) return ACTIVE_EMBEDDING_SEAT;
+  return undefined;
+}
 
 /** Id families that name an immutable artifact and so need no date suffix. */
 const IMMUTABLE_ID_FAMILIES: readonly string[] = ['@cf/', 'self-host/', 'text-embedding-3-'];
@@ -559,6 +611,15 @@ export function findRoutingFaults(profile: NamedProfile, priceBook: PriceBook): 
     }
 
     const kind = OP_KINDS[op];
+    if (kind === 'embedding' && embeddingSeatFor(route.id) === undefined) {
+      // Refused at construction, not at first call: a vector with no registered
+      // seat has no column to be written to and no column to be read from, so
+      // the call is paid for and unusable. Same failure shape as an unpriced
+      // model, and refused in the same breath for the same reason.
+      faults.push(
+        `${label(op)}: '${route.id}' has no registered embedding seat — its vectors would have no column to live in, and a read would have nothing to compare a query against`,
+      );
+    }
     if (kind === 'chat' && route.maxOutputTokens <= 0) {
       faults.push(`${label(op)}: a chat op needs a positive maxOutputTokens to estimate against`);
     }

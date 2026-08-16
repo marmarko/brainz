@@ -37,6 +37,7 @@
 
 import type { SQL, TransactionSQL } from 'bun';
 
+import { isSeatColumn } from '../../schema/embedding-seat.ts';
 import { candidatePoolFor, withVectorScan } from '../../schema/vector-query.ts';
 import { textArrayLiteral } from '../write/pg-values.ts';
 import { grantSet, type Grant } from './fence.ts';
@@ -247,26 +248,49 @@ export async function hydrate(
  * `test/core/search/arms.test.ts` runs this same text with a deliberately
  * mis-sized pool as its control, which is what makes "the pool sizing matters"
  * a measurement rather than a source-code assertion.
+ *
+ * **The column is an argument, and that is the whole of the seat contamination
+ * fix.** It used to be the literal `c.embedding`, which is right for exactly as
+ * long as one model is ever routed to the `embedding` op. With two seats
+ * registered the column a read must scan is a property of which model embedded
+ * *this query*, and a literal here would rank one model's query against another
+ * model's vectors — same-width, that computes a full ranking and is wrong with
+ * nothing to report it. The value comes from the seat resolved from the
+ * gateway's own metering record; {@link isSeatColumn} is asked here anyway,
+ * because an identifier cannot be a bound parameter and "it came from a seat
+ * object" is a convention rather than a closed set.
  */
-export function vectorArmSql(): string {
+export function vectorArmSql(column: string): string {
+  if (!isSeatColumn(column)) {
+    throw new Error(
+      `'${column}' is not a registered embedding-seat column — the vector arm interpolates this name into SQL, so it may only ever be one the seat registry owns`,
+    );
+  }
   return `SELECT ${CHUNK_COLUMNS}
        FROM chunk c
        ${PAGE_JOIN}
-      WHERE c.embedding IS NOT NULL
+      WHERE c.${column} IS NOT NULL
         AND ${LIVE_AND_IN_GRANT}
-      ORDER BY c.embedding <=> $2::vector
+      ORDER BY c.${column} <=> $2::vector
       LIMIT $3`;
 }
 
 export interface VectorArmRequest {
   readonly queryVector: readonly number[];
+  /**
+   * The column the model that produced {@link queryVector} writes into —
+   * `embedding-seat.ts:seatForModel(modelId).column`, where `modelId` is what
+   * the gateway reported having called. Required rather than defaulted: a
+   * default is the misread, silently.
+   */
+  readonly column: string;
   readonly grant: Grant;
   readonly limit: number;
   readonly offset?: number;
 }
 
 /**
- * Nearest neighbours over `chunk.embedding`, inside `withVectorScan`.
+ * Nearest neighbours over the requesting seat's column, inside `withVectorScan`.
  *
  * The pool is {@link candidatePoolFor}'s arithmetic — `offset + max(limit * 5,
  * 100)` — computed once and used for the GUC *and* the `LIMIT`. Every guard in
@@ -297,7 +321,11 @@ export async function runVectorScan(
   const literal = `[${request.queryVector.join(',')}]`;
 
   const rows = await withVectorScan(sql, { candidatePool: pool }, async (tx: TransactionSQL) => {
-    return (await tx.unsafe(vectorArmSql(), [textArrayLiteral(request.grant), literal, pool])) as ChunkRow[];
+    return (await tx.unsafe(vectorArmSql(request.column), [
+      textArrayLiteral(request.grant),
+      literal,
+      pool,
+    ])) as ChunkRow[];
   });
 
   const candidates = new Map<string, Candidate>();
@@ -655,6 +683,17 @@ export interface ArmDispatch {
    * undefined), which is the shape Assumption 5's contract exists to avoid.
    */
   readonly queryVector: readonly number[] | null;
+  /**
+   * The seat column {@link queryVector} may be compared against, or `null`.
+   *
+   * Carried beside the vector rather than derived here, because the only thing
+   * in the process that knows which model produced a vector is the gateway's
+   * metering record, and it is `read.ts:embedQuery` that holds it. A `null`
+   * column with a non-null vector is a real state — a model answered, and no
+   * registered seat owns a column its vectors could be ranked in — and it drops
+   * the arm exactly as a missing vector does.
+   */
+  readonly vectorColumn: string | null;
 }
 
 export interface ArmsOutcome {
@@ -687,13 +726,14 @@ export async function runArms(dispatch: ArmDispatch): Promise<ArmsOutcome> {
     if (result.ranked.length > 0) armsUsed.push(arm);
   };
 
-  if (dispatch.queryVector === null) {
+  if (dispatch.queryVector === null || dispatch.vectorColumn === null) {
     degraded.push('embedding_unavailable');
   } else {
     absorb(
       'vector',
       await vectorArm(dispatch.sql, {
         queryVector: dispatch.queryVector,
+        column: dispatch.vectorColumn,
         grant: dispatch.grant,
         limit: dispatch.limit,
         ...(dispatch.offset === undefined ? {} : { offset: dispatch.offset }),

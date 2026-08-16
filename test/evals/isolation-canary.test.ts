@@ -30,6 +30,7 @@ import {
   sealAttestation,
   type SignedAttestation,
 } from '../../src/mcp/attestation.ts';
+import { EMBEDDING_SEATS } from '../../src/schema/embedding-seat.ts';
 
 const SIGNER = createInProcessSigner({ key: 'canary-probe-key', keyId: 'canary-2026-08' });
 
@@ -80,8 +81,18 @@ const HEALTHY_DB: NonNullable<CanaryOptions['query']> = (sql) => {
   if (sql.includes('pg_settings')) return Promise.resolve([{ setting: '40', boot_val: '40' }]);
   if (sql.includes("amname = 'hnsw'")) {
     return Promise.resolve([
-      { table_name: 'chunk', column_name: 'embedding' },
-      { table_name: 'fact', column_name: 'embedding' },
+      // One row per registered embedding seat per embedding-bearing table,
+      // because that is what a healthy tenant reports: the seat registry
+      // (`src/schema/embedding-seat.ts`) is what decides how many vector
+      // columns exist, and rung 13 gave every one of them its own index.
+      // Derived rather than listed so a third seat cannot make this fixture a
+      // description of a deployment nobody runs — the check it feeds compares
+      // against the same registry, and a hardcoded list would quietly become
+      // the reason it passes.
+      ...EMBEDDING_SEATS.flatMap((seat) => [
+        { table_name: 'chunk', column_name: seat.column },
+        { table_name: 'fact', column_name: seat.column },
+      ]),
       { table_name: 'entity', column_name: 'embedding' },
       { table_name: 'entity_card', column_name: 'embedding' },
     ]);

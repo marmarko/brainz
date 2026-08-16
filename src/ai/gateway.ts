@@ -96,8 +96,8 @@ import {
   type TokenUsage,
 } from './pricing.ts';
 import {
-  EMBEDDING_PIN,
   IMAGE_INPUT_TOKENS,
+  embeddingSeatFor,
   OP_ACCEPTS_IMAGES,
   OP_ADMITS_EMPTY_ANSWER,
   OP_KINDS,
@@ -716,7 +716,12 @@ export function createModelGateway(options: ModelGatewayOptions): ModelGateway {
           input,
           apiKey: key.resolved.key,
           maxOutputTokens: route.maxOutputTokens,
-          embeddingDimensions: kind === 'embedding' ? EMBEDDING_PIN.dimensions : null,
+          // **The routed model's width, not a global one.** With two seats
+          // registered, one number cannot be right for both — and being wrong
+          // here is not a caught error but a request for a width the model
+          // does not produce, followed by a mismatch on the way back that
+          // indicts the model rather than the configuration.
+          embeddingDimensions: kind === 'embedding' ? seatWidthFor(route.id) : null,
           metadata: { op, tenantId, profile: profile.name, budgetLabel: budget.label },
         });
       } catch (error) {
@@ -759,11 +764,13 @@ export function createModelGateway(options: ModelGatewayOptions): ModelGateway {
       }
 
       if (outcome === null && kind === 'embedding' && response.output.kind === 'embedding') {
-        const wrong = response.output.vectors.some(
-          (vector) => vector.length !== EMBEDDING_PIN.dimensions,
-        );
         // KTD8: the width is a property of the column as much as the vector, and
-        // a mismatched vector degrades recall with no error anywhere.
+        // a mismatched vector degrades recall with no error anywhere. Which
+        // column — and therefore which width — is decided by the model that was
+        // called, so the expected width is read from the route rather than from
+        // a constant that can only describe one seat.
+        const expected = seatWidthFor(route.id);
+        const wrong = response.output.vectors.some((vector) => vector.length !== expected);
         if (wrong) outcome = 'embedding_dimension_mismatch';
       }
 
@@ -888,6 +895,28 @@ export const PROVIDER_DIRECT_BASES: Readonly<Record<ProviderId, string | null>> 
  * where it sits (`/v1` for OpenAI, `/v1beta/openai` for Google) and the root is
  * the part an operator configures.
  */
+/**
+ * The width the model behind a routed id produces, for the two places that have
+ * to know it: what to ask the provider for, and what to refuse on the way back.
+ *
+ * A routed embedding model with no registered seat is a fault rather than a
+ * default — its vectors have no column, so accepting them would be paying for
+ * something nothing can store or read.
+ */
+function seatWidthFor(modelId: string): number {
+  const seat = embeddingSeatFor(modelId);
+  if (seat === undefined) {
+    // Unreachable through a validated profile — `findRoutingFaults` refuses an
+    // embedding route with no seat at construction — and asserted here anyway,
+    // because the alternative to a throw is a default width, and a default
+    // width is the silent recall loss this whole check exists against.
+    throw new GatewayConfigError(
+      `embedding model '${modelId}' has no registered seat, so there is no width to hold it to`,
+    );
+  }
+  return seat.dimensions;
+}
+
 const CHAT_PATH = '/chat/completions';
 const EMBEDDINGS_PATH = '/embeddings';
 const RERANK_PATH = '/rerank';

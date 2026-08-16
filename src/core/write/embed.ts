@@ -45,9 +45,19 @@
 import type { SQL } from 'bun';
 
 import type { Budget, ModelGateway } from '../../ai/gateway.ts';
-import { PROFILES, routeFor, type ModelOp, type RoutingProfileName } from '../../ai/routing.ts';
+import {
+  PROFILES,
+  embeddingSeatFor,
+  routeFor,
+  type ModelOp,
+  type RoutingProfileName,
+} from '../../ai/routing.ts';
 import type { CallerIdentity } from '../../control/secrets.ts';
-import { EMBEDDING_DIMENSIONS } from '../../schema/vector-index.ts';
+import {
+  ACTIVE_EMBEDDING_SEAT,
+  isSeatColumn,
+  type EmbeddingSeat,
+} from '../../schema/embedding-seat.ts';
 
 /** KTD13's op name. A caller asks for this, never for a model. */
 export const EMBED_OP: ModelOp = 'embedding';
@@ -104,10 +114,13 @@ export function queryEncoding(query: string): string {
  * silent recall bug, and a `NaN` component makes every distance against the row
  * undefined without failing any insert.
  */
-export function vectorLiteral(vector: readonly number[]): string {
-  if (vector.length !== EMBEDDING_DIMENSIONS) {
+export function vectorLiteral(
+  vector: readonly number[],
+  seat: EmbeddingSeat = ACTIVE_EMBEDDING_SEAT,
+): string {
+  if (vector.length !== seat.dimensions) {
     throw new EmbeddingWidthError(
-      `refusing a ${vector.length}-dimension vector: the column is ${EMBEDDING_DIMENSIONS} and truncation belongs to the provider's dimensions parameter, not to this process`,
+      `refusing a ${vector.length}-dimension vector for seat '${seat.id}': the column ${seat.column} is ${seat.dimensions} and truncation belongs to the provider's dimensions parameter, not to this process`,
     );
   }
   for (const component of vector) {
@@ -222,18 +235,22 @@ export interface PendingChunk {
  * backlog, so a crash anywhere between the commit and the backfill is a resumed
  * loop rather than a lost write.
  */
-export async function pendingChunkEmbeddings(sql: SQL, limit: number): Promise<PendingChunk[]> {
-  const rows = (await sql`
-    SELECT c.chunk_id::text AS chunk_id, c.content, p.title
+export async function pendingChunkEmbeddings(
+  sql: SQL,
+  limit: number,
+  column: string = ACTIVE_EMBEDDING_SEAT.column,
+): Promise<PendingChunk[]> {
+  const rows = (await sql.unsafe(
+    `SELECT c.chunk_id::text AS chunk_id, c.content, p.title
       FROM chunk c
       LEFT JOIN page p ON p.page_id = c.page_id
-     WHERE c.embedding IS NULL
+     WHERE c.${seatColumn(column)} IS NULL
        AND c.deleted_at IS NULL
        AND c.quarantined_at IS NULL
        AND (p.page_id IS NULL OR (p.deleted_at IS NULL AND p.quarantined_at IS NULL))
      ORDER BY c.chunk_id
-     LIMIT ${Math.max(1, Math.trunc(limit))}
-  `) as Array<{ chunk_id: string; content: string; title: string | null }>;
+     LIMIT ${Math.max(1, Math.trunc(limit))}`,
+  )) as Array<{ chunk_id: string; content: string; title: string | null }>;
 
   return rows.map((row) => ({ chunkId: row.chunk_id, content: row.content, title: row.title }));
 }
@@ -262,15 +279,27 @@ export async function runChunkEmbedBacklog(options: {
   readonly batchSize?: number;
   /** Stop after this many chunks. Unbounded when absent. */
   readonly limit?: number;
+  /**
+   * Which seat's backlog to drain. Defaults to the seat the tenant is
+   * provisioned at; a caller whose gateway routes `embedding` elsewhere passes
+   * that seat instead.
+   *
+   * It is an input rather than something derived from the gateway because the
+   * backlog query runs *before* any call is made — "which chunks are
+   * unembedded" is not answerable until you say in which space. What happens if
+   * the two disagree is the point of the check below.
+   */
+  readonly seat?: EmbeddingSeat;
 }): Promise<BacklogResult> {
   const batchSize = Math.max(1, Math.trunc(options.batchSize ?? CHUNK_EMBED_BATCH));
   const ceiling = options.limit === undefined ? Number.POSITIVE_INFINITY : options.limit;
+  const seat = options.seat ?? ACTIVE_EMBEDDING_SEAT;
   let embedded = 0;
 
   for (;;) {
     if (embedded >= ceiling) break;
     const take = Math.min(batchSize, ceiling - embedded);
-    const pending = await pendingChunkEmbeddings(options.sql, take);
+    const pending = await pendingChunkEmbeddings(options.sql, take, seat.column);
     if (pending.length === 0) break;
 
     const outcome = await embedTexts({
@@ -282,32 +311,69 @@ export async function runChunkEmbedBacklog(options: {
     });
 
     if (!outcome.ok) {
-      return { embedded, remaining: await backlogSize(options.sql), failure: outcome.reason };
+      return { embedded, remaining: await backlogSize(options.sql, seat.column), failure: outcome.reason };
+    }
+
+    // **What answered has to be what this backlog is for.** The rows were
+    // chosen because one column was NULL; the vectors came from whatever the
+    // gateway's profile routes `embedding` to. Nothing in the types connects
+    // those two, and the mismatch is not malformed — it is a well-formed vector
+    // of another space. Writing it here would be the silent recall loss the
+    // whole seat mechanism exists against, so the batch is refused and the rows
+    // stay in the backlog. Reported by name, because the remedy is a
+    // configuration change and not a retry.
+    const answered = embeddingSeatFor(outcome.modelId);
+    if (answered === undefined || answered.id !== seat.id) {
+      return {
+        embedded,
+        remaining: await backlogSize(options.sql, seat.column),
+        failure: 'embedding_seat_mismatch',
+      };
     }
 
     for (const [index, chunk] of pending.entries()) {
       const vector = outcome.vectors[index];
       if (vector === undefined) continue;
-      await options.sql`
-        UPDATE chunk
-           SET embedding = ${vectorLiteral(vector)}::vector
-         WHERE chunk_id = ${chunk.chunkId}::bigint
-           AND embedding IS NULL
-      `;
+      await options.sql.unsafe(
+        `UPDATE chunk
+           SET ${seatColumn(seat.column)} = $1::vector
+         WHERE chunk_id = $2::bigint
+           AND ${seatColumn(seat.column)} IS NULL`,
+        [vectorLiteral(vector, seat), chunk.chunkId],
+      );
       embedded += 1;
     }
   }
 
-  return { embedded, remaining: await backlogSize(options.sql) };
+  return { embedded, remaining: await backlogSize(options.sql, seat.column) };
 }
 
-export async function backlogSize(sql: SQL): Promise<number> {
-  const rows = (await sql`
-    SELECT count(*)::int AS pending
+export async function backlogSize(
+  sql: SQL,
+  column: string = ACTIVE_EMBEDDING_SEAT.column,
+): Promise<number> {
+  const rows = (await sql.unsafe(
+    `SELECT count(*)::int AS pending
       FROM chunk c
       LEFT JOIN page p ON p.page_id = c.page_id
-     WHERE c.embedding IS NULL AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
-       AND (p.page_id IS NULL OR (p.deleted_at IS NULL AND p.quarantined_at IS NULL))
-  `) as Array<{ pending: number }>;
+     WHERE c.${seatColumn(column)} IS NULL AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
+       AND (p.page_id IS NULL OR (p.deleted_at IS NULL AND p.quarantined_at IS NULL))`,
+  )) as Array<{ pending: number }>;
   return rows[0]?.pending ?? 0;
+}
+
+/**
+ * The one place a seat column becomes SQL text.
+ *
+ * An identifier cannot be a bound parameter, so the value has to come from a
+ * closed set — and the check belongs at the point of interpolation rather than
+ * at the point the caller was handed a seat object, which is a convention.
+ */
+function seatColumn(column: string): string {
+  if (!isSeatColumn(column)) {
+    throw new Error(
+      `'${column}' is not a registered embedding-seat column — the write path interpolates this name into SQL, so it may only ever be one the seat registry owns`,
+    );
+  }
+  return column;
 }
