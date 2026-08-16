@@ -3,8 +3,32 @@
 One package, several entrypoints. Each directory is owned by specific
 implementation units in the roadmap plan; the plan is the authority on scope.
 
+## The entrypoints, and what runs them
+
+Three files start processes. Everything else in this tree is a library those
+three compose:
+
+| File | Process | Started by |
+|---|---|---|
+| `mcp/serve.ts` | The MCP surface plus the OAuth endpoints, on `PORT` | the image's `CMD` (Dockerfile) |
+| `worker/serve.ts` | The readiness route plus the scheduler/runner loop | `entrypoint` on `WorkerFleet` (`mcp/router.ts`) |
+| `web/serve.ts` | Signup, sessions, subscription, connectors, BYOK | its own deployment |
+
+Each reads its configuration through `fleet/env.ts`, **refuses to start on a
+missing variable rather than defaulting**, and prints one
+`{"event":"listening",…}` line to stdout once the socket is bound. That line is
+the readiness signal a supervisor, a test harness and a human reading the
+container log all use. `test/fleet/` drives these as processes — spawned, then
+sent real HTTP — because the failure they exist against is a module that
+composes correctly and serves nothing.
+
+`fleet/compose.ts` holds the pieces all three build the same way: the control
+plane handle, the file-backed secret store, and the model gateway. It composes
+and never decides — every policy it touches is owned somewhere else.
+
 | Directory | Owns | Units |
 |---|---|---|
+| `fleet/` | The composition layer the three entrypoints share: environment reading (fail-closed, one refusal per missing variable), the listening announcement, and one builder per dependency every process needs. It decides which *implementation* of each port a deployed process receives, and nothing else. | U1, U6, U10, U15 |
 | `control/` | Control plane (content-free), tenant provisioning, secret store, the migration runner that moves a tenant along the schema ladder and the ports the fleet's scheduled sweep runs it through. It also holds U15's half: the **identity** schema and its accessors — a second database, separate from the content-free control plane, so that plane's claim stays literally true of the database the register names — the webhook verifier that is the only thing allowed to move a tenant's tier, the seam the consolidation cycle reads that tier through, and the warm pool | U2, U3, U15 |
 | `schema/` | The per-tenant schema as an ordered ladder of rungs, the applier that provisioning calls, and the one vector-query helper every read goes through | U3 |
 | `ai/` | The single model gateway — routing by op, metering, pricing, key resolution. **No other directory imports a provider SDK.** | U20 |

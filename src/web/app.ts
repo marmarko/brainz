@@ -55,7 +55,9 @@ import {
   type HashCost,
 } from '../control/accounts.ts';
 import { openFreeSubscription, subscriptionOf, type BillingTier } from '../control/billing.ts';
-import { applyBillingEvent } from '../control/billing.ts';
+import { applyBillingEvent, recordCheckoutCustomer } from '../control/billing.ts';
+import type { CheckoutPort } from '../control/checkout.ts';
+import type { BrainProvisioner } from '../control/provisioner.ts';
 import type { ProviderId } from '../ai/keys.ts';
 import { CONNECT_STEPS, claudeCodeCommand, connectionStatus, installLink } from './connect.ts';
 import { adminDispatch } from './admin.ts';
@@ -141,6 +143,26 @@ export interface WebAppDeps {
   readonly mcpUrl: string;
   readonly byok: ProviderKeyWriter;
   readonly connectors: ConnectorVendor;
+  /**
+   * How a signup becomes a brain (`src/control/provisioner.ts`).
+   *
+   * A port, for the reason `SeverancePort` and `ProviderKeyWriter` are ports:
+   * provisioning resolves connection strings and claims pool projects under the
+   * control-plane identity, and R11 says this module holds neither. It takes a
+   * language and answers a tenant id; the mapping from account to tenant is
+   * written here, in `account.brain`, because the identity database is the only
+   * place that mapping is allowed to exist.
+   */
+  readonly provisioner: BrainProvisioner;
+  /**
+   * How a user starts paying (`src/control/checkout.ts`).
+   *
+   * Absent disables `/api/billing/checkout` rather than faking it — the same
+   * rule `severance` follows, for a stronger reason: a route that answered with
+   * a URL this process invented would send somebody to a page that takes no
+   * money and record a customer the vendor has never heard of.
+   */
+  readonly checkout?: CheckoutPort;
   /**
    * U18's severance flow. Absent disables the routes rather than faking them:
    * an endpoint that answered `ok` for a severance nothing performed is the
@@ -380,6 +402,7 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     }
 
     if (path === '/api/logout' && request.method === 'POST') return handleLogout(request);
+    if (path === '/api/brain' && request.method === 'POST') return handleProvisionRetry(request, session);
     if (path === '/api/me') return handleMe(session);
     if (path === '/api/spend') return handleSpend(session);
     if (path === '/api/connect') return handleConnectInfo(session);
@@ -387,6 +410,7 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     if (path === '/api/connectors' && request.method === 'DELETE') return handleDisconnect(request, session);
     if (path === '/api/byok' && request.method === 'POST') return handleByok(request, session);
     if (path === '/api/byok' && request.method === 'DELETE') return handleByokRevoke(request, session);
+    if (path === '/api/billing/checkout' && request.method === 'POST') return handleCheckout(session);
     if (path === '/api/export-config') return handleExportConfig();
     if (path === '/api/severance/preview') return handleSeverancePreview(url, session);
     if (path === '/api/severance' && request.method === 'POST') {
@@ -452,12 +476,125 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       if (!created.ok) return json({ ok: false, code: created.reason }, 400);
 
       await openFreeSubscription(deps.sql, { accountId: created.accountId, now: now() });
+
+      // **The brain, before the session.** A signup that answered `201` and
+      // handed back a cookie without provisioning is the state this app shipped
+      // in: the account existed, the language the user chose was validated and
+      // discarded, and every later request that needed a tenant refused with
+      // `no_brain_yet` — including the free-tier connector gate, which no caller
+      // could ever reach. Provisioning is what makes a signup mean something, so
+      // it happens here and its failure is reported rather than deferred to a
+      // background job this system does not have.
+      const brain = await provisionBrain(created.accountId, ftsLanguage);
+      if (!brain.ok) return brain.response;
+
       const session = await createSession(deps.sql, { accountId: created.accountId, now: now() });
       const cookie = { 'set-cookie': sessionCookie(session.token, Math.floor(ABSOLUTE_SESSION_MS / 1000)) };
       return (
         afterForm(request, '/connect', cookie) ??
-        json({ ok: true, account_id: created.accountId, fts_language: ftsLanguage }, 201, cookie)
+        json(
+          {
+            ok: true,
+            account_id: created.accountId,
+            fts_language: ftsLanguage,
+            tenant_id: brain.tenantId,
+          },
+          201,
+          cookie,
+        )
       );
+    }
+
+    /**
+     * Provision, then record the link — in that order, and in the two databases
+     * each half belongs to.
+     *
+     * The tenant is the control plane's and the *mapping* is the identity
+     * store's; there is no distributed transaction between them and there is not
+     * meant to be. If the link write loses (`tenant_in_use` — a tenant id
+     * already claimed by another account), the provisioned tenant is orphaned
+     * rather than handed to the wrong owner, which is the direction that cannot
+     * produce a cross-account brain. The unique index on `account.brain.tenant_id`
+     * is what makes "one brain, one owner" a database fact.
+     */
+    async function provisionBrain(
+      accountId: string,
+      ftsLanguage: string,
+    ): Promise<{ readonly ok: true; readonly tenantId: string } | { readonly ok: false; readonly response: Response }> {
+      const provisioned = await deps.provisioner.provision({ ftsLanguage });
+      if (!provisioned.ok) {
+        // The reason is not echoed. It names substrate and pool state, which is
+        // deployment shape rather than something the person signing up can act
+        // on, and this is a public origin.
+        return {
+          ok: false,
+          response: json(
+            {
+              ok: false,
+              code: 'provisioning_unavailable',
+              message: 'Your account exists, but we could not build your brain just now. Sign in and try again.',
+            },
+            503,
+          ),
+        };
+      }
+
+      const linked = await attachBrain(deps.sql, {
+        accountId,
+        tenantId: provisioned.tenantId,
+        ftsLanguage,
+        now: now(),
+      });
+      if (!linked.ok) {
+        return {
+          ok: false,
+          response: json(
+            {
+              ok: false,
+              code: 'provisioning_unavailable',
+              message: 'Your account exists, but we could not build your brain just now. Sign in and try again.',
+            },
+            503,
+          ),
+        };
+      }
+      return { ok: true, tenantId: provisioned.tenantId };
+    }
+
+    /**
+     * The retry, for an account whose signup provisioned nothing.
+     *
+     * Without it the 503 above is terminal: the email is taken, the password
+     * works, and there is no route that can ever give that account a brain. It
+     * is idempotent by reading `account.brain` first — a second call must not
+     * spend a second pool project on an account that already has one.
+     */
+    async function handleProvisionRetry(request: Request, session: Session): Promise<Response> {
+      const existing = await brainOf(deps.sql, session.accountId);
+      if (existing !== null) {
+        return json({ ok: true, tenant_id: existing.tenantId, created: false });
+      }
+
+      // **The language is asked again rather than remembered.** A signup whose
+      // provisioning failed recorded no `account.brain` row, and that row is the
+      // only place the choice is kept — deliberately, because the choice belongs
+      // to the brain. So the retry re-asks and refuses without an answer; a
+      // retry that defaulted here would be KTD9's silent anglicisation arriving
+      // through the back door, on exactly the accounts nobody is watching.
+      const chosen = stringOf(await body(request), 'fts_language');
+      if (chosen.length === 0) {
+        return json(
+          {
+            ok: false,
+            code: 'fts_language_required',
+            message: 'Choose the language your notes and mail are mostly written in.',
+          },
+          400,
+        );
+      }
+
+      const brain = await provisionBrain(session.accountId, chosen);
+      return brain.ok ? json({ ok: true, tenant_id: brain.tenantId, created: true }, 201) : brain.response;
     }
 
     async function handleLogin(request: Request): Promise<Response> {
@@ -762,6 +899,58 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         already_severed: outcome.alreadySevered,
         polling_stopped: stopped.length,
       });
+    }
+
+    /**
+     * Start a subscription: create the vendor's customer, **record it**, then
+     * hand back the URL.
+     *
+     * **The record happens before the redirect, and that ordering is the fix.**
+     * The webhook resolves an owner by customer id and nothing in this system
+     * ever wrote one, so a correctly-signed delivery for a real paying customer
+     * answered `unknown_customer` and the tier never moved. Recording after the
+     * redirect would leave the same hole for as long as the round trip takes,
+     * which is exactly when the first delivery arrives.
+     *
+     * **A customer that cannot be bound does not get a payment page.** If the
+     * account already names a different customer, this refuses rather than
+     * sending somebody to pay against an id whose events will land on another
+     * row — the unique index makes that a database fact and this makes it a
+     * legible refusal.
+     */
+    async function handleCheckout(session: Session): Promise<Response> {
+      const vendor = deps.checkout;
+      if (vendor === undefined) {
+        return json(
+          { ok: false, code: 'not_configured', message: 'This deployment has no billing vendor configured.' },
+          501,
+        );
+      }
+
+      const subscription = await subscriptionOf(deps.sql, session.accountId);
+      if (subscription.tier === 'paid') {
+        return json({ ok: false, code: 'already_subscribed' }, 409);
+      }
+
+      const started = await vendor.start({
+        accountId: session.accountId,
+        successUrl: `${deps.origin}/dashboard`,
+        cancelUrl: `${deps.origin}/dashboard`,
+      });
+      if (!started.ok) {
+        return json({ ok: false, code: 'checkout_unavailable' }, 502);
+      }
+
+      const recorded = await recordCheckoutCustomer(deps.sql, {
+        accountId: session.accountId,
+        customerId: started.customerId,
+        now: now(),
+      });
+      if (!recorded.ok) {
+        return json({ ok: false, code: 'checkout_conflict', reason: recorded.reason }, 409);
+      }
+
+      return json({ ok: true, url: started.url });
     }
 
     function handleExportConfig(): Response {

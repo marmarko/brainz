@@ -45,6 +45,11 @@ const WEBHOOK_SECRET = 'whsec_a_secret_this_test_invented_and_stripe_never_saw';
 const ADMIN_CREDENTIAL = 'bzadm_operator';
 const AT = new Date('2026-08-13T09:00:00.000Z');
 const TENANT = 'alice';
+/**
+ * What the fake provisioner answers. The same id `signedIn` seeds, so a signup
+ * that provisions and a fixture that seeds describe one tenant rather than two.
+ */
+const PROVISIONED_TENANT = TENANT;
 
 let identity: IdentityFixture;
 let control: ControlFixture;
@@ -58,12 +63,30 @@ let recorded: {
   minted: { tenantId: string; source: string }[];
   disconnected: { tenantId: string; source: string }[];
   severed: { tenantId: string; origin: string; confirm: string }[];
+  provisioned: { ftsLanguage: string }[];
 };
 
-function app(overrides: { adminCredential?: string; severance?: boolean } = {}) {
+function app(
+  overrides: {
+    adminCredential?: string;
+    severance?: boolean;
+    /** Make provisioning fail, so the signup handler's refusal arm is reachable. */
+    provisioning?: 'ok' | 'fails';
+  } = {},
+) {
   return createWebApp({
     sql,
     controlSql,
+    provisioner: {
+      provision(request: { ftsLanguage: string }) {
+        recorded.provisioned.push({ ...request });
+        return Promise.resolve(
+          overrides.provisioning === 'fails'
+            ? ({ ok: false, reason: 'no_substrate_configured' } as const)
+            : ({ ok: true, tenantId: PROVISIONED_TENANT, via: 'synchronous' } as const),
+        );
+      },
+    },
     origin: ORIGIN,
     mcpUrl: MCP_URL,
     stripeWebhookSecret: WEBHOOK_SECRET,
@@ -147,7 +170,7 @@ async function reset(): Promise<void> {
   await sql`DELETE FROM account.billing_event`;
   await controlSql`DELETE FROM control.job`;
   await controlSql`DELETE FROM control.tenant`;
-  recorded = { byokPuts: [], byokRevokes: [], minted: [], disconnected: [], severed: [] };
+  recorded = { byokPuts: [], byokRevokes: [], minted: [], disconnected: [], severed: [], provisioned: [] };
 }
 
 /** A signed-in account whose brain is a seeded tenant. */
@@ -184,7 +207,7 @@ beforeAll(async () => {
   control = await createControlPlane('webapp');
   sql = connectIdentity(identity);
   controlSql = connectControl(control);
-  recorded = { byokPuts: [], byokRevokes: [], minted: [], disconnected: [], severed: [] };
+  recorded = { byokPuts: [], byokRevokes: [], minted: [], disconnected: [], severed: [], provisioned: [] };
 }, 60_000);
 
 afterAll(async () => {

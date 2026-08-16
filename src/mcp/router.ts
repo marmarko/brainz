@@ -71,12 +71,26 @@ abstract class FleetContainer extends Container {
   abstract override sleepAfter: string;
 }
 
+/**
+ * The MCP fleet runs the image's own `CMD`, so it names no entrypoint — one
+ * default in one place, rather than the same command written twice and drifting.
+ */
 export class McpFleet extends FleetContainer {
   override sleepAfter = '15m';
 }
 
+/**
+ * The worker fleet is the same image with a different entrypoint, which is the
+ * mechanism that makes "one image, two fleets" real rather than a packaging
+ * claim. **Without this override the worker fleet would run the MCP server**:
+ * every instance would serve an HTTP surface nobody routes to it, and no
+ * consolidation cycle would ever run — a fleet that is up, healthy, and doing
+ * none of its work. `test/fleet/image.test.ts` reads this literal and the
+ * Dockerfile's `CMD` and refuses either naming a module that does not listen.
+ */
 export class WorkerFleet extends FleetContainer {
   override sleepAfter = '5m';
+  override entrypoint = ['bun', 'run', 'src/worker/serve.ts'];
 }
 
 /*

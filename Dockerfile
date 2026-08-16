@@ -15,10 +15,18 @@
 # against a continuously running fleet, and U6's OAuth discovery metadata binds
 # absolute issuer URLs to its public origin.
 #
-# Not yet serving traffic. The entrypoints named in CMD land with U6 (MCP) and
-# U10 (worker); until then this image builds and starts nothing useful. That is
-# deliberate — the image and its configuration are validated before there is any
-# application code to blame for a deployment failure.
+# The entrypoints exist and serve. `src/mcp/serve.ts` binds the MCP surface;
+# `src/worker/serve.ts` binds the worker fleet's readiness route and runs the
+# scheduler/runner loop. Both print one `{"event":"listening",…}` line to stdout
+# after the socket is bound, which is how a supervisor, a test harness or a human
+# reading the container log learns the same fact from the same place.
+#
+# The rule this file now depends on: **CMD must name a module that listens.** It
+# previously named `src/mcp/server.ts`, which only exports a factory — run
+# directly it evaluated some definitions and exited 0 with an empty stdout and
+# nothing on :8080, and the platform read that as a healthy start.
+# `test/fleet/image.test.ts` parses this CMD and the entrypoint on each Container
+# class and refuses a file that is not one of the serving entrypoints.
 #
 # Build for Cloudflare Containers, which runs linux/amd64 only:
 #   docker build --platform linux/amd64 -t brainz-fleet .
@@ -78,6 +86,6 @@ EXPOSE 8080
 # `pingEndpoint`, not a Docker HEALTHCHECK — the platform ignores the latter.
 
 # Default entrypoint is the MCP fleet. The worker fleet runs this same image
-# with `entrypoint` overridden on its Container class (wrangler.toml).
-# Both paths land in later units: src/mcp/ is U6, src/worker/ is U10.
-CMD ["bun", "run", "src/mcp/server.ts"]
+# with `entrypoint` overridden on its Container class (see `WorkerFleet` in
+# src/mcp/router.ts).
+CMD ["bun", "run", "src/mcp/serve.ts"]

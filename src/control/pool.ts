@@ -25,6 +25,18 @@
  * meaningful value meaning "provision synchronously", which is U2's behaviour and
  * is what the web app runs with until a receipt exists.
  *
+ * **Where each half is called from, because this header once described a wiring
+ * that did not exist.** The *claim* half is wired:
+ * `src/control/provisioner.ts` calls {@link assignPoolProject} on every signup
+ * when `BRAINZ_POOL_TARGET` is above zero, falls back to synchronous
+ * provisioning on `pool_empty`, and `test/fleet/signup.test.ts` drives it through
+ * the running web process. The *fill* half is not, and cannot be from this repo:
+ * {@link fillPool} needs a vendor credential to create projects with, the web
+ * process holds none, and there is no scheduled filler. An operator fills the
+ * pool out of band. Since the shipped default is `0`, the shipped default never
+ * claims either — which is the honest state and the reason both sentences are
+ * here rather than one optimistic one.
+ *
  * **The claim is a compare-and-set, for the same reason every other claim in
  * this directory is.** Two signups arriving together, or one signup racing a
  * drain, must produce one tenant per project. `UPDATE … WHERE state = 'ready'`

@@ -419,6 +419,53 @@ export async function subscriptionOf(sql: SQL, accountId: string): Promise<Subsc
   };
 }
 
+/**
+ * Which customer this account is, as recorded before checkout starts.
+ *
+ * **Nothing in `src/` wrote this column.** Every write lived in a test, so a
+ * genuine, correctly-signed delivery could never resolve an owner: the webhook
+ * looks an account up *by customer id* (`applyToSubscription`), found nothing,
+ * and answered `unknown_customer` — a paid subscription that never became a paid
+ * tier, silently, for every real customer. This is the writer, and it runs
+ * before the user is sent to the vendor rather than after they come back,
+ * because the `checkout.session.completed` delivery can arrive first and
+ * frequently does.
+ *
+ * **Idempotent, and it never re-points an existing customer.** The `WHERE`
+ * admits a row whose column is null or already this exact id; a row naming a
+ * different customer is left alone and reported. Repointing would move a paying
+ * customer's subscription onto another account — the direction that cannot be
+ * undone by a retry — and the unique index on the column means the alternative
+ * failure is a constraint violation rather than a silent swap.
+ */
+export async function recordCheckoutCustomer(
+  sql: SQL,
+  request: {
+    readonly accountId: string;
+    readonly customerId: string;
+    readonly now: Date;
+  },
+): Promise<
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: 'invalid_customer_id' | 'not_this_account' }
+> {
+  // The column's own alphabet (`account.stripe_id`), checked here so a malformed
+  // id is a typed refusal rather than a constraint violation the caller reports
+  // as an outage. Same rule `readEvent` applies to an id off the wire.
+  if (!/^[a-z]{1,12}_[A-Za-z0-9]{1,126}$/.test(request.customerId)) {
+    return { ok: false, reason: 'invalid_customer_id' };
+  }
+
+  const updated = await sql<{ account_id: string }[]>`
+    UPDATE account.subscription
+       SET stripe_customer_id = ${request.customerId}, updated_at = ${request.now}
+     WHERE account_id = ${request.accountId}
+       AND (stripe_customer_id IS NULL OR stripe_customer_id = ${request.customerId})
+    RETURNING account_id`;
+
+  return updated.length === 0 ? { ok: false, reason: 'not_this_account' } : { ok: true };
+}
+
 /** Called when an account is created, so every account has a subscription row. */
 export async function openFreeSubscription(
   sql: SQL,

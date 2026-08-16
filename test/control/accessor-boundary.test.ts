@@ -50,9 +50,13 @@ const ACCESSOR = 'src/control/storage.ts';
  *
  * `provision.ts` writes `storage_prefix` onto the control-plane row — the
  * schema's own `storage_prefix_belongs_to_this_tenant` CHECK is what pins that.
- * `dispatch.ts` and `attestation.ts` put it in U16's isolation receipt, which is
- * a JSON document and therefore cannot carry a branded type across the wire; the
- * prefix reaches them from `prefixFor` and is copied, never constructed.
+ * `control-store.ts` is the SQL half of that same write: it maps the column
+ * `provision.ts` names onto the statement that stores it, and adds no second
+ * opinion about what a prefix looks like. `provisioner.ts` copies the value
+ * `prefixFor` handed back onto the record those two persist. `dispatch.ts` and
+ * `attestation.ts` put it in U16's isolation receipt, which is a JSON document
+ * and therefore cannot carry a branded type across the wire; the prefix reaches
+ * them from `prefixFor` and is copied, never constructed.
  *
  * **The exemption is narrower than it looks, deliberately.** It is consulted
  * *after* the cast rule and the `PREFIX_ROOT` literal rule, so a file on this
@@ -62,6 +66,8 @@ const ACCESSOR = 'src/control/storage.ts';
  */
 const PREFIX_RECORDERS: readonly string[] = [
   'src/control/provision.ts',
+  'src/control/control-store.ts',
+  'src/control/provisioner.ts',
   'src/mcp/dispatch.ts',
   'src/mcp/attestation.ts',
 ];
