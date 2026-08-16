@@ -463,4 +463,38 @@ describe('applying an event', () => {
       await applyBillingEvent({ sql, controlSql, payload, header: header(payload), secret: SECRET, now: AT }),
     ).toEqual({ ok: false, reason: 'malformed_event' });
   });
+
+  test('AN ID CARRYING AN UNDERSCORE AFTER ITS PREFIX IS APPLIED, NOT DISCARDED', async () => {
+    // The vendor's id alphabet is not `[A-Za-z0-9]` after the prefix, and never
+    // was: `cs_test_…`, `cs_live_…` and `sub_sched_…` are ordinary ids. A
+    // narrower alphabet here is not a safety property — the signature has
+    // already proved the delivery came from the vendor — it is a genuine
+    // upgrade being thrown away, and `src/web/app.ts` answers the refusal with
+    // the 400 its own comment says the vendor gives up on. So a delivery this
+    // system cannot *store* is a column to widen, not a delivery to drop.
+    const { tenantId } = await aPayingCustomer();
+    const payload = subscriptionEvent({
+      id: 'evt_stale_active',
+      type: 'customer.subscription.updated',
+      customer: 'cus_alice',
+      subscription: 'sub_sched_alice',
+      status: 'active',
+    });
+
+    expect(
+      await applyBillingEvent({ sql, controlSql, payload, header: header(payload), secret: SECRET, now: AT }),
+    ).toEqual({ ok: true, outcome: 'applied', tier: 'paid', tenantId });
+
+    // Both halves land, which is what exercises the column's own domain: a
+    // widened regex over an unwidened `account.stripe_id` would be a constraint
+    // violation rather than a refusal, and the claim-release path would hand the
+    // vendor a retry that fails the same way forever.
+    const events = await sql<{ event_id: string }[]>`
+      SELECT event_id FROM account.billing_event WHERE event_id = 'evt_stale_active'`;
+    expect(events).toHaveLength(1);
+
+    const subs = await sql<{ stripe_subscription_id: string | null }[]>`
+      SELECT stripe_subscription_id FROM account.subscription WHERE stripe_customer_id = 'cus_alice'`;
+    expect(subs[0]?.stripe_subscription_id).toBe('sub_sched_alice');
+  });
 });

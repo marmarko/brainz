@@ -201,6 +201,21 @@ export type ApplyOutcome =
   | { readonly ok: true; readonly outcome: 'duplicate' | 'ignored' | 'unknown_customer' }
   | { readonly ok: false; readonly reason: SignatureRefusal | 'malformed_event' };
 
+/**
+ * The `account.stripe_id` domain, in one place, because three call sites refuse
+ * against it and a fourth copy is how they drift apart.
+ *
+ * **It admits underscores after the prefix, because the vendor's ids do** —
+ * `cs_test_…`, `cs_live_…`, `sub_sched_…`. A narrower alphabet is not the safer
+ * direction here and reading it as one is the mistake: the signature has already
+ * established the delivery is genuine, so refusing an id we simply cannot store
+ * discards a correctly-signed upgrade behind the 400 that `src/web/app.ts` says
+ * the vendor gives up on. Keep this in step with the domain — a regex wider than
+ * the column turns a refusal into a constraint violation, which the claim-release
+ * path then invites the vendor to retry forever.
+ */
+const VENDOR_ID = /^[a-z]{1,12}_[A-Za-z0-9][A-Za-z0-9_]{0,125}$/;
+
 interface StripeEvent {
   readonly id: string;
   readonly type: string;
@@ -225,8 +240,10 @@ function readEvent(payload: string): StripeEvent | null {
 
   // The alphabets in `account-schema.sql` are narrower than "any string", and a
   // value the column cannot hold must be refused here rather than raising a
-  // constraint violation the caller would report as an outage.
-  if (!/^[a-z]{1,12}_[A-Za-z0-9]{1,126}$/.test(id)) return null;
+  // constraint violation the caller would report as an outage. Narrower than
+  // *the vendor* is a different thing entirely, and {@link VENDOR_ID} says why
+  // this one is not.
+  if (!VENDOR_ID.test(id)) return null;
   if (!/^[a-z][a-z0-9_]{0,31}(\.[a-z][a-z0-9_]{0,31}){0,5}$/.test(type)) return null;
 
   const object =
@@ -242,7 +259,7 @@ function readEvent(payload: string): StripeEvent | null {
 
 function stringField(object: Record<string, unknown>, name: string): string | null {
   const value = object[name];
-  return typeof value === 'string' && /^[a-z]{1,12}_[A-Za-z0-9]{1,126}$/.test(value) ? value : null;
+  return typeof value === 'string' && VENDOR_ID.test(value) ? value : null;
 }
 
 /**
@@ -451,8 +468,9 @@ export async function recordCheckoutCustomer(
 > {
   // The column's own alphabet (`account.stripe_id`), checked here so a malformed
   // id is a typed refusal rather than a constraint violation the caller reports
-  // as an outage. Same rule `readEvent` applies to an id off the wire.
-  if (!/^[a-z]{1,12}_[A-Za-z0-9]{1,126}$/.test(request.customerId)) {
+  // as an outage. Same rule `readEvent` applies to an id off the wire, and the
+  // same one pattern — see {@link VENDOR_ID}.
+  if (!VENDOR_ID.test(request.customerId)) {
     return { ok: false, reason: 'invalid_customer_id' };
   }
 

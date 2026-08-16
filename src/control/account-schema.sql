@@ -97,9 +97,19 @@ CREATE DOMAIN account.token_digest AS varchar(64)
 
 -- An identifier minted by the billing vendor: `cus_…`, `sub_…`, `evt_…`,
 -- `price_…`. Opaque, printable, and incapable of holding a URL or a sentence.
+--
+-- **The suffix admits underscores, because the vendor's does.** `cs_test_…`,
+-- `cs_live_…` and `sub_sched_…` are ordinary ids, and this alphabet is the one
+-- `src/control/billing.ts` refuses a delivery against *before* it reaches the
+-- column. Narrower than the vendor is not safer here: the signature has already
+-- established the delivery is genuine, so an id this column cannot hold is a
+-- correctly-signed upgrade discarded with a 400 the vendor gives up on. What the
+-- alphabet is actually for — no URL, no sentence, no whitespace, bounded — is
+-- unchanged, and the first character after the prefix is still alphanumeric so
+-- the separator cannot be doubled into something that reads as two prefixes.
 CREATE DOMAIN account.stripe_id AS varchar(140)
   CONSTRAINT stripe_id_is_a_prefixed_opaque_handle
-  CHECK (VALUE ~ '^[a-z]{1,12}_[A-Za-z0-9]{1,126}$');
+  CHECK (VALUE ~ '^[a-z]{1,12}_[A-Za-z0-9][A-Za-z0-9_]{0,125}$');
 
 -- A dotted event name (`customer.subscription.updated`). A closed set would be
 -- better and is not available: the vendor adds event types without asking, and a
