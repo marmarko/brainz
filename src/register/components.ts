@@ -239,6 +239,21 @@ export const SHARED_COMPONENTS: readonly RegisterEntry[] = [
     evidence: { hosts: ['api.pipedream.com', 'pipedream.com'] },
   },
   {
+    id: 'stripe',
+    name: 'Stripe (subscription billing) — the vendor',
+    kind: 'vendor',
+    shared_by: 'some_tenants',
+    transmits_user_content: false,
+    blast_radius:
+      'Every tenant who has reached checkout, and only those: Stripe holds their email address, their payment relationship and the customer id `account.subscription` is keyed on, while a free-tier account never becomes a customer at all (`stripe_customer_id` stays null). No brain content is ever sent to it and `account.billing_event` deliberately stores no event payload, which is why this row says no where the other vendors say yes — and it is the one line `docs/legal/privacy-policy.md` makes about a named subprocessor. The credential that lets the vendor’s events *do* anything here is a separate blast radius with a separate entry, `billing-webhook-secret`; this entry is the party, not the key.',
+    rotation_owner: 'control-plane operator on call',
+    rotation:
+      'Nothing brainz holds addresses Stripe today: there is no SDK, no API key and no outbound call in `src/`, so the only credential in this relationship is the endpoint signing secret, rotated under its own entry. The vendor account itself is migrated rather than rotated, the way the Cloudflare entry says of its own. Building the checkout and portal legs U15 reported `deferred` adds a secret API key to this relationship, and that is a change to this entry rather than a config edit.',
+    evidence: {},
+    note:
+      'No host, no provider and no binding: the contact is an inbound webhook verified by HMAC, so none of the three completeness sweeps can find this entry and none of them would go red if it were deleted. It is named because R10 asks for every party user data reaches and `docs/legal/subprocessors.md` publishes Stripe as one — a subprocessor the register does not name is the mismatch R10 exists to prevent, in the direction nothing scans for. `test/register/completeness.test.ts` holds this row and `billing-webhook-secret` in place, and says in as many words what that assertion can and cannot establish.',
+  },
+  {
     id: 'openai',
     name: 'OpenAI — embeddings',
     kind: 'model-provider',

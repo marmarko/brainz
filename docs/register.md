@@ -65,6 +65,7 @@ path and cannot prove a deployed container is denied one.
 | `identity-store` | Identity and billing database (accounts, sessions, subscriptions) | platform-credential | all_tenants | no |
 | `pool-secret-namespace` | Warm-pool connection strings (`pool/` namespace) | platform-credential | no_tenant_data | no |
 | `pipedream` | Pipedream (connector substrate) + the project key | vendor | some_tenants | **yes** |
+| `stripe` | Stripe (subscription billing) — the vendor | vendor | some_tenants | no |
 | `openai` | OpenAI — embeddings | model-provider | all_tenants | **yes** |
 | `google` | Google — extraction, enrichment, contradiction detection | model-provider | all_tenants | **yes** |
 | `cloudflare-models` | Cloudflare Workers AI — open-weight inference and the rerank endpoint | model-provider | all_tenants | **yes** |
@@ -72,7 +73,7 @@ path and cannot prove a deployed container is denied one.
 | `web-app` | Web app and control plane (`app.brainz.*`) | web-app | all_tenants | no |
 | `claude-client` | Claude (the connecting client) | client | some_tenants | **yes** |
 
-**10 of 17 components receive user content**: `cloudflare`, `mcp-fleet`, `worker-fleet`, `neon-platform`, `object-storage-parent-credential`, `pipedream`, `openai`, `google`, `cloudflare-models`, `claude-client`. Everything else exists for a user without their words reaching it, which is a different question from whether it can hurt them.
+**10 of 18 components receive user content**: `cloudflare`, `mcp-fleet`, `worker-fleet`, `neon-platform`, `object-storage-parent-credential`, `pipedream`, `openai`, `google`, `cloudflare-models`, `claude-client`. Everything else exists for a user without their words reaching it, which is a different question from whether it can hurt them.
 
 ### Blast radius and rotation
 
@@ -209,6 +210,20 @@ path and cannot prove a deployed container is denied one.
 **Rotation.** Rotated in the Pipedream dashboard and re-put into the control plane’s store. Per-user tokens are revoked individually as part of the account-erasure runbook rather than by rotating this key.
 
 **Evidence in the code.** hosts `api.pipedream.com`, `pipedream.com`.
+
+#### `stripe` — Stripe (subscription billing) — the vendor
+
+**Kind.** vendor · **Shared by.** some_tenants · **Receives user content.** no
+
+**Blast radius.** Every tenant who has reached checkout, and only those: Stripe holds their email address, their payment relationship and the customer id `account.subscription` is keyed on, while a free-tier account never becomes a customer at all (`stripe_customer_id` stays null). No brain content is ever sent to it and `account.billing_event` deliberately stores no event payload, which is why this row says no where the other vendors say yes — and it is the one line `docs/legal/privacy-policy.md` makes about a named subprocessor. The credential that lets the vendor’s events *do* anything here is a separate blast radius with a separate entry, `billing-webhook-secret`; this entry is the party, not the key.
+
+**Rotation owner.** control-plane operator on call
+
+**Rotation.** Nothing brainz holds addresses Stripe today: there is no SDK, no API key and no outbound call in `src/`, so the only credential in this relationship is the endpoint signing secret, rotated under its own entry. The vendor account itself is migrated rather than rotated, the way the Cloudflare entry says of its own. Building the checkout and portal legs U15 reported `deferred` adds a secret API key to this relationship, and that is a change to this entry rather than a config edit.
+
+**Note.** No host, no provider and no binding: the contact is an inbound webhook verified by HMAC, so none of the three completeness sweeps can find this entry and none of them would go red if it were deleted. It is named because R10 asks for every party user data reaches and `docs/legal/subprocessors.md` publishes Stripe as one — a subprocessor the register does not name is the mismatch R10 exists to prevent, in the direction nothing scans for. `test/register/completeness.test.ts` holds this row and `billing-webhook-secret` in place, and says in as many words what that assertion can and cannot establish.
+
+**Evidence in the code.** none a scanner can find — this component is named because it exists, not because a sweep reported it.
 
 #### `openai` — OpenAI — embeddings
 
@@ -444,6 +459,18 @@ Identical content, so a script auditing the blast radius reads the published doc
           "pipedream.com"
         ]
       }
+    },
+    {
+      "id": "stripe",
+      "name": "Stripe (subscription billing) — the vendor",
+      "kind": "vendor",
+      "shared_by": "some_tenants",
+      "transmits_user_content": false,
+      "blast_radius": "Every tenant who has reached checkout, and only those: Stripe holds their email address, their payment relationship and the customer id `account.subscription` is keyed on, while a free-tier account never becomes a customer at all (`stripe_customer_id` stays null). No brain content is ever sent to it and `account.billing_event` deliberately stores no event payload, which is why this row says no where the other vendors say yes — and it is the one line `docs/legal/privacy-policy.md` makes about a named subprocessor. The credential that lets the vendor’s events *do* anything here is a separate blast radius with a separate entry, `billing-webhook-secret`; this entry is the party, not the key.",
+      "rotation_owner": "control-plane operator on call",
+      "rotation": "Nothing brainz holds addresses Stripe today: there is no SDK, no API key and no outbound call in `src/`, so the only credential in this relationship is the endpoint signing secret, rotated under its own entry. The vendor account itself is migrated rather than rotated, the way the Cloudflare entry says of its own. Building the checkout and portal legs U15 reported `deferred` adds a secret API key to this relationship, and that is a change to this entry rather than a config edit.",
+      "evidence": {},
+      "note": "No host, no provider and no binding: the contact is an inbound webhook verified by HMAC, so none of the three completeness sweeps can find this entry and none of them would go red if it were deleted. It is named because R10 asks for every party user data reaches and `docs/legal/subprocessors.md` publishes Stripe as one — a subprocessor the register does not name is the mismatch R10 exists to prevent, in the direction nothing scans for. `test/register/completeness.test.ts` holds this row and `billing-webhook-secret` in place, and says in as many words what that assertion can and cannot establish."
     },
     {
       "id": "openai",

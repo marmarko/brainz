@@ -121,6 +121,53 @@ describe('the register accounts for everything the code names', () => {
     expect(key?.blast_radius).toContain('any');
   });
 
+  test('the billing relationship is named on both halves — the vendor, and the key', () => {
+    // **The pair no sweep can reach.** The contact with Stripe is an inbound
+    // webhook verified with an HMAC: `src/control/billing.ts` imports no SDK,
+    // names no host and is no routing provider, and there is no binding for it.
+    // So all three evidence sets miss both rows, and `findRegisterGaps` would
+    // stay green if either were deleted tomorrow — the same blindness that makes
+    // `object-storage-parent-credential` and `attestation-signing-key` entries a
+    // human had to put there, and the reason those two are asserted by hand too.
+    //
+    // Both halves, because they are different failures. `docs/legal/subprocessors.md`
+    // publishes Stripe as a party that holds our users' account and payment
+    // data, and a published subprocessor the register does not name is the
+    // mismatch R10 exists to prevent. The signing secret is a separate radius
+    // that U15's re-plan §3 requires be written down: it is capability, not
+    // data, and losing it is somebody else's model spend.
+    //
+    // **What this cannot do**, said rather than left to be assumed: it compares
+    // the register against itself, which is the trap this file is otherwise
+    // written to avoid. It holds the rows in place and holds them to the claims
+    // that matter. It cannot establish that either row is true in fact, and no
+    // scanner in this repo can, because the vendor is invisible to all of them.
+    const stripe = SHARED_COMPONENTS.find((entry) => entry.id === 'stripe');
+    expect(stripe).toBeDefined();
+    expect(stripe?.kind).toBe('vendor');
+    // Account and payment data, never brain content — the one claim the privacy
+    // policy makes about a named subprocessor.
+    expect(stripe?.transmits_user_content).toBe(false);
+    expect(stripe?.blast_radius).toContain('payment');
+
+    const secret = SHARED_COMPONENTS.find((entry) => entry.id === 'billing-webhook-secret');
+    expect(secret).toBeDefined();
+    // Why it is a platform credential rather than a billing detail: whoever
+    // holds it forges an event, and a tier is paid model phases on a brain.
+    expect(secret?.blast_radius).toContain('forge');
+    expect(secret?.blast_radius).toContain('tier');
+
+    // The property that makes the two assertions above load-bearing rather than
+    // decorative: neither row has evidence a scanner produced, so nothing else
+    // in this file would notice their removal.
+    for (const entry of [stripe, secret]) {
+      expect({ id: entry?.id, evidence: Object.keys(entry?.evidence ?? {}) }).toEqual({
+        id: entry?.id,
+        evidence: [],
+      });
+    }
+  });
+
   test('exactly two model-side processors receive content, per KTD13', () => {
     // The claim that makes a third provider a subprocessor change rather than a
     // config edit. If this number moves, the register moved with it — which is

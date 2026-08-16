@@ -5,7 +5,7 @@ implementation units in the roadmap plan; the plan is the authority on scope.
 
 | Directory | Owns | Units |
 |---|---|---|
-| `control/` | Control plane (content-free), tenant provisioning, secret store, the migration runner that moves a tenant along the schema ladder and the ports the fleet's scheduled sweep runs it through | U2, U3 |
+| `control/` | Control plane (content-free), tenant provisioning, secret store, the migration runner that moves a tenant along the schema ladder and the ports the fleet's scheduled sweep runs it through. It also holds U15's half: the **identity** schema and its accessors — a second database, separate from the content-free control plane, so that plane's claim stays literally true of the database the register names — the webhook verifier that is the only thing allowed to move a tenant's tier, the seam the consolidation cycle reads that tier through, and the warm pool | U2, U3, U15 |
 | `schema/` | The per-tenant schema as an ordered ladder of rungs, the applier that provisioning calls, and the one vector-query helper every read goes through | U3 |
 | `ai/` | The single model gateway — routing by op, metering, pricing, key resolution. **No other directory imports a provider SDK.** | U20 |
 | `core/` | Write path, retrieval stack, consolidation cycle, briefing assembly, media/OCR | U4, U5, U11, U12, U21 |
@@ -13,6 +13,7 @@ implementation units in the roadmap plan; the plan is the authority on scope.
 | `worker/` | Typed job runner, locking, dead-lettering, the scheduled fleets | U10 |
 | `ingest/` | Chat-export and folder import, Pipedream connector substrate, first-import gate | U8, U9 |
 | `web/` | The web app — signup, sessions, subscription, connectors, spend, BYOK entry, the guided connect flow, and the `/admin` scope table. It holds the identity database, the control plane, and a **write-only** port for tenant provider keys; it holds no secret store, no tenant connection and no model gateway, because R11 is a claim about capability rather than intent. Filed here rather than under `apps/` because `tsconfig.json` covers `src`, `test` and `scripts`, and code that is neither typechecked nor scanned by the guards is worse than a differently-named directory. | U15 |
+| `register/` | R10's register as **data**, the renderer that publishes `docs/register.md` as a table for a person and a JSON block for a machine, and the completeness check that holds it to three evidence sets the register does not author — every `http(s)://` host named under `src/`, every provider a routing profile can reach, and every binding `wrangler.toml` declares. A register checked against its own rendering is complete by construction and can still be wrong in fact, which is the failure R10 exists against; adding a vendor turns it red instead. Both directions are failures, so an entry naming a vendor the code no longer calls is a finding too. What no sweep can reach — a credential with no host literal, a party contacted only inbound — is named by hand and asserted by name in `test/register/completeness.test.ts`. | U16 |
 
 **The tenant schema is a ladder, and rungs are append-only.** `schema/tenant.sql` is rung one
 and `schema/migrations/` holds the rest; `schema/migrations.ts` is the ordered list.
