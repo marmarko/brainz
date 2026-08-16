@@ -43,6 +43,15 @@
  * entities, and nothing joins the two — so a derivation-only sweep would delete
  * the person's card and leave every sentence about them answering `recall`.
  *
+ * **A hazard on the text handle, stated where an editor will see it.** The
+ * surface forms include the entity's *inferred* aliases, not only the ones a
+ * user stated. A short or generic inferred alias widens the sweep, and this
+ * sweep deletes. The mitigation is the flow rather than a filter: the controller
+ * sees {@link previewSubjectErasure}'s match list — every page, with the handle
+ * that found it — before instructing, exactly as they see a blast radius before
+ * a `forget`. Anything that makes erasure invocable without that preview
+ * re-opens this.
+ *
  * **What neither handle reaches**, stated here rather than discovered by a
  * regulator: a message that mentions the correspondent, from which no fact was
  * extracted, *and* which does not contain the identifier or any known alias as
@@ -267,6 +276,20 @@ export async function eraseSubject(
                   AND (statement ILIKE ${pattern} OR coalesce(owner_name, '') ILIKE ${pattern})`;
     }
 
+    // **The snapshot table is a second copy of every document**, and this unit
+    // built it. `page_version` outlives the 72h purge by design (its foreign key
+    // is ON DELETE SET NULL, so history survives a tombstone being reaped) — so
+    // a subject erasure that retracted the page and left the snapshot would hand
+    // the requester a receipt while her mail sat verbatim in a table nothing
+    // else will ever sweep. Keyed on `doc_key` rather than `page_id`, because
+    // `page_id` may already have been nulled by an earlier purge.
+    const docKeys = preview.matches.map((match) =>
+      match.externalRef === null ? `page:${match.pageId}` : match.externalRef,
+    );
+    if (docKeys.length > 0) {
+      await tx`DELETE FROM page_version WHERE doc_key = ANY(${textArrayLiteral(docKeys)}::text[])`;
+    }
+
     if (preview.entityIds.length > 0) {
       const ids = textArrayLiteral(preview.entityIds);
       await tx`UPDATE entity_card SET deleted_at = ${at}::timestamptz
@@ -369,30 +392,26 @@ async function matchingPages(
     }
   }
 
-  // The derivation handle: pages behind facts the entity's own edges came from.
-  if (entityIds.length > 0) {
-    const ids = textArrayLiteral(entityIds);
-    const rows = (await sql`
-      SELECT DISTINCT p.page_id::text AS page_id, p.external_ref
-        FROM page p
-        JOIN chunk c ON c.page_id = p.page_id
-        JOIN fact_source fs ON fs.chunk_id = c.chunk_id
-        JOIN fact f ON f.fact_id = fs.fact_id
-        JOIN entity_edge e ON e.origin_contexts && f.origin_contexts
-       WHERE p.deleted_at IS NULL
-         AND (e.subject_entity_id = ANY(${ids}::text[]::bigint[])
-              OR e.object_entity_id = ANY(${ids}::text[]::bigint[]))
-    `) as Array<{ page_id: string; external_ref: string | null }>;
-    for (const row of rows) {
-      if (!matches.has(row.page_id)) {
-        matches.set(row.page_id, {
-          pageId: row.page_id,
-          externalRef: row.external_ref,
-          handle: 'derivation',
-        });
-      }
-    }
-  }
+  // **There is deliberately no page-discovery arm here for the entity graph, and
+  // the reason is a hazard rather than an omission.** The schema has no
+  // structural edge from a fact to the entity it is about: `fact_source` reaches
+  // chunks, `entity_edge` reaches entities, and nothing joins the two. The
+  // tempting proxy is to walk `entity_edge` and match facts whose origins
+  // overlap the edge's — and it is catastrophically wrong, in the *ordinary*
+  // shape rather than an exotic one. In a single-origin brain (every row
+  // `personal`, which is what an alpha tenant looks like) every fact's origins
+  // overlap every edge's, so once the subject has one edge the arm matches every
+  // fact-bearing page in the brain and the erasure deletes it. Origin overlap is
+  // a fence, not a derivation edge.
+  //
+  // So page discovery is the text handle, and the entity subtree below is
+  // reached directly by id. The limit that leaves — a page that mentions the
+  // correspondent, from which no fact was extracted, and which contains neither
+  // the identifier nor any known alias as text — is stated in this module's
+  // header rather than papered over with a proxy that over-matches. The
+  // `handle` field stays on {@link SubjectMatch} for the day a structural link
+  // exists; until then every match is honestly `text`.
+  void entityIds;
 
   return [...matches.values()].sort((left, right) => Number(left.pageId) - Number(right.pageId));
 }

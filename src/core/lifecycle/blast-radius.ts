@@ -167,8 +167,10 @@ export type ForgetPreviewOutcome =
  * vocabulary. It is a mirror rather than a shared helper because the two run at
  * different times against different states, and a preview that shared the
  * retraction's statements would be one edit away from *being* the retraction.
- * The suite pins the mirror by asserting the counts against the same fixture the
- * cascade runs on.
+ * The suite pins the mirror rather than trusting it: the last case in
+ * `test/core/lifecycle/blast-radius.test.ts` runs the preview and then
+ * `forgetRecord` itself over the same fixture and asserts the three counts
+ * agree. It runs last, because the second half of it mutates.
  */
 export async function previewForget(
   sql: SQL,

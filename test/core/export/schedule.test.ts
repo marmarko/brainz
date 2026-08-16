@@ -248,6 +248,44 @@ describe('the run, and the two columns it writes to', () => {
   );
 
   test(
+    'a successful export CLEARS a previous failure, or the reminder says "failing" forever',
+    async () => {
+      const failing: SelfExportDestination = {
+        kind: 'object_store',
+        write: () => {
+          const failure = new Error('the bucket did not answer');
+          failure.name = 'DestinationUnreachable';
+          return Promise.reject(failure);
+        },
+      };
+      await runSelfExport(sql, { destination: failing, now: NOW });
+      expect((await readExportState(sql)).lastFailure).toBe('DestinationUnreachable');
+
+      await runSelfExport(sql, {
+        destination: { kind: 'object_store', write: () => Promise.resolve() },
+        now: new Date(NOW.getTime() + DAY_MS),
+      });
+
+      const after = await readExportState(sql);
+      expect(after.lastFailure).toBeNull();
+      // And the reminder stops calling a working backup broken.
+      const age = await readContentAge(sql);
+      expect(
+        selfExportNag({
+          destinationConfigured: true,
+          lastExportAt: after.lastExportAt,
+          oldestContentAt: age.oldestContentAt,
+          pages: age.pages,
+          lastFailure: after.lastFailure,
+          state: { lastShownAt: null, lastBand: 0 },
+          now: new Date(NOW.getTime() + 100 * DAY_MS),
+        })?.text ?? '',
+      ).not.toContain('failing');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
     'the reminder bound is per caller, so a second client is not silenced by the first',
     async () => {
       await recordNagShown(sql, { callerKey: 'grant-1', band: 30, at: NOW });

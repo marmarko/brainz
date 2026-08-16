@@ -41,6 +41,7 @@ const EMBEDDING = `('[1' || repeat(',0', ${EMBEDDING_DIMENSIONS - 1}) || ']')::v
 async function seed(): Promise<void> {
   await sql.unsafe(`
     DELETE FROM erased_subject;
+    DELETE FROM page_version;
     DELETE FROM fact_source; DELETE FROM entity_edge; UPDATE fact SET superseded_by = NULL;
     DELETE FROM commitment; DELETE FROM entity_card;
     DELETE FROM fact; DELETE FROM entity_alias; DELETE FROM entity_slug; DELETE FROM entity;
@@ -107,6 +108,19 @@ async function seed(): Promise<void> {
            (SELECT c.chunk_id FROM chunk c JOIN page p ON p.page_id = c.page_id
              WHERE p.external_ref = 'gmail:a2');
 
+    -- A fact about the bystander alone, sourced from the bystander's OWN chunk.
+    -- This is the shape U4's write path creates for every extracted fact, and
+    -- it is what makes the over-deletion below observable: in a single-origin
+    -- brain every fact's origins overlap every edge's origins, so a page
+    -- discovery keyed on origin overlap matches this page too.
+    INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+    SELECT '${BYSTANDER} presented the numbers', ${EMBEDDING}, ARRAY['${ORIGIN}'], page_id
+      FROM page WHERE external_ref = 'gmail:a3';
+    INSERT INTO fact_source (fact_id, chunk_id)
+    SELECT (SELECT fact_id FROM fact WHERE statement = '${BYSTANDER} presented the numbers'),
+           (SELECT c.chunk_id FROM chunk c JOIN page p ON p.page_id = c.page_id
+             WHERE p.external_ref = 'gmail:a3');
+
     INSERT INTO commitment (statement, owner_name, trust_level, derivation, origin_contexts)
     VALUES ('send the plan', '${SUBJECT}', 'model_extracted', 'model_derived', ARRAY['${ORIGIN}']),
            ('file the report', '${BYSTANDER}', 'model_extracted', 'model_derived', ARRAY['${ORIGIN}']);
@@ -141,7 +155,7 @@ describe('the fixture holds what the erasure is about', () => {
       expect(await count('entity')).toBe(2);
       expect(await count('entity_card')).toBe(2);
       expect(await count('commitment')).toBe(2);
-      expect(await count('fact')).toBe(2);
+      expect(await count('fact')).toBe(3);
       expect(await count('entity_edge', 'TRUE')).toBe(1);
     },
     TEST_TIMEOUT_MS,
@@ -193,10 +207,13 @@ describe('the span reaches derivation, not only rows', () => {
       expect(await count('entity_card')).toBe(1);
       expect(await count('entity_edge', 'TRUE')).toBe(0);
 
-      const facts = (await sql`SELECT statement FROM fact WHERE deleted_at IS NULL`) as Array<{
-        statement: string;
-      }>;
-      expect(facts.map((row) => row.statement)).toEqual(['the rollout is owned']);
+      const facts = (await sql`
+        SELECT statement FROM fact WHERE deleted_at IS NULL ORDER BY statement
+      `) as Array<{ statement: string }>;
+      expect(facts.map((row) => row.statement)).toEqual([
+        `${BYSTANDER} presented the numbers`,
+        'the rollout is owned',
+      ]);
 
       const commitments = (await sql`
         SELECT owner_name FROM commitment WHERE deleted_at IS NULL
@@ -230,6 +247,68 @@ describe('the span reaches derivation, not only rows', () => {
         'gmail:a1',
         'gmail:a2',
       ]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe('the sweep does not widen past the person it is about', () => {
+  test(
+    'a page that only ever mentioned the OTHER correspondent survives',
+    async () => {
+      // The failure this is written against: `entity_edge.origin_contexts &&
+      // fact.origin_contexts` looks like a derivation edge and is not one. In a
+      // single-origin brain — the ordinary alpha shape, everything `personal` —
+      // every fact overlaps every edge, so once the subject has one edge, every
+      // fact-bearing page in the brain matches. Erasing one correspondent would
+      // delete the brain.
+      await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app' });
+
+      const survivors = (await sql`
+        SELECT external_ref FROM page WHERE deleted_at IS NULL ORDER BY external_ref
+      `) as Array<{ external_ref: string }>;
+      expect(survivors.map((row) => row.external_ref)).toEqual(['gmail:a3']);
+
+      const facts = (await sql`
+        SELECT statement FROM fact WHERE deleted_at IS NULL ORDER BY statement
+      `) as Array<{ statement: string }>;
+      expect(facts.map((row) => row.statement)).toEqual([
+        `${BYSTANDER} presented the numbers`,
+        'the rollout is owned',
+      ]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a captured version does not keep the erased correspondent\'s document text',
+    async () => {
+      // `page_version` is a second copy of every document — this unit's own rung
+      // says so — and the 72h purge cannot reach it by design (ON DELETE SET
+      // NULL is what keeps history alive across a purge). A subject erasure that
+      // tombstoned the page and left the snapshot would hand a requester a
+      // receipt while her mail sat verbatim in the table the same unit created.
+      const [{ page_id: pageId } = { page_id: '' }] = (await sql`
+        SELECT page_id::text AS page_id FROM page WHERE external_ref = 'gmail:a2'
+      `) as Array<{ page_id: string }>;
+      await sql`
+        INSERT INTO page_version (doc_key, version, page_id, origin_context, source_type,
+                                  title, body, content_sha256, captured_from)
+        VALUES ('gmail:a2', 1, ${pageId}::bigint, ${ORIGIN}, 'email',
+                ${`A thread about the rollout`},
+                ${`the rollout owner is ${SUBJECT} and nobody disputed it`},
+                ${'f'.repeat(64)}, 'live')
+      `;
+      expect(await count('page_version', 'TRUE')).toBe(1);
+
+      await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app' });
+
+      const rows = (await sql`SELECT doc_key, body FROM page_version`) as Array<{
+        doc_key: string;
+        body: string;
+      }>;
+      expect(rows.filter((row) => row.body.includes('alice-example'))).toEqual([]);
+      expect(rows.map((row) => row.doc_key)).not.toContain('gmail:a2');
     },
     TEST_TIMEOUT_MS,
   );

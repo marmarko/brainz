@@ -28,6 +28,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { previewForget, previewSeverance } from '../../../src/core/lifecycle/blast-radius.ts';
 import { parseId } from '../../../src/mcp/ids.ts';
+import { forgetRecord } from '../../../src/mcp/tombstone.ts';
 import { EMBEDDING_DIMENSIONS } from '../../../src/schema/vector-index.ts';
 import { connect, dropFixtureDatabase, provisionFixture, type SchemaFixture } from '../../schema/fixture.ts';
 
@@ -240,6 +241,32 @@ describe('forget preview', () => {
       const before = await census();
       await previewForget(sql, { id: parseId(`doc:${workPageId}`)!, grant: [WORK] });
       expect(await census()).toEqual(before);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'the preview matches what the retraction actually does — run last, because it mutates',
+    async () => {
+      // The preview is a *mirror* of `forgetRecord`, not a shared helper: the
+      // two run at different times against different states, and a preview that
+      // shared the retraction's statements would be one edit from being it. A
+      // mirror is only worth anything while somebody compares the two, so this
+      // is that comparison — same fixture, both code paths, same numbers.
+      const id = parseId(`doc:${workPageId}`)!;
+      const preview = await previewForget(sql, { id, grant: [WORK] });
+      expect(preview.ok).toBe(true);
+      if (!preview.ok) return;
+
+      const receipt = await forgetRecord(sql, { id, grant: [WORK], now: new Date() });
+      expect(receipt.ok).toBe(true);
+      if (!receipt.ok) return;
+
+      expect(receipt.cascade.pages).toBe(preview.cascade.pages);
+      expect(receipt.cascade.chunks).toBe(preview.cascade.chunks);
+      expect(receipt.cascade.facts).toBe(preview.cascade.facts);
+      // Not vacuous: the cascade really reached three kinds of row.
+      expect(receipt.cascade.pages + receipt.cascade.chunks + receipt.cascade.facts).toBe(3);
     },
     TEST_TIMEOUT_MS,
   );
