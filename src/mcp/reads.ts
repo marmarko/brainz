@@ -27,7 +27,7 @@
 
 import type { SQL } from 'bun';
 
-import { fenceEntity, fenceRow, fenceScalar, type Grant } from '../core/search/fence.ts';
+import { fenceEntity, fenceRow, fenceScalar, visibleOrigins, type Grant } from '../core/search/fence.ts';
 // The shared normalizer, reached through the read side's re-export — the same
 // function objects `write/links.ts` files aliases with, never a second copy.
 // `test/core/search/normalize.test.ts` asserts that identity across the seam.
@@ -276,6 +276,16 @@ async function fetchEntity(sql: SQL, grant: Grant, key: string): Promise<RecordO
       kind: 'ent',
       title: row.canonical_name,
       text: `${row.canonical_name} — ${row.entity_type}`,
+      // **The whole union here, deliberately, and it is not the same decision as
+      // `entityCard.origins` above.** This field is a trust input: its only
+      // consumer is `tools/context.ts:project`, which reads it to decide R2a
+      // demarcation and does not pass it on — `ProjectedRecord` has no `origins`
+      // at all, which is what keeps a union out of a caller's hands. Narrowing
+      // it would weaken that decision rather than tighten a fence: a canonical
+      // name an outside sender chose in an origin this grant does not hold is
+      // still attacker-authored text, and intersecting first can flip
+      // `isExternalUnion` from true to false, so a name that arrived inside the
+      // untrusted region starts arriving outside it.
       origins: row.origin_contexts,
       sourceType: null,
       createdAt: isoOf(row.created_at),
@@ -292,6 +302,16 @@ export interface EntityCard {
   readonly name: string;
   readonly type: string;
   readonly aliases: readonly string[];
+  /**
+   * The origins **this grant holds** for the entity, never its whole union.
+   *
+   * An entity is fenced on *intersect* (`fence.ts`), so a shared name resolves
+   * under either half of a brain — deliberately, because a subset rule would
+   * refuse every name that appears in both. The union is a row attribute rather
+   * than the name, and returning it whole told a `work:mail` caller that the
+   * person also appears in a personal mailbox: a fact about the personal
+   * mailbox, delivered with no row crossing. `visibleOrigins` is the projection.
+   */
   readonly origins: readonly string[];
   readonly facts: readonly { readonly id: string; readonly text: string; readonly origins: readonly string[] }[];
 }
@@ -491,7 +511,14 @@ export async function entityCard(sql: SQL, grant: Grant, name: string): Promise<
       name: row.canonical_name,
       type: row.entity_type,
       aliases: aliases.map((a) => a.alias),
-      origins: row.origin_contexts,
+      // Intersected, for the reason `fence.ts:visibleOrigins` argues at length:
+      // the aliases above were fenced because an alias is a spelling an outside
+      // sender chose, and the origin union is the same disclosure with the
+      // content stripped out — "there is a personal half" is the sentence this
+      // fence exists to refuse. The facts below carry their own unions and need
+      // no narrowing: they are already subset-fenced, so every origin on them is
+      // one this grant holds.
+      origins: visibleOrigins(row.origin_contexts, grant),
       facts: facts.map((fact) => ({
         id: formatId('fact', fact.fact_id),
         text: fact.statement,

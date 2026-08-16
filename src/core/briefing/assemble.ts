@@ -153,6 +153,19 @@ export interface BriefingParticipant {
   readonly name: string;
   /** U11's card, or `null` when enrichment has not written one. */
   readonly card: string | null;
+  /**
+   * The entity's **whole** origin union, as a trust input rather than as
+   * something a caller is shown.
+   *
+   * Its only consumer is `tools/read.ts`'s `demarcateIfExternal(person.card, …)`,
+   * and the union is the correct input to that question for the reason
+   * `fence.ts:visibleOrigins` sets out: a card written over mail an outsider
+   * sent is attacker-authored text whether or not this grant holds the origin it
+   * came from, and intersecting first can flip the demarcation off. The handler
+   * renders `id`, `name` and the wrapped card and does not render this field —
+   * a surface that wants to *show* a participant's origins must intersect, the
+   * way `reads.ts:entityCard` does.
+   */
   readonly origins: readonly string[];
 }
 

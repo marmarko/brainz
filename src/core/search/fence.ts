@@ -93,6 +93,46 @@ export function fenceEntity(origins: readonly string[], grant: Grant | ReadonlyS
 }
 
 /**
+ * A row's origin union **as this credential may be told it** — the intersection.
+ *
+ * The companion to {@link fenceEntity}, and needed for exactly the reason that
+ * rule is looser than the others. An entity resolves on *intersect* because an
+ * entity is a name; the licence for that is the header's sentence — resolving a
+ * name is not reading a row, and everything the resolution reaches goes back
+ * through the subset and scalar rules. `entity.origin_contexts` is a row
+ * attribute rather than the name: returned whole, it tells a `work:mail`
+ * credential that the person it just resolved also appears in a mailbox it may
+ * not read. No page, chunk or fact crosses, and the fence is still breached —
+ * the existence of the personal half is itself the thing being fenced.
+ *
+ * **The intersection rather than nothing.** The intersection is what the caller
+ * already holds, so it discloses nothing, and it keeps the field doing its job,
+ * which is attribution. An empty array was the other candidate and is worse
+ * *here specifically*: it already means something in this system and it does not
+ * mean "redacted". {@link fenceRow} refuses an empty union, `demarcation.ts:
+ * isExternalUnion` calls one external, and the DDL forbids `origin_contexts`
+ * from being empty at all — every reader treats it as a write-path bug read
+ * fail-closed. Synthesising it as a privacy measure overloads a sentinel.
+ *
+ * **This is for a value a caller is shown, never for a trust decision.** R2a's
+ * demarcation asks a different question — could an outsider have written this —
+ * and the honest input to that is the *whole* union: an entity whose canonical
+ * name an outside sender chose in an origin this grant does not hold is still
+ * attacker-authored text, and intersecting first can flip `isExternalUnion` from
+ * true to false. So `tools/context.ts:project` keeps reading the union, and the
+ * property that makes that safe is that its output carries no origins at all.
+ *
+ * Fail-closed by construction: an empty grant, or a row with no overlap, returns
+ * nothing — which is the same answer the fence would have given before the
+ * caller got this far.
+ */
+export function visibleOrigins(origins: readonly string[], grant: Grant | ReadonlySet<string>): string[] {
+  const allowed = grant instanceof Set ? grant : new Set(grant as Grant);
+  if (allowed.size === 0) return [];
+  return origins.filter((origin) => allowed.has(origin));
+}
+
+/**
  * The candidate filter every arm's output passes through.
  *
  * Two predicates, both non-negotiable: live (R12 soft delete, U9 quarantine) and
