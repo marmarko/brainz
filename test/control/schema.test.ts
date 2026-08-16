@@ -1431,6 +1431,11 @@ const CONTENT_BEARING_SQL: readonly ContentBearingEntry[] = [
     because:
       "H6's rung adds no table and no column at all: eight trigger functions with `SET search_path` pinned, and one twin trigger per trigger that called an unpinned one. So it holds no content in the sense this list means — but it is emphatically the tenant's database rather than the control plane's, because what it pins is R15's origin fence, and the origin fence is the mechanism that decides which of a user's own rows a fenced read may reach. It is named here rather than exempted for the reason rung 4 gives, and with one extra: a rung whose whole subject is an enforcement mechanism is the last one that should be able to arrive without a sentence from its author",
   },
+  {
+    path: 'schema/migrations/v9-lifecycle.sql',
+    because:
+      "U17's lifecycle rung holds content, and one of its four tables holds the most of any table in the schema: `page_version` stores whole document bodies, because `page` has no body column and a version a revert cannot read is not a version. It is the tenant's database emphatically — it is a second copy of every document the user has, so it carries R15's scalar origin, the immutability trigger and rung 8's pinned twin, and a fenced read reaches it exactly as it reaches `page`. The other three are content-free by shape and are named here anyway, for the reason rung 4 gives: `self_export` is a destination name from a closed set plus timestamps and a digest; `self_export_nag` is a grant-derived caller key, a timestamp and a band number; and `erased_subject` is deliberately a **digest** of a correspondent's identifier rather than the identifier, because a tombstone whose purpose is that we hold nothing about someone must not be the one place we kept their address",
+  },
 ];
 
 const CONTROL_PREFIX = 'control/';

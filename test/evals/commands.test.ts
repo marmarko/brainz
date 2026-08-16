@@ -64,17 +64,14 @@ async function run(script: string, args: readonly string[] = []) {
 }
 
 describe('a command still owned by a later unit stays loudly unimplemented', () => {
-  test('test:roundtrip exits non-zero and names its owning unit', async () => {
-    const result = await run('test:roundtrip');
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toContain('test:roundtrip is declared but not implemented yet');
-    expect(result.stderr).toContain('owned by U17');
-    // The exact clause U1 wrote, kept verbatim: it is the sentence that stops
-    // somebody wiring the placeholder into CI as a passing gate.
-    expect(result.stderr).toContain('an unimplemented\n  gate must never look green');
-  });
-
+  // `test:roundtrip` used to live here, and U17 implemented it. What it must
+  // NOT do is change the property this describe block is about: the command
+  // still exits non-zero without a substrate, now because it refuses rather
+  // than because nobody wrote it. That case moved to the block below, so the
+  // contract is still asserted and the assertion no longer describes a
+  // placeholder that is gone.
   test('an unknown command name is refused rather than silently succeeding', async () => {
+
     const proc = Bun.spawn({
       cmd: ['bun', 'run', 'scripts/not-yet.ts', 'eval:imaginary', 'U99'],
       cwd: ROOT,
@@ -85,6 +82,20 @@ describe('a command still owned by a later unit stays loudly unimplemented', () 
     const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
     expect(exitCode).toBe(1);
     expect(stderr).toContain('eval:imaginary is declared but not implemented yet');
+  });
+
+  test('an implemented command still refuses loudly when it cannot run', async () => {
+    // U17 wired `test:roundtrip`. The knowledge-parity leg makes model calls, so
+    // it is scheduled and secret-gated, and without the substrate it must exit
+    // non-zero. An implemented gate that reported success because it could not
+    // run would be a stronger version of the placeholder problem, not a fix for
+    // it — the run happens somewhere the failure is never read.
+    const result = await run('test:roundtrip');
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toContain('NOT RUN');
+    expect(result.stdout).toContain('BRAINZ_REAL_SUBSTRATE');
+    // And it says why the blocking half is not a weaker version of itself.
+    expect(result.stdout).toContain('file-parity half is NOT a weaker version');
   });
 
   test('the router with no arguments is a usage error, not a pass', async () => {
