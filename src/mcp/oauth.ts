@@ -60,6 +60,15 @@
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
+// **The constant-time compare is imported, never re-written.** This module used
+// to carry a private copy of the same four lines, and `verifyTenantBearer` open
+// -coded them a third time. Three implementations of one primitive is how one of
+// them quietly stops being constant-time: a length short-circuit added to fix a
+// throw, a digest "simplified" away, and only one of the three call sites gets
+// the correction. `accounts.ts`'s own comment already said there must not be a
+// second copy; `test/control/constant-time.test.ts` is what makes that true
+// rather than remembered.
+import { constantTimeEqual } from '../control/accounts.ts';
 import { isValidTenantId } from '../control/secrets.ts';
 import { grantScopeViolations, type GrantScope } from './grant-scope.ts';
 import type { Endpoint } from './tools/index.ts';
@@ -186,15 +195,18 @@ export function stripBearer(header: string): string {
 /**
  * Constant-time comparison of a presented bearer against the stored one.
  *
- * Digests rather than raw strings, so the comparison is over two equal-length
- * buffers whatever the caller sent — `timingSafeEqual` throws on a length
- * mismatch, and catching that throw would itself be the length oracle.
+ * The comparison itself is `accounts.ts:constantTimeEqual` — digested rather
+ * than compared raw, so it is over two equal-length buffers whatever the caller
+ * sent, because `timingSafeEqual` throws on a length mismatch and catching that
+ * throw would itself be the length oracle. What is this function's own is the
+ * two things the shared primitive must not decide: the `Bearer ` prefix comes
+ * off first, and an empty string on either side is refused before the compare —
+ * `constantTimeEqual('', '')` is **true**, so an absent header against an unset
+ * secret would otherwise authenticate.
  */
 export function verifyTenantBearer(presented: string, stored: string): boolean {
   if (presented.length === 0 || stored.length === 0) return false;
-  const a = createHash('sha256').update(stripBearer(presented)).digest();
-  const b = createHash('sha256').update(stored).digest();
-  return timingSafeEqual(a, b);
+  return constantTimeEqual(stripBearer(presented), stored);
 }
 
 /** One-way derivation of the access-token signing key from the tenant bearer. */
@@ -269,12 +281,6 @@ export function verifyAccessToken(token: string, signingKey: string, nowMs: numb
 
 function sign(material: string, signingKey: string): string {
   return createHmac('sha256', signingKey).update(material).digest('hex');
-}
-
-function constantTimeEqual(a: string, b: string): boolean {
-  const left = createHash('sha256').update(a).digest();
-  const right = createHash('sha256').update(b).digest();
-  return timingSafeEqual(left, right);
 }
 
 /**
