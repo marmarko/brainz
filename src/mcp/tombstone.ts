@@ -43,6 +43,109 @@ import { formatId, type OpaqueId } from './ids.ts';
 /** R12's window, and U17's runbook inherits it. */
 export const FORGET_TTL_HOURS = 72;
 
+/** One table the `forget`-family tombstone reaches, and how to name it. */
+export interface TombstonedTable {
+  readonly table: string;
+  readonly key: string;
+  /** The field this table's count appears under on a receipt. */
+  readonly field: string;
+  /**
+   * An extra predicate a row must satisfy to be **restorable**, or absent when
+   * un-deleting is unconditional.
+   *
+   * Exists for exactly one shape and it is a schema fact rather than a policy:
+   * a UNIQUE index over *live* rows means the state a row was tombstoned from
+   * may have been taken by another row since. Un-deleting into that is a
+   * constraint violation that aborts the whole restore transaction, so the row
+   * that cannot come back is skipped and counted rather than raised.
+   *
+   * `entity_card` is the only such table today, and
+   * `test/core/lifecycle/restore-coverage.test.ts` asserts that against
+   * `pg_indexes` rather than against this comment.
+   */
+  readonly restorableWhen?: string;
+}
+
+/**
+ * Every table a `deleted_at` may be written to by a user-facing retraction, in
+ * **purge order**.
+ *
+ * ONE list, iterated by {@link restoreForgotten} and {@link purgeExpiredTombstones}
+ * both, and that is the whole point of its existing. Three executors write these
+ * tombstones and they do not write the same set: `forgetRecord` below reaches
+ * four tables, `lifecycle/severance.ts:severOrigin` reaches two more
+ * (`entity_card`, `commitment`), and `lifecycle/subject-erasure.ts:eraseSubject`
+ * a seventh (`attachment`). The restore knew about the first four. So a user who
+ * disconnected the wrong account, or erased the wrong correspondent, pressed
+ * undo, got `ok: true`, and got a brain with its entity cards, its commitments
+ * and its attachments still deleted — no error and no partial flag, which is
+ * strictly worse than a refusal.
+ *
+ * The order is FK order and is not arbitrary: `commitment` references `fact` and
+ * `page`, `attachment` and `entity_card` reference `page` and `entity`, and a
+ * parent deleted first would cascade rows out from under the count that is about
+ * to be reported for them. Restoring is order-free — an `UPDATE … SET deleted_at
+ * = NULL` has no referential order — so the restore iterates the same list and
+ * simply does not care.
+ *
+ * `test/core/lifecycle/restore-coverage.test.ts` reads `information_schema` and
+ * refuses any table carrying `deleted_at` that appears in neither this list nor
+ * {@link DELETED_AT_IS_NOT_A_TOMBSTONE}. An eighth table cannot be tombstoned
+ * without somebody deciding, in writing, which of the two it belongs to.
+ */
+export const TOMBSTONED_TABLES: readonly TombstonedTable[] = [
+  { table: 'commitment', key: 'commitment_id', field: 'commitments' },
+  { table: 'attachment', key: 'attachment_id', field: 'attachments' },
+  {
+    table: 'entity_card',
+    key: 'card_id',
+    field: 'entityCards',
+    // `entity_card_one_live_per_entity` is UNIQUE over live cards.
+    restorableWhen:
+      'NOT EXISTS (SELECT 1 FROM entity_card live ' +
+      'WHERE live.entity_id = entity_card.entity_id AND live.deleted_at IS NULL)',
+  },
+  { table: 'fact', key: 'fact_id', field: 'facts' },
+  { table: 'chunk', key: 'chunk_id', field: 'chunks' },
+  { table: 'page', key: 'page_id', field: 'pages' },
+  { table: 'entity', key: 'entity_id', field: 'entities' },
+];
+
+/**
+ * Tables whose `deleted_at` means something else, with the reason each is out.
+ *
+ * A list of exclusions with no reasons is a list that grows every time the
+ * census goes red, which would turn the guard into the thing it exists to
+ * prevent. Each entry has to say what its column *is*, and the suite asserts the
+ * sentence is there.
+ */
+export const DELETED_AT_IS_NOT_A_TOMBSTONE: readonly { readonly table: string; readonly because: string }[] = [
+  {
+    table: 'entity_edge',
+    because:
+      'a reconciliation retraction, not a user retraction: `core/write/links.ts` and ' +
+      '`worker/consolidate/deterministic.ts` set it to now() when a later derivation supersedes an edge, ' +
+      'so restoring one by instant would resurrect a relationship a cycle deliberately retired. ' +
+      'The rows go when their entity goes, through `entity_edge`’s ON DELETE CASCADE, and ' +
+      '`subject-erasure.ts` hard-deletes them outright rather than tombstoning for the same reason.',
+  },
+];
+
+/** Counts per table, keyed by the field names {@link TOMBSTONED_TABLES} declares. */
+export interface TombstoneCounts {
+  readonly pages: number;
+  readonly chunks: number;
+  readonly facts: number;
+  readonly entities: number;
+  readonly entityCards: number;
+  readonly commitments: number;
+  readonly attachments: number;
+}
+
+function noCounts(): Record<string, number> {
+  return Object.fromEntries(TOMBSTONED_TABLES.map((entry) => [entry.field, 0]));
+}
+
 export interface CascadeCounts {
   readonly pages: number;
   readonly chunks: number;
@@ -201,7 +304,24 @@ async function tombstone(tx: SQL, statement: string, params: readonly unknown[])
 }
 
 export type RestoreOutcome =
-  | { readonly ok: true; readonly restored: CascadeCounts }
+  | {
+      readonly ok: true;
+      readonly restored: TombstoneCounts;
+      /**
+       * Cards left deleted because the entity has a live one again.
+       *
+       * `entity_card_one_live_per_entity` is a UNIQUE index over live cards and
+       * `writeEntityCard` inserts under `ON CONFLICT (entity_id) WHERE
+       * deleted_at IS NULL`, so a consolidation cycle can write a fresh card for
+       * an entity whose previous card is tombstoned. An unguarded un-delete then
+       * raises `23505` and takes the whole restore transaction — every other
+       * table's rows with it. The newer card is the newer summary of the same
+       * entity, so the stale one stays deleted; what must not happen is that
+       * being silent, because a restore that quietly returns less than it
+       * restored is the defect this function was fixed for.
+       */
+      readonly supersededCards: number;
+    }
   | { readonly ok: false; readonly reason: 'ttl_expired' };
 
 /**
@@ -221,32 +341,56 @@ export async function restoreForgotten(
     return { ok: false, reason: 'ttl_expired' };
   }
 
-  const restored = await sql.begin(async (tx) => ({
-    pages: await touched(tx, 'page', 'page_id', request.deletedAt),
-    chunks: await touched(tx, 'chunk', 'chunk_id', request.deletedAt),
-    facts: await touched(tx, 'fact', 'fact_id', request.deletedAt),
-    entities: await touched(tx, 'entity', 'entity_id', request.deletedAt),
-  }));
+  const outcome = await sql.begin(async (tx) => {
+    const counts = noCounts();
+    let blocked = 0;
+    // **The same list the purge walks**, so a table cannot be tombstoned by one
+    // of the three executors and reachable by only one of the two sweeps. Order
+    // is irrelevant here — an `UPDATE … SET deleted_at = NULL` has no
+    // referential order — and the list is walked in its declared order anyway so
+    // there is one reading of it rather than two.
+    for (const entry of TOMBSTONED_TABLES) {
+      const restored = await touched(tx, entry, request.deletedAt);
+      counts[entry.field] = restored;
+      if (entry.restorableWhen !== undefined) {
+        blocked += (await tombstonedAt(tx, entry.table, request.deletedAt)) - restored;
+      }
+    }
+    return { counts, blocked };
+  });
 
-  return { ok: true, restored };
+  return {
+    ok: true,
+    restored: outcome.counts as unknown as TombstoneCounts,
+    supersededCards: outcome.blocked,
+  };
 }
 
-async function touched(tx: SQL, table: string, key: string, deletedAt: string): Promise<number> {
+async function touched(tx: SQL, entry: TombstonedTable, deletedAt: string): Promise<number> {
+  // Identifiers and the guard predicate are module constants, never input.
+  const guard = entry.restorableWhen === undefined ? '' : ` AND ${entry.restorableWhen}`;
   const rows = (await tx.unsafe(
-    `UPDATE ${table} SET deleted_at = NULL WHERE deleted_at = $1::timestamptz RETURNING ${key}`,
+    `UPDATE ${entry.table} SET deleted_at = NULL
+      WHERE deleted_at = $1::timestamptz${guard} RETURNING ${entry.key}`,
     [deletedAt],
   )) as Array<Record<string, unknown>>;
   return rows.length;
+}
+
+/** Rows still carrying this instant — the denominator for a guarded restore. */
+async function tombstonedAt(tx: SQL, table: string, deletedAt: string): Promise<number> {
+  const rows = (await tx.unsafe(
+    `SELECT count(*)::int AS n FROM ${table} WHERE deleted_at = $1::timestamptz`,
+    [deletedAt],
+  )) as Array<{ n: number }>;
+  return Number(rows[0]?.n ?? 0);
 }
 
 /**
  * What a purge removed. A superset of {@link CascadeCounts}, because the purge
  * reaches two tables no single `forget` cascade writes to.
  */
-export interface PurgeCounts extends CascadeCounts {
-  readonly commitments: number;
-  readonly attachments: number;
-}
+export interface PurgeCounts extends TombstoneCounts {}
 
 /**
  * Hard-delete every tombstone past the TTL.
@@ -289,14 +433,15 @@ export async function purgeExpiredTombstones(
       [cutoff],
     );
 
-    const commitments = await deleted(tx, 'commitment', 'commitment_id', cutoff);
-    const attachments = await deleted(tx, 'attachment', 'attachment_id', cutoff);
-    const facts = await deleted(tx, 'fact', 'fact_id', cutoff);
-    const chunks = await deleted(tx, 'chunk', 'chunk_id', cutoff);
-    const pages = await deleted(tx, 'page', 'page_id', cutoff);
-    const entities = await deleted(tx, 'entity', 'entity_id', cutoff);
-
-    return { pages, chunks, facts, entities, commitments, attachments };
+    // In the list's declared order, which IS the FK order — see
+    // {@link TOMBSTONED_TABLES}. Walking the same list the restore walks is what
+    // makes "what tombstoning reaches, both sweeps reach" a property of one
+    // declaration rather than of two functions agreeing.
+    const counts = noCounts();
+    for (const entry of TOMBSTONED_TABLES) {
+      counts[entry.field] = await deleted(tx, entry.table, entry.key, cutoff);
+    }
+    return counts as unknown as PurgeCounts;
   });
 }
 
