@@ -38,6 +38,7 @@ import { createJobQueue, createLeaseChannel } from './queue.ts';
 import { createJobRunner } from './runner.ts';
 import { ALPHA_SCHEDULER, runSchedulerTick } from './scheduler.ts';
 import { createConsolidateHandler } from './consolidate/cycle.ts';
+import { createExportHandler, enqueueDueExports } from './export.ts';
 import { createSchemaSweepPorts } from '../control/schema-sweep.ts';
 import { createConsolidateWorld } from '../control/tier.ts';
 import { fleetIdentity } from '../control/secrets.ts';
@@ -71,18 +72,26 @@ export async function startWorkerFleet(env: Environment): Promise<WorkerFleetPro
    * worker that opened a connection per job and never closed one exhausts the
    * per-tenant LRU the whole runtime choice was made around.
    */
+  /**
+   * One tenant's database, opened under that tenant's fleet identity and no
+   * wider one. Lifted out of the consolidation world because the export job
+   * needs exactly the same handle under exactly the same identity, and two
+   * copies of this closure is two places for the identity to be widened.
+   */
+  async function connectTenant(tenantId: string) {
+    const resolved = await secrets.store.resolve(fleetIdentity(tenantId), tenantId);
+    if (!resolved.ok) {
+      throw new Error(
+        `no resolvable connection secret for ${tenantId} (${resolved.reason}); this instance cannot serve it`,
+      );
+    }
+    const sql = new SQL(resolved.secret.connectionString, { max: 2 });
+    return { sql, close: () => sql.close() };
+  }
+
   const ports = createConsolidateWorld({
     controlSql,
-    async connect(tenantId: string) {
-      const resolved = await secrets.store.resolve(fleetIdentity(tenantId), tenantId);
-      if (!resolved.ok) {
-        throw new Error(
-          `no resolvable connection secret for ${tenantId} (${resolved.reason}); this instance cannot consolidate it`,
-        );
-      }
-      const sql = new SQL(resolved.secret.connectionString, { max: 2 });
-      return { sql, close: () => sql.close() };
-    },
+    connect: connectTenant,
     // One gateway per tenant is the R22 shape, and this fleet's gateway already
     // resolves keys per tenant on every call, so the same instance satisfies it.
     gateway: () => gateway,
@@ -99,10 +108,42 @@ export async function startWorkerFleet(env: Environment): Promise<WorkerFleetPro
     },
   });
 
+  /**
+   * U17's scheduled self-export, given the handler and the enqueuer it never
+   * had (`src/worker/export.ts`).
+   *
+   * **`destinations` is empty, and that is a statement rather than a stub.**
+   * The two kinds this fleet could serve are both blocked on something that
+   * does not exist in `src/`:
+   *
+   *   * `object_store` — `src/control/object-store.ts` is a real
+   *     `ErasableObjectStore`/writer against the storage accessor, but every
+   *     call needs a prefix-scoped credential and there is no production
+   *     `ScopedCredentialMinter` anywhere in `src/`. `web/serve.ts` wires a
+   *     *refusing* minter for exactly this reason, and a destination whose
+   *     every delivery fails is worse than a fleet that admits it has none:
+   *     the failure would be banked on the tenant's row and read back to the
+   *     user as their scheduled export failing.
+   *   * `user_bucket` — rung 9's `self_export` carries a destination *kind* and
+   *     no address and no credential, so there is nowhere to put the one the
+   *     user would give us. `/api/export-config` still answers `501` saying so.
+   *
+   * Registering the handler anyway is deliberate: a job already on the queue
+   * drains to an honest outcome instead of sitting `due` forever, which is what
+   * happens to a kind the runner has no handler for.
+   */
+  const exportHandler = createExportHandler({
+    open: connectTenant,
+    destinations: {},
+    onExport(tenantId, outcome) {
+      process.stdout.write(`${JSON.stringify({ event: 'export', tenant: tenantId, ...outcome })}\n`);
+    },
+  });
+
   const runner = createJobRunner({
     queue,
     leases,
-    handlers: { consolidate: createConsolidateHandler(ports) },
+    handlers: { consolidate: createConsolidateHandler(ports), export: exportHandler },
     owner: `worker-${process.pid}`,
     concurrency: integer(env, 'BRAINZ_WORKER_CONCURRENCY', 4),
   });
@@ -117,6 +158,12 @@ export async function startWorkerFleet(env: Environment): Promise<WorkerFleetPro
       { sql: controlSql, queue, config: ALPHA_SCHEDULER, stealGraceMs: DEFAULT_STEAL_GRACE_MS, schemas },
       { now },
     );
+    // The export lane, alongside the consolidation one rather than inside it:
+    // `runSchedulerTick` is the consolidation trigger set and folding a second
+    // cadence into it would make its result type answer for two questions. Each
+    // tenant's export is scheduled onto the slot its consolidation already
+    // wakes, so this adds a job and not a wake — see `export.ts`.
+    await enqueueDueExports({ sql: controlSql, queue }, { now });
     await runner.runOnce({ now });
   }
 
