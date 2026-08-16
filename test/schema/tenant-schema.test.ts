@@ -136,6 +136,13 @@ const EXPECTED_TABLES: ReadonlyMap<string, TableClass> = new Map([
   ['self_export', 'operational'],
   ['self_export_nag', 'operational'],
   ['erased_subject', 'operational'],
+
+  // U18's rung. One append-only row per context severance: an origin, an
+  // instant, and the two count objects the preview computed inside the
+  // executing transaction. No content, no inference — the recompute worklist is
+  // derived from this row and each row's own origins rather than stored as a
+  // per-row flag that could go stale.
+  ['severance', 'operational'],
 ]);
 
 const SHARED_ORIGIN_TRIGGER_FUNCTION = 'refuse_origin_change';
@@ -422,6 +429,9 @@ const ORIGIN_FIXTURES: ReadonlyMap<string, { readonly where: string; readonly ta
       { where: `target_ref = 'entity:fence'`, tamper: `origin_contexts = ARRAY['personal','work']` },
     ],
     ['page_version', { where: `doc_key = 'fence:version'`, tamper: `origin_context = 'work'` }],
+    // U18. The audit record of a destructive operation: an origin that could be
+    // edited afterwards is a trail that can be made to describe a different event.
+    ['severance', { where: `origin_context = 'personal'`, tamper: `origin_context = 'work'` }],
   ]);
 
 describe('R15 — the database refuses to let an origin move, on every table that has one', () => {
@@ -463,6 +473,8 @@ describe('R15 — the database refuses to let an origin move, on every table tha
                                 content_sha256, captured_from)
       VALUES ('fence:version', 1, 'personal', 'note', 'fence fixture', 'the body as it stood',
               repeat('d', 64), 'live');
+      INSERT INTO severance (origin_context, severed_at, removed, recomputed, surviving_origins)
+      VALUES ('personal', now(), '{}'::jsonb, '{}'::jsonb, ARRAY['work']);
     `);
   });
 
