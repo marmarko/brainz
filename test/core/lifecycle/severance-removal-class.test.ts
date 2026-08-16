@@ -304,3 +304,109 @@ describe('the new takes are on forget’s clock like every other one', () => {
     TEST_TIMEOUT_MS,
   );
 });
+
+describe('the three judgements the new statements make', () => {
+  const CAL = 'work:cal';
+  const DRIVE = 'work:drive';
+  const ALREADY_TAKEN = new Date('2026-07-15T00:00:00.000Z');
+  const LATE = new Date('2026-08-01T00:00:00.000Z');
+  const LATER = new Date('2026-08-02T00:00:00.000Z');
+  const LATEST = new Date('2026-08-03T00:00:00.000Z');
+
+  test(
+    'an unstamped alias is judged by its entity, so a mixed entity keeps it',
+    async () => {
+      // The `coalesce(a.origin_contexts, e.origin_contexts)` half, which is the
+      // read fence's own expression. `entity_alias.origin_contexts` is nullable
+      // because every rung is expand-only, and NULL means "nobody recorded where
+      // this came from" — not "take it". Judged by its entity's whole union, an
+      // unstamped alias on a mixed entity is not in the removal class, and an
+      // unstamped alias on an exactly-severed entity would have cascaded anyway.
+      await sql.unsafe(`
+        INSERT INTO entity_alias (entity_id, alias, alias_source)
+        VALUES (${mixedA}::bigint, 'unstamped spelling', 'user');
+        INSERT INTO entity_alias (entity_id, alias, alias_source, origin_contexts)
+        VALUES (${mixedA}::bigint, 'the calendar spelling', 'user', ARRAY['${CAL}']);
+      `);
+
+      const outcome = await severOrigin(sql, { origin: WORK, confirm: WORK, now: LATE });
+      expect(outcome.ok).toBe(true);
+      if (!outcome.ok) return;
+      // Neither is a `work:mail` row: one is unattributed, one belongs to
+      // another origin entirely.
+      expect(outcome.receipt.archived.aliases).toBe(0);
+
+      const kept = (await sql`SELECT alias FROM entity_alias ORDER BY alias`) as Array<{
+        alias: string;
+      }>;
+      expect(kept.map((row) => row.alias)).toEqual(['the calendar spelling', 'unstamped spelling']);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a severance whose only rows have no parent still reports that it took something',
+    async () => {
+      // `alreadySevered` used to sum four tables — pages, chunks, facts,
+      // entities. A parentless attachment and an alias off a surviving mixed
+      // entity are precisely the two rows none of those four covers, so a
+      // severance that took both reported "nothing left to take".
+      await sql.unsafe(`
+        INSERT INTO attachment (page_id, origin_context, media_type, object_key)
+        VALUES (NULL, '${CAL}', 'text/calendar', 'tenants/t/att/invite.ics');
+      `);
+
+      const outcome = await severOrigin(sql, { origin: CAL, confirm: CAL, now: LATER });
+      expect(outcome.ok).toBe(true);
+      if (!outcome.ok) return;
+      expect(outcome.receipt.tombstoned.attachments).toBe(1);
+      expect(outcome.receipt.archived.aliases).toBe(1);
+      // Nothing else at all was taken — which is the whole point of the case.
+      expect(outcome.receipt.tombstoned.pages).toBe(0);
+      expect(outcome.receipt.tombstoned.chunks).toBe(0);
+      expect(outcome.receipt.tombstoned.facts).toBe(0);
+      expect(outcome.receipt.tombstoned.entities).toBe(0);
+      expect(outcome.receipt.alreadySevered).toBe(false);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'an attachment another retraction already holds keeps that retraction’s instant',
+    async () => {
+      // `deleted_at IS NULL` on the tombstone, and here it is load-bearing
+      // rather than an optimisation: re-stamping a row a `forget` already took
+      // would move it onto the severance's instant and silently detach it from
+      // the undo of the call that took it. (`previewSeverance`'s attachment arm
+      // carries no such filter, so `removed.attachments` over-counts here —
+      // reported, not repaired: the preview is not this module's file.)
+      await sql.unsafe(`
+        INSERT INTO attachment (page_id, origin_context, media_type, object_key, deleted_at)
+        VALUES (NULL, '${DRIVE}', 'application/pdf', 'tenants/t/att/earlier.pdf',
+                '${ALREADY_TAKEN.toISOString()}'::timestamptz);
+      `);
+
+      const outcome = await severOrigin(sql, { origin: DRIVE, confirm: DRIVE, now: LATEST });
+      expect(outcome.ok).toBe(true);
+      if (!outcome.ok) return;
+      expect(outcome.receipt.tombstoned.attachments).toBe(0);
+      expect(outcome.receipt.alreadySevered).toBe(true);
+
+      const held = (await sql`
+        SELECT deleted_at FROM attachment WHERE object_key = 'tenants/t/att/earlier.pdf'
+      `) as Array<{ deleted_at: string }>;
+      expect(new Date(held[0]?.deleted_at ?? 0).toISOString()).toBe(ALREADY_TAKEN.toISOString());
+
+      // And the undo that owns it still reaches it, which is the consequence
+      // the assertion above exists for.
+      const restored = await restoreForgotten(sql, {
+        deletedAt: ALREADY_TAKEN.toISOString(),
+        now: new Date(ALREADY_TAKEN.getTime() + 3600_000),
+      });
+      expect(restored.ok).toBe(true);
+      if (!restored.ok) return;
+      expect(restored.restored.attachments).toBe(1);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
