@@ -154,7 +154,24 @@ CREATE TABLE control.tenant (
   rank1_sample_count       integer                      NOT NULL DEFAULT 0,
 
   -- U20's rolling spend counter, in integer micro-USD so money never rounds
-  -- through a float. NULL cap means "the platform default applies".
+  -- through a float.
+  --
+  -- **The cap is a ceiling on the window, not an allowance per unit of work.**
+  -- Every reader subtracts `spend_micro_usd` from it before spending against it
+  -- (`src/ingest/first-import.ts:readHeadroom`,
+  -- `src/control/tier.ts:consolidationTierOf`); a reader that hands the raw
+  -- column to a repeating job grants a fresh cap every time the job runs, which
+  -- is not a smaller cap than intended but no cap at all.
+  --
+  -- The window rolls inside the same UPDATE that accumulates, and *only* when
+  -- that UPDATE runs — so a lapsed `spend_window_started_at` is read as zero
+  -- spend rather than as last month's total, by both readers, on purpose.
+  --
+  -- NULL cap means "no ceiling from this column". The ingest gate substitutes a
+  -- platform default of its own (`DEFAULT_TENANT_SPEND_CEILING`) because an
+  -- unbounded first import is the largest single spend in the system; the
+  -- consolidation reader does not, because a cycle is already bounded by its own
+  -- estimate and the `internal` tier carries no cap row.
   spend_micro_usd          bigint                       NOT NULL DEFAULT 0,
   spend_window_started_at  timestamptz                  NOT NULL DEFAULT now(),
   spend_cap_micro_usd      bigint,
