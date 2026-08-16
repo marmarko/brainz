@@ -8,7 +8,9 @@
  * that "did this call have permission to change something" has exactly one
  * answer and one implementation.
  *
- * **The matrix, and why each row is what it is.**
+ * **The matrix, and why each row is what it is.** It is read only after the
+ * credential's own scope has been checked — every action here is tenant-wide,
+ * so a grant narrowed to one context is refused before any row applies.
  *
  * | client declares | gate |
  * |---|---|
@@ -42,6 +44,7 @@
 
 import type { PauseAuthority } from '../ingest/pause.ts';
 import type { ClientCapabilities } from './client-capabilities.ts';
+import type { GrantScope } from './grant-scope.ts';
 import {
   deepLinkFor,
   MANAGE_ACTION_NAMES,
@@ -90,6 +93,17 @@ export interface ManageGateInput {
   readonly signingKey: string;
   readonly tenantId: string;
   readonly callerKey: string;
+  /**
+   * What the *credential* is for — U18's {@link GrantScope}, straight off the
+   * claims.
+   *
+   * **Required, and required is the point.** Every other input here describes
+   * the client or the request; this is the only one that describes the grant,
+   * and an optional field defaulting to `whole_brain` is a field a hand-built
+   * call omits — which is exactly how the gate came to decide a tenant-wide
+   * change from the client's rendering capability alone.
+   */
+  readonly scope: GrantScope;
   readonly nowMs: number;
   readonly webAppBaseUrl: string;
 }
@@ -106,6 +120,33 @@ export function resolveManageGate(input: ManageGateInput): ManageGate {
       kind: 'refuse',
       code: 'invalid_params',
       message: `\`action\` must be one of ${MANAGE_ACTION_NAMES.join(', ')}.`,
+    };
+  }
+
+  // **Every action here is tenant-wide, and a narrowed grant is not.** Pausing
+  // `gmail` stops the personal mailbox as surely as the work one; a zeroed
+  // spend cap stops every connector at once. The matrix above asks what the
+  // *client* can render — it never asked what the *credential* was for, so a
+  // work-connector grant that a user consented to for their work context held
+  // full authority over settings that belong to the whole brain.
+  //
+  // It is checked here as well as at the nonce mint (`resources.ts`) because a
+  // nonce is a bearer value: it leaves this server on a resource read and comes
+  // back as a tool argument, so a closed mint and a closed gate are two claims,
+  // not one. This branch is also the one that covers the elicitation row, where
+  // no nonce is involved at all.
+  //
+  // It sits above both credential branches so the refusal lands *before* a
+  // confirmation is minted. A narrowed grant that reached `ask` would already
+  // hold a spendable `requestState`, and the user would have been asked to
+  // authorise a change the connector was never entitled to request.
+  if (input.scope !== 'whole_brain') {
+    return {
+      kind: 'refuse',
+      code: 'scope_denied',
+      message:
+        `\`${def.action}\` applies to this whole brain, and this connection holds part of it. ` +
+        `Open ${deepLinkFor(def.action, input.webAppBaseUrl)} to change it.`,
     };
   }
 

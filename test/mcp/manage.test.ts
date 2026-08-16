@@ -17,7 +17,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 
 import { NO_CLIENT_CAPABILITIES } from '../../src/mcp/client-capabilities.ts';
 import { deepLinkFor, MANAGE_ACTIONS } from '../../src/mcp/panel.ts';
-import { deriveSigningKey, hashToken } from '../../src/mcp/oauth.ts';
+import { deriveSigningKey, hashToken, mintAccessToken } from '../../src/mcp/oauth.ts';
 import { PANEL_NONCE_TTL_MS, mintPanelToken } from '../../src/mcp/panel-token.ts';
 import { PANEL_RESOURCE_URI } from '../../src/mcp/panel.ts';
 import { readResource } from '../../src/mcp/resources.ts';
@@ -601,5 +601,126 @@ describe('the text twin is reachable without a panel', () => {
       );
     }
     expect(serialised).toContain('https://app.brainz.test');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// U18 — a credential that holds a slice of the brain does not manage the brain.
+// ---------------------------------------------------------------------------
+
+/**
+ * **`manage` is tenant-wide, and nothing above it checked the grant's scope.**
+ *
+ * The spend cap, the context policy and the source pauses are properties of the
+ * whole brain: pausing `gmail` stops the personal mailbox as surely as the work
+ * one, and zeroing the cap stops every connector at once. A work-connector
+ * grant is a slice — that is the entire product meaning of U18's narrowing —
+ * and the gate that decides whether a call may change something asked only what
+ * the *client* could render, never what the *credential* was for.
+ *
+ * Two checkpoints, because either alone is a control the other's failure hides:
+ *
+ *   * `resources.ts` minted the panel nonce for any authenticated caller. That
+ *     is the mint, and it also hands back the panel HTML, which renders the
+ *     tenant-wide settings a narrowed grant should not be reading either.
+ *   * `manage-gate.ts` never consulted the scope. A nonce is a bearer value: it
+ *     rides `_meta` on a resource read and is echoed back as a tool argument, so
+ *     "the mint is closed" is not the same claim as "the gate refuses". The gate
+ *     test below therefore mints its nonce **directly**, so the gate is asked
+ *     the question even when the mint would not have answered it.
+ */
+describe('a narrowed grant does not manage the whole brain', () => {
+  const NARROWED_GRANT_ID = 'g-work-connector';
+
+  function narrowedAuthorization(): string {
+    return `Bearer ${mintAccessToken(
+      {
+        grantId: NARROWED_GRANT_ID,
+        tenantId: fixture.tenantId,
+        clientId: 'client-work-connector',
+        scope: 'narrowed',
+        origins: ['work:*'],
+        writeOrigin: 'work:agent',
+        endpoint: 'mcp',
+        issuedAt: fixture.now(),
+        expiresAt: fixture.now() + 3_600_000,
+      },
+      deriveSigningKey(fixture.bearer),
+    )}`;
+  }
+
+  /** A structurally perfect nonce for the narrowed caller, minted past the mint. */
+  function nonceForNarrowedGrant(): string {
+    return mintPanelToken(deriveSigningKey(fixture.bearer), {
+      purpose: 'panel',
+      tenantId: fixture.tenantId,
+      callerKey: NARROWED_GRANT_ID,
+      expiresAt: fixture.now() + PANEL_NONCE_TTL_MS,
+    });
+  }
+
+  test('the panel resource is not minted for a credential that holds a slice', async () => {
+    const result = await readResource(fixture.deps, {
+      authorization: narrowedAuthorization(),
+      uri: PANEL_RESOURCE_URI,
+      clientCapabilities: PANEL_CLIENT,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe('scope_denied');
+    // And no nonce came back on the refusal, which is the half that matters:
+    // the nonce is the credential the gate below accepts.
+    expect(result.meta?.['brainz.app/panel_nonce']).toBeUndefined();
+    // Nor did the panel HTML, which renders the tenant-wide settings.
+    expect(result.contents).toBeUndefined();
+  });
+
+  test('and the whole-brain credential still gets one, so the refusal is not blanket', async () => {
+    const result = await readResource(fixture.deps, {
+      authorization: `Bearer ${fixture.bearer}`,
+      uri: PANEL_RESOURCE_URI,
+      clientCapabilities: PANEL_CLIENT,
+    });
+    expect(result.ok).toBe(true);
+    expect(typeof result.meta?.['brainz.app/panel_nonce']).toBe('string');
+  });
+
+  test('a valid nonce does not carry a narrowed grant past the gate, and writes nothing', async () => {
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail', panel_nonce: nonceForNarrowedGrant() },
+      { capabilities: PANEL_CLIENT, authorization: narrowedAuthorization() },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe('scope_denied');
+    expect((await stores()).paused).toEqual([]);
+  });
+
+  test('nor does a confirmation on the elicitation branch, and it is never even asked', async () => {
+    // The refusal has to land *before* the prompt is minted. A narrowed grant
+    // that reaches `input_required` has already been handed a `requestState`
+    // it can spend, and the user has been asked to authorise a change the
+    // connector was never entitled to request.
+    const result = await fixture.call(
+      'manage',
+      { action: 'set_spend_cap', value: '1000' },
+      { capabilities: ELICITING_CLIENT, authorization: narrowedAuthorization() },
+    );
+
+    expect(result.inputRequired).toBeUndefined();
+    expect(result.ok).toBe(false);
+    expect(result.error?.code).toBe('scope_denied');
+    expect((await stores()).spendCap).toBeNull();
+  });
+
+  test('the same call under the whole-brain credential still applies, so the gate is scope and not breakage', async () => {
+    const result = await fixture.call(
+      'manage',
+      { action: 'pause_source', value: 'gmail', panel_nonce: await mintNonce() },
+      { capabilities: PANEL_CLIENT },
+    );
+    expect(result.ok).toBe(true);
+    expect((await stores()).paused).toEqual([{ source: 'gmail', by: 'panel' }]);
   });
 });

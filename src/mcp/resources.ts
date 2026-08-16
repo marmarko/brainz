@@ -137,6 +137,27 @@ export async function readResource(
     );
   }
 
+  // **The panel is tenant-wide; a narrowed credential is not.** The spend cap,
+  // the context policy and the source pauses are properties of the whole brain
+  // — pausing `gmail` stops the personal mailbox as surely as the work one —
+  // and a work-connector grant is a slice of it, which is the entire product
+  // meaning of U18's narrowing. So this refuses on the credential's scope and
+  // not only on the client's capability: the two questions are "can this host
+  // render a panel" and "is this credential for the brain the panel manages",
+  // and the second had no asker.
+  //
+  // It closes the *mint*. It does not close the gate, and cannot: a nonce is a
+  // bearer value that rides `_meta` here and comes back as a tool argument, so
+  // `manage-gate.ts` asks the same question again on the way in. Either check
+  // alone is a control whose failure the other one hides.
+  if (claims.scope !== 'whole_brain') {
+    log(deps, now, actor, 'scope_denied');
+    return refuse(
+      'scope_denied',
+      'This connection holds part of this brain rather than all of it, and these settings apply to all of it. Open the web app to change them.',
+    );
+  }
+
   if (deps.settings === undefined) {
     log(deps, now, actor, 'unavailable');
     return refuse('unavailable', 'This brain’s settings could not be reached.');

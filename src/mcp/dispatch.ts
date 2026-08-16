@@ -463,6 +463,10 @@ export async function dispatch(
       signingKey,
       tenantId: authenticatedTenantId,
       callerKey: claims.grantId,
+      // What the credential is for, not just what the client can render. Every
+      // `manage` action is tenant-wide and a narrowed grant is a slice of the
+      // tenant, so the gate needs the scope to answer at all.
+      scope: claims.scope,
       nowMs: now.getTime(),
       webAppBaseUrl: deps.webAppBaseUrl ?? DEFAULT_WEB_APP_BASE_URL,
     });
