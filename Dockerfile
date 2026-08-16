@@ -28,6 +28,44 @@
 # `test/fleet/image.test.ts` parses this CMD and the entrypoint on each Container
 # class and refuses a file that is not one of the serving entrypoints.
 #
+# THE SECOND RULE, AND WHY THE COMMAND NOW HAS A SCRIPT IN FRONT OF IT
+# --------------------------------------------------------------------
+# `src/fleet/compose.ts` requires `BRAINZ_SECRETS_FILE` and
+# `src/control/secret-file.ts` reads a JSON file: every tenant's connection
+# string and bearer grant. That leaves exactly two ways to get one into a
+# container, and both of the obvious ones are wrong:
+#
+#   * COPY it into the image. A credential in a build artefact — as durable as a
+#     commit, pushed to a registry, and harder to notice.
+#   * Take the path from configuration. Then the deployment can point the fleet
+#     at a file *in* the image, which is the first mistake wearing a second hat,
+#     and a wrong path silently yields an empty store rather than an error: a
+#     fleet that answers `not_found` for every brain it holds.
+#
+# So the content arrives as a secret (`BRAINZ_SECRETS_JSON`, set with
+# `wrangler secret put`, forwarded by `src/mcp/router.ts`) and this image writes
+# it to a path **it** chooses, fresh per start, 0600, outside /app — then drops
+# the variable and hands over with `exec`. The image cannot contain the store
+# because nothing copies one; the deployment cannot name the path because the
+# bootstrap overrides it. Neither half can come from the other, which is what
+# makes the wrong path unavailable rather than merely discouraged.
+#
+# The honest limits of this, written down rather than discovered later:
+#
+#   * It is a **snapshot**. A tenant provisioned after the secret was set is
+#     invisible to a running instance until the secret is re-put and the instance
+#     restarts. The web process is the only writer (see `secret-file.ts`), and it
+#     does not run in this container — on Cloudflare Containers there is no
+#     shared volume for it to write through.
+#   * A Workers secret is capped at 5 KB, so the store is bounded at roughly a
+#     dozen tenants. That ceiling is the alpha's, not the design's: the managed
+#     secret store `wrangler.toml` describes implements the same `SecretBackend`
+#     port and removes both limits at once.
+#
+# A self-hosted deployment with a real volume opts out by overriding the
+# container command in its own compose file; the strict refusal below is for the
+# platform that has no volume to offer.
+#
 # Build for Cloudflare Containers, which runs linux/amd64 only:
 #   docker build --platform linux/amd64 -t brainz-fleet .
 
@@ -75,6 +113,70 @@ COPY --chown=bun:bun package.json bun.lock ./
 COPY --chown=bun:bun src ./src
 COPY --chown=bun:bun LICENSE ./LICENSE
 
+# ---------------------------------------------------------------------------
+# The bootstrap every start path runs. See the header for the decision; this is
+# the mechanism.
+#
+# Written here rather than copied from `bin/` deliberately: a script in the tree
+# and a Dockerfile that installs it are two artefacts that can drift, and this
+# one is small enough that the drift would cost more than the duplication saves.
+# `test/fleet/image.test.ts` lifts it back out of this heredoc and *executes* it,
+# so it is a control rather than a claim.
+#
+# root-owned and 0755: the `bun` user runs it and must never be able to rewrite
+# the thing that materialises the store it then reads.
+# ---------------------------------------------------------------------------
+COPY --chmod=0755 <<'FLEET_BOOTSTRAP' /usr/local/bin/fleet-bootstrap
+#!/bin/sh
+# Materialise the secret store, then hand over. See the Dockerfile header.
+set -eu
+
+# A refusal, never a default. An empty store is not "no tenants yet" — it is a
+# fleet that answers `not_found` for every brain it holds, which reads as data
+# loss. The wording matches `src/fleet/env.ts:refuseToStart` so an operator sees
+# one phrase for every configuration refusal, whichever layer noticed.
+if [ -z "${BRAINZ_SECRETS_JSON:-}" ]; then
+  printf 'refusing to start: BRAINZ_SECRETS_JSON is required and was not set\n' >&2
+  exit 1
+fi
+
+# Ignored, and said out loud. Silently overriding it would leave an operator who
+# mounted a volume wondering why their store is not being read.
+if [ -n "${BRAINZ_SECRETS_FILE:-}" ]; then
+  printf 'note: BRAINZ_SECRETS_FILE=%s is ignored; this image chooses the path\n' \
+    "$BRAINZ_SECRETS_FILE" >&2
+fi
+
+# 0600 by construction rather than by a later chmod: the file is never
+# momentarily group-readable. `mktemp -d` makes the directory 0700 as well, so
+# the path is unguessable and fresh per start — nothing here can be baked.
+umask 077
+secrets_dir="$(mktemp -d "${TMPDIR:-/tmp}/brainz-secrets.XXXXXX")"
+BRAINZ_SECRETS_FILE="$secrets_dir/secrets.json"
+export BRAINZ_SECRETS_FILE
+# `printf` is a shell builtin here, so the value never becomes an argv anybody
+# can read out of /proc.
+printf '%s' "$BRAINZ_SECRETS_JSON" > "$BRAINZ_SECRETS_FILE"
+
+# Validate the bytes actually written, not the variable. Malformed JSON would
+# otherwise boot green and fail at the first tenant resolve, which surfaces as
+# an outage for one user rather than as a bad deploy.
+if ! bun -e 'const store = JSON.parse(await Bun.file(Bun.env.BRAINZ_SECRETS_FILE).text()); if (typeof store !== "object" || store === null || Array.isArray(store)) throw new Error("not an object")' 2>/dev/null; then
+  rm -rf "$secrets_dir"
+  printf 'refusing to start: BRAINZ_SECRETS_JSON is not a JSON object\n' >&2
+  exit 1
+fi
+
+# The fleet needs the file, never the blob. Left set, every tenant's connection
+# string would sit in the environ of the process that parses attacker-supplied
+# content, for the life of the instance.
+unset BRAINZ_SECRETS_JSON
+
+# `exec`, so the fleet process is the container's own — a wrapper shell would
+# swallow the SIGTERM the platform sends on scale-to-zero.
+exec "$@"
+FLEET_BOOTSTRAP
+
 # Non-root from here down. The MCP fleet parses attacker-supplied content
 # (mailbox payloads reach it), so the blast radius of a parser bug should stop
 # at a process that owns nothing.
@@ -85,7 +187,9 @@ EXPOSE 8080
 # Readiness is Cloudflare's port poll against the Container class's
 # `pingEndpoint`, not a Docker HEALTHCHECK — the platform ignores the latter.
 
-# Default entrypoint is the MCP fleet. The worker fleet runs this same image
-# with `entrypoint` overridden on its Container class (see `WorkerFleet` in
-# src/mcp/router.ts).
-CMD ["bun", "run", "src/mcp/serve.ts"]
+# Default command is the MCP fleet, through the bootstrap. The worker fleet runs
+# this same image with `entrypoint` overridden on its Container class (see
+# `WorkerFleet` in src/mcp/router.ts) — and Cloudflare's `entrypoint` *replaces*
+# the container's command rather than adding to it, so that override names this
+# same bootstrap. Two explicit argvs, no merge semantics to be wrong about.
+CMD ["/usr/local/bin/fleet-bootstrap", "bun", "run", "src/mcp/serve.ts"]

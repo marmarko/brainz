@@ -1,11 +1,19 @@
 # Cloudflare Containers configuration for both fleets (U1 step 6, KTD2).
 #
-# NOT YET SERVING REAL TRAFFIC. This file is complete in shape and deliberately
-# unbound: no route and no custom domain, and the Worker entrypoint plus both
-# Container classes land in later units (U6, U10). It exists now because three
-# later units verify against a continuously running, publicly reachable fleet,
-# and because a deployment shape is much cheaper to get wrong before there is
-# application code to blame.
+# DEPLOYABLE. This file was written unbound — no route, no origin, no trigger —
+# because the Worker entrypoint and both Container classes landed in later units
+# and "binding a route now would publish an endpoint that 500s" was true when it
+# was written. It is no longer true: `src/mcp/serve.ts` and `src/worker/serve.ts`
+# bind sockets and answer, `src/mcp/router.ts` routes to the first and now wakes
+# the second, and both Container classes are handed their configuration. What
+# changed, and what each change replaced, is recorded at the bottom of this file
+# rather than deleted with the reasoning it retired — a config that quietly drops
+# the sentence explaining why something was absent teaches the next reader
+# nothing about why it is now present.
+#
+# The deploy runbook — every command, in order, from a clean checkout, including
+# teardown — is `docs/deploy.md`. This file is the configuration; that one is the
+# procedure.
 #
 # Shape, per KTD2: Worker -> Durable Object -> Container. Containers are not an
 # alternative to Workers, they are reached through one. The Worker named in
@@ -32,12 +40,29 @@
 
 name = "brainz-fleet"
 
-# The router Worker. Lands with U6; it resolves the tenant from the
-# authenticated bearer and hands the request to that tenant's container.
+# The router Worker. It resolves the tenant from the authenticated bearer and
+# hands the request to that tenant's container; its `scheduled` handler wakes the
+# worker fleet on the trigger below.
 main = "src/mcp/router.ts"
 
 compatibility_date = "2026-08-12"
 compatibility_flags = ["nodejs_compat"]
+
+# The public origin, and the reason there is one.
+#
+# U6's OAuth discovery documents embed absolute issuer URLs, and a connector
+# binds to what it reads — so the origin has to exist before a connector is
+# pointed at it, and it has to be stable. `workers.dev` is the zero-config option
+# and no custom domain is registered yet, so this is `https://<name>.<account
+# subdomain>.workers.dev` and `BRAINZ_PUBLIC_ORIGIN` is set to exactly that
+# string. The two are one fact expressed twice: `src/fleet/env.ts` refuses an
+# origin with a path or a trailing slash precisely because a mismatch between
+# them surfaces days later as a client rejecting an issuer.
+#
+# Moving to a custom domain is therefore not a config-only change — it re-points
+# every connector that bound to the old issuer. The `[[routes]]` stanza that does
+# it is recorded at the bottom of this file.
+workers_dev = true
 
 [observability]
 enabled = true
@@ -136,24 +161,84 @@ tag = "v1"
 new_sqlite_classes = ["McpFleet", "WorkerFleet"]
 
 # ---------------------------------------------------------------------------
-# Deliberately absent until the surrounding units land.
+# DECISION 3 — the cron that wakes the worker fleet.
 #
-# Routes. U6's OAuth discovery metadata binds absolute issuer URLs to a stable
-# public origin, so the origin is provisioned before U6 rather than discovered
-# during it. Binding a route now would publish an endpoint that 500s.
+# A container class nobody addresses never boots. `WORKER_FLEET` was bound above
+# and reached by nothing: the Worker's only handler routed to `MCP_FLEET`, so a
+# deploy would have succeeded, the MCP surface would have served, and no
+# consolidation cycle would ever have run. This trigger is the caller — it
+# invokes `scheduled` in src/mcp/router.ts, which dials one named worker
+# instance's readiness route and lets that process's own loop do the work.
 #
-#   [[routes]]
-#   pattern = "mcp.<origin>"
-#   custom_domain = true
+# **Thirty minutes, and why not five.** The cron is not the schedule; it is the
+# wake. `ALPHA_SCHEDULER` (src/worker/scheduler.ts) already decides which tenants
+# are due, and its `minIntervalMs` is 30 minutes — so waking more often than that
+# cannot make any tenant consolidate sooner. What it would do is cost: the worker
+# fleet's `sleepAfter` is 5m, so any cron period at or under it holds an instance
+# awake permanently and bills a batch fleet like an interactive one. At 30m the
+# instance wakes, ticks, and sheds — and the price is latency the batch lane can
+# absorb: a tenant that becomes due right after a wake waits up to half an hour,
+# against a 24h ceiling.
 #
-# Scheduled triggers for the worker fleet (U10 owns the schedule itself).
+# The container's own timer fires every `BRAINZ_WORKER_TICK_MS` (60s) once it is
+# awake, so one wake is several ticks, not one.
+# ---------------------------------------------------------------------------
+[triggers]
+crons = ["*/30 * * * *"]
+
+# ---------------------------------------------------------------------------
+# NO R2 BINDING, DELIBERATELY.
 #
-#   [triggers]
-#   crons = ["*/5 * * * *"]
+# An `[[r2_buckets]]` binding is a *Worker* capability: it hands `env.BUCKET` to
+# code running in workerd. Nothing in this Worker touches object storage — the
+# router resolves a tenant and forwards a request — and a binding cannot be
+# forwarded into a container, which is where the object store actually lives.
+# `src/control/object-store.ts` builds a `Bun.S3Client` against an S3-compatible
+# endpoint with a scoped access key, over the container's ordinary internet
+# egress (`enableInternet` defaults to true on the Container class). So a binding
+# here would be configuration nothing reads, and the honest thing is to say why
+# it is absent rather than to add one that looks like plumbing.
 #
-# Secrets. Nothing credential-shaped belongs in this file — it is committed to a
-# public repo. The per-tenant connection strings and bearer grants live in the
-# named secret store behind src/control/secrets.ts, which exists precisely
-# because platform environment variables cannot hold per-tenant secrets at
-# scale. The store's own access credential is set with `wrangler secret put`.
+# The credentials that path needs are not in either fleet's env manifest either
+# (src/mcp/router.ts), and for a reason worth checking before adding them:
+# `createTenantObjectStore` has no production composition root. Every caller needs
+# a prefix-scoped credential and the only `ScopedCredentialMinter` in `src/`
+# refuses. When a real minter lands, the credential joins a manifest, this comment
+# changes, and `test/fleet/router-env.test.ts` is the file that notices.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# WHAT CHANGED, AND WHAT IT REPLACED.
+#
+# This block used to read "deliberately absent until the surrounding units
+# land". Those units landed, so the absences are recorded here as decisions
+# taken rather than deleted along with the reasoning that made them absences.
+#
+# * **Routes.** Was: "binding a route now would publish an endpoint that 500s",
+#   with a commented custom-domain stanza. The entrypoints serve, so the origin
+#   is bound — as `workers_dev` (see the top of this file), because no custom
+#   domain is registered. The custom-domain stanza is still the migration path
+#   and is still not a config-only change: every connector that completed OAuth
+#   against the workers.dev issuer bound to it.
+#
+#     [[routes]]
+#     pattern = "mcp.<a domain you own>"
+#     custom_domain = true
+#
+# * **Triggers.** Was: "U10 owns the schedule itself", commented at `*/5`. U10
+#   landed; the schedule is `ALPHA_SCHEDULER` inside the container. The cron is
+#   now present at `*/30` and is a wake rather than a schedule — see DECISION 3
+#   for why the two are not the same thing and why the tighter period costs
+#   money without buying latency.
+#
+# * **Secrets.** Unchanged in principle and now specific. Nothing
+#   credential-shaped belongs in this file; it is committed to a public repo.
+#   Every value is set with `wrangler secret put` and forwarded into the
+#   containers by name — the manifests are `MCP_FLEET_VARIABLES` and
+#   `WORKER_FLEET_VARIABLES` in src/mcp/router.ts, and `docs/deploy.md` lists
+#   every name in order. Note that per-tenant connection strings and bearer
+#   grants travel as ONE secret (`BRAINZ_SECRETS_JSON`, materialised into a file
+#   by the image's bootstrap), which is an alpha shape with a 5 KB ceiling on it
+#   — the Dockerfile header states the limits and `docs/deploy.md` states the
+#   arithmetic.
 # ---------------------------------------------------------------------------
