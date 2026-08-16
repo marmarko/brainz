@@ -495,6 +495,9 @@ describe('the webhook route is outside every cookie rule', () => {
     const payload = JSON.stringify({
       id: 'evt_web',
       type: 'customer.subscription.updated',
+      // When the vendor made it. `billing.ts` orders deliveries on this, since
+      // the vendor does not promise the order it delivers them in.
+      created: Math.floor(AT.getTime() / 1000),
       data: { object: { id: 'sub_alice', customer: 'cus_alice', status: 'active' } },
     });
     const response = await app()(
@@ -519,6 +522,7 @@ describe('the webhook route is outside every cookie rule', () => {
     const payload = JSON.stringify({
       id: 'evt_forged_web',
       type: 'customer.subscription.updated',
+      created: Math.floor(AT.getTime() / 1000),
       data: { object: { id: 'sub_alice', customer: 'cus_alice', status: 'active' } },
     });
     const t = Math.floor(AT.getTime() / 1000);

@@ -69,11 +69,14 @@ function subscriptionEvent(options: {
   readonly customer: string;
   readonly subscription: string;
   readonly status: string;
+  /** When the *vendor* made the event. Not when it was delivered — the two come
+   * apart on exactly the delivery this file's ordering test is about. */
+  readonly created?: number;
 }): string {
   return JSON.stringify({
     id: options.id,
     type: options.type,
-    created: NOW_SECONDS,
+    created: options.created ?? NOW_SECONDS,
     data: {
       object: {
         id: options.subscription,
@@ -459,6 +462,136 @@ describe('applying an event', () => {
     // input. A validly signed non-JSON body is what proves the order.
     await aPayingCustomer();
     const payload = 'not json at all';
+    expect(
+      await applyBillingEvent({ sql, controlSql, payload, header: header(payload), secret: SECRET, now: AT }),
+    ).toEqual({ ok: false, reason: 'malformed_event' });
+  });
+
+  test('A LATE DELIVERY DOES NOT RE-UPGRADE A CANCELLED TENANT', async () => {
+    // **The vendor does not promise order.** Everything the signature check
+    // establishes is still true of this delivery: right secret, right body,
+    // inside the tolerance, an event id nothing has claimed. It is genuine and
+    // it is stale, and those are not the same question — so the two replay
+    // controls this module already has cannot answer it. The tolerance admits
+    // it (it was signed a moment ago), the event-id primary key admits it (a
+    // different event), and without a third control the cancellation is undone
+    // by an upgrade the vendor emitted *before* it, with no path back: nothing
+    // else ever writes that tier down again.
+    const { tenantId } = await aPayingCustomer();
+
+    const cancelled = subscriptionEvent({
+      id: 'evt_cancel',
+      type: 'customer.subscription.updated',
+      customer: 'cus_alice',
+      subscription: 'sub_alice',
+      status: 'canceled',
+      created: NOW_SECONDS,
+    });
+    expect(
+      await applyBillingEvent({
+        sql,
+        controlSql,
+        payload: cancelled,
+        header: header(cancelled),
+        secret: SECRET,
+        now: AT,
+      }),
+    ).toEqual({ ok: true, outcome: 'applied', tier: 'free', tenantId });
+
+    // Emitted a minute *earlier*, delivered now.
+    const late = subscriptionEvent({
+      id: 'evt_late_active',
+      type: 'customer.subscription.updated',
+      customer: 'cus_alice',
+      subscription: 'sub_alice',
+      status: 'active',
+      created: NOW_SECONDS - 60,
+    });
+    expect(
+      await applyBillingEvent({
+        sql,
+        controlSql,
+        payload: late,
+        header: header(late),
+        secret: SECRET,
+        now: AT,
+      }),
+    ).toEqual({ ok: true, outcome: 'superseded' });
+
+    // Both halves of the tier, because a stale event that moved only one of
+    // them would be the worse bug: a free subscription over a paid brain.
+    const subs = await sql<{ tier: string; status: string }[]>`
+      SELECT tier::text AS tier, status::text AS status FROM account.subscription`;
+    expect(subs[0]).toMatchObject({ tier: 'free', status: 'canceled' });
+
+    const tenants = await controlSql<{ tier: string }[]>`
+      SELECT tier::text AS tier FROM control.tenant WHERE tenant_id = ${tenantId}`;
+    expect(tenants[0]?.tier).toBe('free');
+
+    // Recorded, not silently dropped: an operator asking why an upgrade did not
+    // land needs the delivery to be in the table with a reason on it.
+    const rows = await sql<{ outcome: string }[]>`
+      SELECT outcome::text AS outcome FROM account.billing_event WHERE event_id = 'evt_late_active'`;
+    expect(rows[0]?.outcome).toBe('superseded');
+  });
+
+  test('a later delivery still applies, or the control above is just a stop', async () => {
+    // The half that makes the half above mean something. Same tenant, same
+    // shape, `created` moved forward instead of back.
+    const { tenantId } = await aPayingCustomer();
+
+    const cancelled = subscriptionEvent({
+      id: 'evt_first_cancel',
+      type: 'customer.subscription.updated',
+      customer: 'cus_alice',
+      subscription: 'sub_alice',
+      status: 'canceled',
+      created: NOW_SECONDS - 60,
+    });
+    await applyBillingEvent({
+      sql,
+      controlSql,
+      payload: cancelled,
+      header: header(cancelled),
+      secret: SECRET,
+      now: AT,
+    });
+
+    const resubscribed = subscriptionEvent({
+      id: 'evt_then_active',
+      type: 'customer.subscription.updated',
+      customer: 'cus_alice',
+      subscription: 'sub_alice',
+      status: 'active',
+      created: NOW_SECONDS,
+    });
+    expect(
+      await applyBillingEvent({
+        sql,
+        controlSql,
+        payload: resubscribed,
+        header: header(resubscribed),
+        secret: SECRET,
+        now: AT,
+      }),
+    ).toEqual({ ok: true, outcome: 'applied', tier: 'paid', tenantId });
+
+    const tenants = await controlSql<{ tier: string }[]>`
+      SELECT tier::text AS tier FROM control.tenant WHERE tenant_id = ${tenantId}`;
+    expect(tenants[0]?.tier).toBe('paid');
+  });
+
+  test('an event carrying no `created` at all is refused, rather than applied out of order', async () => {
+    // `created` is as required a field of the vendor's event object as `id` and
+    // `type`, and the same refusal covers all three. Reading its absence as
+    // "apply unconditionally" would leave the ordering control switched off for
+    // exactly the bodies that carry no way to order them.
+    await aPayingCustomer();
+    const payload = JSON.stringify({
+      id: 'evt_undated',
+      type: 'customer.subscription.updated',
+      data: { object: { id: 'sub_alice', customer: 'cus_alice', status: 'active' } },
+    });
     expect(
       await applyBillingEvent({ sql, controlSql, payload, header: header(payload), secret: SECRET, now: AT }),
     ).toEqual({ ok: false, reason: 'malformed_event' });

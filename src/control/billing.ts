@@ -27,12 +27,23 @@
  *      unauthenticated input.
  *   3. Only then parse.
  *
- * **Two independent replay controls, because neither covers the other.** The
+ * **Three independent replay controls, because none covers the others.** The
  * timestamp tolerance refuses a captured request replayed later. The event-id
  * primary key on `account.billing_event` refuses a *genuine* delivery repeated
  * inside the window — which the vendor does on purpose, and which is the
  * ordinary case rather than an attack. A system with only the first applies
  * every retry twice.
+ *
+ * The third is **recency**, and it is the one a signature cannot supply: the
+ * vendor does not promise delivery order, so a cancellation and the upgrade that
+ * preceded it can arrive the other way round. Both are genuine, both are inside
+ * the tolerance, both carry unseen event ids — and the older one, arriving
+ * second, permanently re-upgrades a cancelled tenant, because nothing else in
+ * the system ever writes that tier back down. So the subscription row carries
+ * the `created` of the newest delivery that moved it and the comparison happens
+ * inside the `UPDATE`'s own `WHERE`, where two racing containers cannot both
+ * win. The fix for an out-of-order delivery is recency, never a stronger
+ * signature: the signature was never wrong.
  *
  * **Two databases, no distributed transaction, and the ordering chosen for it.**
  * The subscription row lives in the identity store and the tier lives in the
@@ -198,7 +209,10 @@ export type ApplyOutcome =
       readonly tier: BillingTier;
       readonly tenantId: string | null;
     }
-  | { readonly ok: true; readonly outcome: 'duplicate' | 'ignored' | 'unknown_customer' }
+  | {
+      readonly ok: true;
+      readonly outcome: 'duplicate' | 'ignored' | 'superseded' | 'unknown_customer';
+    }
   | { readonly ok: false; readonly reason: SignatureRefusal | 'malformed_event' };
 
 /**
@@ -219,7 +233,31 @@ const VENDOR_ID = /^[a-z]{1,12}_[A-Za-z0-9][A-Za-z0-9_]{0,125}$/;
 interface StripeEvent {
   readonly id: string;
   readonly type: string;
+  /**
+   * When the **vendor** made the event, not when it reached us. `null` when the
+   * body carried nothing usable.
+   *
+   * The distinction is the whole of the ordering control. The signature's `t` is
+   * re-stamped on every retry, so it dates the delivery; `created` dates the
+   * state change, and it is the only field in the body that can order two
+   * deliveries the vendor sent in one order and we received in another.
+   */
+  readonly createdAt: Date | null;
   readonly object: Record<string, unknown>;
+}
+
+/**
+ * A unix-second `created`, bounded so it is a date rather than an arithmetic
+ * accident. `null` rather than a default: defaulting to *now* would make every
+ * unorderable delivery the newest one, which is the ordering control switched
+ * off precisely where it is needed.
+ */
+function readCreated(value: unknown): Date | null {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) return null;
+  // Positive, and this side of the year 33658, which is what `Date` can hold
+  // without becoming `Invalid Date` and what a timestamptz column will accept.
+  if (value <= 0 || value > 1e12) return null;
+  return new Date(value * 1000);
 }
 
 /** Read the fields we use, and refuse anything whose shape we cannot trust. */
@@ -238,6 +276,8 @@ function readEvent(payload: string): StripeEvent | null {
   const data = record['data'];
   if (typeof id !== 'string' || typeof type !== 'string') return null;
 
+  const createdAt = readCreated(record['created']);
+
   // The alphabets in `account-schema.sql` are narrower than "any string", and a
   // value the column cannot hold must be refused here rather than raising a
   // constraint violation the caller would report as an outage. Narrower than
@@ -253,6 +293,7 @@ function readEvent(payload: string): StripeEvent | null {
   return {
     id,
     type,
+    createdAt,
     object: typeof object === 'object' && object !== null ? (object as Record<string, unknown>) : {},
   };
 }
@@ -293,6 +334,21 @@ export async function applyBillingEvent(request: {
 
   const event = readEvent(request.payload);
   if (event === null) return { ok: false, reason: 'malformed_event' };
+
+  // **`created` is required exactly where it orders something, and nowhere
+  // else.** A subscription event that carries no usable one cannot be placed
+  // against the last delivery this account applied, and applying it anyway is
+  // the ordering control switched off for precisely the bodies that defeat it.
+  // Every other event type — an invoice notification, a shape the vendor adds
+  // next year, a future envelope that dates itself some other way — is still
+  // recorded as `ignored` rather than refused, because none of them moves a tier
+  // and a 400 on one is a genuine delivery discarded to no purpose (see
+  // {@link VENDOR_ID} for the same mistake made about ids).
+  //
+  // Checked before the claim, so a refusal burns no event id.
+  if (SUBSCRIPTION_EVENTS.has(event.type) && event.createdAt === null) {
+    return { ok: false, reason: 'malformed_event' };
+  }
 
   const acts =
     SUBSCRIPTION_EVENTS.has(event.type) || event.type === CHECKOUT_COMPLETED;
@@ -353,6 +409,19 @@ async function applyToSubscription(
     return { ok: true, outcome: 'ignored' };
   }
 
+  // Non-null by construction: `applyBillingEvent` refuses a subscription event
+  // with no `created` before the claim is taken, and the checkout branch
+  // returned above. It is restated rather than asserted because getting it wrong
+  // is silent and fails *open* — a null bound into the predicate below is
+  // written back into `last_event_created_at`, which disarms the ordering
+  // control for that account permanently, which is the exact failure the column
+  // exists to stop. A throw releases the claim, so the vendor's retry still has
+  // a delivery to make.
+  const createdAt = event.createdAt;
+  if (createdAt === null) {
+    throw new Error('a subscription event reached the tier write carrying no `created`');
+  }
+
   const subscriptionId = stringField(event.object, 'id');
   const rawStatus =
     event.type === 'customer.subscription.deleted'
@@ -367,14 +436,45 @@ async function applyToSubscription(
   const currentPeriodEnd =
     typeof periodEnd === 'number' && Number.isFinite(periodEnd) ? new Date(periodEnd * 1000) : null;
 
-  await request.sql`
+  // **The third replay control, and it lives in the `WHERE` rather than above
+  // it.** The vendor does not promise delivery order, so a cancellation and the
+  // upgrade that preceded it can arrive the other way round — and every check
+  // this module already ran says yes to both: the signature is genuine, the
+  // timestamp is inside the tolerance, the event id is one nothing has claimed.
+  // Without this predicate the older event wins by arriving second and the
+  // downgrade is undone permanently, because nothing else ever writes that tier
+  // back down.
+  //
+  // Read-then-write would be the same bug wearing a check: two containers
+  // holding two deliveries would both read the old value, both decide they are
+  // newer, and the loser of the race would land last. One statement, one
+  // predicate, and the database arbitrates.
+  //
+  // `<=` and not `<`. A retry after a mid-apply failure releases its claim and
+  // arrives again carrying the same `created`, and a genuine consecutive pair of
+  // vendor events can share a second; strict `>` would turn both into permanent
+  // refusals, which is the wrong failure for the ordinary case.
+  const applied = await request.sql<{ account_id: string }[]>`
     UPDATE account.subscription
     SET tier = ${tier}::account.subscription_tier,
         status = ${status}::account.subscription_status,
         stripe_subscription_id = ${tier === 'paid' ? subscriptionId : null},
         current_period_end = ${currentPeriodEnd},
+        last_event_created_at = ${createdAt},
         updated_at = ${request.now}
-    WHERE account_id = ${owner.account_id}`;
+    WHERE account_id = ${owner.account_id}
+      AND (last_event_created_at IS NULL OR last_event_created_at <= ${createdAt})
+    RETURNING account_id`;
+
+  if (applied.length === 0) {
+    // Recorded rather than dropped, and under its own outcome: "we refused a
+    // stale delivery" is the answer to "why did the upgrade not land", and
+    // folding it into `ignored` is how that answer stops existing. Nothing
+    // touches the control plane below — a stale event that moved only the other
+    // half of the tier would be the worse bug.
+    await markOutcome(request.sql, event.id, 'superseded');
+    return { ok: true, outcome: 'superseded' };
+  }
 
   // The other half, in the other database. `control.tenant.tier` is what the
   // consolidation cycle reads; without this write the subscription would say
@@ -395,7 +495,7 @@ async function applyToSubscription(
 async function markOutcome(
   sql: SQL,
   eventId: string,
-  outcome: 'applied' | 'duplicate' | 'ignored' | 'unknown_customer',
+  outcome: 'applied' | 'duplicate' | 'ignored' | 'superseded' | 'unknown_customer',
 ): Promise<void> {
   await sql`
     UPDATE account.billing_event

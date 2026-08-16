@@ -167,10 +167,17 @@ CREATE TYPE account.verification_purpose AS ENUM ('email_verify', 'password_rese
 -- rather than an error: a correctly signed, in-window, repeated delivery is
 -- ordinary vendor behaviour, and recording it as a failure would hide the one
 -- case that matters — a tier transition applied twice.
+--
+-- `superseded` is the third replay control's outcome, and it is deliberately not
+-- `ignored`: a delivery we chose not to act on and a *genuine* delivery that
+-- arrived after a newer one are different events to whoever is asking why an
+-- upgrade did not land, and folding them together makes the ordering control
+-- invisible in the one table that records it.
 CREATE TYPE account.billing_event_outcome AS ENUM (
   'applied',
   'duplicate',
   'ignored',
+  'superseded',
   'unknown_customer'
 );
 
@@ -344,6 +351,23 @@ CREATE TABLE account.subscription (
   -- and for the "you keep model phases until" copy, never as the authority on
   -- whether to run them — that is `status`, which the vendor moves.
   current_period_end      timestamptz,
+
+  -- **`created` of the newest delivery this row has been moved by, and the
+  -- reason it is a column rather than a variable.** The vendor does not promise
+  -- delivery order, so a cancellation and the upgrade that preceded it can
+  -- arrive the other way round — both correctly signed, both inside the
+  -- tolerance, both carrying event ids nothing has claimed. Neither existing
+  -- replay control can see it: the tolerance is about *when it was sent* and the
+  -- `billing_event` primary key is about *whether we have seen this one*.
+  --
+  -- Compared inside the `UPDATE`'s own `WHERE` (`src/control/billing.ts`), never
+  -- read and then written: two containers holding two different deliveries would
+  -- both pass a read-then-write and the later write would win by luck.
+  --
+  -- NULL on every row that predates the control and on every row no subscription
+  -- event has touched, and NULL admits the next delivery — the alternative would
+  -- be a column that refuses every tenant's first upgrade.
+  last_event_created_at   timestamptz,
 
   updated_at              timestamptz                  NOT NULL DEFAULT now(),
 

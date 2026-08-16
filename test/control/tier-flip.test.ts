@@ -74,6 +74,11 @@ function subscriptionEvent(id: string, status: string): string {
   return JSON.stringify({
     id,
     type: status === 'canceled' ? 'customer.subscription.deleted' : 'customer.subscription.updated',
+    // The vendor stamps every event with when it made it, and `billing.ts` now
+    // refuses to apply one older than the last it applied. This file delivers a
+    // downgrade and then an upgrade, so they share a second rather than moving
+    // backwards — the tie the ordering control admits on purpose.
+    created: Math.floor(AT.getTime() / 1000),
     data: {
       object: {
         id: 'sub_dreamer',

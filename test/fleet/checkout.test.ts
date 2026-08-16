@@ -152,6 +152,9 @@ function subscriptionEvent(id: string): Record<string, unknown> {
   return {
     id,
     type: 'customer.subscription.created',
+    // The vendor stamps every event with when it made it; `billing.ts` orders
+    // deliveries on it, and a body without one is not one of their events.
+    created: Math.floor(Date.now() / 1000),
     data: {
       object: {
         id: SUBSCRIPTION,
