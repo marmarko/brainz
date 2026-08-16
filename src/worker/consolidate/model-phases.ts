@@ -530,7 +530,7 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
       };
     }
 
-    await writeCanonicalSummary(deps.sql, {
+    const written = await writeCanonicalSummary(deps.sql, {
       sourcePageId: page.pageId,
       title: page.title,
       summary,
@@ -538,6 +538,17 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
       sources: [{ sourceType: page.sourceType, externalRef: page.externalRef }],
       runId: deps.runId,
     });
+    // A synthesis whose inputs span more than one origin has no honest scalar to
+    // be filed under, and the seam refuses it. Counted as `logged` rather than
+    // `applied`: the page was seen and the model was paid for, and nothing was
+    // written. Unreachable from here today — `selectIngestedPages` derives
+    // `origins` from a page's own scalar column — and read rather than ignored,
+    // because a caller that discarded the outcome is how the seam's refusal
+    // would come to mean nothing the day a phase summarises across pages.
+    if (!written.ok) {
+      logged += 1;
+      continue;
+    }
     applied += 1;
   }
 

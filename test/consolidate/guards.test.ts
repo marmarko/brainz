@@ -31,6 +31,7 @@ import {
   buildExtractionPrompt,
   gateFor,
   selectExtractionCandidates,
+  writeCanonicalSummary,
 } from '../../src/worker/consolidate/materialize.ts';
 import {
   runContradictionPhase,
@@ -563,6 +564,122 @@ describe('5 — truncation degrades by importance, not by primary key', () => {
       expect(both.map((candidate) => candidate.pageId).sort()).toEqual(
         [dull.pageId, salient.pageId].sort(),
       );
+    },
+    SETUP_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 5 — a synthesis is filed where every input can reach it, or it is not filed.
+// ---------------------------------------------------------------------------
+
+/**
+ * **`page.origin_context` is a scalar, and a synthesis is not.**
+ *
+ * `writeCanonicalSummary` takes `origins: readonly string[]`, computes its R12a
+ * admission over all of them, unions them — and then files the page and its
+ * chunk under `origins[0]`. Everything downstream fences a page on that one
+ * string, so a summary derived from a work input and a personal one is readable
+ * by a grant holding whichever origin sorted first, and invisible to the other.
+ * It is also severed by whichever origin it happens to name and survives
+ * severance of the rest, which makes it a copy of retired content.
+ *
+ * **This is not currently reachable through the fleet**, and saying so is part
+ * of the finding: the single production caller is `runSynopsisPhase`, whose
+ * pages come from `selectIngestedPages`, which builds `origins: [origin_context]`
+ * from the page's own scalar column — one element, always. The defect is in the
+ * seam's contract rather than in today's traffic: the parameter invites N, the
+ * admission logic reads all N, and only the two INSERTs quietly keep one. A
+ * multi-page synthesis is exactly what a later phase would call this for.
+ *
+ * So it is closed at the seam and the test drives the seam directly, because
+ * that is the only place the shape exists.
+ */
+describe('5 — a multi-origin synthesis is refused rather than filed under one input', () => {
+  test(
+    'two origins in, nothing written, and the reason is typed',
+    async () => {
+      const { sql } = tenant;
+      const source = await seedPage(sql, {
+        origin: 'personal:mail',
+        sourceType: 'email',
+        title: 'the thread the synthesis came from',
+        body: 'Ronan Whitfield joined Verdant Systems.',
+      });
+
+      const before = await countRows(sql, 'page');
+      const outcome = await writeCanonicalSummary(sql, {
+        sourcePageId: source.pageId,
+        title: 'a synthesis over two contexts',
+        summary: 'MULTI-ORIGIN-SYNTHESIS the offsite clashes with the appointment.',
+        // `union` sorts, so `personal:mail` would be `origins[0]` and the whole
+        // synthesis would land in the personal half — readable by a personal
+        // grant that never saw the work input.
+        origins: ['work:mail', 'personal:mail'],
+        sources: [{ sourceType: 'email', externalRef: null }],
+        runId: (
+          await openRun(sql, {
+            trigger: 'time_ceiling',
+            tier: 'paid',
+            now: new Date(),
+            estimateMicroUsd: 0,
+          })
+        ).run.runId,
+      });
+
+      const filed = (await sql`
+        SELECT p.origin_context AS page_origin, c.origin_context AS chunk_origin
+          FROM page p JOIN chunk c ON c.page_id = p.page_id
+         WHERE c.content LIKE 'MULTI-ORIGIN-SYNTHESIS%'
+      `) as Array<{ page_origin: string; chunk_origin: string }>;
+      expect(filed).toEqual([]);
+      expect(outcome.ok).toBe(false);
+      expect(outcome.ok === false ? outcome.reason : '').toBe('multi_origin_synthesis');
+      expect(await countRows(sql, 'page')).toBe(before);
+
+      const leaked = (await sql`
+        SELECT count(*)::int AS n FROM chunk WHERE content LIKE 'MULTI-ORIGIN-SYNTHESIS%'
+      `) as Array<{ n: number }>;
+      expect(leaked[0]?.n).toBe(0);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
+    'one origin in — including the same one named twice — still writes, so this is not a blanket refusal',
+    async () => {
+      const { sql } = tenant;
+      const source = await seedPage(sql, {
+        origin: 'work:mail',
+        sourceType: 'email',
+        title: 'the thread the synthesis came from',
+        body: 'Ronan Whitfield joined Verdant Systems.',
+      });
+
+      const outcome = await writeCanonicalSummary(sql, {
+        sourcePageId: source.pageId,
+        title: 'a synthesis over one context',
+        summary: 'SINGLE-ORIGIN-SYNTHESIS the offsite is on the twelfth.',
+        origins: ['work:mail', 'work:mail'],
+        sources: [{ sourceType: 'email', externalRef: null }],
+        runId: (
+          await openRun(sql, {
+            trigger: 'time_ceiling',
+            tier: 'paid',
+            now: new Date(),
+            estimateMicroUsd: 0,
+          })
+        ).run.runId,
+      });
+
+      expect(outcome.ok).toBe(true);
+
+      const rows = (await sql`
+        SELECT p.origin_context AS page_origin, c.origin_context AS chunk_origin
+          FROM page p JOIN chunk c ON c.page_id = p.page_id
+         WHERE c.content LIKE 'SINGLE-ORIGIN-SYNTHESIS%'
+      `) as Array<{ page_origin: string; chunk_origin: string }>;
+      expect(rows).toEqual([{ page_origin: 'work:mail', chunk_origin: 'work:mail' }]);
     },
     SETUP_TIMEOUT_MS,
   );

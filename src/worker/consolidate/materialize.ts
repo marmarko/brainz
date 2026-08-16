@@ -491,13 +491,45 @@ export async function enqueueReview(
 }
 
 /**
+ * Why a summary over more than one origin is refused rather than filed.
+ *
+ * `page.origin_context` and `chunk.origin_context` are **scalars**, and R15
+ * fences a page on that one string. A synthesis over two origins has no honest
+ * scalar: whichever one it takes, it becomes readable by a grant that never saw
+ * the other input and invisible to the grant that did. Picking `origins[0]` off
+ * a sorted union makes that worse rather than better — the survivor is decided
+ * by alphabetical order, so nobody reading the call site can predict which half
+ * of the brain a synthesis lands in.
+ *
+ * Nor is there a spare origin to file it under. `severance.ts` sweeps
+ * `page WHERE origin_context = $1`, so a summary parked at some synthetic origin
+ * would survive the severance of every input it was derived from — a copy of
+ * retired content, which is the erasure failure one unit over.
+ *
+ * So the seam refuses. The refusal is typed rather than thrown because the
+ * caller has a real answer for it: the page was seen, nothing was applied.
+ */
+export type CanonicalSummaryOutcome =
+  | { readonly ok: true; readonly pageId: string; readonly admitted: boolean }
+  | { readonly ok: false; readonly reason: 'multi_origin_synthesis'; readonly origins: readonly string[] };
+
+/**
  * The canonical summary — the surface U5's compiled-truth boost is for.
  *
- * It is a page like any other except in the two ways that matter: it is
- * `model_derived`, so no later cycle reads it as evidence, and its
- * `compiled_truth` is R12a's admission decision, taken once here against the
- * shared verdict and stored rather than recomputed by a ranking stage that would
- * have to re-refuse the same three forgeries.
+ * It is a page like any other except in the three ways that matter: it is
+ * `model_derived`, so no later cycle reads it as evidence; its `compiled_truth`
+ * is R12a's admission decision, taken once here against the shared verdict and
+ * stored rather than recomputed by a ranking stage that would have to re-refuse
+ * the same three forgeries; and it is written **only when its inputs collapse to
+ * one origin**, per {@link CanonicalSummaryOutcome}.
+ *
+ * Today's single caller (`model-phases.ts:runSynopsisPhase`) always satisfies
+ * that: its pages come from `selectIngestedPages`, which builds `origins` from
+ * the page's own scalar column. The guard is therefore unreachable through the
+ * fleet as it stands, and it is here rather than at the call site because the
+ * *parameter* is what invites the shape — the admission logic already reads all
+ * N origins, and a later phase summarising across pages is exactly the caller
+ * this signature was written for.
  */
 export async function writeCanonicalSummary(
   sql: SQL,
@@ -509,16 +541,25 @@ export async function writeCanonicalSummary(
     readonly sources: readonly ClaimSource[];
     readonly runId: string;
   },
-): Promise<{ readonly pageId: string; readonly admitted: boolean }> {
+): Promise<CanonicalSummaryOutcome> {
+  const origins = union(input.origins);
+
+  // Before the digest, before the admission verdict, and before any write: a
+  // refusal that had already spent a model call's worth of work would tempt the
+  // next reader to "just file it somewhere".
+  const only = origins[0];
+  if (origins.length !== 1 || only === undefined) {
+    return { ok: false, reason: 'multi_origin_synthesis', origins };
+  }
+
   const admission = admitToCompiledTruth(attestationsForOrigins(input.origins, input.sources));
   const digest = new Bun.CryptoHasher('sha256').update(input.summary).digest('hex');
-  const origins = union(input.origins);
 
   const pages = (await sql`
     INSERT INTO page (origin_context, source_type, title, derivation, compiled_truth,
                       embedding_model, embedding_dimensions, chunker_version, normalizer_version,
                       content_sha256, external_ref)
-    VALUES (${origins[0] ?? ''}, 'note', ${`Summary — ${input.title ?? 'untitled'}`},
+    VALUES (${only}, 'note', ${`Summary — ${input.title ?? 'untitled'}`},
             ${MODEL_DERIVED}, ${admission.admitted},
             (SELECT embedding_model FROM page WHERE page_id = ${input.sourcePageId}::bigint),
             (SELECT embedding_dimensions FROM page WHERE page_id = ${input.sourcePageId}::bigint),
@@ -538,8 +579,8 @@ export async function writeCanonicalSummary(
   // phase that has already spent its budget.
   await sql`
     INSERT INTO chunk (origin_context, content, page_id, ordinal)
-    VALUES (${origins[0] ?? ''}, ${input.summary}, ${pageId}::bigint, 0)
+    VALUES (${only}, ${input.summary}, ${pageId}::bigint, 0)
   `;
 
-  return { pageId, admitted: admission.admitted };
+  return { ok: true, pageId, admitted: admission.admitted };
 }
