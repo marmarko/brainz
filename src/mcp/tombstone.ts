@@ -240,16 +240,37 @@ async function touched(tx: SQL, table: string, key: string, deletedAt: string): 
 }
 
 /**
+ * What a purge removed. A superset of {@link CascadeCounts}, because the purge
+ * reaches two tables no single `forget` cascade writes to.
+ */
+export interface PurgeCounts extends CascadeCounts {
+  readonly commitments: number;
+  readonly attachments: number;
+}
+
+/**
  * Hard-delete every tombstone past the TTL.
  *
  * Ordered, and the order is the whole of the FK story:
  *
  *   1. clear `superseded_by` pointers into the doomed set, because that FK has
  *      no `ON DELETE` action and would otherwise refuse the delete;
- *   2. facts, whose `fact_source` rows cascade with them;
- *   3. chunks;
- *   4. pages, which cascade to any chunk or fact still referencing them;
- *   5. entities, whose slugs and aliases cascade.
+ *   2. commitments and attachments, **by their own `deleted_at`** (see below);
+ *   3. facts, whose `fact_source` rows cascade with them;
+ *   4. chunks;
+ *   5. pages, which cascade to any chunk or fact still referencing them;
+ *   6. entities, whose slugs, aliases and cards cascade.
+ *
+ * **Why steps 2 exists rather than being left to the cascades.** A commitment
+ * cascades from its fact and its page, and an attachment from its page — so for
+ * most rows the later steps would take them anyway. Not for all of them:
+ * extraction writes a commitment with a NULL `page_id` *and* a NULL `fact_id`
+ * whenever it could not attribute one, and U17's subject erasure tombstones an
+ * attachment whose OCR text names a correspondent while the page it hangs off
+ * stays live. Neither has a parent to cascade from, so without this step a row
+ * the product told a user was deleted sits in the brain in plaintext for its
+ * whole life. Tombstoning is a promise about a 72-hour window; a table the purge
+ * does not reach makes that promise false rather than slow.
  *
  * A caller runs this on a schedule (U10's job types are fixed at U10, so the
  * scheduled binding lands with the unit that owns the queue); it is exported as
@@ -258,7 +279,7 @@ async function touched(tx: SQL, table: string, key: string, deletedAt: string): 
 export async function purgeExpiredTombstones(
   sql: SQL,
   request: { readonly now: Date; readonly ttlHours?: number },
-): Promise<CascadeCounts> {
+): Promise<PurgeCounts> {
   const cutoff = new Date(request.now.getTime() - (request.ttlHours ?? FORGET_TTL_HOURS) * 3600_000).toISOString();
 
   return sql.begin(async (tx) => {
@@ -268,12 +289,14 @@ export async function purgeExpiredTombstones(
       [cutoff],
     );
 
+    const commitments = await deleted(tx, 'commitment', 'commitment_id', cutoff);
+    const attachments = await deleted(tx, 'attachment', 'attachment_id', cutoff);
     const facts = await deleted(tx, 'fact', 'fact_id', cutoff);
     const chunks = await deleted(tx, 'chunk', 'chunk_id', cutoff);
     const pages = await deleted(tx, 'page', 'page_id', cutoff);
     const entities = await deleted(tx, 'entity', 'entity_id', cutoff);
 
-    return { pages, chunks, facts, entities };
+    return { pages, chunks, facts, entities, commitments, attachments };
   });
 }
 

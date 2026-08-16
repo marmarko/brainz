@@ -236,6 +236,9 @@ describe('R22 resolution order', () => {
     // different answers, and silently choosing the second bills the platform
     // for a call the user was supposed to pay for.
     const failing = {
+      // A store that has no cache still declares the window it serves from, so
+      // R12's receipt has a number to carry for every implementation.
+      cacheWindowMs: 0,
       resolve() {
         return Promise.reject(new Error('secret store unreachable'));
       },

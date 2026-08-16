@@ -67,6 +67,19 @@ Access, correction, export and deletion: from the app, or by writing to us. Expo
 markdown you can read without us. Deleting your account deletes the database, the stored files,
 the control-plane row, the connector vendor's record of you, and any provider key you stored.
 
+**How long deletion takes, stated as a number rather than as "promptly".** Records stop being
+reachable the moment the deletion runs. They stop being *recoverable* when our database provider's
+point-in-time-recovery window rolls, which is **7 days** — that second figure is the one a deletion
+answer has to quote, because quoting the first would claim an irreversibility the platform does not
+provide. The same bound applies either way you reached us: to your own account deletion, and to a
+user's instruction to delete information about someone else specifically.
+
+One part of that is a fact about somebody else's system and we report it as one. Removing the
+connector vendor's record of you happens at that vendor; whether it also ends the permission you
+gave at the account you connected is a question we have asked and have not had answered in
+writing. We do not claim it, our deletion receipt carries that point as unverified, and you can
+remove our app from your provider's own connected-applications settings yourself at any time.
+
 ## If you are not our user
 
 If you have written to one of our users, or attended a meeting with one, some information about

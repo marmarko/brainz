@@ -119,6 +119,17 @@ export interface ErasureReceipt {
    */
   readonly tokensRevoked: 'confirmed' | 'unverified' | 'not_applicable';
   /**
+   * How long another fleet process may still resolve the revoked provider key.
+   *
+   * `revokeAll` deletes the backend row and the calling instance's cache entry.
+   * It cannot reach the cache in a second container, and eliminating that would
+   * take a shared revocation channel this system does not have. So the bound
+   * travels on the receipt for the same reason `tokensRevoked` does: a receipt
+   * that said "no stored provider key remains", full stop, would be asserting
+   * something the process writing it cannot know.
+   */
+  readonly providerKeyCacheWindowSeconds: number;
+  /**
    * The stated deletion SLA: the platform's point-in-time-recovery window.
    *
    * Rows stop being *queryable* when the leg returns. They stop being
@@ -218,11 +229,20 @@ export async function eraseAccount(
 
   // ---- Leg 2: the tenant's stored BYOK provider key (R22). Every provider in
   // one call, so none is forgotten by an enumeration that drifted.
+  const cacheWindowSeconds = Math.ceil(deps.providerKeys.cacheWindowMs / 1000);
   try {
     const outcome = await deps.providerKeys.revokeAll(deps.caller, request.tenantId);
     legs.push(
       outcome.ok
-        ? { leg: 'provider_key', status: 'done' }
+        ? {
+            leg: 'provider_key',
+            status: 'done',
+            // The bound, on the leg as well as on the receipt: a key another
+            // fleet process resolved before this call may be served from that
+            // process's cache until it expires. Stated rather than asserted
+            // away, exactly as the connector's `tokensRevoked` is.
+            detail: `revoked; a copy already resolved by another fleet process may be served from its cache for up to ${cacheWindowSeconds}s`,
+          }
         : { leg: 'provider_key', status: 'failed', detail: outcome.reason },
     );
   } catch (error) {
@@ -230,18 +250,40 @@ export async function eraseAccount(
   }
 
   // ---- Leg 3: the object-storage prefix.
+  //
+  // **The listing is the evidence, not `deletePrefix`'s return value.** That
+  // number is how many objects the call removed, which is a different question
+  // from whether any are left: S3 and R2 list a prefix a page at a time, so the
+  // obvious list+delete implementation removes a page, returns a page's count,
+  // and leaves the rest. A leg that classified on `before.length` alone reports
+  // `done` over a prefix it only partly emptied — and `complete: true` on a
+  // receipt is the artifact that answers a deletion request. There is no
+  // production implementation of this port in `src/` yet, so nothing but this
+  // re-list constrains the one somebody writes.
   const prefix = deps.storage.prefixFor(fleetIdentity(request.tenantId), request.tenantId);
   if (!prefix.ok) {
     legs.push({ leg: 'object_store', status: 'failed', detail: prefix.reason });
   } else {
     try {
       const before = await deps.objects.list(prefix.prefix);
-      const removed = await deps.objects.deletePrefix(prefix.prefix);
-      legs.push({
-        leg: 'object_store',
-        status: before.length === 0 ? 'already_absent' : 'done',
-        removed,
-      });
+      if (before.length === 0) {
+        legs.push({ leg: 'object_store', status: 'already_absent', removed: 0 });
+      } else {
+        const removed = await deps.objects.deletePrefix(prefix.prefix);
+        const after = await deps.objects.list(prefix.prefix);
+        legs.push(
+          after.length === 0
+            ? { leg: 'object_store', status: 'done', removed }
+            : {
+                leg: 'object_store',
+                status: 'failed',
+                removed,
+                // A count, never the keys: a receipt is not a directory listing
+                // of what is still there.
+                detail: `${after.length} of ${before.length} objects remain under the prefix`,
+              },
+        );
+      }
     } catch (error) {
       legs.push({ leg: 'object_store', status: 'failed', detail: messageOf(error) });
     }
@@ -301,6 +343,7 @@ export async function eraseAccount(
     legs,
     complete: legs.every((leg) => leg.status === 'done' || leg.status === 'already_absent'),
     tokensRevoked,
+    providerKeyCacheWindowSeconds: cacheWindowSeconds,
     unrecoverableAfterDays: PITR_WINDOW_DAYS,
     erasedAt: at,
   };

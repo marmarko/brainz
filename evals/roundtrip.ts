@@ -54,6 +54,50 @@ export const STAGES = [
   're-consolidate, then score the blocking eval',
 ] as const;
 
+/**
+ * What this run can report, given what it can reach.
+ *
+ * Exported and pure so the file's own rule — *nothing here reports a stage it
+ * did not run* — is a test rather than a sentence. It was a sentence, and the
+ * first stage was a hardcoded `ok` underneath it: no export ran, no database was
+ * opened, and a reader of the output was told a leg passed that never executed.
+ * Contained, because the command exits non-zero either way and no gate goes
+ * green on it — and exactly the failure this file was written against, which is
+ * the reason it is not left as a comment.
+ *
+ * **The first stage is `deferred` for the same reason as the other three**, and
+ * not as a euphemism: exporting a source brain needs a provisioned tenant with
+ * content in it, which is the stage below. Where the export leg *is* proven is
+ * named in its detail, so a reader is sent somewhere real instead of being
+ * reassured here.
+ */
+export function stages(): StageResult[] {
+  return [
+    {
+      stage: STAGES[0],
+      status: 'deferred',
+      detail:
+        'needs the fresh tenant below to export from; the export path itself is proven on every push by test/core/export/roundtrip-file-parity.test.ts, which round-trips a real brain and compares tree digests',
+    },
+    {
+      stage: STAGES[1],
+      status: 'deferred',
+      detail:
+        'provisioning a fresh tenant creates a Neon project; no cloud resource is created from this environment',
+    },
+    {
+      stage: STAGES[2],
+      status: 'deferred',
+      detail: 'blocked on the fresh tenant above',
+    },
+    {
+      stage: STAGES[3],
+      status: 'deferred',
+      detail: 'blocked on the fresh tenant above; re-consolidation is metered model spend',
+    },
+  ];
+}
+
 function report(out: (line: string) => void, results: readonly StageResult[]): void {
   for (const result of results) {
     out(`  ${result.status.padEnd(8)} ${result.stage} — ${result.detail}`);
@@ -82,30 +126,7 @@ export async function main(argv: readonly string[]): Promise<number> {
 
   // The substrate is present. Each stage reports for itself; nothing here
   // reports a stage it did not run.
-  const results: StageResult[] = [
-    {
-      stage: STAGES[0],
-      status: 'ok',
-      detail:
-        'src/core/export/{reconstruct,tree}.ts — reconstruction is digest-verified per page and the tree is a fixed point from generation two',
-    },
-    {
-      stage: STAGES[1],
-      status: 'deferred',
-      detail:
-        'provisioning a fresh tenant creates a Neon project; no cloud resource is created from this environment',
-    },
-    {
-      stage: STAGES[2],
-      status: 'deferred',
-      detail: 'blocked on the fresh tenant above',
-    },
-    {
-      stage: STAGES[3],
-      status: 'deferred',
-      detail: 'blocked on the fresh tenant above; re-consolidation is metered model spend',
-    },
-  ];
+  const results: StageResult[] = stages();
 
   out('');
   report(out, results);

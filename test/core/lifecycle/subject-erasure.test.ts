@@ -21,6 +21,9 @@ import {
   previewSubjectErasure,
   subjectDigest,
 } from '../../../src/core/lifecycle/subject-erasure.ts';
+import { captureSupersededVersions, revertPage } from '../../../src/core/lifecycle/versions.ts';
+import { contentDigest, type WriteContext } from '../../../src/core/write/write-path.ts';
+import { purgeExpiredTombstones } from '../../../src/mcp/tombstone.ts';
 import { EMBEDDING_DIMENSIONS } from '../../../src/schema/vector-index.ts';
 import { connect, dropFixtureDatabase, provisionFixture, type SchemaFixture } from '../../schema/fixture.ts';
 
@@ -42,6 +45,7 @@ async function seed(): Promise<void> {
   await sql.unsafe(`
     DELETE FROM erased_subject;
     DELETE FROM page_version;
+    DELETE FROM review_queue; DELETE FROM attachment;
     DELETE FROM fact_source; DELETE FROM entity_edge; UPDATE fact SET superseded_by = NULL;
     DELETE FROM commitment; DELETE FROM entity_card;
     DELETE FROM fact; DELETE FROM entity_alias; DELETE FROM entity_slug; DELETE FROM entity;
@@ -132,6 +136,42 @@ async function count(table: string, where = 'deleted_at IS NULL'): Promise<numbe
     `SELECT count(*)::int AS n FROM ${table} WHERE ${where}`,
   )) as Array<{ n: number }>;
   return rows[0]?.n ?? 0;
+}
+
+async function liveStatements(table: 'fact' | 'commitment'): Promise<string[]> {
+  const rows = (await sql.unsafe(
+    `SELECT statement FROM ${table} WHERE deleted_at IS NULL ORDER BY statement`,
+  )) as Array<{ statement: string }>;
+  return rows.map((row) => row.statement);
+}
+
+/**
+ * The alias `resolveOrCreateEntity` writes for **every** surface form the
+ * extractor emits (`src/core/write/links.ts` — `normalize(request.name)` as an
+ * `inferred` alias, with no length floor). A correspondent who signs off `Al`
+ * puts a two-character row in the alias vocabulary through the ordinary write
+ * path, and the erasure sweep reads that vocabulary.
+ */
+async function seedInferredNickname(alias: string): Promise<void> {
+  await sql`
+    INSERT INTO entity_alias (entity_id, alias, alias_source, confidence)
+    SELECT entity_id, ${alias}, 'inferred', 0.5 FROM entity WHERE canonical_name = ${SUBJECT}
+  `;
+}
+
+/** Three rows about other people that a substring sweep on `al` would take. */
+async function seedRowsAboutOtherPeople(): Promise<void> {
+  await sql.unsafe(`
+    INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+    SELECT 'the legal review is with Alvarez & Partners', ${EMBEDDING}, ARRAY['${ORIGIN}'], page_id
+      FROM page WHERE external_ref = 'gmail:a3';
+    INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+    SELECT 'renewal terms are final', ${EMBEDDING}, ARRAY['${ORIGIN}'], page_id
+      FROM page WHERE external_ref = 'gmail:a3';
+    INSERT INTO commitment (statement, owner_name, trust_level, derivation, origin_contexts)
+    VALUES ('send the Alberta numbers to the board', '${BYSTANDER}',
+            'model_extracted', 'model_derived', ARRAY['${ORIGIN}']);
+  `);
 }
 
 beforeEach(async () => {
@@ -451,3 +491,419 @@ describe('the receipt', () => {
     TEST_TIMEOUT_MS,
   );
 });
+
+// ===========================================================================
+// The sweep's width — the hazard this module's own header names.
+//
+// The header says the mitigation for a short inferred alias "is the flow rather
+// than a filter: the controller sees previewSubjectErasure's match list — every
+// page, with the handle that found it — before instructing." Two properties
+// have to hold for that sentence to be true, and each has its own block below:
+// the sweep must not take rows the identifier does not name, and the preview
+// must be able to NAME every row the sweep will take. A count of `facts: 2` is
+// not a match list.
+// ===========================================================================
+
+describe('the text handle matches a name, not a substring', () => {
+  test(
+    'a two-character inferred alias does not take three other people\'s rows',
+    async () => {
+      // `al` reaches `legal`, `Alvarez`, `renewal`, `final` and `Alberta` as a
+      // substring. Under `statement ILIKE '%al%'` erasing one correspondent
+      // soft-deletes another correspondent's commitment and two facts about a
+      // law firm — onto a 72h clock, with nothing telling the user to restore
+      // rows they do not know were taken.
+      await seedInferredNickname('al');
+      await seedRowsAboutOtherPeople();
+
+      const preview = await previewSubjectErasure(sql, { identifier: SUBJECT });
+      expect(preview.surfaceForms).toContain('al');
+
+      await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app' });
+
+      const facts = await liveStatements('fact');
+      expect(facts).toContain('the legal review is with Alvarez & Partners');
+      expect(facts).toContain('renewal terms are final');
+      expect(await liveStatements('commitment')).toContain(
+        'send the Alberta numbers to the board',
+      );
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'and a correspondent who really is called Al is still erased by it',
+    async () => {
+      // The other half, and the reason the fix is a word boundary rather than a
+      // length floor: a filter that dropped short aliases would answer the
+      // over-deletion by quietly under-erasing, which on this operation is the
+      // worse failure of the two.
+      await seedInferredNickname('al');
+      await sql.unsafe(`
+        INSERT INTO fact (statement, embedding, origin_contexts, page_id)
+        SELECT 'al owns the deployment window', ${EMBEDDING}, ARRAY['${ORIGIN}'], page_id
+          FROM page WHERE external_ref = 'gmail:a3';
+      `);
+
+      await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app' });
+
+      expect(await liveStatements('fact')).not.toContain('al owns the deployment window');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a regex metacharacter in an identifier does not widen the sweep either',
+    async () => {
+      // The mirror of the LIKE-metacharacter guard above. A sweep that moved to
+      // regex matching without moving its escaping would answer `.*` by
+      // matching every row in the brain.
+      const preview = await previewSubjectErasure(sql, { identifier: '.*' });
+      expect(preview.matches).toEqual([]);
+      expect(preview.removed.facts).toBe(0);
+      expect(preview.removed.commitments).toBe(0);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe('the preview names what it will take, so the flow can be the mitigation', () => {
+  test(
+    'every fact and commitment the sweep will remove is named in the preview',
+    async () => {
+      const preview = await previewSubjectErasure(sql, { identifier: SUBJECT });
+
+      const facts = preview.rows.filter((row) => row.kind === 'fact');
+      const commitments = preview.rows.filter((row) => row.kind === 'commitment');
+
+      // The count and the list are the same set, so a receipt cannot report a
+      // number nobody can inspect.
+      expect(facts).toHaveLength(preview.removed.facts);
+      expect(commitments).toHaveLength(preview.removed.commitments);
+
+      expect(facts.map((row) => row.excerpt)).toContain(`${SUBJECT} owns the rollout`);
+      // The owner is in the excerpt because the owner is why this row matched:
+      // an excerpt that showed only `send the plan` would name a row without
+      // showing the controller what named it.
+      expect(commitments.map((row) => row.excerpt)).toContain(`${SUBJECT}: send the plan`);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a row found by its own text says so, and one found through its page says that',
+    async () => {
+      const preview = await previewSubjectErasure(sql, { identifier: SUBJECT });
+
+      // The subject's commitment hangs off no page at all: only its own text
+      // names her, and that is the handle a controller has to be able to see.
+      const commitment = preview.rows.find((row) => row.kind === 'commitment');
+      expect(commitment?.handle).toBe('text');
+
+      // The fact on `gmail:a2` goes because its page goes.
+      const fact = preview.rows.find(
+        (row) => row.kind === 'fact' && row.excerpt === `${SUBJECT} owns the rollout`,
+      );
+      expect(fact?.handle).toBe('page');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'what the erasure actually removed is what the receipt names',
+    async () => {
+      await seedInferredNickname('al');
+      await seedRowsAboutOtherPeople();
+
+      const receipt = await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app' });
+
+      const removedFacts = receipt.rows.filter((row) => row.kind === 'fact').map((row) => row.excerpt);
+      const stillLive = await liveStatements('fact');
+      for (const statement of removedFacts) expect(stillLive).not.toContain(statement);
+      // And nothing went that the receipt did not name.
+      const gone = (await sql`
+        SELECT statement FROM fact WHERE deleted_at IS NOT NULL
+      `) as Array<{ statement: string }>;
+      expect(gone.map((row) => row.statement).sort()).toEqual([...removedFacts].sort());
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+// ===========================================================================
+// The tables nothing else will ever sweep.
+//
+// `page` rides `forget`'s 72h purge; `page_version`'s foreign key is ON DELETE
+// SET NULL and `review_queue` has no foreign key at all, both deliberately, so
+// neither is ever reached by it. A subject erasure that does not take them
+// itself does not take them.
+// ===========================================================================
+
+describe('a document edited after its snapshot was banked', () => {
+  const DOC = 'drive:doc1';
+  const V1_TITLE = 'Draft, first pass';
+  const V1_BODY = `draft reviewed by ${SUBJECT}, reachable on +49 30 111111`;
+  const V2_TITLE = 'Draft, first pass';
+  const V2_BODY = 'draft reviewed by the reviewer';
+
+  async function seedEditedDocument(): Promise<void> {
+    await sql.unsafe(`
+      INSERT INTO page (origin_context, source_type, title, external_ref, embedding_model,
+                        embedding_dimensions, chunker_version, normalizer_version,
+                        content_sha256, deleted_at)
+      VALUES ('${ORIGIN}', 'document', ${quoted(V1_TITLE)}, '${DOC}',
+              'text-embedding-3-small', ${EMBEDDING_DIMENSIONS}, 1, 1,
+              '${contentDigest(V1_TITLE, V1_BODY)}', now());
+      INSERT INTO chunk (origin_context, content, page_id, ordinal, deleted_at)
+      SELECT '${ORIGIN}', ${quoted(V1_BODY)}, page_id, 0, now()
+        FROM page WHERE external_ref = '${DOC}' AND deleted_at IS NOT NULL;
+
+      INSERT INTO page (origin_context, source_type, title, external_ref, embedding_model,
+                        embedding_dimensions, chunker_version, normalizer_version, content_sha256)
+      VALUES ('${ORIGIN}', 'document', ${quoted(V2_TITLE)}, '${DOC}',
+              'text-embedding-3-small', ${EMBEDDING_DIMENSIONS}, 1, 1,
+              '${contentDigest(V2_TITLE, V2_BODY)}');
+      INSERT INTO chunk (origin_context, content, page_id, ordinal)
+      SELECT '${ORIGIN}', ${quoted(V2_BODY)}, page_id, 0
+        FROM page WHERE external_ref = '${DOC}' AND deleted_at IS NULL;
+    `);
+
+    // Through the shipped capture path, not by hand: this is what the sweep
+    // that rescues a predecessor before the 72h purge actually banks.
+    const swept = await captureSupersededVersions(sql, {});
+    expect(swept.captured).toBe(1);
+  }
+
+  test(
+    'the snapshot naming the correspondent goes, though no live page names her',
+    async () => {
+      await seedEditedDocument();
+      const banked = (await sql`SELECT body FROM page_version WHERE doc_key = ${DOC}`) as Array<{
+        body: string;
+      }>;
+      expect(banked[0]?.body).toContain(SUBJECT);
+
+      const preview = await previewSubjectErasure(sql, { identifier: SUBJECT });
+      // The live page no longer carries her name, so page discovery does not
+      // reach this document at all — and the history is where her mail is.
+      expect(preview.matches.map((match) => match.externalRef)).not.toContain(DOC);
+      expect(preview.removed.versions).toBeGreaterThan(0);
+
+      await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app' });
+
+      const rows = (await sql`SELECT doc_key, body FROM page_version`) as Array<{
+        doc_key: string;
+        body: string;
+      }>;
+      expect(rows.filter((row) => row.body.includes('alice-example'))).toEqual([]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'and a revert cannot re-introduce her, because the snapshot is not there to re-ingest',
+    async () => {
+      await seedEditedDocument();
+      await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app' });
+
+      // `revertPage` re-ingests a snapshot body through U4 with no erased-subject
+      // consult — and it cannot have one, because the tombstone stores a digest
+      // and no caller can recover the identifier to hash. The property that
+      // closes it is upstream: the snapshot is gone, so the revert refuses at
+      // its first statement and never reaches `ingestDocument`.
+      const outcome = await revertPage({ sql } as unknown as WriteContext, {
+        docKey: DOC,
+        version: 1,
+        grant: [ORIGIN],
+        now: new Date(),
+      });
+      expect(outcome).toEqual({ ok: false, reason: 'not_found' });
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe('an unreviewed proposal quoting the correspondent', () => {
+  async function seedProposals(): Promise<void> {
+    await sql.unsafe(`
+      INSERT INTO review_queue (kind, target_ref, proposal, confidence, origin_contexts)
+      VALUES ('entity_card', 'entity:1',
+              'propose card: ${SUBJECT} is the rollout owner and lives in Berlin',
+              0.6, ARRAY['${ORIGIN}']);
+      INSERT INTO review_queue (kind, target_ref, proposal, confidence, origin_contexts,
+                                state, closed_by, closed_at)
+      VALUES ('commitment', 'commitment:1',
+              'propose commitment: ${SUBJECT} will send the plan',
+              0.7, ARRAY['${ORIGIN}'], 'applied', 'user_out_of_band', now());
+      INSERT INTO review_queue (kind, target_ref, proposal, confidence, origin_contexts)
+      VALUES ('fact', 'fact:9', 'propose fact: ${BYSTANDER} presented the numbers',
+              0.6, ARRAY['${ORIGIN}']);
+    `);
+  }
+
+  test(
+    'goes, in every state — the queue has no foreign key, so nothing else ever will',
+    async () => {
+      await seedProposals();
+      const preview = await previewSubjectErasure(sql, { identifier: SUBJECT });
+      expect(preview.removed.reviewQueue).toBe(2);
+      expect(preview.rows.filter((row) => row.kind === 'review_queue')).toHaveLength(2);
+
+      await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app' });
+
+      const rows = (await sql`SELECT proposal FROM review_queue`) as Array<{ proposal: string }>;
+      expect(rows.map((row) => row.proposal)).toEqual([
+        `propose fact: ${BYSTANDER} presented the numbers`,
+      ]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe('the attachment, which is where a signature and an address usually are', () => {
+  async function seedAttachments(): Promise<void> {
+    await sql.unsafe(`
+      INSERT INTO attachment (page_id, origin_context, media_type, object_key, ocr_text)
+      SELECT page_id, '${ORIGIN}', 'application/pdf', 'tenants/t/attachments/deck.pdf',
+             'signed by ${SUBJECT}, home address included'
+        FROM page WHERE external_ref = 'gmail:a2';
+      INSERT INTO attachment (page_id, origin_context, media_type, object_key, ocr_text)
+      SELECT page_id, '${ORIGIN}', 'application/pdf', 'tenants/t/attachments/scan.pdf',
+             'countersigned by ${SUBJECT}'
+        FROM page WHERE external_ref = 'gmail:a3';
+      INSERT INTO attachment (page_id, origin_context, media_type, object_key, ocr_text)
+      SELECT page_id, '${ORIGIN}', 'application/pdf', 'tenants/t/attachments/numbers.pdf',
+             'quarterly numbers, presented by ${BYSTANDER}'
+        FROM page WHERE external_ref = 'gmail:a3';
+    `);
+  }
+
+  test(
+    'the row goes — whether the page it hangs off is going or only its OCR text names her',
+    async () => {
+      await seedAttachments();
+      const preview = await previewSubjectErasure(sql, { identifier: SUBJECT });
+      expect(preview.removed.attachments).toBe(2);
+
+      await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app' });
+
+      const live = (await sql`
+        SELECT object_key, ocr_text FROM attachment WHERE deleted_at IS NULL
+      `) as Array<{ object_key: string; ocr_text: string }>;
+      expect(live.map((row) => row.object_key)).toEqual(['tenants/t/attachments/numbers.pdf']);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'and the stored object goes with it, under the key the row recorded',
+    async () => {
+      await seedAttachments();
+      const deleted: string[] = [];
+      const receipt = await eraseSubject(
+        {
+          sql,
+          objects: {
+            delete: (key) => {
+              deleted.push(key);
+              return Promise.resolve(true);
+            },
+          },
+        },
+        { identifier: SUBJECT, erasedBy: 'app' },
+      );
+
+      expect(deleted.sort()).toEqual([
+        'tenants/t/attachments/deck.pdf',
+        'tenants/t/attachments/scan.pdf',
+      ]);
+      expect(receipt.attachmentObjectsRemoved).toBe(2);
+      expect(receipt.attachmentObjectsUnreachable).toBe(0);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'and a run with no object store says the objects are still there rather than nothing',
+    async () => {
+      await seedAttachments();
+      const receipt = await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app' });
+      expect(receipt.attachmentObjectsRemoved).toBe(0);
+      expect(receipt.attachmentObjectsUnreachable).toBe(2);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+// ===========================================================================
+// What the soft-delete idiom actually promises.
+//
+// This module soft-deletes so a mis-targeted erasure is recoverable, and the
+// rows then ride `forget`'s existing 72h purge. That claim is only true of the
+// tables the purge reaches, and this block runs the real purge rather than
+// asserting the claim in prose.
+// ===========================================================================
+
+describe('the residue the purge is supposed to take, taken', () => {
+  const LONG_AGO = new Date(Date.now() - 96 * 3600_000);
+
+  test(
+    'the addressing namespace and the recall vocabulary go with the entity',
+    async () => {
+      // `entity_alias` and `entity_slug` carry the identifier in plaintext and
+      // have no `deleted_at` to set. They are not a longer-lived residue than
+      // `fact.statement`: both cascade from `entity`, which the purge takes on
+      // the same clock as everything else this erasure tombstoned.
+      await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app', now: LONG_AGO });
+
+      expect(await count('entity_alias', 'TRUE')).toBe(2);
+      await purgeExpiredTombstones(sql, { now: new Date() });
+
+      const aliases = (await sql`SELECT alias FROM entity_alias`) as Array<{ alias: string }>;
+      expect(aliases.map((row) => row.alias)).toEqual([BYSTANDER]);
+      const slugs = (await sql`SELECT slug FROM entity_slug`) as Array<{ slug: string }>;
+      expect(slugs).toHaveLength(1);
+      expect(slugs[0]?.slug).not.toContain('alice-example');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a commitment that hangs off no page and no fact is taken too',
+    async () => {
+      // The commitment this fixture's subject owns has a NULL `page_id` and a
+      // NULL `fact_id` — the shape `materialize.ts` writes whenever extraction
+      // could not attribute one — so no cascade reaches it. Purged by
+      // `deleted_at` or her name sits in `owner_name` for the life of the brain.
+      await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app', now: LONG_AGO });
+      await purgeExpiredTombstones(sql, { now: new Date() });
+
+      const rows = (await sql`SELECT owner_name FROM commitment`) as Array<{ owner_name: string }>;
+      expect(rows.map((row) => row.owner_name)).toEqual([BYSTANDER]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'an attachment whose OCR text named her, on a page that is staying, is taken too',
+    async () => {
+      await sql.unsafe(`
+        INSERT INTO attachment (page_id, origin_context, media_type, object_key, ocr_text)
+        SELECT page_id, '${ORIGIN}', 'application/pdf', 'tenants/t/attachments/scan.pdf',
+               'countersigned by ${SUBJECT}'
+          FROM page WHERE external_ref = 'gmail:a3';
+      `);
+
+      await eraseSubject({ sql }, { identifier: SUBJECT, erasedBy: 'app', now: LONG_AGO });
+      await purgeExpiredTombstones(sql, { now: new Date() });
+
+      expect(await count('attachment', 'TRUE')).toBe(0);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+/** A single-quoted SQL literal for the `unsafe` seeds above. */
+function quoted(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}

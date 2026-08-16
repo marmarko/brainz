@@ -61,6 +61,15 @@ export interface ProviderKeyBackend {
 }
 
 export interface TenantProviderKeyStore {
+  /**
+   * How long a resolved key may be served from **one instance's** cache.
+   *
+   * Exposed rather than left as an implementation detail because it is the exact
+   * bound R12's erasure receipt has to state: revoking clears this process's
+   * entry and the backend row, and cannot reach a second container's memory.
+   * See {@link createTenantProviderKeyStore}.
+   */
+  readonly cacheWindowMs: number;
   /** Read a tenant's key for one provider. That tenant's fleet identity only. */
   resolve(caller: CallerIdentity, tenantId: string, provider: ProviderId): Promise<KeyResolveResult>;
   /** Create or rotate. Control plane only; invalidates the cache. */
@@ -78,7 +87,19 @@ export interface TenantProviderKeyStore {
 
 export interface TenantProviderKeyStoreOptions {
   readonly backend: ProviderKeyBackend;
-  /** Request-path read, so it caches; a cache that outlives a revocation is a bug. */
+  /**
+   * Request-path read, so it caches. **A cache that outlives a revocation is a
+   * bug in the process that revoked, and a stated bound in every other one.**
+   *
+   * Revocation deletes this instance's entry before it touches the backend, so
+   * the revoking process is never a side door. It has no way to reach the cache
+   * of a second container that resolved the key a moment earlier — closing that
+   * needs a shared revocation channel (a pub/sub invalidation, or a generation
+   * counter read on the hot path, which is the cache paid for again), and this
+   * system has neither. So the window is bounded by this TTL, published as
+   * {@link TenantProviderKeyStore.cacheWindowMs}, and carried on R12's erasure
+   * receipt rather than being quietly absent from it.
+   */
   readonly ttlMs?: number;
   readonly now?: () => number;
   readonly maxEntries?: number;
@@ -181,6 +202,8 @@ export function createTenantProviderKeyStore(
   }
 
   return {
+    cacheWindowMs: ttlMs,
+
     async resolve(caller, tenantId, provider) {
       // Order matters: permission, then id validity, then cache, then backend.
       // A denied caller reaches neither the cache nor the store, and learns

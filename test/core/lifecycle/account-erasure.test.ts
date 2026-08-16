@@ -33,6 +33,7 @@ import {
   controlPlaneIdentity,
   createInMemorySecretBackend,
   createTenantSecretStore,
+  fleetIdentity,
   tenantNamespace,
   type SecretBackend,
 } from '../../../src/control/secrets.ts';
@@ -59,8 +60,17 @@ const CALLER = controlPlaneIdentity();
 let control: ControlFixture;
 let controlSql: SQL;
 
-/** An object store that can be emptied. `RawStore` (U8) has only put and get. */
-function objectStore() {
+/**
+ * An object store that can be emptied. `RawStore` (U8) has only put and get.
+ *
+ * `pageSize` is not a decoration. There is no production implementation of
+ * `ErasableObjectStore` in `src/` yet, so this fake is the only thing that has
+ * ever exercised the leg — and a fake that always empties the prefix in one call
+ * is a fixture that can never provoke the branch where it does not. S3 and R2
+ * list at 1,000 keys per page, so an implementation written as one list plus one
+ * delete removes a page and returns a page's count, which is the shape below.
+ */
+function objectStore(options: { readonly pageSize?: number } = {}) {
   const objects = new Map<string, Uint8Array>();
   return {
     objects,
@@ -70,6 +80,7 @@ function objectStore() {
     deletePrefix(prefix: TenantPrefix): Promise<number> {
       let removed = 0;
       for (const key of [...objects.keys()]) {
+        if (options.pageSize !== undefined && removed >= options.pageSize) break;
         if (key.startsWith(prefix)) {
           objects.delete(key);
           removed += 1;
@@ -124,8 +135,12 @@ interface Harness {
   readonly providerKeyBackend: ReturnType<typeof createInMemoryProviderKeyBackend>;
 }
 
-async function harness(options: { readonly pipedreamFails?: boolean } = {}): Promise<Harness> {
-  const objects = objectStore();
+async function harness(
+  options: { readonly pipedreamFails?: boolean; readonly objectPageSize?: number } = {},
+): Promise<Harness> {
+  const objects = objectStore(
+    options.objectPageSize === undefined ? {} : { pageSize: options.objectPageSize },
+  );
   const neon = neonApi();
   const connect = pipedream(options.pipedreamFails === true ? { fail: true } : {});
 
@@ -384,6 +399,116 @@ describe('the stated time bound', () => {
       // The platform PITR window, per the roadmap. Rows stop being queryable
       // immediately; they stop being *recoverable* when the window rolls.
       expect(receipt.unrecoverableAfterDays).toBe(7);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe('a leg that removed some of what it found is not done', () => {
+  test(
+    'the object-store leg fails when objects remain under the prefix it emptied',
+    async () => {
+      // The fake removes one key per call and reports one, which is what a
+      // list+delete written without paging does against a prefix with more keys
+      // than a page. `deletePrefix`'s own return value cannot detect that — it
+      // is the number of objects the call removed, not the number that were
+      // there — so the leg re-lists and believes the store rather than the call.
+      const h = await harness({ objectPageSize: 1 });
+      expect(h.objects.objects.size).toBe(3);
+
+      const receipt = await eraseAccount(h.deps, { tenantId: TENANT });
+
+      const leg = receipt.legs.find((entry) => entry.leg === 'object_store');
+      expect(leg?.status).toBe('failed');
+      expect(receipt.complete).toBe(false);
+      // Objects really are still there: the assertion is the store's state, not
+      // the leg's own opinion of itself.
+      expect([...h.objects.objects.keys()]).toContain(`tenants/${TENANT}/raw/two`);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'and the control-plane row survives it, because it is the only record of what to retry',
+    async () => {
+      const h = await harness({ objectPageSize: 1 });
+      await eraseAccount(h.deps, { tenantId: TENANT });
+      expect(await tenantRows(TENANT)).toBe(1);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'an empty prefix is still already_absent rather than a failure',
+    async () => {
+      const h = await harness({ objectPageSize: 1 });
+      h.objects.objects.delete(`tenants/${TENANT}/raw/one`);
+      h.objects.objects.delete(`tenants/${TENANT}/raw/two`);
+
+      const receipt = await eraseAccount(h.deps, { tenantId: TENANT });
+      expect(receipt.legs.find((entry) => entry.leg === 'object_store')?.status).toBe(
+        'already_absent',
+      );
+      expect(receipt.complete).toBe(true);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+describe('the one thing revocation cannot do by itself', () => {
+  test(
+    'the receipt states the window another fleet process may still serve the key for',
+    async () => {
+      const h = await harness();
+      const receipt = await eraseAccount(h.deps, { tenantId: TENANT });
+
+      // `revokeAll` deletes the backend row and this instance's cache entry. It
+      // cannot reach a cache in another container, and a receipt that said
+      // "no stored provider key remains" full stop would be asserting something
+      // this process cannot know. The bound is carried, the way the vendor's
+      // `tokensRevoked: 'unverified'` is carried.
+      expect(receipt.providerKeyCacheWindowSeconds).toBe(60);
+      const leg = receipt.legs.find((entry) => entry.leg === 'provider_key');
+      expect(leg?.status).toBe('done');
+      expect(leg?.detail).toContain('60');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'and the stated window is the one a second fleet process actually has',
+    async () => {
+      // Two stores over one backend: two containers of the same fleet. Without
+      // this the number on the receipt is a decoration nobody checked.
+      let clock = 1_000_000;
+      const backend = createInMemoryProviderKeyBackend();
+      const processA = createTenantProviderKeyStore({ backend, now: () => clock });
+      const processB = createTenantProviderKeyStore({ backend, now: () => clock });
+      await processA.put(CALLER, TENANT, 'openai', 'sk-live-byok');
+      expect(await processB.resolve(fleetIdentity(TENANT), TENANT, 'openai')).toEqual({
+        ok: true,
+        key: 'sk-live-byok',
+      });
+
+      const h = await harness();
+      const receipt = await eraseAccount(
+        { ...h.deps, providerKeys: processA },
+        { tenantId: TENANT },
+      );
+      expect(await backend.get(`provider-key/${TENANT}/openai`)).toBeUndefined();
+
+      // Inside the stated window the other process still serves it. Stated, not
+      // denied — this is the fact the receipt is reporting.
+      expect(await processB.resolve(fleetIdentity(TENANT), TENANT, 'openai')).toEqual({
+        ok: true,
+        key: 'sk-live-byok',
+      });
+
+      clock += receipt.providerKeyCacheWindowSeconds * 1000;
+      expect(await processB.resolve(fleetIdentity(TENANT), TENANT, 'openai')).toEqual({
+        ok: false,
+        reason: 'not_found',
+      });
     },
     TEST_TIMEOUT_MS,
   );

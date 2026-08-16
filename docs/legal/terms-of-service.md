@@ -77,7 +77,15 @@ Beta. We will try hard and we do not promise an uptime figure we have not measur
 
 Export produces markdown you can read and re-import elsewhere, with no lock-in and no proprietary
 format. Deleting your account removes your database, your stored files, your control-plane row,
-your record at the connector vendor along with its access tokens, and any provider key you stored.
+the connector vendor's record of you, and any provider key you stored.
+
+**What that does not establish, said here rather than left to be assumed.** Removing the connector
+vendor's record of you is a deletion at that vendor. Whether it also ends the permission you gave
+at the account you connected — your mail provider — is a question we have put to them and have not
+had answered in writing. So we do not claim it. Our deletion receipt reports that point as
+unverified rather than as done, and if you want the certainty now, remove our app from your
+provider's own connected-applications settings as well.
+
 The deletion window is bounded by our database provider's point-in-time-recovery period, which the
 privacy policy states.
 
