@@ -307,13 +307,28 @@ function detailFor(reasons: readonly DegradedReason[], state: IndexState): strin
   if (reasons.includes('embedding_backlog')) {
     parts.push(`${state.chunksPendingEmbedding} passages are not searchable by meaning yet`);
   }
-  if (reasons.includes('embedding_unavailable')) {
+  // **The two arm-availability reasons are answered together, because each
+  // sentence names the arms that *did* answer.** Written one reason at a time
+  // they contradict each other the moment both fire: the vector sentence says
+  // the result came from text and graph, the keyword sentence says it came from
+  // meaning and graph, and a read that lost both — a caller pasting a document
+  // as a query loses the embedding to the read's spend ceiling and the keyword
+  // arm to Postgres's tsquery parser in the same call — emitted both. One of
+  // them is always false and the reader has no way to tell which.
+  const noVectorArm = reasons.includes('embedding_unavailable');
+  const noKeywordArm = reasons.includes('query_too_complex');
+  if (noVectorArm && noKeywordArm) {
+    parts.push(
+      'neither the meaning-based nor the keyword arm of this search could run, so results came ' +
+        'from graph matching alone',
+    );
+  } else if (noVectorArm) {
     parts.push('the meaning-based arm of this search could not run, so results came from text and graph matching only');
   }
   if (reasons.includes('rerank_unavailable')) {
     parts.push('the final re-scoring pass could not run, so these results are ordered by the earlier stages alone');
   }
-  if (reasons.includes('query_too_complex')) {
+  if (noKeywordArm && !noVectorArm) {
     // No length, no excerpt, no count of anything the caller typed: this
     // sentence reaches logs and support tickets, and the query is the user's own
     // words — a pasted document, in the case that produced this reason.

@@ -187,4 +187,50 @@ describe('search_degraded', () => {
     // Counts and state names only: this string reaches logs and support tickets.
     expect(degraded?.detail).not.toMatch(/[A-Z][a-z]+ [A-Z][a-z]+/);
   });
+
+  test('BOTH ARMS DOWN IS ONE SENTENCE, NOT TWO THAT CONTRADICT EACH OTHER', () => {
+    // **The per-reason sentence shape names the survivors, and two of them
+    // disagree.** Each sentence was written as if its reason were the only one
+    // that had fired, so it states what the *other* arms answered from.
+    // `embedding_unavailable` therefore says results came from text and graph,
+    // `query_too_complex` says they came from meaning and graph, and a read that
+    // fired both — a caller pasting a document as a query, which exhausts the
+    // read's spend ceiling and Postgres's tsquery parser in the same call —
+    // gets both sentences in one `detail`. One of them is always false, the
+    // reader cannot tell which, and only the graph arm actually ran.
+    const degraded = degradedSearch(
+      { pages: 40, chunks: 900, chunksPendingEmbedding: 0, importInProgress: false },
+      ['embedding_unavailable', 'query_too_complex'],
+    );
+
+    expect(degraded?.reasons).toContain('embedding_unavailable');
+    expect(degraded?.reasons).toContain('query_too_complex');
+
+    const detail = degraded?.detail ?? '';
+    // Neither survivor claim may stand: the text arm did not run, and neither
+    // did the meaning arm.
+    expect(detail).not.toContain('came from text and graph');
+    expect(detail).not.toContain('came from meaning and graph');
+    // What is left is the one arm that did run, said once.
+    expect(detail).toContain('graph matching alone');
+    // Still content-free, and still short enough for the envelope's own bound.
+    expect(detail).not.toMatch(/[A-Z][a-z]+ [A-Z][a-z]+/);
+    expect(detail.length).toBeLessThan(600);
+  });
+
+  test('one arm down still names the arms that answered', () => {
+    // The half that keeps the fix from being "delete the sentences". Each
+    // reason on its own keeps saying which arms carried the result.
+    const noVector = degradedSearch(
+      { pages: 40, chunks: 900, chunksPendingEmbedding: 0, importInProgress: false },
+      ['embedding_unavailable'],
+    );
+    expect(noVector?.detail).toContain('came from text and graph matching only');
+
+    const noText = degradedSearch(
+      { pages: 40, chunks: 900, chunksPendingEmbedding: 0, importInProgress: false },
+      ['query_too_complex'],
+    );
+    expect(noText?.detail).toContain('came from meaning and graph matching only');
+  });
 });
