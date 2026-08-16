@@ -128,6 +128,19 @@ export interface ClientFailure {
   readonly ok: false;
   readonly reason: PullFailureReason;
   readonly status: number | null;
+  /**
+   * A sentence a human needs, when the code alone does not carry it (U18).
+   *
+   * Optional and additive. `reason` is the closed set every caller branches on
+   * and stays the contract; this is for the failures that share a code and not a
+   * cause — a `provider_error` from a 502 and a `provider_error` from "brainz's
+   * own OAuth application has not cleared CASA" are the same code and completely
+   * different work, and an erasure receipt that could not tell them apart would
+   * report a leg as failed without saying what to do about it.
+   *
+   * It must never carry row content: these strings reach logs and receipts.
+   */
+  readonly detail?: string;
 }
 
 export type ClientOutcome<T> = { readonly ok: true; readonly value: T } | ClientFailure;
