@@ -26,8 +26,14 @@
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { createExportHandler, enqueueDueExports } from '../../src/worker/export.ts';
+import { startWorkerFleet } from '../../src/worker/serve.ts';
+import { tenantNamespace } from '../../src/control/secrets.ts';
+import { writeSecretsFile } from '../fleet/fixture.ts';
 import { createJobQueue, createLeaseChannel } from '../../src/worker/queue.ts';
 import { createJobRunner } from '../../src/worker/runner.ts';
 import { ALPHA_CEILING_MS, nextCeilingDueAt } from '../../src/worker/scheduler.ts';
@@ -379,5 +385,77 @@ describe('the handler runs the export the schedule module already knew how to ru
       expect(closed).toBe(1);
     },
     TEST_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The half neither of the two above can prove: that a running fleet does it.
+// ---------------------------------------------------------------------------
+
+/**
+ * The composition root, driven.
+ *
+ * Everything above composes the pieces itself, which is exactly the shape that
+ * let this capability sit unreachable for two units: a suite that assembles a
+ * handler and calls it proves the handler works and says nothing about whether
+ * any process ever assembles one. `startWorkerFleet` is the process the fleet
+ * image runs, and `tick` is the function its timer calls — so this asserts the
+ * enqueue happens in the deployment rather than in the test.
+ */
+describe('the running worker fleet is what enqueues it', () => {
+  test(
+    'one tick of the real entrypoint puts an export on the queue',
+    async () => {
+      const scratch = mkdtempSync(join(tmpdir(), 'brainz-export-'));
+      const secretsFile = join(scratch, 'secrets.json');
+      await writeSecretsFile(secretsFile, {
+        secrets: { [tenantNamespace(TENANT)]: { connectionString: brain.dsn, bearerGrant: 'unused' } },
+      });
+      await seedTenant(controlSql, TENANT);
+
+      const fleet = await startWorkerFleet({
+        PORT: '0',
+        BRAINZ_CONTROL_DATABASE_URL: control.dsn,
+        BRAINZ_SECRETS_FILE: secretsFile,
+        // Long enough that the only tick is the one driven below.
+        BRAINZ_WORKER_TICK_MS: '3600000',
+      });
+
+      try {
+        await fleet.tick(NOW);
+
+        const rows = (await controlSql`
+          SELECT kind::text AS kind, target::text AS target, run_at
+            FROM control.job WHERE tenant_id = ${TENANT} AND kind = 'export'
+        `) as Array<{ kind: string; target: string; run_at: Date }>;
+
+        expect(rows).toHaveLength(1);
+        expect(rows[0]?.target).toBe('whole_brain');
+        expect(rows[0]?.run_at.toISOString()).toBe(
+          nextCeilingDueAt(TENANT, NOW, ALPHA_CEILING_MS).toISOString(),
+        );
+
+        // And the other half of the registration. Bringing the slot forward is
+        // the only difference between a job the fleet has scheduled and one it
+        // can claim — and a runner whose handler map omits `export` scopes its
+        // claim away from the kind, so the row would simply stay `due` forever.
+        // That is precisely the state this whole change is about, so it is
+        // asserted rather than assumed from the handler being constructed.
+        await controlSql`
+          UPDATE control.job SET run_at = ${new Date(NOW.getTime() - 60_000)}
+           WHERE tenant_id = ${TENANT} AND kind = 'export'`;
+        await fleet.tick(NOW);
+
+        const after = (await controlSql`
+          SELECT state::text AS state FROM control.job
+           WHERE tenant_id = ${TENANT} AND kind = 'export'
+        `) as Array<{ state: string }>;
+        expect(after[0]?.state).toBe('done');
+      } finally {
+        await fleet.stop();
+        rmSync(scratch, { recursive: true, force: true });
+      }
+    },
+    SETUP_TIMEOUT_MS,
   );
 });
