@@ -317,11 +317,20 @@ export const briefing: Handler = async (ctx, args) => {
     materialized: bundle.coverage === 'materialized',
   });
 
+  // The advisory lane, and both of its tenants. Each carries its own dismissal
+  // because each is bounded by its own rule — a shared sentence would describe
+  // one of them wrongly, and this is the lane whose whole justification is that
+  // the reader can trust what it says about how often it will say it again.
+  const notice = [
+    ...(bundle.prompt === null ? [] : [`${bundle.prompt.text} ${bundle.prompt.dismissal}`]),
+    ...(bundle.backup === null ? [] : [`${bundle.backup.text} ${bundle.backup.dismissal}`]),
+  ];
+
   return {
     ok: true,
     ...(degraded === null ? {} : { resultClass: 'degraded' as const }),
     degraded,
-    ...(bundle.prompt === null ? {} : { notice: [`${bundle.prompt.text} ${bundle.prompt.dismissal}`] }),
+    ...(notice.length === 0 ? {} : { notice }),
     content: {
       coverage: bundle.coverage,
       tier: bundle.tier,

@@ -92,6 +92,15 @@
 import type { SQL } from 'bun';
 
 import { FIRST_PARTY_SURFACES } from '../../mcp/demarcation.ts';
+import {
+  readContentAge,
+  readExportState,
+  readNagState,
+  recordNagShown,
+  selfExportNag,
+  type NagState,
+  type SelfExportNag,
+} from '../export/schedule.ts';
 import type { Grant } from '../search/fence.ts';
 import { textArrayLiteral } from '../write/pg-values.ts';
 import { bandOf, upgradePrompt, type PromptState, type UpgradePrompt } from './prompt.ts';
@@ -201,8 +210,33 @@ export interface MaterializedLayer {
   readonly at: string | null;
 }
 
+/**
+ * What R18's backup reminder needs, gathered with everything else.
+ *
+ * **Why it rides this read rather than a schedule of its own.**
+ * `src/core/export/schedule.ts` argues it at length: the reminder is bounded
+ * *per caller*, and the caller-keyed bound only means anything on a read a
+ * caller actually makes. The morning briefing is that read — the same one the
+ * free→paid prompt rides, for the same reason and under the same discipline.
+ *
+ * **It costs one keyed row, one singleton row and one fenced count**, which is
+ * the class the header permits: an aggregate over an indexed predicate that
+ * returns no rows. It is the same shape as `pendingDebt`, over the same table.
+ */
+export interface SelfExportFacts {
+  readonly destinationConfigured: boolean;
+  readonly lastExportAt: string | null;
+  /** A run that was attempted and failed, so silence is not read as "not set up". */
+  readonly lastFailure: string | null;
+  readonly oldestContentAt: string | null;
+  /** Fenced by the grant, like every other count in the bundle. */
+  readonly pages: number;
+  readonly nag: NagState;
+}
+
 export interface BriefingSource {
   readonly cursor: { readonly lastReadAt: string | null; readonly prompt: PromptState };
+  readonly selfExport: SelfExportFacts;
   readonly meetings: readonly BriefingMeeting[];
   readonly commitments: readonly BriefingCommitment[];
   readonly changed: readonly BriefingRecord[];
@@ -289,6 +323,14 @@ export interface Briefing {
   /** Empty on a materialised layer; R8's list on a cold one. */
   readonly notIncluded: readonly string[];
   readonly prompt: UpgradePrompt | null;
+  /**
+   * R18's backup reminder, or `null` — which is the ordinary answer.
+   *
+   * A second nullable advisory rather than a field on `prompt`: the two are
+   * bounded independently and answer different questions, and folding them into
+   * one slot would make a brain that owes both show one of them at random.
+   */
+  readonly backup: SelfExportNag | null;
   readonly tokens: number;
 }
 
@@ -363,6 +405,20 @@ export function assembleBriefing(source: BriefingSource, options: BriefingOption
       pendingReview: source.counts.pendingReview,
       uncorroboratedClaims: source.counts.uncorroboratedClaims,
       state: source.cursor.prompt,
+      now: options.now,
+    }),
+    // Bounded by its own module, on its own state, against the same clock. This
+    // half is deliberately a call rather than a re-implementation: the band
+    // ladder, the fortnight and the "nothing to back up is silence" rule are one
+    // discipline, and a second copy here is how a reminder comes to fire on a
+    // schedule the module it is named after would refuse.
+    backup: selfExportNag({
+      destinationConfigured: source.selfExport.destinationConfigured,
+      lastExportAt: source.selfExport.lastExportAt,
+      oldestContentAt: source.selfExport.oldestContentAt,
+      pages: source.selfExport.pages,
+      lastFailure: source.selfExport.lastFailure,
+      state: source.selfExport.nag,
       now: options.now,
     }),
     tokens: spent,
@@ -605,6 +661,12 @@ export async function collectBriefing(
 
   const counts = await readCounts(sql, grantLiteral, layer.at);
 
+  // R18's three facts. Two keyed reads and one fenced count — see
+  // `SelfExportFacts` for why they belong on this read and not on a schedule.
+  const exportState = await readExportState(sql);
+  const nagState = await readNagState(sql, options.callerKey);
+  const contentAge = await readContentAge(sql, { origins: grant });
+
   return {
     cursor: {
       lastReadAt,
@@ -612,6 +674,17 @@ export async function collectBriefing(
         lastShownAt: cursorRow?.prompt_last_shown_at == null ? null : isoOf(cursorRow.prompt_last_shown_at),
         lastShownDebt: cursorRow?.prompt_last_debt ?? 0,
       },
+    },
+    selfExport: {
+      // "Never chosen a destination" is the column, not an inference from a
+      // missing export: a user who configured one and has never had a
+      // successful run is in a different state and gets a different sentence.
+      destinationConfigured: exportState.destinationKind !== null,
+      lastExportAt: exportState.lastExportAt,
+      lastFailure: exportState.lastFailure,
+      oldestContentAt: contentAge.oldestContentAt,
+      pages: contentAge.pages,
+      nag: nagState,
     },
     meetings: meetingRows.map((row) => ({
       ...recordOfPage(row),
@@ -876,5 +949,17 @@ export async function briefing(
   // The bundle's own basis decides, rather than a second reading of `options`:
   // whatever the delta was built from is what the bookmark answers to.
   await advanceBriefingCursor(sql, options, bundle.prompt, bundle.delta.basis === 'cursor');
+  // **Banked whether or not the caller named a window**, for the reason the
+  // upgrade prompt's bound is: a client that always names one would otherwise
+  // see this every single morning, which is the daily nag the module's whole
+  // design exists to refuse. It is banked only when one actually fired — a
+  // write on a silent read would move the bound the silence was measured from.
+  if (bundle.backup !== null) {
+    await recordNagShown(sql, {
+      callerKey: options.callerKey,
+      band: bundle.backup.band,
+      at: options.now,
+    });
+  }
   return bundle;
 }

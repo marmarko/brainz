@@ -31,6 +31,7 @@
 
 import type { SQL } from 'bun';
 
+import { textArrayLiteral } from '../write/pg-values.ts';
 import { reconstructLivePages } from './reconstruct.ts';
 import { planTree, type ExportManifest, type ExportedFile } from './tree.ts';
 
@@ -277,13 +278,27 @@ export async function runSelfExport(
 /**
  * The two facts the nag needs from the brain itself: how much is in it, and how
  * long any of it has been there.
+ *
+ * **`origins` fences it, and the caller that reads this on the briefing passes
+ * one.** "Your brain holds N documents" is the most direct statement about
+ * corpus size any surface makes, and a credential scoped to one origin has no
+ * business being told the whole number — every other count in the bundle is
+ * fenced by the grant, and a reminder that was not would be the one place a
+ * narrow connection learns how big the brain it cannot read is. Omitted means
+ * whole-brain, which is what a scheduled export itself runs as.
  */
 export async function readContentAge(
   sql: SQL,
+  options: { readonly origins?: readonly string[] } = {},
 ): Promise<{ readonly pages: number; readonly oldestContentAt: string | null }> {
+  // Bun sends a JS array as a scalar, so the fence crosses the wire as a
+  // literal and `NULL` means "no fence" — the same shape `versions.ts` uses.
+  const fence = options.origins === undefined ? null : textArrayLiteral(options.origins);
   const rows = (await sql`
     SELECT count(*)::int AS pages, min(created_at)::text AS oldest
-      FROM page WHERE deleted_at IS NULL AND quarantined_at IS NULL
+      FROM page
+     WHERE deleted_at IS NULL AND quarantined_at IS NULL
+       AND (${fence}::text[] IS NULL OR origin_context = ANY(${fence}::text[]))
   `) as Array<{ pages: number; oldest: string | null }>;
   const row = rows[0];
   return { pages: Number(row?.pages ?? 0), oldestContentAt: row?.oldest ?? null };

@@ -70,6 +70,17 @@ function record(id: string, title: string, text: string) {
 function source(overrides: Partial<BriefingSource> = {}): BriefingSource {
   return {
     cursor: { lastReadAt: null, prompt: { lastShownAt: null, lastShownDebt: 0 } },
+    // R18's reminder is bounded on its own state and graded by its own suite;
+    // an empty brain is the one input under which it is unconditionally silent,
+    // so every case below measures the lanes it is actually about.
+    selfExport: {
+      destinationConfigured: false,
+      lastExportAt: null,
+      lastFailure: null,
+      oldestContentAt: null,
+      pages: 0,
+      nag: { lastShownAt: null, lastBand: 0 },
+    },
     meetings: [
       {
         ...record('m1', 'Roadmap review', 'Attendees: priya@example.com'),
