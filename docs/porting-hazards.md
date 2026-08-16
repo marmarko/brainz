@@ -192,11 +192,16 @@ over a 2,000-chunk fixture is a few milliseconds. The index is a scale optimizat
 absence is invisible at any scale you'd test at by hand — and because it is an *optimization*,
 a missing index reads as a performance nit rather than a shipped defect.
 
-**brainz analog.** Direct and current. KTD8 selects `text-embedding-3-large`, natively 3072d,
-against a `vector` type that indexes to 2,000. The plan resolves it by **truncating to 1536d**
-(Matryoshka), which sits inside the ceiling with headroom — `halfvec(3072)` is the alternative
-if a future model makes native dimensionality worth the storage. Either resolution is fine; the
-hazard is shipping *neither* and not noticing.
+**brainz analog.** Direct and current, and it has now been lived through twice. KTD8 selected
+`text-embedding-3-large`, natively 3072d, against a `vector` type that indexes to 2,000, and
+resolved it by **truncating to 1536d** (Matryoshka) — inside the ceiling with headroom, with
+`halfvec(3072)` as the alternative if a future model makes native dimensionality worth the
+storage. The seat has since moved to a natively-1024d model whose endpoint ignores the
+`dimensions` parameter, so there is nothing to truncate with and nothing to get wrong in that
+direction; the ceiling check moved with it, from rung one's DDL to the whole ladder
+(`test/hazards/h2-missing-vector-index.test.ts`), because the column the arm reads is now
+declared by a later rung and a scan of the baseline would be checking a column nothing queries.
+Either resolution is fine; the hazard is shipping *neither* and not noticing.
 
 The multi-tenant shape makes it worse than single-tenant: schema is applied per tenant at
 provision time (KTD9). A DDL step that fails on one tenant and succeeds on the next produces a
