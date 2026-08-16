@@ -34,7 +34,13 @@
  * against.
  *
  * Prices drift. This table and `docs/research/2026-08-12-model-catalog-pricing.md`
- * are dated snapshots of the same catalog; production reads this one.
+ * were dated snapshots of the same catalog; production reads this one. They are
+ * no longer the same date: the Cloudflare rows were re-verified on 2026-08-16
+ * against the account's own model catalog rather than a pricing page, which is
+ * what moved the reranker off its rounded figure, added the vision seat's price,
+ * and added the judge's cached-input rate. Where the two disagree, this file is
+ * the later reading and the research doc is the earlier one — neither is stale
+ * in the sense of wrong, and only one of them is billed against.
  */
 
 /** A wire model id, as pinned by `routing.ts`. */
