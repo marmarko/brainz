@@ -30,6 +30,7 @@ import {
   createBudget,
   createInMemorySpendMeter,
   createModelGateway,
+  type InMemorySpendMeter,
   type ModelGateway,
   type ModelTransport,
   type TransportRequest,
@@ -40,10 +41,16 @@ import {
   createInMemoryProviderKeyBackend,
   createTenantProviderKeyStore,
 } from '../../../src/ai/keys.ts';
-import { HOSTED_PROFILE } from '../../../src/ai/routing.ts';
+import { CANONICAL_PRICE_BOOK, costMicroUsd } from '../../../src/ai/pricing.ts';
+import { HOSTED_PROFILE, routeFor } from '../../../src/ai/routing.ts';
 import { fleetIdentity, type CallerIdentity } from '../../../src/control/secrets.ts';
 import { queryEncoding } from '../../../src/core/write/embed.ts';
-import { embedQuery, recall, recallArms } from '../../../src/core/search/read.ts';
+import {
+  READ_PATH_SPEND_CEILING,
+  embedQuery,
+  recall,
+  recallArms,
+} from '../../../src/core/search/read.ts';
 import {
   EMBEDDING_DIMENSIONS,
   createSearchFixture,
@@ -130,14 +137,26 @@ function transportThat(options: TransportOptions): ModelTransport & {
 function gatewayThat(options: TransportOptions): {
   readonly gateway: ModelGateway;
   readonly transport: ReturnType<typeof transportThat>;
+  /**
+   * The gateway's own ledger, handed back.
+   *
+   * A cap is only a cap if the money never left, and the transport alone cannot
+   * say that: a call refused *after* the provider ran still records spend. So
+   * the assertions about a ceiling are made here — which ops were billed to this
+   * tenant, and for how much — rather than on a degraded flag, which is equally
+   * true of a provider outage that cost full price.
+   */
+  readonly meter: InMemorySpendMeter;
 } {
   const transport = transportThat(options);
+  const meter = createInMemorySpendMeter();
   return {
     transport,
+    meter,
     gateway: createModelGateway({
       profile: HOSTED_PROFILE,
       transport,
-      meter: createInMemorySpendMeter(),
+      meter,
       keys: {
         store: createTenantProviderKeyStore({ backend: createInMemoryProviderKeyBackend() }),
         hosted: createHostedKeyPool({
@@ -344,12 +363,22 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
       // refusal does — a partial answer, flagged — because a cap that turns an
       // expensive read into a 500 is a search outage with a spend rationale.
       // A cap of one micro-dollar is the cheapest way to observe the exhausted
-      // branch. Only the embedding call is reached: this corpus packs fewer
-      // candidates than `RERANK_CANDIDATES_FLOOR`, so the cross-encoder stage
-      // resolves off before it can be refused — which the test above ("the
-      // reranker refusing costs the ordering, not the read") already covers on
-      // the other side of the same conversion.
-      const { gateway } = gatewayThat({ refuse: false });
+      // branch.
+      //
+      // **And the second stage still runs, which this used to claim it did
+      // not.** The note here said the cross-encoder "resolves off before it can
+      // be refused" because the corpus packs fewer candidates than
+      // `RERANK_CANDIDATES_FLOOR`. Both halves were wrong: `recall` reaches
+      // `scoreWithCrossEncoder` whenever the stage resolves `unavailable`, which
+      // is what a caller supplying no scorer gets, and the floor is a *default
+      // candidate count*, not a gate. What actually happens is arithmetic —
+      // `reserve` refuses only what does not fit, the embedding's estimate is
+      // two micro-USD and does not, the cross-encoder's is one and does — so a
+      // cap that stops stage 1 can still be paying for stage 2. That is the
+      // shared budget behaving correctly, and it is asserted here rather than
+      // described, because a comment claiming a call was never made while the
+      // meter shows it billed is the exact failure this file is about.
+      const { gateway, transport, meter } = gatewayThat({ refuse: false });
 
       const response = await recall({
         sql,
@@ -368,6 +397,185 @@ describe('Assumption 5 — a provider failure is a partial answer, not an outage
       expect(response.results.length).toBeGreaterThan(0);
       expect(response.armsUsed).toContain('fts');
       expect(response.armsUsed).not.toContain('vector');
+
+      // On the gateway: stage 1 was refused *before* the provider, and stage 2
+      // was not refused at all. Naming both is what keeps the sentence above
+      // from drifting back into "only the embedding call is reached".
+      expect(meter.records().map((record) => record.op)).toEqual(['rerank']);
+      expect(transport.texts).toEqual([]);
+      expect(transport.rerankCalls).toBe(1);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'THE RERANK IS REFUSED BY MONEY THE EMBEDDING ALREADY SPENT',
+    async () => {
+      // **The rerank is the request-path call most likely to run away, and
+      // nothing was holding its budget to account.** `scoreWithCrossEncoder`
+      // threads `request.budget` into the gateway, and every mutation of that
+      // one line survived: drop the caller's budget and mint a fresh one, or
+      // pass `capMicroUsd: null`, and no test noticed — because the two
+      // assertions this path had were about *degraded flags*, and a flag reads
+      // identically whether the call was refused for free or made at full price.
+      //
+      // The property under test is the one the shared budget exists for: the two
+      // model calls of one read draw on **one** ceiling, so what stage 1 spends
+      // is gone from stage 2. The violating case is a read whose embedding
+      // consumes the whole ceiling — built exactly, rather than approximated,
+      // because the cap is spent to the micro-USD and the refusal has to be the
+      // budget's rather than a rounding accident.
+      const { gateway, transport, meter } = gatewayThat({ refuse: false });
+
+      const query = 'widget calibration advisory';
+      // Derived from the canonical table and the gateway's own four-characters-
+      // to-the-token estimate, so this stays true when a price moves. The fake
+      // transport reports the same token count the estimator reserved, so the
+      // settled cost lands on the estimate and the budget ends exactly full.
+      const route = routeFor(HOSTED_PROFILE, 'embedding');
+      const price = CANONICAL_PRICE_BOOK.lookup(route.id);
+      if (price === undefined) throw new Error(`${route.id} must be priced for this test to mean anything`);
+      const embedding = costMicroUsd(
+        { inputTokens: Math.ceil(queryEncoding(query).length / 4), outputTokens: 0 },
+        price,
+      );
+      expect(embedding).toBeGreaterThan(0);
+
+      const shared = createBudget({ label: 'one-read', capMicroUsd: embedding });
+
+      const response = await recall({
+        sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        budget: shared,
+        query,
+        grant: GRANT,
+        limit: 5,
+        now: new Date('2026-06-01T00:00:00Z'),
+      });
+
+      // Stage 1 ran, was billed, and left nothing.
+      expect(transport.texts).toHaveLength(1);
+      expect(shared.spentMicroUsd()).toBe(embedding);
+      expect(response.armsUsed).toContain('vector');
+
+      // Stage 2, on the gateway rather than on a flag: the cross-encoder was
+      // never reached, and no rerank spend was recorded against this tenant.
+      // Under any budget the request did not authorise — a fresh per-stage
+      // budget, or an uncapped one — both of these go the other way.
+      expect(transport.rerankCalls).toBe(0);
+      expect(meter.records().map((record) => record.op)).toEqual(['embedding']);
+      expect(meter.totalFor(TENANT)).toBe(embedding);
+
+      // And the read is still a read: a refused ceiling costs the ordering, the
+      // same way a refused provider does.
+      expect(response.degraded).toContain('rerank_unavailable');
+      expect(response.rerankApplied).toBe(false);
+      expect(response.results.length).toBeGreaterThan(0);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'AND THE CEILING IT DRAWS ON IS THE ONE THE REQUEST MINTED, NOT ONE OF ITS OWN',
+    async () => {
+      // The other half of the same property, on the shape production actually
+      // takes: **no caller budget at all**. `recall` mints one budget and hands
+      // the *same object* to both stages, and a mutation that passes the
+      // un-budgeted request to stage 2 instead gives the rerank a second full
+      // ceiling — the two calls of one read then spend twice what one read is
+      // allowed, and every degraded flag reads the same either way.
+      //
+      // Observing it needs a read that spends its whole ceiling on stage 1,
+      // which the pricing makes narrow: the embedder is priced 43× the
+      // cross-encoder per token, so the only query that leaves the rerank
+      // nothing is one that fills the ceiling almost exactly. That query is
+      // *derived* here rather than guessed, from the ceiling and the canonical
+      // table, so it stays the largest permitted read when either number moves.
+      const { gateway, transport, meter } = gatewayThat({ refuse: false });
+
+      const embedRoute = routeFor(HOSTED_PROFILE, 'embedding');
+      const embedPrice = CANONICAL_PRICE_BOOK.lookup(embedRoute.id);
+      if (embedPrice === undefined) throw new Error(`${embedRoute.id} must be priced`);
+
+      // The most tokens whose cost still fits the ceiling; one more and the
+      // embedding is refused, which would leave the ceiling untouched and prove
+      // nothing. The gateway estimates four characters to the token, and
+      // `embedQuery` sends `queryEncoding(query)` — seven characters of prefix —
+      // so the query is sized so the *encoded* text lands on a token boundary.
+      const tokens = Math.floor(
+        (READ_PATH_SPEND_CEILING * 1_000_000) / embedPrice.inputMicroUsdPerMillion,
+      );
+      const query = 'x'.repeat(tokens * 4 - queryEncoding('').length);
+      expect(Math.ceil(queryEncoding(query).length / 4)).toBe(tokens);
+
+      const response = await recall({
+        sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        // No budget. The default is the thing under test.
+        query,
+        grant: GRANT,
+        limit: 5,
+        now: new Date('2026-06-01T00:00:00Z'),
+      });
+
+      // Stage 1 was granted and spent the ceiling to the micro-USD.
+      expect(transport.texts).toHaveLength(1);
+      expect(meter.totalFor(TENANT)).toBe(READ_PATH_SPEND_CEILING);
+
+      // Non-vacuous: the vector arm answered, so there *was* a candidate list
+      // for the cross-encoder to be asked about. Without this the assertion
+      // below would also hold for a read that packed nothing.
+      expect(response.armsUsed).toContain('vector');
+      expect(response.results.length).toBeGreaterThan(0);
+
+      // And stage 2 was refused by what stage 1 spent — on the gateway, not on
+      // a flag. A second ceiling of its own makes both of these go the other
+      // way, at exactly the price the first one was supposed to have exhausted.
+      expect(transport.rerankCalls).toBe(0);
+      expect(meter.records().map((record) => record.op)).toEqual(['embedding']);
+      expect(response.degraded).toContain('rerank_unavailable');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'ONE TENANT MAY STILL SPEND WITHOUT LIMIT, ONE BOUNDED READ AT A TIME',
+    async () => {
+      // **A disclosed gap, pinned so it cannot be forgotten or overstated.**
+      // The ceiling above bounds one request. Nothing bounds a tenant: the
+      // gateway's meter accumulates and has no way to refuse, the two readers
+      // that do enforce a tenant ceiling (`first-import.ts:readHeadroom`,
+      // `tier.ts:consolidationTierOf`) sit on the ingest and consolidation
+      // paths, and the edge limiter counts requests rather than money. So the
+      // honest statement of this module's protection is "one request cannot run
+      // away", not "a tenant cannot" — and this is that statement in the only
+      // form that cannot rot into a comment nobody re-reads.
+      //
+      // **It is a tripwire, not a wish.** It asserts today's behaviour, so the
+      // day a tenant-level request-path cap lands it goes red — and whoever
+      // builds it deletes this test and the paragraph in `ai/gateway.ts` that
+      // says the layer does not exist, together.
+      const { gateway, transport, meter } = gatewayThat({ refuse: false });
+
+      // Each read is comfortably inside the per-request ceiling and each mints
+      // its own, so the ceiling is doing exactly its job every time.
+      const costly = 'widget '.repeat(10_000);
+      const reads = 10;
+      for (let attempt = 0; attempt < reads; attempt += 1) {
+        const embedded = await embedQuery({ gateway, tenantId: TENANT, caller: CALLER, query: costly });
+        expect(embedded.vector).not.toBeNull();
+      }
+
+      // On the gateway: every call reached the provider, every call was billed,
+      // and the tenant's total is several times what any one request is allowed
+      // to spend. Nothing refused anything.
+      expect(transport.texts).toHaveLength(reads);
+      expect(meter.records()).toHaveLength(reads);
+      expect(meter.totalFor(TENANT)).toBeGreaterThan(READ_PATH_SPEND_CEILING * 5);
     },
     TEST_TIMEOUT_MS,
   );

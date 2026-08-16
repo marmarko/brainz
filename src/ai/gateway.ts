@@ -36,6 +36,42 @@
  *     consolidation phase can carry a per-phase cap while a request-path rerank
  *     carries a different one, in the same process, with no coordination.
  *
+ * **What this module caps, and what it does not — written here because this is
+ * the module other files have credited with caps it does not have.** A comment
+ * in `core/search/read.ts` once justified an unbounded read budget on the
+ * grounds that "the caps that matter are the tenant-level ones the gateway's
+ * meter enforces". No such layer exists, and the shape of the mistake is easy to
+ * repeat, so the four facts are stated together:
+ *
+ *   - **A `Budget` bounds one caller's declared unit of work, and nothing
+ *     wider.** It is an in-process object with no identity beyond its label; two
+ *     requests holding two budgets do not know about each other, by design
+ *     (rule 4).
+ *   - **{@link SpendMeter} accumulates. It cannot refuse.** `record` moves
+ *     `control.tenant.spend_micro_usd` and returns nothing a caller could act
+ *     on, and it runs *after* the provider has answered. It is the ledger, not
+ *     the gate — reading it as a cap is reading a receipt as a permission.
+ *   - **The two readers that do enforce a tenant ceiling are elsewhere and are
+ *     never consulted from a request.** `ingest/first-import.ts:readHeadroom`
+ *     gates an import and `control/tier.ts:consolidationTierOf` sizes a
+ *     consolidation cycle; both subtract the window's spend from the cap before
+ *     handing anything out. Neither sits on the path a `recall` or a `remember`
+ *     takes.
+ *   - **The edge limiter bounds rate, not money.** `mcp/rate-limit.ts` says so
+ *     in its own header, and its lanes are counted per Worker isolate rather
+ *     than globally.
+ *
+ * So a tenant's request-path spend is bounded per call and unbounded in the
+ * number of calls: at the shipped defaults — 60 requests a minute per grant, a
+ * read ceiling of `READ_PATH_SPEND_CEILING` — the worst case a single grant can
+ * drive is roughly a quarter of a dollar a minute, metered accurately and
+ * refused by nothing. Closing it needs an atomic conditional reservation
+ * against the control-plane row (check and hold in one UPDATE, released or
+ * settled after the call), because a headroom *read* before `reserve` is the
+ * check-then-act shape rule 1 exists to refuse. That is not built. Until it is,
+ * no comment in this repository may describe a tenant-level cap on the request
+ * path — including this one, which describes its absence.
+ *
  * **Retention posture, decided here rather than in a console setting nobody
  * owns.** Every chunk of the user's mail transits this module. AI Gateway
  * retains request and response bodies when logging is on, so the transport
