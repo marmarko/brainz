@@ -26,6 +26,30 @@ Two directions, both of which are failures:
   was removed and is still being claimed, which overstates the blast radius an
   auditor is asked to trust.
 
+## What that check cannot establish
+
+Worth knowing before a green build is read as confirmation of this page. The
+sweeps find a vendor that arrives as a hostname, as a routing provider, or as a
+deployment binding — which is most of them, and is why the register is generated
+rather than remembered. **They cannot find a party reached only through
+configuration.**
+
+The live example is Google. Since the model seats moved onto one Cloudflare
+credential, the hosted route to Google records its provider as `cloudflare` and
+calls a Cloudflare hostname; the fact that Google serves it is in the model id
+string and nowhere a sweep looks. Google's entry survives here because the
+*self-hosted* profile still reaches it directly — not because of the hosted plane
+that sends it the most content. Withdraw that profile and the check does not
+merely fall silent, it reports Google as a stale entry and invites its deletion.
+A guard that can point the wrong way is worth writing down rather than trusting,
+and that is what this section is.
+
+Three consequences: rows whose evidence no scanner produces are named by hand and
+say so in their own `note`; `docs/legal/subprocessors.md` — which no gate reads at
+all — states the same limitation for the reader who arrives from a privacy
+policy; and `upstream/concepts.jsonl:gap.register-passthrough-vendor-blindness`
+carries the fourth evidence set that would close it.
+
 ## What is deliberately not here
 
 **Per-tenant secrets.** A tenant's own connection string, their bearer, and a
@@ -246,6 +270,8 @@ path and cannot prove a deployed container is denied one.
 **Rotation owner.** control-plane operator on call
 
 **Rotation.** On the self-host profile, rotated in the Google Cloud console and re-put into the control plane’s store. On the hosted profile there is nothing here to rotate: Cloudflare holds the provider relationship, and rotating the Cloudflare token is what cuts this path off.
+
+**Note.** Read the evidence on this row narrowly: **both halves of it come from the self-host profile, and neither can see the hosted one.** Since the seats moved, the hosted route to Google records `provider: cloudflare` and calls a Cloudflare hostname — the serving lab is encoded in the model id (`google/gemini-3.5-flash-lite`) and appears in none of the three completeness sweeps. So this entry is held in place by the self-hosted deployment reaching Google directly, not by the hosted plane that actually sends the most content there. Withdraw the self-host profile and the check does not fall silent: it reports this entry as stale and invites its deletion, while every extracted document keeps crossing to Google through the passthrough. It is named by hand for the same reason `stripe` is, and `upstream/concepts.jsonl:gap.register-passthrough-vendor-blindness` carries the fourth evidence set that would make the sweep see it.
 
 **Evidence in the code.** hosts `generativelanguage.googleapis.com`; routing providers `google`.
 
@@ -508,7 +534,8 @@ Identical content, so a script auditing the blast radius reads the published doc
         "providers": [
           "google"
         ]
-      }
+      },
+      "note": "Read the evidence on this row narrowly: **both halves of it come from the self-host profile, and neither can see the hosted one.** Since the seats moved, the hosted route to Google records `provider: cloudflare` and calls a Cloudflare hostname — the serving lab is encoded in the model id (`google/gemini-3.5-flash-lite`) and appears in none of the three completeness sweeps. So this entry is held in place by the self-hosted deployment reaching Google directly, not by the hosted plane that actually sends the most content there. Withdraw the self-host profile and the check does not fall silent: it reports this entry as stale and invites its deletion, while every extracted document keeps crossing to Google through the passthrough. It is named by hand for the same reason `stripe` is, and `upstream/concepts.jsonl:gap.register-passthrough-vendor-blindness` carries the fourth evidence set that would make the sweep see it."
     },
     {
       "id": "cloudflare-models",

@@ -286,6 +286,8 @@ export const SHARED_COMPONENTS: readonly RegisterEntry[] = [
     rotation:
       'On the self-host profile, rotated in the Google Cloud console and re-put into the control plane’s store. On the hosted profile there is nothing here to rotate: Cloudflare holds the provider relationship, and rotating the Cloudflare token is what cuts this path off.',
     evidence: { hosts: ['generativelanguage.googleapis.com'], providers: ['google'] },
+    note:
+      'Read the evidence on this row narrowly: **both halves of it come from the self-host profile, and neither can see the hosted one.** Since the seats moved, the hosted route to Google records `provider: cloudflare` and calls a Cloudflare hostname — the serving lab is encoded in the model id (`google/gemini-3.5-flash-lite`) and appears in none of the three completeness sweeps. So this entry is held in place by the self-hosted deployment reaching Google directly, not by the hosted plane that actually sends the most content there. Withdraw the self-host profile and the check does not fall silent: it reports this entry as stale and invites its deletion, while every extracted document keeps crossing to Google through the passthrough. It is named by hand for the same reason `stripe` is, and `upstream/concepts.jsonl:gap.register-passthrough-vendor-blindness` carries the fourth evidence set that would make the sweep see it.',
   },
   {
     id: 'cloudflare-models',
