@@ -321,6 +321,112 @@ describe('each check fails for its own reason', () => {
   });
 });
 
+/**
+ * `attestation.signed` — the one check the whole R10 trust story rests on.
+ *
+ * **A key id is not a signature.** The check declares that the receipt "is
+ * signed, and verifies against the published verification key"; comparing
+ * `signature.key_id` to a published string checks that the receipt *names* the
+ * key, which anybody who has ever seen one receipt can do. A fleet that had
+ * stopped signing — or an attacker who had reached the endpoint — would keep
+ * this green while every claim under it became unverifiable, which is precisely
+ * the "a receipt that outlives its property" failure `attestation.ts` is built
+ * against.
+ *
+ * The shipped signer is symmetric and publishes a *digest* rather than a key, so
+ * an outside party holding only the published value cannot verify at all. That
+ * is a `deferred`, not a `pass`: this file's first rule.
+ */
+describe('a receipt is verified, not recognised', () => {
+  const FORGED = { alg: 'HMAC-SHA256', key_id: 'canary-2026-08', value: '00'.repeat(32) } as const;
+
+  const probeSigned = async (options: Omit<CanaryOptions, 'endpoint' | 'token'>): Promise<string> => {
+    const report = await runCanary({
+      endpoint: 'https://canary.example/mcp',
+      token: 'a-caller-supplied-bearer',
+      tenantId: 't-canary',
+      ...options,
+    });
+    return report.results.find((result) => result.id === 'attestation.signed')?.outcome ?? 'missing';
+  };
+
+  test('a receipt signed by nothing, naming the right key, does not pass', async () => {
+    const receipt = await receiptFor({ signature: FORGED });
+    expect(await probeSigned({
+      call: await healthyCall(receipt),
+      verificationKey: 'canary-2026-08',
+    })).not.toBe('pass');
+  });
+
+  test('and with a verifier in hand it is a failure, stated as one', async () => {
+    const receipt = await receiptFor({ signature: FORGED });
+    expect(await probeSigned({
+      call: await healthyCall(receipt),
+      verificationKey: 'canary-2026-08',
+      verifier: SIGNER,
+    })).toBe('fail');
+  });
+
+  test('a genuine receipt verifies, so the check is not refusing everything', async () => {
+    const receipt = await receiptFor();
+    expect(await probeSigned({
+      call: await healthyCall(receipt),
+      verificationKey: 'canary-2026-08',
+      verifier: SIGNER,
+    })).toBe('pass');
+  });
+
+  test('a receipt edited after signing fails, because the payload is re-split from the body', async () => {
+    // The tenant id is inside what was signed. A receipt whose body was changed
+    // and whose signature was kept must not verify, or the signature covers a
+    // document nobody sent.
+    const receipt = await receiptFor({ tenant_id: 't-somebody-else' });
+    expect(await probeSigned({
+      call: await healthyCall(receipt),
+      verificationKey: 'canary-2026-08',
+      verifier: SIGNER,
+    })).toBe('fail');
+  });
+
+  test('a signature under some other key fails without needing a verifier', async () => {
+    const receipt = await receiptFor({
+      signature: { alg: 'HMAC-SHA256', key_id: 'not-the-published-key', value: '00'.repeat(32) },
+    });
+    expect(await probeSigned({
+      call: await healthyCall(receipt),
+      verificationKey: 'canary-2026-08',
+    })).toBe('fail');
+  });
+
+  test('a published value that cannot verify defers, and says why', async () => {
+    // The shipped signer is symmetric: what it publishes is a digest of the key,
+    // not the key. A holder can tell WHICH key signed and cannot check that it
+    // did. `deferred` is the honest answer and `pass` is the dangerous one.
+    const receipt = await receiptFor();
+    const report = await runCanary({
+      endpoint: 'https://canary.example/mcp',
+      token: 'x',
+      tenantId: 't-canary',
+      call: await healthyCall(receipt),
+      verificationKey: 'canary-2026-08',
+    });
+    const result = report.results.find((entry) => entry.id === 'attestation.signed');
+    expect(result?.outcome).toBe('deferred');
+    expect(result?.detail).toContain('verif');
+  });
+
+  test('an unsigned receipt still fails outright', async () => {
+    const receipt = await receiptFor({
+      signature: { status: 'unsigned', reason: 'this fleet is wired to no attestation signer' },
+    });
+    expect(await probeSigned({
+      call: await healthyCall(receipt),
+      verificationKey: 'canary-2026-08',
+      verifier: SIGNER,
+    })).toBe('fail');
+  });
+});
+
 describe('an outside party can run it from the published docs', () => {
   test('the known record is published in the source, not hidden in a fixture', () => {
     // A canary whose expected answer is private is a canary only we can read.

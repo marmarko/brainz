@@ -36,6 +36,8 @@
 
 import {
   isSigned,
+  verifyAttestation,
+  type AttestationSigner,
   type SignedAttestation,
 } from '../src/mcp/attestation.ts';
 import { HNSW_EF_SEARCH_DEFAULT } from '../src/schema/vector-query.ts';
@@ -106,9 +108,9 @@ export const CANARY_CHECKS: readonly CanaryCheck[] = [
   },
   {
     id: 'attestation.signed',
-    asserts: 'the receipt is signed, and verifies against the published verification key',
+    asserts: 'the receipt is signed, and its signature verifies against the published verification key',
     needs: 'published_verification_key',
-    why: 'An unsigned receipt is a claim. A signed one is a proof only if the key is not the fleet’s to read — see `docs/register.md`, `attestation-signing-key`.',
+    why: 'An unsigned receipt is a claim. A signed one is a proof only if the key is not the fleet’s to read — see `docs/register.md`, `attestation-signing-key`. And it is only a proof if somebody checked the signature: matching the key *id* is something anyone who has seen one receipt can do, so a receipt named right and signed by nothing must never grade as a pass.',
   },
   {
     id: 'boundary.database',
@@ -214,8 +216,27 @@ export interface CanaryOptions {
    */
   readonly controlDatabaseUrl?: string | undefined;
   readonly tenantId?: string | undefined;
-  /** The published verification key, when there is one. */
+  /**
+   * The published verification key's identifier, when one is published.
+   *
+   * **On its own this can only ever produce `fail` or `deferred`.** A key id
+   * says which key a receipt *names*; it says nothing about whether that key
+   * signed. A mismatch is decisive — the receipt names some other key — and a
+   * match is not, so a match without {@link CanaryOptions.verifier} defers.
+   */
   readonly verificationKey?: string | undefined;
+  /**
+   * What can actually check the MAC.
+   *
+   * A verifier rather than raw key bytes, for the reason `attestation.ts` gives:
+   * the shipped signer is symmetric, and an API taking a key would invite a
+   * caller to pass the *signing* key around as though it were public. It is
+   * injected — like `call` and `query` — because who can verify depends on the
+   * scheme. An outside party holding only the published digest of an HMAC key
+   * cannot verify anything and gets a `deferred` that says so; a deployment
+   * whose signer publishes a real public key hands one in and earns the pass.
+   */
+  readonly verifier?: Pick<AttestationSigner, 'verify'> | undefined;
   /** Injected so the suite can drive this without a network. */
   readonly call?: typeof callTool;
   /** Injected so the suite can drive the database half without a database. */
@@ -354,19 +375,51 @@ export async function runCanary(options: CanaryOptions = {}): Promise<CanaryRepo
     // Signing is deferred rather than failed while no key is published: a
     // `fail` here would say the deployment is wrong, and what is missing is a
     // key nobody has minted.
-    if (options.verificationKey === undefined) {
+    if (options.verificationKey === undefined && options.verifier === undefined) {
       defer('attestation.signed');
     } else if (receipt === undefined) {
       push('attestation.signed', 'fail', 'no receipt to verify');
     } else if (!isSigned(receipt.signature)) {
       push('attestation.signed', 'fail', `the receipt is unsigned: ${receipt.signature.reason}`);
-    } else if (receipt.signature.key_id === options.verificationKey) {
-      push('attestation.signed', 'pass', `signed under key ${receipt.signature.key_id}`);
-    } else {
+    } else if (
+      options.verificationKey !== undefined &&
+      receipt.signature.key_id !== options.verificationKey
+    ) {
+      // Decisive in this direction and only this one: a receipt naming another
+      // key was not signed by the published one, whoever else it was signed by.
       push(
         'attestation.signed',
         'fail',
         `signed under ${receipt.signature.key_id}, which is not the published key`,
+      );
+    } else if (options.verifier === undefined) {
+      // **The name matches and nothing has been verified.** This is the branch
+      // the check used to call a pass, and calling it one is how the whole R10
+      // story became a string comparison: a receipt carrying the right key id
+      // and a signature of zeroes read as proof. Whether the MAC is right is
+      // simply not answerable from a key id — and for the symmetric signer that
+      // ships it is not answerable by an outside party at all, because what is
+      // published is a digest of the key rather than the key. So it defers, and
+      // this file's first rule is that `deferred` is never `pass`.
+      push(
+        'attestation.signed',
+        'deferred',
+        'the receipt names the published key and nothing verified its signature: a key id is not a proof, ' +
+          'and the shipped signer is symmetric, so what is published is a digest of the key rather than a key ' +
+          'an outside party could check against',
+      );
+    } else {
+      // `verifyAttestation` splits the payload back out of the receipt rather
+      // than trusting the two to have stayed together, so a body edited after
+      // signing verifies against the edited body and fails.
+      const verified = await verifyAttestation(receipt, options.verifier);
+      push(
+        'attestation.signed',
+        verified ? 'pass' : 'fail',
+        verified
+          ? `the signature under key ${receipt.signature.key_id} verifies against this receipt`
+          : `the signature under key ${receipt.signature.key_id} does not verify against this receipt — ` +
+            'either it was not signed by that key, or the body was edited after it was',
       );
     }
   }
