@@ -50,6 +50,7 @@ function authorizeOnce(overrides: Partial<AuthorizeRequest> = {}) {
     codeChallengeMethod: 'S256',
     state: 'opaque-state-1',
     tenantId: 'tenant-a',
+    scope: 'narrowed' as const,
     origins: ['personal:mail', 'personal:agent'],
     writeOrigin: 'personal:agent',
     endpoint: 'mcp',

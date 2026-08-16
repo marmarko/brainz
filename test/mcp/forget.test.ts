@@ -317,8 +317,12 @@ describe('forget is fenced like every other tool', () => {
         {
           grantId: 'g-forget-fence',
           tenantId: fixture.tenantId,
-          origins: ['work:mail'],
-          writeOrigin: 'personal:agent',
+          scope: 'narrowed',
+          // U18: a narrowed grant's write origin must be inside it, so this
+          // work-scoped fixture writes at `work:agent` rather than planting
+          // personal rows it could never read back.
+          origins: ['work:mail', 'work:agent'],
+          writeOrigin: 'work:agent',
           endpoint: 'mcp',
           clientId: 'client-test',
           issuedAt: fixture.now(),

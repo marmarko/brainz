@@ -57,6 +57,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 import { isValidTenantId } from '../control/secrets.ts';
+import { grantScopeViolations, type GrantScope } from './grant-scope.ts';
 import type { Endpoint } from './tools/index.ts';
 
 // ---------------------------------------------------------------------------
@@ -91,9 +92,25 @@ export interface GrantClaims {
   /** Stable id for this grant. The access log's actor column, and nothing else. */
   readonly grantId: string;
   readonly tenantId: string;
+  /**
+   * Whether this credential holds the brain or a slice of it (U18).
+   *
+   * **Required, and explicit.** Before U18 the marker was `origins.length === 0`
+   * — a convention `dispatch.ts` read as "the whole brain", which is the one
+   * place this system inverted `fence.ts`'s "an empty grant sees nothing (not
+   * everything)". With narrowed grants real, a list that filters to empty would
+   * have *widened* to the whole brain silently and above every fence. The
+   * invariant `scope === 'narrowed' ⟺ origins.length > 0` is now checked at mint
+   * and again at verify — see `grant-scope.ts`.
+   */
+  readonly scope: GrantScope;
   /** R15's fence, as the grant holds it. Reads see these origins and no others. */
   readonly origins: readonly string[];
-  /** Where this grant's writes land. Never taken from a request parameter. */
+  /**
+   * Where this grant's writes land. Never taken from a request parameter, and —
+   * since U18 — never outside {@link origins}: a grant that writes where it
+   * cannot read plants rows it can never see.
+   */
   readonly writeOrigin: string;
   readonly endpoint: Endpoint;
   readonly clientId: string;
@@ -187,7 +204,14 @@ export function mintAccessToken(claims: GrantClaims, signingKey: string): string
   return `${header}.${payload}.${sign(`${header}.${payload}`, signingKey)}`;
 }
 
-export type TokenRefusal = 'malformed' | 'bad_signature' | 'expired' | 'wrong_tenant';
+/**
+ * `bad_scope` is U18's, and it is a distinct reason on purpose: a signed token
+ * whose scope is incoherent is a *minting* bug or a forged claims payload, not a
+ * malformed string, and the two want different investigations. The wire still
+ * says one sentence — `dispatch.ts` collapses every refusal into
+ * `UNAUTHORIZED_MESSAGE`, because distinguishing them to a caller is an oracle.
+ */
+export type TokenRefusal = 'malformed' | 'bad_signature' | 'expired' | 'wrong_tenant' | 'bad_scope';
 
 export type TokenVerdict =
   | { readonly ok: true; readonly claims: GrantClaims }
@@ -228,6 +252,13 @@ export function verifyAccessToken(token: string, signingKey: string, nowMs: numb
   if (typeof claims.expiresAt !== 'number' || claims.expiresAt <= nowMs) {
     return { ok: false, reason: 'expired' };
   }
+
+  // U18. **Checked here, at verify, and not only at mint.** A signer is a thing
+  // an attacker might obtain and a mint is a thing a future caller might route
+  // around; a token whose scope is incoherent is refused before a tenant
+  // database is opened. `scope: 'narrowed'` with no origins is the specific
+  // shape that used to widen to the whole brain — see `grant-scope.ts`.
+  if (grantScopeViolations(claims).length > 0) return { ok: false, reason: 'bad_scope' };
 
   return { ok: true, claims };
 }
@@ -279,6 +310,8 @@ export type OAuthError =
   | 'invalid_redirect_uri'
   | 'invalid_client_metadata'
   | 'unsupported_grant_type'
+  /** U18: a consent step asked for a scope this server refuses to sign. */
+  | 'invalid_scope'
   | 'rate_limited';
 
 export interface ClientRecord {
@@ -293,6 +326,8 @@ export interface CodeRecord {
   readonly redirectUri: string;
   readonly codeChallenge: string;
   readonly tenantId: string;
+  /** U18. Carried through the flow so a redeem cannot re-decide it. */
+  readonly scope: GrantScope;
   readonly origins: readonly string[];
   readonly writeOrigin: string;
   readonly endpoint: Endpoint;
@@ -304,6 +339,8 @@ export interface CodeRecord {
 export interface RefreshRecord {
   readonly clientId: string;
   readonly tenantId: string;
+  /** U18. A refresh re-issues the grant it was given, never a wider one. */
+  readonly scope: GrantScope;
   readonly origins: readonly string[];
   readonly writeOrigin: string;
   readonly endpoint: Endpoint;
@@ -460,6 +497,8 @@ export interface AuthorizeRequest {
    * a real session without changing anything below.
    */
   readonly tenantId: string;
+  /** U18's explicit marker. `narrowed` with no origins is refused below. */
+  readonly scope: GrantScope;
   readonly origins: readonly string[];
   readonly writeOrigin: string;
   readonly endpoint: Endpoint;
@@ -499,6 +538,21 @@ export function authorize(store: AuthorizationStore, request: AuthorizeRequest):
     return { ok: false, error: 'invalid_request', description: 'unroutable tenant' };
   }
 
+  // U18. **Refused at mint as well as at verify**, and the duplication is the
+  // design: verify is the backstop against a forged or hand-assembled claims
+  // payload, and mint is what stops this server from ever putting its own
+  // signature on an incoherent scope. A code that cannot become a valid token
+  // must not be issued, or the failure surfaces at the client as a broken
+  // connector rather than here as a refused consent.
+  const scopeFindings = grantScopeViolations({
+    scope: request.scope,
+    origins: request.origins,
+    writeOrigin: request.writeOrigin,
+  });
+  if (scopeFindings.length > 0) {
+    return { ok: false, error: 'invalid_scope', description: scopeFindings.join('; ') };
+  }
+
   const random = request.random ?? randomBytes;
   const code = base64url(random(32));
   const ttl = (request.ttlSeconds ?? DEFAULT_CODE_TTL_SECONDS) * 1000;
@@ -508,6 +562,7 @@ export function authorize(store: AuthorizationStore, request: AuthorizeRequest):
     redirectUri: request.redirectUri,
     codeChallenge: request.codeChallenge,
     tenantId: request.tenantId,
+    scope: request.scope,
     origins: [...request.origins],
     writeOrigin: request.writeOrigin,
     endpoint: request.endpoint,
@@ -557,6 +612,9 @@ export function redeemAuthorizationCode(
     grant: {
       grantId: record.grantId,
       tenantId: record.tenantId,
+      // Read off the record, never re-decided here: a redeem that recomputed
+      // the scope would be a second place the fence is chosen.
+      scope: record.scope,
       origins: record.origins,
       writeOrigin: record.writeOrigin,
       endpoint: record.endpoint,
@@ -610,6 +668,7 @@ export function issueTokens(
   store.putRefresh(hashToken(refreshToken), {
     clientId: options.grant.clientId,
     tenantId: options.grant.tenantId,
+    scope: options.grant.scope,
     origins: [...options.grant.origins],
     writeOrigin: options.grant.writeOrigin,
     endpoint: options.grant.endpoint,
@@ -650,6 +709,9 @@ export function redeemRefreshToken(
     grant: {
       grantId: record.grantId,
       tenantId: record.tenantId,
+      // Read off the record, never re-decided here: a redeem that recomputed
+      // the scope would be a second place the fence is chosen.
+      scope: record.scope,
       origins: record.origins,
       writeOrigin: record.writeOrigin,
       endpoint: record.endpoint,

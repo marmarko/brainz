@@ -31,6 +31,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { migrateTenantSchema } from '../../src/control/migrate.ts';
 import { HEAD_SCHEMA_VERSION } from '../../src/schema/migrations.ts';
+import { agentOriginFor, classOf } from '../../src/mcp/grant-scope.ts';
 import { AGENT_ORIGIN, createMcpFixture, type McpFixture } from './fixture.ts';
 import { deriveSigningKey, mintAccessToken, type GrantClaims } from '../../src/mcp/oauth.ts';
 import { FIXTURE_FTS_LANGUAGE } from '../schema/fixture.ts';
@@ -57,11 +58,14 @@ afterAll(async () => {
 
 /** A signed grant with explicit origins, so dispatch never reads the brain's own. */
 function tokenWithOrigins(fixture: McpFixture, origins: readonly string[]): string {
+  // U18: the write origin has to be inside the grant, so it is derived here.
+  const agent = agentOriginFor(classOf(origins[0] ?? AGENT_ORIGIN) ?? 'personal');
   const claims: GrantClaims = {
     grantId: `g-${origins.join('-')}`,
     tenantId: fixture.tenantId,
-    origins,
-    writeOrigin: AGENT_ORIGIN,
+    scope: 'narrowed',
+    origins: [...origins, agent],
+    writeOrigin: agent,
     endpoint: 'mcp',
     clientId: 'client-schema-guard',
     issuedAt: fixture.now(),

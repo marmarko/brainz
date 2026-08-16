@@ -334,6 +334,11 @@ async function handleAuthorize(deps: ServerDeps, request: Request, url: URL): Pr
     codeChallengeMethod: params.get('code_challenge_method') ?? '',
     state: params.get('state') ?? '',
     tenantId,
+    // U18's explicit marker. The alpha consent step still grants the whole
+    // brain — narrowing is a UI choice U15's consent screen owns — but the
+    // grant now *says* whole brain rather than expressing it as an empty list
+    // a reader downstream has to interpret as "everything".
+    scope: 'whole_brain',
     origins: [],
     writeOrigin: deps.writeOrigin ?? DEFAULT_WRITE_ORIGIN,
     endpoint,

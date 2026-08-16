@@ -76,6 +76,7 @@ import {
   type AttestationSigner,
   type TenantBoundaryFacts,
 } from './attestation.ts';
+import { resolveGrant } from './grant-scope.ts';
 import { brainOrigins, indexState } from './reads.ts';
 import type { TenantConnections } from './tenant-db.ts';
 import { briefing, entity, fetchOne, recall, search } from './tools/read.ts';
@@ -386,7 +387,6 @@ export async function dispatch(
 ): Promise<DispatchResult> {
   const now = deps.now();
   const nonce = mintDelimiter(deps.nonceSource);
-  const writeOrigin = deps.writeOrigin ?? DEFAULT_WRITE_ORIGIN;
 
   const refuse = (
     code: string,
@@ -515,9 +515,19 @@ export async function dispatch(
   }
 
   // ---- 4. The fence, derived from the credential. --------------------------
+  //
+  // **The marker is read, never inferred.** This line used to say
+  // `claims.origins.length > 0 ? claims.origins : fullBrainGrant(…)`, which made
+  // an empty list mean *the whole brain* — the one place this system inverted
+  // `fence.ts`'s "an empty grant sees nothing (not everything)", and a fail-open
+  // sitting above every fence rather than beside one. U18 made the scope an
+  // explicit claim, refused at mint and again at verify, so by the time control
+  // reaches here a `narrowed` grant is guaranteed to name at least one origin
+  // and `expandGrant`'s wildcard floor guarantees the expansion is non-empty
+  // too. Neither guarantee is assumed: `grant-scope.ts` carries both.
   let grant: Grant;
   try {
-    grant = claims.origins.length > 0 ? claims.origins : await fullBrainGrant(sql, writeOrigin);
+    grant = await resolveGrant(claims, () => brainOrigins(sql));
   } catch {
     return refuse('unavailable', 'This brain could not be reached.', 'unavailable', actor);
   }
@@ -637,6 +647,10 @@ function verifyCredential(
         // secret that would let a log reader become it.
         grantId: `bearer:${hashToken(presented).slice(0, 16)}`,
         tenantId: context.tenantId,
+        // The provisioned bearer is the whole brain, and since U18 it *says* so
+        // rather than expressing it as an empty list somebody downstream has to
+        // interpret. This is the only producer of `whole_brain` in the system.
+        scope: 'whole_brain',
         origins: [],
         writeOrigin: context.writeOrigin,
         endpoint: context.endpoint,
@@ -712,13 +726,6 @@ async function schemaRefusal(
         suggestion:
           'Try the same call again shortly — this instance is being replaced by one that understands it.',
       };
-}
-
-/** Every origin this brain holds, plus the one its agent writes through. */
-async function fullBrainGrant(sql: Parameters<typeof brainOrigins>[0], writeOrigin: string): Promise<Grant> {
-  const origins = new Set(await brainOrigins(sql));
-  origins.add(writeOrigin);
-  return [...origins];
 }
 
 /**

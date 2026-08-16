@@ -42,6 +42,7 @@ function claimsFor(tenantId: string) {
   return {
     grantId: 'g-0001',
     tenantId,
+    scope: 'narrowed' as const,
     origins: ['personal:mail', 'personal:agent'],
     writeOrigin: 'personal:agent',
     endpoint: 'mcp' as const,

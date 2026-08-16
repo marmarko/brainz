@@ -24,6 +24,7 @@ import {
   type GrantClaims,
 } from '../../src/mcp/oauth.ts';
 import { advertisedTools, TOOL_NAMES } from '../../src/mcp/tools/index.ts';
+import { agentOriginFor, classOf } from '../../src/mcp/grant-scope.ts';
 import { AGENT_ORIGIN, createMcpFixture, seedEntity, seedFact, seedPage, type McpFixture } from './fixture.ts';
 
 const SETUP_TIMEOUT_MS = 180_000;
@@ -141,13 +142,25 @@ afterAll(async () => {
   await fixture?.close();
 });
 
-/** An access token for a narrower grant than the tenant bearer carries. */
+/**
+ * A signed grant narrower than the tenant bearer carries.
+ *
+ * **U18 makes the write origin part of the grant rather than a constant.** A
+ * narrowed grant whose `writeOrigin` sits outside its own origins is refused at
+ * the credential now (`grant-scope.ts`), because it plants rows it can never
+ * read back. So the helper derives the write origin from the origins it was
+ * given and adds the matching agent origin to the grant — which is what a real
+ * work-connector grant looks like, and what this helper was quietly not
+ * expressing when it hardcoded `personal:agent` beside `['work:mail']`.
+ */
 function tokenFor(origins: readonly string[], overrides: Partial<GrantClaims> = {}): string {
+  const agent = agentOriginFor(classOf(origins[0] ?? AGENT_ORIGIN) ?? 'personal');
   const claims: GrantClaims = {
     grantId: 'g-scoped',
     tenantId: fixture.tenantId,
-    origins,
-    writeOrigin: AGENT_ORIGIN,
+    scope: 'narrowed',
+    origins: [...origins, agent],
+    writeOrigin: agent,
     endpoint: 'mcp',
     clientId: 'client-test',
     issuedAt: fixture.now(),
