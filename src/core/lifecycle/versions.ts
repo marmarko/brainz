@@ -102,9 +102,27 @@ async function captureReconstructed(
   if (!page.verified) return { ok: false, reason: 'unverifiable' };
 
   return sql.begin(async (tx) => {
+    // **The head is this page's own origin's head, and the next number is the
+    // whole document's.** Two different questions that `doc_key` alone answers
+    // as one, because `doc_key` is the bare `external_ref` and two credentials
+    // legitimately hold the same provider object (`write-path.ts:livePageByRef`).
+    //
+    //   * *Has this document changed?* is a question about one origin's copy. A
+    //     shared calendar event is byte-identical in both mailboxes by
+    //     construction, so comparing against the other origin's head answers
+    //     "unchanged" to a document that has no snapshot at all — and returns a
+    //     version number its owner is fenced out of reading.
+    //   * *What number does the next snapshot get?* is a question about the
+    //     unique index, which is `(doc_key, version)`. Allocating per origin
+    //     would collide on the first snapshot of the second copy.
+    //
+    // The residue is that one sequence spans both origins, so a fenced history
+    // has gaps. That is a rung (fold the origin into `doc_key`) rather than an
+    // edit here; `test/core/lifecycle/versions-origin-fence.test.ts` pins it as
+    // an observed fact and the ledger row names it.
     const latest = (await tx`
       SELECT version, content_sha256 FROM page_version
-       WHERE doc_key = ${page.docKey}
+       WHERE doc_key = ${page.docKey} AND origin_context = ${page.originContext}
        ORDER BY version DESC LIMIT 1
     `) as Array<{ version: number; content_sha256: string }>;
 
@@ -113,7 +131,11 @@ async function captureReconstructed(
       return { ok: true as const, status: 'unchanged' as const, version: head.version, docKey: page.docKey };
     }
 
-    const next = (head?.version ?? 0) + 1;
+    const highest = (await tx`
+      SELECT max(version) AS version FROM page_version WHERE doc_key = ${page.docKey}
+    `) as Array<{ version: number | null }>;
+
+    const next = Number(highest[0]?.version ?? 0) + 1;
     await tx`
       INSERT INTO page_version (doc_key, version, page_id, origin_context, subject_context,
                                 subject_confidence, source_type, title, body, content_sha256, captured_from)
@@ -138,10 +160,20 @@ export interface SupersededSweepResult {
  *
  * This is what makes history real for the ordinary case — an edited file, an
  * updated thread — without touching U4's write path. A predecessor is a
- * tombstoned page sharing an `external_ref` with a live one; a page tombstoned
- * by `forget` shares its ref with nothing live and is deliberately *not* swept,
- * because banking a copy of what a user just retracted is a `forget` that did
- * not forget.
+ * tombstoned page sharing an `external_ref` **and an origin** with a live one; a
+ * page tombstoned by `forget` shares that pair with nothing live and is
+ * deliberately *not* swept, because banking a copy of what a user just retracted
+ * is a `forget` that did not forget.
+ *
+ * **The origin half of that pair is load-bearing, not decoration.**
+ * `external_ref` is the provider's id and carries no cross-origin uniqueness —
+ * the same shared calendar event lives in a work mailbox and a personal one,
+ * which is `write-path.ts:livePageByRef`'s whole subject. Keyed on the ref
+ * alone, a page the user retracted in one mailbox has a "live partner" in the
+ * other, is read as a superseded predecessor, and is banked verbatim into
+ * `page_version` — whose foreign key is `ON DELETE SET NULL` precisely so the
+ * 72h purge cannot reach it. The retraction would become permanent retention,
+ * silently, on a schedule.
  *
  * Oldest first, so version numbers run in the order the documents did.
  */
@@ -154,6 +186,7 @@ export async function captureSupersededVersions(
       FROM page dead
       JOIN page live
         ON live.external_ref = dead.external_ref
+       AND live.origin_context = dead.origin_context
        AND live.deleted_at IS NULL
        AND live.page_id <> dead.page_id
      WHERE dead.deleted_at IS NOT NULL
@@ -267,10 +300,18 @@ export async function revertPage(
   if (snapshot === undefined) return { ok: false, reason: 'not_found' };
   if (!fenceScalar(snapshot.origin_context, request.grant)) return { ok: false, reason: 'scope_denied' };
 
+  // **At the snapshot's own origin**, which is the origin the fence above just
+  // authorised and the origin `ingestDocument` below will write to. Without it
+  // this is `ORDER BY page_id DESC` over every page carrying the ref — that is,
+  // whichever mailbox last pulled the shared calendar event — and a work-scoped
+  // revert then banks a `pre_revert` snapshot of the *personal* page: a
+  // cross-origin read turned into a row by a credential that may not read it,
+  // and an `undoVersion` on the receipt that the same credential is refused.
   const live = (await ctx.sql`
     SELECT page_id::text AS page_id, external_ref
       FROM page
      WHERE deleted_at IS NULL
+       AND origin_context = ${snapshot.origin_context}
        AND (external_ref = ${request.docKey}
             OR (external_ref IS NULL AND ${request.docKey} = 'page:' || page_id::text))
      ORDER BY page_id DESC LIMIT 1
