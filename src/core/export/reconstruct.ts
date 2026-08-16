@@ -47,6 +47,7 @@ import { createHash } from 'node:crypto';
 import type { SQL } from 'bun';
 
 import { CHUNK_OVERLAP_CHARS } from '../write/chunker.ts';
+import { textArrayLiteral } from '../write/pg-values.ts';
 import { contentDigest, type SourceType } from '../write/write-path.ts';
 
 /**
@@ -175,21 +176,35 @@ interface PageRow {
 export async function reconstructPage(
   sql: SQL,
   pageId: string,
-  options: { readonly origins?: readonly string[] } = {},
+  options: {
+    readonly origins?: readonly string[];
+    /**
+     * Read a page the tombstone already took.
+     *
+     * Off by default and never on for an export — a backup that resurrects what
+     * a user retracted is a `forget` that did not forget. The one legitimate
+     * caller is U17's superseded-version sweep, which has to rescue a replaced
+     * document's text *before* the 72h purge removes it, and by then the row is
+     * tombstoned by definition.
+     */
+    readonly includeTombstoned?: boolean;
+  } = {},
 ): Promise<ReconstructedPage | null> {
+  const tombstoned = options.includeTombstoned === true;
   const rows = (await sql`
     SELECT page_id::text AS page_id, origin_context, subject_context, subject_confidence,
            source_type, external_ref, title, content_sha256
       FROM page
      WHERE page_id = ${pageId}::bigint
-       AND deleted_at IS NULL AND quarantined_at IS NULL
+       AND (${tombstoned} OR deleted_at IS NULL)
+       AND quarantined_at IS NULL
   `) as PageRow[];
 
   const row = rows[0];
   if (row === undefined) return null;
   if (options.origins !== undefined && !options.origins.includes(row.origin_context)) return null;
 
-  return rebuild(sql, row);
+  return rebuild(sql, row, tombstoned);
 }
 
 /**
@@ -209,7 +224,8 @@ export async function reconstructLivePages(
            source_type, external_ref, title, content_sha256
       FROM page
      WHERE deleted_at IS NULL AND quarantined_at IS NULL
-       AND (${options.origins ?? null}::text[] IS NULL OR origin_context = ANY(${options.origins ?? null}::text[]))
+       AND (${originLiteral(options.origins)}::text[] IS NULL
+            OR origin_context = ANY(${originLiteral(options.origins)}::text[]))
      ORDER BY page_id
   `) as PageRow[];
 
@@ -218,12 +234,25 @@ export async function reconstructLivePages(
   return pages;
 }
 
-async function rebuild(sql: SQL, row: PageRow): Promise<ReconstructedPage> {
+/** Bun sends a JS array as a scalar, so a grant crosses the wire as a literal. */
+function originLiteral(origins: readonly string[] | undefined): string | null {
+  return origins === undefined ? null : textArrayLiteral(origins);
+}
+
+async function rebuild(
+  sql: SQL,
+  row: PageRow,
+  includeTombstoned = false,
+): Promise<ReconstructedPage> {
+  // A tombstoned page's chunks were tombstoned in the same transaction, so the
+  // predicate has to move with the page's or the sweep reconstructs an empty
+  // document and reports it as unverifiable.
   const chunks = (await sql`
     SELECT content
       FROM chunk
      WHERE page_id = ${row.page_id}::bigint
-       AND deleted_at IS NULL AND quarantined_at IS NULL
+       AND (${includeTombstoned} OR deleted_at IS NULL)
+       AND quarantined_at IS NULL
      ORDER BY ordinal, chunk_id
   `) as Array<{ content: string }>;
 
