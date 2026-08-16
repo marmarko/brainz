@@ -99,12 +99,21 @@ export interface CanaryViolation {
 }
 
 /**
- * Who serves the weights, for the independence comparison.
+ * Who made the weights, for the independence comparison.
  *
  * `@cf/zai-org/glm-5.2` is Cloudflare *hosting* a Z.ai model; the family is
  * `zai-org`, not `cloudflare`. Returning the provider there would make every
  * Cloudflare-hosted op look like one family and every Google op like another,
  * which is backwards.
+ *
+ * **The same reasoning is why a bare `vendor/model` id is read the same way.**
+ * Cloudflare's Unified Billing catalog names a passed-through third-party model
+ * as `google/gemini-3.5-flash-lite` — Cloudflare bills it, Google made it. When
+ * the extraction seats moved onto that endpoint their `provider` became
+ * `cloudflare`, and a function that stopped at the provider would have reported
+ * a Gemini judge as independent of Gemini-produced output. That is not a
+ * cosmetic mislabel: judge independence is the property that stops the canary
+ * tier from measuring a model's agreement with itself and calling it quality.
  */
 export function servingOrgOf(route: Route): string {
   for (const prefix of ['@cf/', 'self-host/']) {
@@ -113,6 +122,11 @@ export function servingOrgOf(route: Route): string {
       if (org !== undefined && org.length > 0) return org;
     }
   }
+  // A `vendor/model` id names its vendor. Ids with no slash (`text-embedding-
+  // 3-large`) name no vendor and fall through to the provider, which for those
+  // is the lab itself.
+  const [vendor, ...rest] = route.id.split('/');
+  if (rest.length > 0 && vendor !== undefined && vendor.length > 0) return vendor;
   return route.provider;
 }
 

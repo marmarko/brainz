@@ -182,6 +182,22 @@ function parseListening(line: string): ListeningLine | null {
 }
 
 /**
+ * A Cloudflare account id that is nobody's.
+ *
+ * The hosted routing profile — which is the default, and therefore what every
+ * spawned fleet process below composes — bills its model calls through
+ * `…/accounts/{id}/ai`, and `compose.ts` refuses to start without the id rather
+ * than discovering it is missing inside a tenant's first paid cycle. So a test
+ * that starts a fleet has to supply one, exactly as a deployment does.
+ *
+ * A literal fake, never the real value: this repository is public, the real id
+ * lives in `BRAINZ_CF_ACCOUNT_ID`, and gitleaks runs on every push. Thirty-two
+ * hex characters because that is the shape, and all zeroes because nothing
+ * about the shape should tempt anyone to think it is live.
+ */
+export const FAKE_CF_ACCOUNT_ID = '0'.repeat(32);
+
+/**
  * A secrets file in the shape `src/control/secret-file.ts` reads.
  *
  * Written by the test the way an operator or a pool filler writes it, so what

@@ -36,6 +36,7 @@ import {
   SELF_HOST_PROFILE,
   routeFor,
   type ModelOp,
+  type ProviderId,
 } from '../../src/ai/routing.ts';
 import { createHostedKeyPool, createInMemoryProviderKeyBackend, createTenantProviderKeyStore } from '../../src/ai/keys.ts';
 import {
@@ -55,12 +56,15 @@ import { CANARY, createFakeTransport } from './fixture.ts';
 const ALICE = 'alice';
 const BOB = 'bob';
 
-const HOSTED_KEYS = createHostedKeyPool({
+/** The pooled credentials, per provider, so a test can name one by route. */
+const HOSTED_KEYS_BY_PROVIDER: Readonly<Record<ProviderId, string>> = {
   google: 'hosted-google',
   openai: 'hosted-openai',
   cloudflare: 'hosted-cloudflare',
   'self-host': 'hosted-self-host',
-});
+};
+
+const HOSTED_KEYS = createHostedKeyPool(HOSTED_KEYS_BY_PROVIDER);
 
 function emptyKeyStore() {
   return createTenantProviderKeyStore({ backend: createInMemoryProviderKeyBackend() });
@@ -111,7 +115,10 @@ describe('the happy path meters', () => {
     const route = routeFor(HOSTED_PROFILE, 'extract');
     expect(transport.calls).toHaveLength(1);
     expect(transport.calls[0]?.modelId).toBe(route.id);
-    expect(transport.calls[0]?.apiKey).toBe('hosted-google');
+    // The extraction seat is billed by Cloudflare now, so the pooled key it
+    // resolves is the Cloudflare one — reading the route's own provider rather
+    // than naming a vendor, so this keeps asserting key routing and not a seat.
+    expect(transport.calls[0]?.apiKey).toBe(HOSTED_KEYS_BY_PROVIDER[route.provider]);
 
     const price = CANONICAL_PRICING.get(route.id);
     const expected =
@@ -398,7 +405,12 @@ describe('metering is the point, so it cannot fail quietly', () => {
 
   test('a BYOK call meters against the tenant but not against hosted COGS', async () => {
     const store = emptyKeyStore();
-    await store.put(controlPlaneIdentity(), ALICE, 'google', 'alice-google-key');
+    // Stored against the provider the extraction seat routes to, read from the
+    // table rather than named: a BYOK key is a fact about a provider, and which
+    // provider serves a seat is exactly what the routing table is allowed to
+    // change without a call site noticing.
+    const provider = routeFor(HOSTED_PROFILE, 'extract').provider;
+    await store.put(controlPlaneIdentity(), ALICE, provider, 'alice-tenant-key');
     const { gateway, meter, transport } = gatewayWith({
       keys: { store, hosted: HOSTED_KEYS },
     });
@@ -413,7 +425,7 @@ describe('metering is the point, so it cannot fail quietly', () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
-    expect(transport.calls[0]?.apiKey).toBe('alice-google-key');
+    expect(transport.calls[0]?.apiKey).toBe('alice-tenant-key');
     expect(result.metering.keySource).toBe('byok');
     expect(result.metering.countsTowardHostedCogs).toBe(false);
     // Still metered: R22 wants the user's own cap and visibility intact.
@@ -422,8 +434,10 @@ describe('metering is the point, so it cannot fail quietly', () => {
 
   test('two tenants with different stored keys do not cross-resolve in one process', async () => {
     const store = emptyKeyStore();
-    await store.put(controlPlaneIdentity(), ALICE, 'google', 'alice-google-key');
-    await store.put(controlPlaneIdentity(), BOB, 'google', 'bob-google-key');
+    // Stored against the provider the extraction seat actually routes to.
+    const provider = routeFor(HOSTED_PROFILE, 'extract').provider;
+    await store.put(controlPlaneIdentity(), ALICE, provider, 'alice-tenant-key');
+    await store.put(controlPlaneIdentity(), BOB, provider, 'bob-tenant-key');
     const { gateway, transport } = gatewayWith({ keys: { store, hosted: HOSTED_KEYS } });
 
     for (const tenantId of [ALICE, BOB, ALICE]) {
@@ -436,9 +450,9 @@ describe('metering is the point, so it cannot fail quietly', () => {
       });
     }
     expect(transport.calls.map((call) => call.apiKey)).toEqual([
-      'alice-google-key',
-      'bob-google-key',
-      'alice-google-key',
+      'alice-tenant-key',
+      'bob-tenant-key',
+      'alice-tenant-key',
     ]);
   });
 });
@@ -472,7 +486,10 @@ describe('no user content leaves this module', () => {
       expect(observed).toHaveLength(MODEL_OPS.length);
       const serialized = JSON.stringify({ metered: meter.records(), observed });
       expect(serialized).not.toContain(CANARY);
-      expect(serialized).not.toContain('hosted-google');
+      // No pooled credential of any provider reaches a metering record.
+      for (const key of Object.values(HOSTED_KEYS_BY_PROVIDER)) {
+        expect(serialized).not.toContain(key);
+      }
     }
   });
 

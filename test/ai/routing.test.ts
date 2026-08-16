@@ -138,15 +138,22 @@ describe('the table covers KTD13, keyed by op', () => {
   });
 
   test('the hosted profile is Cloudflare-first, with the two named processors', () => {
-    // KTD13's residency decision, as data rather than prose: salience,
-    // synopsis, vision, rerank and the judge never leave Cloudflare.
-    const cfOnly: readonly ModelOp[] = ['salience', 'synopsis', 'vision', 'rerank', 'judge'];
-    for (const op of cfOnly) {
+    // KTD13's residency decision, as data rather than prose. Since the seat
+    // move it is stronger than it was: every op but embedding is billed by
+    // Cloudflare, five as open weights it runs itself and three as Google's
+    // model passed through its own provider relationship. The two named
+    // processors are unchanged — Google still makes the extraction model and
+    // OpenAI still serves embedding — but only one of them is now reached with
+    // a credential of ours.
+    const openWeights: readonly ModelOp[] = ['salience', 'synopsis', 'vision', 'rerank', 'judge'];
+    for (const op of openWeights) {
       expect(routeFor(HOSTED_PROFILE, op).provider, op).toBe('cloudflare');
       expect(routeFor(HOSTED_PROFILE, op).id.startsWith('@cf/'), op).toBe(true);
     }
     for (const op of ['extract', 'enrich', 'contradiction'] as const) {
-      expect(routeFor(HOSTED_PROFILE, op).provider, op).toBe('google');
+      expect(routeFor(HOSTED_PROFILE, op).provider, op).toBe('cloudflare');
+      // Passed through, not open weights: the id names the lab that made it.
+      expect(routeFor(HOSTED_PROFILE, op).id.startsWith('google/'), op).toBe(true);
     }
     expect(routeFor(HOSTED_PROFILE, 'embedding').provider).toBe('openai');
   });
@@ -155,14 +162,25 @@ describe('the table covers KTD13, keyed by op', () => {
     for (const op of MODEL_OPS) {
       const hosted = routeFor(HOSTED_PROFILE, op);
       const selfHost = routeFor(SELF_HOST_PROFILE, op);
-      if (hosted.provider === 'cloudflare') {
+      if (hosted.id.startsWith('@cf/')) {
+        // Open weights Cloudflare runs: the self-hoster runs the same weights
+        // on their own hardware. The crack this closes is that reusing the
+        // `@cf/` id would resolve Cloudflare's neuron price for hardware
+        // Cloudflare does not own.
         expect(selfHost.provider, op).toBe('self-host');
         expect(selfHost.id.startsWith('self-host/'), op).toBe(true);
-        // The crack this closes: reusing the `@cf/` id would resolve
-        // Cloudflare's neuron price for hardware Cloudflare does not own.
         expect(CANONICAL_PRICE_BOOK.lookup(selfHost.id), op).toBeUndefined();
+      } else if (hosted.provider === 'cloudflare') {
+        // A third-party model passed through Cloudflare's billing. The
+        // self-hoster has no such relationship and goes to the lab directly, so
+        // the row is a DIFFERENT id on a different provider — `google/…` is a
+        // Cloudflare catalog name and means nothing at Google's own endpoint.
+        expect(selfHost.provider, op).toBe('google');
+        expect(selfHost.id, op).not.toBe(hosted.id);
+        expect(selfHost.id.startsWith('google/'), op).toBe(false);
+        expect(CANONICAL_PRICE_BOOK.isCanonical(selfHost.id), op).toBe(true);
       } else {
-        // Google and OpenAI are reachable directly; only Cloudflare is not.
+        // OpenAI is reachable directly by anyone; the row is shared.
         expect(selfHost.id, op).toBe(hosted.id);
       }
     }
@@ -206,11 +224,27 @@ describe('model ids are pinned, not aliased', () => {
   });
 
   test('a proprietary id carries a dated snapshot; the alias is only its prefix', () => {
-    const extract = routeFor(HOSTED_PROFILE, 'extract');
+    // Asserted on the self-host row, which is the one that still reaches Google
+    // directly and can therefore still name a dated snapshot. The hosted row
+    // moved onto a catalog that publishes no dated ids at all and declares
+    // itself unpinnable instead — see the test below and `routing.ts`.
+    const extract = routeFor(SELF_HOST_PROFILE, 'extract');
     expect(extract.alias).toBe('gemini-3.5-flash-lite');
     expect(extract.id).toMatch(/^gemini-3\.5-flash-lite-\d{4}-\d{2}-\d{2}$/);
     expect(extract.id.startsWith(extract.alias)).toBe(true);
     expect(extract.id).not.toBe(extract.alias);
+  });
+
+  test('the one id that cannot be pinned says so on the row', () => {
+    // Exactly one seat, and no more: an undeclared moving alias is still a
+    // startup fault, and a declaration on a pinnable id is too.
+    const declared = Object.values(PROFILES).flatMap((profile) =>
+      MODEL_OPS.map((op) => routeFor(profile, op)).filter((route) => route.unpinnable !== undefined),
+    );
+    expect(new Set(declared.map((route) => route.id))).toEqual(
+      new Set(['google/gemini-3.5-flash-lite']),
+    );
+    for (const route of declared) expect(route.unpinnable?.why.length).toBeGreaterThan(0);
   });
 
   test('an immutable-weights id is its own pin', () => {
@@ -232,8 +266,11 @@ describe('the validator names every fault', () => {
   }
 
   test('a bare alias where a dated snapshot belongs is a fault', () => {
+    // Patched onto `judge`, which carries no unpinnable declaration — the three
+    // extraction seats now do, and the whole point of that field is that this
+    // fault stops firing for them and only for them.
     const faults = findRoutingFaults(
-      withRoute('extract', { id: 'gemini-3.5-flash-lite' }),
+      withRoute('judge', { alias: 'gemini-3.5-flash-lite', id: 'gemini-3.5-flash-lite' }),
       CANONICAL_PRICE_BOOK,
     );
     expect(faults.join('\n')).toContain('pin');

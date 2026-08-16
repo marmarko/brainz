@@ -45,9 +45,9 @@
     "candidates": 100,
     "measured_tokens_per_candidate": 30,
     "envelope_tokens_per_candidate": 400,
-    "micro_usd_per_query_measured": 9,
-    "micro_usd_per_query_at_envelope": 120,
-    "usd_per_active_user_month": 0.1032,
+    "micro_usd_per_query_measured": 10,
+    "micro_usd_per_query_at_envelope": 125,
+    "usd_per_active_user_month": 0.1075,
     "envelope": "KTD4: '~$0.00012/query, about $0.10/active user/month at the ~860-query volume, roughly 15-30x under the original $1.50-3 envelope'",
     "within_envelope": true
   },

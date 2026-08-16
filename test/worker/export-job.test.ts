@@ -33,7 +33,7 @@ import { join } from 'node:path';
 import { createExportHandler, enqueueDueExports } from '../../src/worker/export.ts';
 import { startWorkerFleet } from '../../src/worker/serve.ts';
 import { tenantNamespace } from '../../src/control/secrets.ts';
-import { writeSecretsFile } from '../fleet/fixture.ts';
+import { FAKE_CF_ACCOUNT_ID, writeSecretsFile } from '../fleet/fixture.ts';
 import { createJobQueue, createLeaseChannel } from '../../src/worker/queue.ts';
 import { createJobRunner } from '../../src/worker/runner.ts';
 import { ALPHA_CEILING_MS, nextCeilingDueAt } from '../../src/worker/scheduler.ts';
@@ -417,6 +417,7 @@ describe('the running worker fleet is what enqueues it', () => {
         PORT: '0',
         BRAINZ_CONTROL_DATABASE_URL: control.dsn,
         BRAINZ_SECRETS_FILE: secretsFile,
+      BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
         // Long enough that the only tick is the one driven below.
         BRAINZ_WORKER_TICK_MS: '3600000',
       });

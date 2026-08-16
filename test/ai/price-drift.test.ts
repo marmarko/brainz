@@ -348,8 +348,12 @@ describe('the drift guard goes red', () => {
   });
 
   test('the dollars-per-million form KTD13 prints is caught too', () => {
+    // 1.4 is the judge's input price in the form its vendor's page prints it.
+    // (This control used to use 0.049, the old vision seat's rate — when that
+    // row left the canonical table the control silently stopped controlling
+    // anything, which is the same class of rot the guard itself exists for.)
     const findings = findPriceLiterals(
-      fixture('src/core/estimate.ts', 'const perM = 0.049; // usd\n'),
+      fixture('src/core/estimate.ts', 'const perM = 1.4; // usd\n'),
     );
     expect(findings.some((finding) => finding.rule === 'copied')).toBe(true);
   });

@@ -26,7 +26,7 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 
-import { HOSTED_PROFILE, IMAGE_INPUT_TOKENS } from '../../src/ai/routing.ts';
+import { HOSTED_PROFILE, IMAGE_INPUT_TOKENS, routeFor } from '../../src/ai/routing.ts';
 import { acceptMedia, type AcceptMediaDeps } from '../../src/core/media/accept.ts';
 import { runTranscribePhase } from '../../src/core/media/ocr-phase.ts';
 import { runConsolidationCycle } from '../../src/worker/consolidate/cycle.ts';
@@ -184,8 +184,11 @@ describe('a screenshot becomes text the ordinary stack can find', () => {
       expect(input.images?.length).toBe(1);
       expect(input.images?.[0]?.mediaType).toBe('image/png');
       expect([...(input.images?.[0]?.bytes ?? [])]).toEqual([...bytes]);
-      // KTD13: the phase names an op and never a model.
-      expect(calls[0]?.modelId).toContain('vision');
+      // KTD13: the phase names an op and never a model — so the id on the wire
+      // is whatever the vision row says, read from the table rather than
+      // matched against a substring. (It used to assert the id contained
+      // "vision", which passed only because the old seat's name happened to.)
+      expect(calls[0]?.modelId).toBe(routeFor(HOSTED_PROFILE, 'vision').id);
     },
     TEST_TIMEOUT_MS,
   );

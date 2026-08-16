@@ -102,6 +102,43 @@ export const OP_ACCEPTS_IMAGES: Readonly<Record<ModelOp, boolean>> = Object.free
 });
 
 /**
+ * Which ops have an answer that may legitimately be empty.
+ *
+ * For eight of the nine, an empty answer is never information: a judge that
+ * grades nothing, an extractor that extracts nothing and a synopsis of nothing
+ * are all failures wearing the costume of a result, and the gateway refuses
+ * them (`empty_output`) rather than handing back an empty string that reads as
+ * a successful answer one layer up.
+ *
+ * `vision` is the exception, and it is an exception because a *protocol* says
+ * so: the transcription prompt in `core/media/ocr-phase.ts` instructs the model
+ * to "return an empty response" when an image contains no legible text, and a
+ * photograph of a cat has no text in it. Refusing that answer would leave every
+ * text-free attachment queued and re-sent on every cycle for the life of the
+ * brain — the exact standing charge U21 recorded an empty `ocr_text` to stop.
+ *
+ * The exemption is narrow on purpose. It does NOT cover a vision model that
+ * returned a reasoning trace and no answer — a model that thought and then said
+ * nothing has not told you the image is blank — and it does not cover a model
+ * that reported no usage at all, which is `usage_unreported` and is what the
+ * seat returns today. It covers exactly one thing: a model that ran, billed,
+ * and deliberately said "nothing here".
+ *
+ * A total record so a tenth op cannot be added without deciding which it is.
+ */
+export const OP_ADMITS_EMPTY_ANSWER: Readonly<Record<ModelOp, boolean>> = Object.freeze({
+  extract: false,
+  enrich: false,
+  contradiction: false,
+  salience: false,
+  synopsis: false,
+  vision: true,
+  judge: false,
+  rerank: false,
+  embedding: false,
+});
+
+/**
  * What one image costs in input tokens, for the pre-call estimate.
  *
  * **This is an assumption, not a measurement**, and it is written down here so
@@ -138,6 +175,25 @@ export interface Route {
   readonly provider: ProviderId;
   /** When this pin was taken. Advancing it is a deliberate ledger action. */
   readonly pinnedOn: string;
+  /**
+   * Declared only on a row whose id **cannot** carry a date, with the reason.
+   *
+   * The pin rule above assumes every proprietary model has a dated snapshot to
+   * pin. One does not: Cloudflare's Unified Billing catalog exposes
+   * `google/gemini-3.5-flash-lite` and nothing else — the dated id KTD13 pinned
+   * resolves nowhere on that endpoint, and `google-ai-studio/` and `google-ai/`
+   * are 404s. So the choice is between a rule that cannot be satisfied and a
+   * rule with a hole in it.
+   *
+   * This is the hole, made narrow and loud. It is *not* a new entry in
+   * {@link IMMUTABLE_ID_FAMILIES}: adding `google/` there would state that the
+   * id names an immutable artifact, which is false, and would silently exempt
+   * every future `google/`-prefixed id anybody adds. A per-row declaration
+   * exempts exactly one row, carries the reason in the source, and is itself
+   * checked — declaring it on a row that *could* have been pinned is a fault,
+   * so it cannot quietly become the way new rows are added.
+   */
+  readonly unpinnable?: { readonly why: string };
   /**
    * The output ceiling a chat op is called with, and the basis of the
    * pre-call cost estimate — a cap that estimates optimistically is a cap that
@@ -189,30 +245,98 @@ const SELF_HOST_PREFIX = 'self-host/';
 /** The date this catalog was taken from the vendors' pricing pages. */
 const PIN_DATE = '2026-08-12';
 
-const HOSTED_ROUTES: RoutingProfile = {
-  extract: {
+/** The date every seat below was confirmed with a real call to the account. */
+const CLOUDFLARE_PIN_DATE = '2026-08-16';
+
+/** The one declaration, written once so the three rows that share it agree. */
+const UNPINNABLE_UNIFIED_GEMINI = Object.freeze({
+  why:
+    "Cloudflare's Unified Billing catalog exposes only the undated alias; the dated " +
+    'snapshot KTD13 pinned resolves nowhere on that endpoint, and google-ai-studio/ ' +
+    'and google-ai/ are both 404. The self-host profile keeps the dated id, so the ' +
+    'pin discipline still holds everywhere it can be held.',
+});
+
+/**
+ * The Google rows as they are reached **directly**, which is what an operator
+ * without a Cloudflare account does. Named separately rather than shared by
+ * reference with the hosted table: these two profiles used to point at the same
+ * three objects, so editing the hosted rows in place silently moved self-host
+ * onto Cloudflare too — and the open-source promise would have been broken by a
+ * change that read as touching one profile.
+ */
+const GOOGLE_DIRECT_ROUTES = {
+  extract: Object.freeze({
     op: 'extract',
     alias: 'gemini-3.5-flash-lite',
     id: 'gemini-3.5-flash-lite-2026-07-21',
     provider: 'google',
     pinnedOn: PIN_DATE,
     maxOutputTokens: 4_096,
-  },
-  enrich: {
+  }),
+  enrich: Object.freeze({
     op: 'enrich',
     alias: 'gemini-3.5-flash-lite',
     id: 'gemini-3.5-flash-lite-2026-07-21',
     provider: 'google',
     pinnedOn: PIN_DATE,
     maxOutputTokens: 2_048,
-  },
-  contradiction: {
+  }),
+  contradiction: Object.freeze({
     op: 'contradiction',
     alias: 'gemini-3.5-flash-lite',
     id: 'gemini-3.5-flash-lite-2026-07-21',
     provider: 'google',
     pinnedOn: PIN_DATE,
     maxOutputTokens: 1_024,
+  }),
+} as const satisfies Record<'extract' | 'enrich' | 'contradiction', Route>;
+
+/**
+ * The hosted plane, on one Cloudflare credential.
+ *
+ * Eight of the nine seats resolve through `…/accounts/{id}/ai`: five are `@cf/`
+ * open weights Cloudflare serves itself, three are Google's model reached over
+ * Unified Billing, where Cloudflare holds the provider relationship and passes
+ * inference through at no markup. One credential, no per-provider keys, one
+ * invoice.
+ *
+ * **The ninth is `embedding`, and it deliberately did not move.** The
+ * Cloudflare embedding seat returns 1024 dimensions, the stored column is 1536,
+ * and the `dimensions` parameter is ignored — so the move is a schema rung plus
+ * a re-encode of every chunk in every brain, not a row in this table. Two
+ * vectors of the same width from different models are still not points in the
+ * same space, so even a width-compatible swap would silently destroy recall on
+ * everything already indexed. `upstream/concepts.jsonl:gap.cloudflare-embedding-seat`
+ * carries what would close it; the price is already in the canonical table.
+ */
+const HOSTED_ROUTES: RoutingProfile = {
+  extract: {
+    op: 'extract',
+    alias: 'google/gemini-3.5-flash-lite',
+    id: 'google/gemini-3.5-flash-lite',
+    provider: 'cloudflare',
+    pinnedOn: CLOUDFLARE_PIN_DATE,
+    maxOutputTokens: 4_096,
+    unpinnable: UNPINNABLE_UNIFIED_GEMINI,
+  },
+  enrich: {
+    op: 'enrich',
+    alias: 'google/gemini-3.5-flash-lite',
+    id: 'google/gemini-3.5-flash-lite',
+    provider: 'cloudflare',
+    pinnedOn: CLOUDFLARE_PIN_DATE,
+    maxOutputTokens: 2_048,
+    unpinnable: UNPINNABLE_UNIFIED_GEMINI,
+  },
+  contradiction: {
+    op: 'contradiction',
+    alias: 'google/gemini-3.5-flash-lite',
+    id: 'google/gemini-3.5-flash-lite',
+    provider: 'cloudflare',
+    pinnedOn: CLOUDFLARE_PIN_DATE,
+    maxOutputTokens: 1_024,
+    unpinnable: UNPINNABLE_UNIFIED_GEMINI,
   },
   salience: {
     op: 'salience',
@@ -230,12 +354,28 @@ const HOSTED_ROUTES: RoutingProfile = {
     pinnedOn: PIN_DATE,
     maxOutputTokens: 512,
   },
+  /**
+   * The screenshot specialist, in place of Cloudflare's hosted llama-3.2-vision.
+   *
+   * The swap is a licence decision before it is a quality one: the llama seat
+   * requires submitting the prompt 'agree' to Meta's licence and representing
+   * non-EU domicile, which is not a condition a hosted plane can accept on its
+   * users' behalf. `oos.moondream-screenshot-specialist` declined moondream
+   * only because it had no published price; it now has one, verified against
+   * the account's own catalog and entered in `pricing.ts`.
+   *
+   * What this seat does **not** yet have is a working answer — see the ledger
+   * row `imp.vision-seat-empty-result`. It is routed here rather than left on a
+   * licence-gated model because an empty result is a typed failure that leaves
+   * the attachment queued, and a licence violation is neither typed nor
+   * recoverable.
+   */
   vision: {
     op: 'vision',
-    alias: '@cf/meta/llama-3.2-11b-vision-instruct',
-    id: '@cf/meta/llama-3.2-11b-vision-instruct',
+    alias: '@cf/moondream/moondream3.1-9B-A2B',
+    id: '@cf/moondream/moondream3.1-9B-A2B',
     provider: 'cloudflare',
-    pinnedOn: PIN_DATE,
+    pinnedOn: CLOUDFLARE_PIN_DATE,
     maxOutputTokens: 4_096,
   },
   judge: {
@@ -271,9 +411,11 @@ const HOSTED_ROUTES: RoutingProfile = {
  * hardware it does not bill.
  */
 const SELF_HOST_ROUTES: RoutingProfile = {
-  extract: HOSTED_ROUTES.extract,
-  enrich: HOSTED_ROUTES.enrich,
-  contradiction: HOSTED_ROUTES.contradiction,
+  // The direct rows, NOT the hosted ones. `google/gemini-3.5-flash-lite` is a
+  // Cloudflare catalog id; sent to Google's own endpoint it names nothing.
+  extract: GOOGLE_DIRECT_ROUTES.extract,
+  enrich: GOOGLE_DIRECT_ROUTES.enrich,
+  contradiction: GOOGLE_DIRECT_ROUTES.contradiction,
   salience: {
     op: 'salience',
     alias: 'self-host/nemotron-3-120b-a12b',
@@ -369,14 +511,34 @@ export function findRoutingFaults(profile: NamedProfile, priceBook: PriceBook): 
       faults.push(`${label(op)}: pinnedOn '${route.pinnedOn}' is not an ISO date`);
     }
 
+    // Whether this id can carry a pin at all: an immutable-artifact family
+    // needs no date, and anything else is pinnable by taking a dated snapshot.
+    const immutableFamily = IMMUTABLE_ID_FAMILIES.some((family) => route.id.startsWith(family));
+    const pinnable = immutableFamily || DATED_SNAPSHOT.test(route.id);
+
     if (!route.id.startsWith(route.alias)) {
       faults.push(
         `${label(op)}: id '${route.id}' is not a specialization of alias '${route.alias}'`,
       );
-    } else if (!IMMUTABLE_ID_FAMILIES.some((family) => route.id.startsWith(family))) {
-      if (!DATED_SNAPSHOT.test(route.id)) {
+    } else if (!pinnable && route.unpinnable === undefined) {
+      faults.push(
+        `${label(op)}: '${route.id}' is a moving alias — pin a dated snapshot, or every eval receipt is unfalsifiable`,
+      );
+    }
+
+    if (route.unpinnable !== undefined) {
+      // Both halves matter. Without the first, the field is a blanket exemption
+      // and the pin rule is over the day someone reaches for it out of
+      // convenience; without the second, the exemption is undocumented, which
+      // is the state the whole ledger discipline exists to forbid.
+      if (pinnable) {
         faults.push(
-          `${label(op)}: '${route.id}' is a moving alias — pin a dated snapshot, or every eval receipt is unfalsifiable`,
+          `${label(op)}: '${route.id}' declares itself unpinnable but a pin is available for it — the declaration is for ids that cannot carry one, not for rows nobody scored`,
+        );
+      }
+      if (route.unpinnable.why.trim().length === 0) {
+        faults.push(
+          `${label(op)}: an unpinnable declaration needs a reason naming what makes the id unpinnable`,
         );
       }
     }

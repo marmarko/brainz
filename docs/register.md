@@ -54,7 +54,7 @@ path and cannot prove a deployed container is denied one.
 
 | id | component | kind | shared by | user content reaches it |
 |---|---|---|---|---|
-| `cloudflare` | Cloudflare (Workers, Containers, AI Gateway) | substrate | all_tenants | **yes** |
+| `cloudflare` | Cloudflare (Workers, Containers, model billing) | substrate | all_tenants | **yes** |
 | `mcp-fleet` | MCP fleet (`/mcp`, `/openai`) | fleet | all_tenants | **yes** |
 | `worker-fleet` | Worker fleet (typed job runner) | fleet | all_tenants | **yes** |
 | `neon-platform` | Neon (per-tenant Postgres project) + the org API key | vendor | all_tenants | **yes** |
@@ -77,17 +77,17 @@ path and cannot prove a deployed container is denied one.
 
 ### Blast radius and rotation
 
-#### `cloudflare` — Cloudflare (Workers, Containers, AI Gateway)
+#### `cloudflare` — Cloudflare (Workers, Containers, model billing)
 
 **Kind.** substrate · **Shared by.** all_tenants · **Receives user content.** yes
 
-**Blast radius.** Total. Cloudflare hosts the MCP fleet and the worker fleet as containers, terminates every request, and transports every model call through AI Gateway — so it sees request content in transit and holds the compute that holds every tenant’s decrypted working set. It is the broadest single component in the system, and it is listed rather than treated as invisible substrate precisely because it is the one a reader is most likely to forget to count.
+**Blast radius.** Total, and wider than it was. Cloudflare hosts the MCP fleet and the worker fleet as containers, terminates every request, and holds the compute that holds every tenant’s decrypted working set. It is now also the billing and transport path for eight of the nine model ops on the hosted profile: five open-weight models it runs itself, and — this is the part a reader should not have to infer — the three third-party ops it passes through to Google under its own provider relationship. So the text of every document run through extraction, enrichment or contradiction detection now transits Cloudflare in addition to reaching Google. It is the broadest single component in the system, and it is listed rather than treated as invisible substrate precisely because it is the one a reader is most likely to forget to count.
 
 **Rotation owner.** control-plane operator on call
 
-**Rotation.** The account API token is rotated through the Cloudflare dashboard and re-put into the deployment secret store; the platform account itself cannot be rotated, only migrated, which is what makes it the entry with no mitigation beside it.
+**Rotation.** The account API token is rotated through the Cloudflare dashboard and re-put into the deployment secret store; the platform account itself cannot be rotated, only migrated, which is what makes it the entry with no mitigation beside it. The same token now also pays for model inference, so rotating it stops every model op on the hosted profile except embedding.
 
-**Evidence in the code.** hosts `gateway.ai.cloudflare.com`; deployment bindings `brainz-fleet`.
+**Evidence in the code.** hosts `api.cloudflare.com`, `gateway.ai.cloudflare.com`; deployment bindings `brainz-fleet`.
 
 #### `mcp-fleet` — MCP fleet (`/mcp`, `/openai`)
 
@@ -241,11 +241,11 @@ path and cannot prove a deployed container is denied one.
 
 **Kind.** model-provider · **Shared by.** all_tenants · **Receives user content.** yes
 
-**Blast radius.** The text of every document run through extraction or enrichment, for every tenant on the hosted profile. The second and last of KTD13’s two model-side processors.
+**Blast radius.** The text of every document run through extraction or enrichment, for every tenant. Still one of KTD13’s two model-side processors, but reached two different ways: on the hosted profile the call goes to Google THROUGH Cloudflare’s billing endpoint, so both parties see the content and the platform holds no Google credential at all; on the self-host profile it goes to Google directly with the operator’s own key. The processor is the same either way, which is why this entry did not go away when the route changed.
 
 **Rotation owner.** control-plane operator on call
 
-**Rotation.** Rotated in the Google Cloud console and re-put into the control plane’s store.
+**Rotation.** On the self-host profile, rotated in the Google Cloud console and re-put into the control plane’s store. On the hosted profile there is nothing here to rotate: Cloudflare holds the provider relationship, and rotating the Cloudflare token is what cuts this path off.
 
 **Evidence in the code.** hosts `generativelanguage.googleapis.com`; routing providers `google`.
 
@@ -253,7 +253,7 @@ path and cannot prove a deployed container is denied one.
 
 **Kind.** model-provider · **Shared by.** all_tenants · **Receives user content.** yes
 
-**Blast radius.** Every content-touching model op that is NOT one of the two above: briefing composition, vision, and the cross-encoder rerank that scores a query against candidate passages. It is not a third lab — these are open weights running on Cloudflare GPUs with no proxy to the model’s originating lab — so it adds no subprocessor beyond the Cloudflare entry it belongs to. It is listed separately anyway, because "the rerank endpoint" is a component a reader will look for by name.
+**Blast radius.** Every content-touching model op except embedding: briefing composition, salience, the judge, vision, the cross-encoder rerank that scores a query against candidate passages, and — since the seats moved — extraction, enrichment and contradiction detection, which are Google’s model passed through rather than an open-weight one. For the open-weight ops it is not a third lab (these are open weights on Cloudflare GPUs with no proxy to the originating lab) and it adds no subprocessor beyond the Cloudflare entry it belongs to; for the passed-through ops the originating lab IS a subprocessor and keeps its own entry above. It is listed separately anyway, because "the rerank endpoint" is a component a reader will look for by name.
 
 **Rotation owner.** control-plane operator on call
 
@@ -315,15 +315,16 @@ Identical content, so a script auditing the blast radius reads the published doc
   "components": [
     {
       "id": "cloudflare",
-      "name": "Cloudflare (Workers, Containers, AI Gateway)",
+      "name": "Cloudflare (Workers, Containers, model billing)",
       "kind": "substrate",
       "shared_by": "all_tenants",
       "transmits_user_content": true,
-      "blast_radius": "Total. Cloudflare hosts the MCP fleet and the worker fleet as containers, terminates every request, and transports every model call through AI Gateway — so it sees request content in transit and holds the compute that holds every tenant’s decrypted working set. It is the broadest single component in the system, and it is listed rather than treated as invisible substrate precisely because it is the one a reader is most likely to forget to count.",
+      "blast_radius": "Total, and wider than it was. Cloudflare hosts the MCP fleet and the worker fleet as containers, terminates every request, and holds the compute that holds every tenant’s decrypted working set. It is now also the billing and transport path for eight of the nine model ops on the hosted profile: five open-weight models it runs itself, and — this is the part a reader should not have to infer — the three third-party ops it passes through to Google under its own provider relationship. So the text of every document run through extraction, enrichment or contradiction detection now transits Cloudflare in addition to reaching Google. It is the broadest single component in the system, and it is listed rather than treated as invisible substrate precisely because it is the one a reader is most likely to forget to count.",
       "rotation_owner": "control-plane operator on call",
-      "rotation": "The account API token is rotated through the Cloudflare dashboard and re-put into the deployment secret store; the platform account itself cannot be rotated, only migrated, which is what makes it the entry with no mitigation beside it.",
+      "rotation": "The account API token is rotated through the Cloudflare dashboard and re-put into the deployment secret store; the platform account itself cannot be rotated, only migrated, which is what makes it the entry with no mitigation beside it. The same token now also pays for model inference, so rotating it stops every model op on the hosted profile except embedding.",
       "evidence": {
         "hosts": [
+          "api.cloudflare.com",
           "gateway.ai.cloudflare.com"
         ],
         "bindings": [
@@ -497,9 +498,9 @@ Identical content, so a script auditing the blast radius reads the published doc
       "kind": "model-provider",
       "shared_by": "all_tenants",
       "transmits_user_content": true,
-      "blast_radius": "The text of every document run through extraction or enrichment, for every tenant on the hosted profile. The second and last of KTD13’s two model-side processors.",
+      "blast_radius": "The text of every document run through extraction or enrichment, for every tenant. Still one of KTD13’s two model-side processors, but reached two different ways: on the hosted profile the call goes to Google THROUGH Cloudflare’s billing endpoint, so both parties see the content and the platform holds no Google credential at all; on the self-host profile it goes to Google directly with the operator’s own key. The processor is the same either way, which is why this entry did not go away when the route changed.",
       "rotation_owner": "control-plane operator on call",
-      "rotation": "Rotated in the Google Cloud console and re-put into the control plane’s store.",
+      "rotation": "On the self-host profile, rotated in the Google Cloud console and re-put into the control plane’s store. On the hosted profile there is nothing here to rotate: Cloudflare holds the provider relationship, and rotating the Cloudflare token is what cuts this path off.",
       "evidence": {
         "hosts": [
           "generativelanguage.googleapis.com"
@@ -515,7 +516,7 @@ Identical content, so a script auditing the blast radius reads the published doc
       "kind": "model-provider",
       "shared_by": "all_tenants",
       "transmits_user_content": true,
-      "blast_radius": "Every content-touching model op that is NOT one of the two above: briefing composition, vision, and the cross-encoder rerank that scores a query against candidate passages. It is not a third lab — these are open weights running on Cloudflare GPUs with no proxy to the model’s originating lab — so it adds no subprocessor beyond the Cloudflare entry it belongs to. It is listed separately anyway, because \"the rerank endpoint\" is a component a reader will look for by name.",
+      "blast_radius": "Every content-touching model op except embedding: briefing composition, salience, the judge, vision, the cross-encoder rerank that scores a query against candidate passages, and — since the seats moved — extraction, enrichment and contradiction detection, which are Google’s model passed through rather than an open-weight one. For the open-weight ops it is not a third lab (these are open weights on Cloudflare GPUs with no proxy to the originating lab) and it adds no subprocessor beyond the Cloudflare entry it belongs to; for the passed-through ops the originating lab IS a subprocessor and keeps its own entry above. It is listed separately anyway, because \"the rerank endpoint\" is a component a reader will look for by name.",
       "rotation_owner": "control-plane operator on call",
       "rotation": "Covered by the Cloudflare account token rotation above; there is no separate credential.",
       "evidence": {

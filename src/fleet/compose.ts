@@ -19,9 +19,19 @@ import { SQL } from 'bun';
 
 import { createHostedKeyPool, createTenantProviderKeyStore } from '../ai/keys.ts';
 import type { ProviderKeyBackend } from '../ai/keys.ts';
-import { createDirectTransport, createModelGateway, createPostgresSpendMeter } from '../ai/gateway.ts';
-import type { ModelGateway } from '../ai/gateway.ts';
-import { PROFILES, type ProviderId, type RoutingProfileName } from '../ai/routing.ts';
+import {
+  createCloudflareUnifiedTransport,
+  createDirectTransport,
+  createModelGateway,
+  createPostgresSpendMeter,
+} from '../ai/gateway.ts';
+import type { ModelGateway, ModelTransport } from '../ai/gateway.ts';
+import {
+  PROFILES,
+  type NamedProfile,
+  type ProviderId,
+  type RoutingProfileName,
+} from '../ai/routing.ts';
 import { createFileSecretStore } from '../control/secret-file.ts';
 import { createTenantSecretStore } from '../control/secrets.ts';
 import type { PoolSecretStore, TenantSecretStore } from '../control/secrets.ts';
@@ -72,7 +82,54 @@ export interface GatewayDeps {
 }
 
 /**
+ * Which transport each provider's calls go out on.
+ *
+ * Exported because it is the one decision in this file worth asserting rather
+ * than reading: it had been `createDirectTransport({})` for everything, and
+ * `PROVIDER_DIRECT_BASES.cloudflare` is `null`, so every `@cf/` seat was a
+ * `TransportError` at first call — per tenant, inside a paid consolidation
+ * cycle, on a fleet that booted green.
+ *
+ * **The account id is required at startup, not at first call**, and only for a
+ * profile that actually routes something to Cloudflare. A self-hoster composes
+ * this with an empty environment and gets a working direct transport for every
+ * seat, which is KTD13's open-source promise stated as code rather than as
+ * prose. It is read from `BRAINZ_CF_ACCOUNT_ID`; the repo is public and a
+ * literal here is the incident.
+ */
+export function selectFleetTransport(
+  env: Environment,
+  profile: NamedProfile,
+): (provider: ProviderId) => ModelTransport {
+  const direct = createDirectTransport({});
+  const usesCloudflare = Object.values(profile.routes).some(
+    (route) => route.provider === 'cloudflare',
+  );
+  if (!usesCloudflare) return () => direct;
+
+  const unified = createCloudflareUnifiedTransport({
+    accountId: required(env, 'BRAINZ_CF_ACCOUNT_ID'),
+  });
+  return (provider) => (provider === 'cloudflare' ? unified : direct);
+}
+
+/**
  * The pooled keys an operator supplied, and only those.
+ *
+ * Still per-provider, and still says something true — but it says a smaller
+ * thing than it used to. On the hosted profile one credential now pays for
+ * eight of the nine seats, because Unified Billing holds the provider
+ * relationship for the third-party models too: `BRAINZ_HOSTED_KEY_GOOGLE` is
+ * no longer read by any hosted route, and serves only a self-hoster reaching
+ * Google directly. `BRAINZ_HOSTED_KEY_OPENAI` still pays for the embedding
+ * seat, which did not move.
+ *
+ * Collapsing the pool to one key would therefore be wrong twice over: it would
+ * break the self-host profile, which needs two provider credentials and no
+ * Cloudflare one, and it would break the embedding seat on the hosted plane.
+ * The pool is per-**provider** because a key is a fact about a provider
+ * relationship, and the hosted plane having fewer of those than it used to is a
+ * change in the routing table, not in what a key is.
  *
  * Built by omission rather than by writing `undefined`: an entry present and
  * undefined is not the same as an entry absent under
@@ -96,12 +153,13 @@ function hostedKeys(env: Environment): Partial<Record<ProviderId, string>> {
 /**
  * The single model gateway (`src/README.md`: every model call goes through it).
  *
- * The transport is the **direct** one rather than the hosted gateway: a self
+ * The transport is chosen per provider by {@link selectFleetTransport}: the
+ * Cloudflare seats go out over Unified Billing, everything else direct. A self
  * hoster has no Cloudflare account, and KTD13 requires the direct path to work
- * regardless. An operator on the hosted plane sets the profile to `hosted` and
- * supplies pooled keys; one with neither supplies none, and the key resolver
- * answers `no_key_available` at call time rather than this file inventing a
- * credential at startup.
+ * regardless — the `self-host` profile routes nothing to Cloudflare, so it
+ * composes with no Cloudflare configuration at all. An operator with neither
+ * supplies no keys, and the key resolver answers `no_key_available` at call
+ * time rather than this file inventing a credential at startup.
  */
 export function openFleetGateway(env: Environment, deps: GatewayDeps): ModelGateway {
   const name = (optional(env, 'BRAINZ_ROUTING_PROFILE') ?? 'hosted') as RoutingProfileName;
@@ -115,7 +173,7 @@ export function openFleetGateway(env: Environment, deps: GatewayDeps): ModelGate
 
   return createModelGateway({
     profile,
-    transport: createDirectTransport({}),
+    transport: selectFleetTransport(env, profile),
     meter: createPostgresSpendMeter({ sql: deps.controlSql }),
     keys: {
       store: createTenantProviderKeyStore({ backend: deps.keys }),

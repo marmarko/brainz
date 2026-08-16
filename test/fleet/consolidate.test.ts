@@ -35,7 +35,12 @@ import {
   type ControlFixture,
 } from '../worker/fixture.ts';
 import { dropFixtureDatabase, provisionFixture, type SchemaFixture } from '../schema/fixture.ts';
-import { startService, writeSecretsFile, type RunningService } from './fixture.ts';
+import {
+  FAKE_CF_ACCOUNT_ID,
+  startService,
+  writeSecretsFile,
+  type RunningService,
+} from './fixture.ts';
 
 const SETUP_TIMEOUT_MS = 180_000;
 const TENANT = 'consolidate-seam';
@@ -75,6 +80,7 @@ beforeAll(async () => {
     env: {
       BRAINZ_CONTROL_DATABASE_URL: control.dsn,
       BRAINZ_SECRETS_FILE: secretsFile,
+      BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
       // Fast enough that a case does not wait a minute for its tick.
       BRAINZ_WORKER_TICK_MS: '400',
       BRAINZ_WORKER_CONCURRENCY: '1',

@@ -37,21 +37,21 @@
   },
   "per_op": {
     "extract": {
-      "model_id": "gemini-3.5-flash-lite-2026-07-21",
+      "model_id": "google/gemini-3.5-flash-lite",
       "input_tokens": 30000,
       "output_tokens": 245760,
       "micro_usd": 623400,
       "usd": 0.6234
     },
     "enrich": {
-      "model_id": "gemini-3.5-flash-lite-2026-07-21",
+      "model_id": "google/gemini-3.5-flash-lite",
       "input_tokens": 24000,
       "output_tokens": 49152,
       "micro_usd": 130080,
       "usd": 0.13008
     },
     "contradiction": {
-      "model_id": "gemini-3.5-flash-lite-2026-07-21",
+      "model_id": "google/gemini-3.5-flash-lite",
       "input_tokens": 12000,
       "output_tokens": 1024,
       "micro_usd": 6160,
@@ -72,11 +72,11 @@
       "usd": 0.024432
     },
     "vision": {
-      "model_id": "@cf/meta/llama-3.2-11b-vision-instruct",
+      "model_id": "@cf/moondream/moondream3.1-9B-A2B",
       "input_tokens": 13560,
       "output_tokens": 32768,
-      "micro_usd": 22816,
-      "usd": 0.022816
+      "micro_usd": 36836,
+      "usd": 0.036836
     },
     "judge": {
       "model_id": "@cf/zai-org/glm-5.2",
@@ -86,6 +86,6 @@
       "usd": 0.185056
     }
   },
-  "total_micro_usd": 1005480,
-  "total_usd": 1.00548
+  "total_micro_usd": 1019500,
+  "total_usd": 1.0195
 }

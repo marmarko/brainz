@@ -118,7 +118,13 @@ describe('the U12 A/B receipt', () => {
     // KTD4 quotes ~$0.00012 per query at a hundred 400-token candidates. The
     // receipt derives it; this asserts the derivation still lands there, so a
     // price move or a candidate-count change is visible rather than absorbed.
-    expect(line.micro_usd_per_query_at_envelope).toBe(120);
+    //
+    // It moved, and this is that being visible: 120 → 125 µUSD, because the
+    // reranker's price was carried as the rounded $0.003/M and its real rate is
+    // $0.00311/M. Still ~$0.00012/query to the precision KTD4 quotes, still
+    // 15-30x under the envelope, and now derived from a number that matches the
+    // vendor's own page rather than a tidier one.
+    expect(line.micro_usd_per_query_at_envelope).toBe(125);
   });
 
   test('the cost scales with the dial, which is what makes it a dial', () => {

@@ -46,12 +46,21 @@ const KTD13_DOLLARS_PER_MILLION: ReadonlyArray<{
   readonly input: number;
   readonly output: number | null;
 }> = [
+  // The passthrough id and the direct id are two wire ids for one model, at one
+  // price today because Cloudflare passes third-party inference through at no
+  // markup. Two rows so that if one moves, the other does not follow silently.
+  { id: 'google/gemini-3.5-flash-lite', input: 0.3, output: 2.5 },
   { id: 'gemini-3.5-flash-lite-2026-07-21', input: 0.3, output: 2.5 },
   { id: '@cf/nvidia/nemotron-3-120b-a12b', input: 0.5, output: 1.5 },
-  { id: '@cf/meta/llama-3.2-11b-vision-instruct', input: 0.049, output: 0.676 },
+  // The vision seat. `@cf/meta/llama-3.2-11b-vision-instruct` is gone: nothing
+  // routes to it, because using it requires accepting Meta's licence terms on
+  // the user's behalf, and a price nobody can spend is a price nobody agreed to.
+  { id: '@cf/moondream/moondream3.1-9B-A2B', input: 0.3, output: 1.0 },
   { id: '@cf/zai-org/glm-5.2', input: 1.4, output: 4.4 },
-  { id: '@cf/baai/bge-reranker-base', input: 0.003, output: null },
+  { id: '@cf/baai/bge-reranker-base', input: 0.00311, output: null },
   { id: 'text-embedding-3-large', input: 0.13, output: null },
+  // Priced, verified, and deliberately unrouted — see `pricing.ts`.
+  { id: '@cf/qwen/qwen3-embedding-0.6b', input: 0.0118, output: null },
 ];
 
 const MICRO_PER_DOLLAR = 1_000_000;

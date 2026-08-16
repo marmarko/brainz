@@ -35,7 +35,12 @@ import {
   type IdentityFixture,
 } from '../control/identity-fixture.ts';
 import { dropFixtureDatabase, provisionFixture, type SchemaFixture } from '../schema/fixture.ts';
-import { startService, writeSecretsFile, type RunningService } from './fixture.ts';
+import {
+  FAKE_CF_ACCOUNT_ID,
+  startService,
+  writeSecretsFile,
+  type RunningService,
+} from './fixture.ts';
 
 const SETUP_TIMEOUT_MS = 120_000;
 const TENANT = 'entrypoint-tenant';
@@ -88,6 +93,7 @@ function mcpEnv(): Record<string, string> {
     BRAINZ_PUBLIC_ORIGIN: `https://${ISSUER_HOST}`,
     BRAINZ_CONTROL_DATABASE_URL: control.dsn,
     BRAINZ_SECRETS_FILE: secretsFile,
+      BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
   };
 }
 
@@ -152,6 +158,7 @@ describe('the worker fleet entrypoint serves', () => {
       const service = await start('src/worker/serve.ts', {
         BRAINZ_CONTROL_DATABASE_URL: control.dsn,
         BRAINZ_SECRETS_FILE: secretsFile,
+      BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
         // Long enough that no tick fires during the assertion below: this test
         // is about the process serving, and the seam it runs is its own test.
         BRAINZ_WORKER_TICK_MS: '3600000',
@@ -176,6 +183,7 @@ describe('the web entrypoint serves', () => {
         BRAINZ_IDENTITY_DATABASE_URL: identity.dsn,
         BRAINZ_CONTROL_DATABASE_URL: control.dsn,
         BRAINZ_SECRETS_FILE: secretsFile,
+      BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
         BRAINZ_MCP_URL: `https://${ISSUER_HOST}/mcp`,
         BRAINZ_STRIPE_WEBHOOK_SECRET: 'whsec_this_test_invented_it',
       });

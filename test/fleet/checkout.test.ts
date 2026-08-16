@@ -32,7 +32,12 @@ import {
   type IdentityFixture,
 } from '../control/identity-fixture.ts';
 import { createEmptyDatabase, dropFixtureDatabase, type SchemaFixture } from '../schema/fixture.ts';
-import { startService, writeSecretsFile, type RunningService } from './fixture.ts';
+import {
+  FAKE_CF_ACCOUNT_ID,
+  startService,
+  writeSecretsFile,
+  type RunningService,
+} from './fixture.ts';
 
 const SETUP_TIMEOUT_MS = 180_000;
 const WEB_ORIGIN = 'https://app.brainz.test';
@@ -99,6 +104,7 @@ beforeAll(async () => {
       BRAINZ_IDENTITY_DATABASE_URL: identity.dsn,
       BRAINZ_CONTROL_DATABASE_URL: control.dsn,
       BRAINZ_SECRETS_FILE: secretsFile,
+      BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
       BRAINZ_MCP_URL: 'https://mcp.brainz.test/mcp',
       BRAINZ_STRIPE_WEBHOOK_SECRET: WEBHOOK_SECRET,
       BRAINZ_POOL_TARGET: '1',
