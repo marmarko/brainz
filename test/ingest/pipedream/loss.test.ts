@@ -40,7 +40,7 @@ import { createFakeSource, mailBody, page } from './fixture.ts';
 let fixture: IngestFixture;
 
 const NOW = new Date('2026-08-13T10:00:00.000Z');
-const GMAIL_ORIGIN = originContextFor('gmail');
+const GMAIL_ORIGIN = originContextFor('gmail', null);
 
 beforeAll(async () => {
   fixture = await createIngestFixture('u9loss');
@@ -253,7 +253,7 @@ describe('the loss is visible', () => {
     await pull(source, states);
 
     const view = await sourceStaleness(fixture.tenantSql, { now: NOW });
-    const calendar = view.find((row) => row.originContext === originContextFor('calendar'));
+    const calendar = view.find((row) => row.originContext === originContextFor('calendar', null));
     expect(calendar).toBeDefined();
     expect(calendar!.itemsFailed).toBeGreaterThan(0);
     expect(calendar!.lastItemFailureCode).toBe('rate_limited');
@@ -263,7 +263,7 @@ describe('the loss is visible', () => {
     // The expiry writes a failed run row of its own — deliberately, so the
     // event is visible. What must not follow is that row becoming the permanent
     // answer to "why is this source unhappy" after the recovery succeeded.
-    const origin = originContextFor('drive');
+    const origin = originContextFor('drive', null);
     const before = (await runRows(origin)).length;
     const states = await storeWith(
       stateFor('drive', { cursor: { kind: 'delta', value: 'gone', issuedAt: NOW.toISOString() } }),

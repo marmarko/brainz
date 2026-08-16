@@ -120,7 +120,7 @@ describe('a first import too big for one pass', () => {
     expect(result.decision?.proceed).toBe('deferred');
     expect(result.counts.written).toBe(0);
     expect(
-      await countRows(fixture.tenantSql, 'page', `origin_context = '${originContextFor('gmail')}'`),
+      await countRows(fixture.tenantSql, 'page', `origin_context = '${originContextFor('gmail', null)}'`),
     ).toBe(0);
 
     // The lane the job landed in is the one the schema admits for a connector.
@@ -421,7 +421,7 @@ describe('the ceiling actually holds', () => {
         budget: uncappedBudget(),
       },
       {
-        originContext: originContextFor('calendar'),
+        originContext: originContextFor('calendar', null),
         sourceType: 'calendar',
         title: 'standup',
         body: mailBody('standup that was later cancelled'),

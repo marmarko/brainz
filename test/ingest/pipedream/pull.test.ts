@@ -64,8 +64,8 @@ import { createFakeSource, mailBody, page } from './fixture.ts';
 let fixture: IngestFixture;
 
 const NOW = new Date('2026-08-13T10:00:00.000Z');
-const GMAIL_ORIGIN = originContextFor('gmail');
-const CALENDAR_ORIGIN = originContextFor('calendar');
+const GMAIL_ORIGIN = originContextFor('gmail', null);
+const CALENDAR_ORIGIN = originContextFor('calendar', null);
 /** Stands in for a chunk of the user's mail; asserted absent from the encoder. */
 const NEWSLETTER_CANARY = 'CANARY-9f2a-newsletter-must-not-be-embedded';
 
@@ -472,7 +472,7 @@ describe('staleness events', () => {
     expect(result.stopReason).toBe('auth_expired');
 
     const staleness = await sourceStaleness(fixture.tenantSql, { now: NOW });
-    const drive = staleness.find((row) => row.originContext === originContextFor('drive'));
+    const drive = staleness.find((row) => row.originContext === originContextFor('drive', null));
     expect(drive?.lastFailureCode).toBe('auth_expired');
     expect(drive?.runInProgress).toBe(false);
   });
@@ -686,7 +686,7 @@ describe('the ingest log', () => {
  * initial value was.
  */
 describe('the objects a listing carries', () => {
-  const DRIVE_ORIGIN = originContextFor('drive');
+  const DRIVE_ORIGIN = originContextFor('drive', null);
 
   function mediaItem(id: string, overrides: Partial<PulledMedia> = {}): PulledMedia {
     return {
@@ -1025,7 +1025,7 @@ describe('the objects a listing carries', () => {
     // swept attachments by ref alone would retire a mail attachment that
     // happens to carry the same provider id.
     const shared = externalRefFor('drive', 'shared-object-id');
-    const mailOrigin = originContextFor('gmail');
+    const mailOrigin = originContextFor('gmail', null);
     const accepted = await acceptMedia(
       { sql: fixture.tenantSql, storage: fixture.storage, store: fixture.rawStore },
       {
@@ -1062,7 +1062,7 @@ describe('the objects a listing carries', () => {
     // tombstoned by its own ref, and the attachment is named by nothing at all.
     // Without this the mail is gone and the picture that arrived on it is still
     // in the brain, with its transcript still answering queries.
-    const mailOrigin = originContextFor('gmail');
+    const mailOrigin = originContextFor('gmail', null);
     const ref = externalRefFor('gmail', 'm-with-shot');
     const states = await storeWith(stateFor('gmail'));
     const source = createFakeSource('gmail', 'email', [

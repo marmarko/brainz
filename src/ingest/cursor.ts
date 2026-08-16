@@ -41,6 +41,7 @@
 
 import type { CallerIdentity } from '../control/secrets.ts';
 import type { TenantStorage } from '../control/storage.ts';
+import { ORIGIN_SEPARATOR, classOf } from '../mcp/grant-scope.ts';
 import type { SourceType } from '../core/write/write-path.ts';
 import type { RawObject, RawStore } from './import/raw.ts';
 
@@ -133,6 +134,37 @@ export interface ConnectorState {
    * overwritten: a listing that reports a *different* account is refused.
    */
   readonly accountKey: string | null;
+  /**
+   * **Which half of the brain this connection belongs to**, as U18's context
+   * class — `work`, `personal`, or null for a connection that predates the
+   * choice.
+   *
+   * This field is the *producer* U18's context grants did not have. The grammar,
+   * the wildcard expansion, the mint-and-verify invariant and the read fence
+   * were all real and all tested; what no production path did was write a
+   * `work:` row. Every connector page filed at `pipedream:<source>`, so a
+   * `work:*` grant obtained through the real consent flow expanded to
+   * `['work:agent']` and read back exactly the memories it had written itself.
+   * Recorded here, it becomes `<class>:<source>` on every page, chunk and fact
+   * the source produces ({@link import('./pipedream/pull.ts').originContextFor}).
+   *
+   * **Null is the honest default and not a shrug.** A connection with no
+   * recorded class keeps filing at the vendor class, which no context grant can
+   * name — so it is unreadable by a narrowed grant rather than misfiled into one.
+   * Defaulting it to `personal` would be an unobserved value written into the
+   * one column access is decided on.
+   *
+   * **Chosen at connect, and a change is a disconnect-and-reconnect.** `origin`
+   * is immutable by trigger and U4's replacement lookup keys on
+   * `(external_ref, origin_context)`, so re-classing a live connection does not
+   * move its pages: it strands every one of them at the old origin, out of reach
+   * of a tombstone sweep that scopes by origin, and writes a second live page
+   * for each on the next poll. Nothing in this module overwrites the field —
+   * {@link parseConnectorState} preserves it and the pull runner only ever
+   * spreads it — and a caller that means to re-class a source must disconnect it
+   * first, which is a decision with an owner rather than a silent re-file.
+   */
+  readonly contextClass: string | null;
   readonly cadenceSeconds: number;
   readonly cursor: SourceCursor | null;
   readonly connectedAt: string;
@@ -142,19 +174,53 @@ export interface ConnectorState {
   readonly backfill: PendingBackfill | null;
 }
 
+/**
+ * Is this a context class U18's grammar admits?
+ *
+ * Asked through `classOf` rather than with a regex of its own. A second spelling
+ * of the class grammar is a second answer to "what may this credential read",
+ * and the one in `grant-scope.ts` is the one the fence, the wildcard expansion
+ * and the OAuth scope parser already agree on.
+ */
+export function isContextClass(value: unknown): value is string {
+  return typeof value === 'string' && classOf(`${value}${ORIGIN_SEPARATOR}x`) === value;
+}
+
+export class ConnectorContextError extends Error {
+  constructor(value: unknown) {
+    super(`${JSON.stringify(value)} is not a context class`);
+    this.name = 'ConnectorContextError';
+  }
+}
+
 export function connectSource(input: {
   readonly source: ConnectorSource;
   readonly externalUserId: string;
   readonly accountId?: string | null;
   readonly accountKey?: string | null;
+  /**
+   * U18's context class for this connection. Absent means the vendor class —
+   * see {@link ConnectorState.contextClass} for why that is the default and why
+   * it is not `personal`.
+   */
+  readonly contextClass?: string | null;
   readonly cadenceSeconds?: number;
   readonly now: Date;
 }): ConnectorState {
+  // **A throw, not a fallback.** A caller that asked for a class the grammar
+  // does not admit meant something by it; filing that connection at the vendor
+  // class instead would put a user's work mail in a half of the brain nobody
+  // chose, and the fence would then be doing exactly what it was told.
+  if (input.contextClass !== undefined && input.contextClass !== null && !isContextClass(input.contextClass)) {
+    throw new ConnectorContextError(input.contextClass);
+  }
+
   return {
     source: input.source,
     externalUserId: input.externalUserId,
     accountId: input.accountId ?? null,
     accountKey: normalizeAccountKey(input.accountKey ?? null),
+    contextClass: input.contextClass ?? null,
     cadenceSeconds: normalizeCadenceSeconds(input.source, input.cadenceSeconds),
     cursor: null,
     connectedAt: input.now.toISOString(),
@@ -335,6 +401,13 @@ export function parseConnectorState(parsed: unknown): ConnectorState | null {
   const accountKey = record.accountKey;
   if (accountKey !== null && accountKey !== undefined && typeof accountKey !== 'string') return null;
 
+  // All-or-nothing, like every other field — and this one earns it twice over.
+  // Dropping a malformed class to null would file a work connector's mail at the
+  // vendor class, where the user's work grant cannot see it; coercing it would
+  // write an unobserved value into the column access is decided on.
+  const contextClass = record.contextClass;
+  if (contextClass !== null && contextClass !== undefined && !isContextClass(contextClass)) return null;
+
   const cursor = record.cursor;
   if (cursor !== null && !isCursor(cursor)) return null;
 
@@ -354,6 +427,7 @@ export function parseConnectorState(parsed: unknown): ConnectorState | null {
     externalUserId,
     accountId: accountId ?? null,
     accountKey: normalizeAccountKey((accountKey as string | undefined) ?? null),
+    contextClass: (contextClass as string | undefined) ?? null,
     cadenceSeconds: Math.trunc(cadence as number),
     cursor:
       cursor === null

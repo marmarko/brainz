@@ -69,7 +69,7 @@ import {
 import { createFakeSource, page } from './fixture.ts';
 
 const NOW = new Date('2026-08-16T09:00:00.000Z');
-const GMAIL_ORIGIN = originContextFor('gmail');
+const GMAIL_ORIGIN = originContextFor('gmail', null);
 
 /** The correspondent who asks to be erased. */
 const SUBJECT = 'alice@example.test';

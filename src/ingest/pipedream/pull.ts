@@ -131,12 +131,38 @@ import { tombstoneRefs } from './tombstone.ts';
 import type { ProviderSource } from './sources/types.ts';
 
 /**
- * R15's origin, credential-derived and immutable: the vendor and the source
- * that fetched the item. Every page, chunk and fact this unit writes carries
- * it, and it is what scopes the tombstone sweep.
+ * R15's origin, credential-derived and immutable: **which half of the brain this
+ * connection belongs to, and the source that fetched the item.** Every page,
+ * chunk and fact this unit writes carries it, and it is what scopes the
+ * tombstone sweep.
+ *
+ * **This is the producer U18's context grants did not have.** The grammar, the
+ * wildcard expansion, the mint-and-verify scope invariant and the read fence
+ * were all built and all tested — against rows planted in SQL, because nothing
+ * in `src/` wrote one. Every connector page filed at `pipedream:<source>`, whose
+ * class no `work:*` or `personal:*` grant can name, so a work-scoped grant
+ * obtained through the real consent flow expanded to `['work:agent']` and read
+ * back exactly the memories it had written itself. "A work-scoped grant provably
+ * cannot read personal rows" was true of it, and so was "it cannot read a
+ * mailbox". A connection that records a context class now files at
+ * `<class>:<source>`, and `test/ingest/pipedream/context-origin.test.ts` proves
+ * the read-back through the real `expandGrant` and the real fence.
+ *
+ * **`null` keeps the vendor class, and that is the safe direction rather than
+ * the timid one.** `origin` is immutable by trigger and U4's replacement lookup
+ * keys on `(external_ref, origin_context)`, so re-originating an existing
+ * connection would strand every page it already wrote at the old origin — out of
+ * reach of a tombstone sweep that scopes by origin — and write a second live
+ * page for each on the next poll. `pipedream:<source>` is also unreachable by
+ * any narrowed grant, so the failure mode of a forgotten class is a mailbox a
+ * context grant cannot see, never one it should not have seen.
+ *
+ * The parameter is **required** for the same reason `PulledFailure.retryable`
+ * is: the caller is the only one that knows, and a default here would be a
+ * decision about access that nobody made.
  */
-export function originContextFor(source: ConnectorSource): string {
-  return `pipedream:${source}`;
+export function originContextFor(source: ConnectorSource, contextClass: string | null): string {
+  return contextClass === null ? `pipedream:${source}` : `${contextClass}:${source}`;
 }
 
 /** How many items one pull will take from a provider before stopping. */
@@ -454,7 +480,6 @@ function windowDaysOf(window: ImportWindow): number | null {
 
 export async function runPull(request: PullRequest): Promise<PullResult> {
   const { tenant, source, states } = request;
-  const originContext = originContextFor(source.source);
   const sourceType = SOURCE_TYPE_FOR[source.source];
   const interactive = request.interactive ?? true;
   const maxItems = request.maxItems ?? DEFAULT_MAX_ITEMS_PER_PULL;
@@ -486,6 +511,13 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
       stopReason: 'not_connected',
     };
   }
+
+  // **Read from the connection, not from the source name.** Which half of the
+  // brain a connected account belongs to is the user's answer at connect, and it
+  // is the whole difference between a `work:*` grant that can read this mailbox
+  // and one that reads only the memories it wrote itself. Computed after the
+  // state read for that reason: before it, there is no connection to ask.
+  const originContext = originContextFor(source.source, state.contextClass);
 
   let mode = pullModeFor(state);
 
