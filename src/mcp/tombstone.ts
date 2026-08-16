@@ -449,7 +449,7 @@ export async function restoreForgotten(
       const restored = await touched(tx, entry, request.deletedAt);
       counts[entry.field] = restored;
       if (entry.restorableWhen !== undefined) {
-        blocked += (await tombstonedAt(tx, entry.table, request.deletedAt)) - restored;
+        blocked += await tombstonedAt(tx, entry.table, request.deletedAt);
       }
     }
 
@@ -462,7 +462,7 @@ export async function restoreForgotten(
     for (const entry of ARCHIVED_TABLES) {
       const moved = await unarchived(tx, entry, request.deletedAt);
       archives[entry.field] = moved;
-      squatted += (await archivedAt(tx, entry.archive, request.deletedAt)) - moved;
+      squatted += await archivedAt(tx, entry.archive, request.deletedAt);
     }
     return { counts, blocked, archives, squatted };
   });
@@ -504,7 +504,17 @@ async function unarchived(tx: SQL, entry: ArchivedTable, severedAt: string): Pro
   return rows.length;
 }
 
-/** Rows still archived at this instant — the denominator for a guarded un-archive. */
+/**
+ * Rows still archived at this instant — **read after the un-archive, and it is
+ * the answer rather than a term in one.**
+ *
+ * {@link unarchived} DELETEs every row it moved, so what still carries the
+ * instant afterwards is exactly the set {@link ArchivedTable.blockedWhen}
+ * refused. Subtracting the moved rows from this — which is what it used to do —
+ * measures a denominator that has already had its numerator taken out of it, and
+ * reports `residue − moved`: zero over a partly-squatted archive, and a negative
+ * count over one where everything came back.
+ */
 async function archivedAt(tx: SQL, archive: string, severedAt: string): Promise<number> {
   const rows = (await tx.unsafe(
     `SELECT count(*)::int AS n FROM ${archive} WHERE severed_at = $1::timestamptz`,
@@ -524,7 +534,13 @@ async function touched(tx: SQL, entry: TombstonedTable, deletedAt: string): Prom
   return rows.length;
 }
 
-/** Rows still carrying this instant — the denominator for a guarded restore. */
+/**
+ * Rows still carrying this instant — **read after the restore**, for the reason
+ * {@link archivedAt} states: {@link touched} has already cleared the flag on
+ * everything {@link TombstonedTable.restorableWhen} admitted, so the remainder
+ * IS the blocked set and subtracting the restored rows from it under-reports by
+ * exactly the number that came back.
+ */
 async function tombstonedAt(tx: SQL, table: string, deletedAt: string): Promise<number> {
   const rows = (await tx.unsafe(
     `SELECT count(*)::int AS n FROM ${table} WHERE deleted_at = $1::timestamptz`,
