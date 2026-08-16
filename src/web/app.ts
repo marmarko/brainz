@@ -45,6 +45,7 @@ import {
   beginPasswordReset,
   brainOf,
   completePasswordReset,
+  constantTimeEqual,
   createSession,
   logIn,
   normalizeEmail,
@@ -434,7 +435,21 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       }
       const presented = request.headers.get('authorization') ?? '';
       const offered = presented.startsWith('Bearer ') ? presented.slice(7) : presented;
-      if (offered.length !== configured.length || offered !== configured) {
+      // **Constant time, through the one primitive written for it.** The
+      // comparison this replaced short-circuited twice: a length test that
+      // answered "how long is the operator credential" in a single request, and
+      // then a `!==` that walks the bytes and stops at the first difference —
+      // character-at-a-time recovery, on the endpoint that reads every tenant's
+      // operational state. `accounts.ts:constantTimeEqual` digests both sides
+      // first, so the comparison is over two equal-length buffers whatever
+      // arrived and there is nothing left to time.
+      //
+      // **The unset check above must stay above this.** Digesting means
+      // `constantTimeEqual('', '')` is true, so an empty bearer against an unset
+      // credential would authenticate if the order were swapped — which is why
+      // the fail-closed 404 is a separate, earlier statement rather than a
+      // condition folded into this one.
+      if (!constantTimeEqual(offered, configured)) {
         return json({ ok: false, code: 'unauthorized', message: 'No.' }, 401);
       }
 

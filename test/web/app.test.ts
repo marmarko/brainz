@@ -11,6 +11,7 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { createHmac } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import type { SQL } from 'bun';
 
 import { ABSOLUTE_SESSION_MS, attachBrain } from '../../src/control/accounts.ts';
@@ -573,6 +574,51 @@ describe('/admin over HTTP', () => {
     // admin surface open to everybody, and the fail-closed direction is to not
     // be there.
     expect(response.status).toBe(404);
+  });
+
+  test('AN EMPTY BEARER DOES NOT AUTHENTICATE, WHATEVER THE COMPARISON DOES', async () => {
+    // The trap in the fix rather than in the bug. `constantTimeEqual` digests
+    // both sides first, so `constantTimeEqual('', '')` is **true** — an empty
+    // presented credential against an unset configured one would authenticate
+    // if the comparison ran before the unset check. The order below is
+    // load-bearing and this is what pins it.
+    await reset();
+    const missing = await app({ adminCredential: '' })(get('/admin?op=fleet_status', {}));
+    expect(missing.status).toBe(404);
+
+    // And with a credential configured, an absent header is a refusal.
+    const empty = await app()(get('/admin?op=fleet_status', {}));
+    expect(empty.status).toBe(401);
+  });
+
+  test('THE CREDENTIAL IS NOT COMPARED IN A WAY THAT LEAKS ITS LENGTH', async () => {
+    // **Asserted structurally, because the defect is not observable in a
+    // response.** A `!==` on two secrets returns the same 401 as a constant-time
+    // compare; what differs is how long it takes, and a timing assertion in a
+    // unit suite is a flake generator rather than a proof. What *is* checkable,
+    // deterministically, is that the call site routes through the one primitive
+    // written for this — `accounts.ts:constantTimeEqual`, whose own comment says
+    // `src/web/` needs it — and that no length test on the credential survives
+    // beside it. `test/mcp/guards.test.ts` and `test/ai/boundary.test.ts` make
+    // the same kind of claim for the same reason: the invariant outlives the
+    // reviewer who knows about it.
+    //
+    // A short-circuiting comparison leaks twice over. `offered.length !==
+    // configured.length` answers "how long is the credential" in one request,
+    // and `offered !== configured` then walks the bytes and stops at the first
+    // difference — which is the classic character-at-a-time recovery, on the
+    // one endpoint that reads every tenant's operational state.
+    const source = readFileSync(`${import.meta.dir}/../../src/web/app.ts`, 'utf8');
+    const executable = source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '');
+
+    expect(executable).toContain('constantTimeEqual(offered, configured)');
+    // The length comparison specifically, in either direction.
+    expect(executable).not.toMatch(/offered\.length\s*[!=]==\s*configured\.length/);
+    expect(executable).not.toMatch(/configured\.length\s*[!=]==\s*offered\.length/);
+    // And the raw string comparison it was paired with.
+    expect(executable).not.toMatch(/offered\s*[!=]==\s*configured/);
   });
 });
 
