@@ -53,6 +53,29 @@ export interface RemovalCounts {
   readonly entityCards: number;
   readonly commitments: number;
   readonly edges: number;
+  /**
+   * Spellings severance takes by **moving** them into `severed_alias`.
+   *
+   * **The one take with no `deleted_at` behind it, and it was missing from this
+   * preview entirely.** `severance.ts:archiveExactOriginAliases` moves every
+   * alias whose origins are exactly the severed one out of `entity_alias`,
+   * because rung 11 lets an alias be narrower than its entity and rung 12 gives
+   * it somewhere to go. The receipt reports it as `archived.aliases`; this
+   * column is what makes the preview the user consented to, and the
+   * append-only `severance.removed` audit jsonb written from it, describe the
+   * same event. Without it the audit row understated the severance by every
+   * spelling it took.
+   *
+   * **Zero in the `recomputed` column, and that is a statement rather than a
+   * placeholder.** An alias asserts nothing, so it cannot be left *wrong* by
+   * losing an input the way a fact or a card is, and nothing in this system
+   * re-derives one — `severance.ts:recomputeWorklist` counts facts, entities,
+   * cards, commitments and edges, and no consolidation phase revisits a
+   * spelling. Counting mixed aliases there would also sweep in every unstamped
+   * legacy alias of every mixed entity, reported as a recompute cost nobody
+   * pays.
+   */
+  readonly aliases: number;
 }
 
 export interface SeverancePreview {
@@ -110,6 +133,16 @@ export async function previewSeverance(
  * through one credential, so "mixed" is not a state it can be in) and the
  * derived tables by set equality. `mixed` reports zero for the ingested tables
  * for the same reason, and set difference for the derived ones.
+ *
+ * **Every arm filters the rows a previous retraction already holds.** The
+ * `attachment` and `entity_edge` arms did not, where `page`, `chunk`, `fact`,
+ * `entity`, `entity_card` and `commitment` did — so a preview of severing an
+ * origin counted every attachment a prior `forget` had tombstoned and every edge
+ * a consolidation cycle had retired, as rows this severance was about to take.
+ * The executor filters on `deleted_at IS NULL` regardless, and deliberately:
+ * re-stamping a row another retraction took would move it onto this instant and
+ * detach it from that call's undo. So the over-count was the preview's alone —
+ * a number the user consented to that was never going to happen.
  */
 async function counts(sql: SQL, origin: string, mode: 'exact' | 'mixed'): Promise<RemovalCounts> {
   const derived = mode === 'exact' ? sql`origin_contexts <@ ARRAY[${origin}]::text[]` : sql`NOT (origin_contexts <@ ARRAY[${origin}]::text[])`;
@@ -122,7 +155,7 @@ async function counts(sql: SQL, origin: string, mode: 'exact' | 'mixed'): Promis
       (SELECT count(*)::int FROM chunk
         WHERE deleted_at IS NULL AND ${ingested} AND origin_context = ${origin}) AS chunks,
       (SELECT count(*)::int FROM attachment
-        WHERE ${ingested} AND origin_context = ${origin}) AS attachments,
+        WHERE deleted_at IS NULL AND ${ingested} AND origin_context = ${origin}) AS attachments,
       (SELECT count(*)::int FROM fact
         WHERE deleted_at IS NULL AND origin_contexts @> ARRAY[${origin}]::text[] AND ${derived}) AS facts,
       (SELECT count(*)::int FROM entity
@@ -132,7 +165,19 @@ async function counts(sql: SQL, origin: string, mode: 'exact' | 'mixed'): Promis
       (SELECT count(*)::int FROM commitment
         WHERE deleted_at IS NULL AND origin_contexts @> ARRAY[${origin}]::text[] AND ${derived}) AS commitments,
       (SELECT count(*)::int FROM entity_edge
-        WHERE origin_contexts @> ARRAY[${origin}]::text[] AND ${derived}) AS edges
+        WHERE deleted_at IS NULL AND origin_contexts @> ARRAY[${origin}]::text[] AND ${derived}) AS edges,
+      -- The alias take, mirroring severance.ts:archiveExactOriginAliases
+      -- statement for statement: the join to entity, the coalesce that reads an
+      -- unstamped legacy row as its entity's own union, and NO liveness filter
+      -- on the entity, because the executor has none either. A preview that
+      -- improved on the executor here would be a preview of a different
+      -- operation, which is the one thing it may not be. entity_alias carries no
+      -- deleted_at at all -- presence is the state -- so there is nothing to
+      -- filter on the alias itself.
+      (SELECT count(*)::int FROM entity_alias a
+         JOIN entity e ON e.entity_id = a.entity_id
+        WHERE ${ingested}
+          AND coalesce(a.origin_contexts, e.origin_contexts) <@ ARRAY[${origin}]::text[]) AS aliases
   `) as Array<Record<string, number>>;
 
   const row = rows[0] ?? {};
@@ -145,6 +190,7 @@ async function counts(sql: SQL, origin: string, mode: 'exact' | 'mixed'): Promis
     entityCards: Number(row.entity_cards ?? 0),
     commitments: Number(row.commitments ?? 0),
     edges: Number(row.edges ?? 0),
+    aliases: Number(row.aliases ?? 0),
   };
 }
 

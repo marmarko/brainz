@@ -425,6 +425,11 @@ export async function recomputeWorklist(
       pages: 0,
       chunks: 0,
       attachments: 0,
+      // Zero, and it is the same statement `RemovalCounts.aliases` makes: a
+      // spelling asserts nothing, so losing an input cannot leave it wrong, and
+      // no phase of consolidation re-derives one. A worklist that counted them
+      // would be asking a cycle for work that has no producer.
+      aliases: 0,
       facts: Number(row.facts ?? 0),
       entities: Number(row.entities ?? 0),
       entityCards: Number(row.entity_cards ?? 0),
@@ -483,6 +488,7 @@ function emptyCounts(): RemovalCounts {
     pages: 0,
     chunks: 0,
     attachments: 0,
+    aliases: 0,
     facts: 0,
     entities: 0,
     entityCards: 0,
