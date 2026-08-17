@@ -71,6 +71,13 @@ function app(
   overrides: {
     adminCredential?: string;
     severance?: boolean;
+    /**
+     * `false` composes the app the way a deployment with no Pipedream
+     * configuration composes it. That is a legitimate deployment — chat exports
+     * and folder imports need no vendor — so it has to be a state a test can
+     * reach, not a comment.
+     */
+    connectors?: boolean;
     /** Make provisioning fail, so the signup handler's refusal arm is reachable. */
     provisioning?: 'ok' | 'fails';
   } = {},
@@ -104,19 +111,23 @@ function app(
         return Promise.resolve({ ok: true });
       },
     },
-    connectors: {
-      mintClaimUrl(request) {
-        recorded.minted.push({ ...request });
-        return Promise.resolve({
-          claimUrl: `${ORIGIN}/connect/claim/00000000-0000-4000-8000-000000000001#abcdefghijklmnop`,
-          expiresAt: new Date(AT.getTime() + 600_000),
-        });
-      },
-      disconnect(request) {
-        recorded.disconnected.push({ ...request });
-        return Promise.resolve({ deleted: true, tokensRevoked: 'unverified' as const });
-      },
-    },
+    ...(overrides.connectors === false
+      ? {}
+      : {
+          connectors: {
+            mintClaimUrl(request: { tenantId: string; source: string }) {
+              recorded.minted.push({ ...request });
+              return Promise.resolve({
+                claimUrl: `${ORIGIN}/connect/claim/00000000-0000-4000-8000-000000000001#abcdefghijklmnop`,
+                expiresAt: new Date(AT.getTime() + 600_000),
+              });
+            },
+            disconnect(request: { tenantId: string; source: string }) {
+              recorded.disconnected.push({ ...request });
+              return Promise.resolve({ deleted: true, tokensRevoked: 'unverified' as const });
+            },
+          },
+        }),
     // U18. Absent when `severance: false`, so the "no port wired" branch is a
     // state a test can reach rather than a comment — an endpoint that answered
     // ok for a severance nothing performed is the lie this port shape exists to
@@ -325,6 +336,243 @@ describe('the free-tier connector decision', () => {
     expect(await response.json()).toMatchObject({ ok: true });
     // The tenant is the authenticated one — never a field from the request body.
     expect(recorded.minted).toEqual([{ tenantId: TENANT, source: 'gmail' }]);
+  });
+});
+
+/**
+ * **A deployment with no connector vendor, which is a legitimate one.**
+ *
+ * What this replaced: `web/serve.ts` supplied a vendor whose methods threw a
+ * bare `Error`, so this route answered a generic 500 — a deployment fact
+ * presented to the user as an outage.
+ */
+describe('a deployment with no connector vendor', () => {
+  test('answers a typed 501 rather than a 500, and mints nothing', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const response = await app({ connectors: false })(
+      post('/api/connectors', { source: 'gmail' }, { cookie }),
+    );
+
+    expect(response.status).toBe(501);
+    expect(await response.json()).toMatchObject({ ok: false, code: 'unavailable' });
+    expect(recorded.minted).toEqual([]);
+  });
+
+  /**
+   * **The ordering, which is the decision and not an accident of statement
+   * order.**
+   *
+   * `connectorGate` answers 402 with copy that asks the user to pay. On a
+   * deployment holding no vendor credential, no amount of paying makes a
+   * connector work — so tier-first bills somebody for a capability the
+   * deployment does not have and they learn otherwise on the retry. This
+   * account is on the free tier and still gets the true answer first.
+   */
+  test('says so before it says `tier_required`', async () => {
+    await reset();
+    const cookie = await signedIn('free');
+    const response = await app({ connectors: false })(
+      post('/api/connectors', { source: 'gmail' }, { cookie }),
+    );
+
+    expect(response.status).toBe(501);
+    expect(await response.json()).toMatchObject({ code: 'unavailable' });
+  });
+
+  test('disconnect refuses too, rather than reporting half of one as done', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const response = await app({ connectors: false })(
+      new Request(`${ORIGIN}/api/connectors`, {
+        method: 'DELETE',
+        headers: { origin: ORIGIN, cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ source: 'gmail' }),
+      }),
+    );
+
+    // `ok: true` with `vendor_deleted: false` would be the `applied: true` lie
+    // one unit over, on the operation a user reaches for to make something stop.
+    expect(response.status).toBe(501);
+    expect(recorded.disconnected).toEqual([]);
+  });
+
+  test('the dashboard does not offer a button whose route answers 501', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const page = await (await app({ connectors: false })(get('/dashboard', { cookie }))).text();
+    const offered = await (await app()(get('/dashboard', { cookie }))).text();
+    // Whatever the page says about connectors, the two renders must differ:
+    // a paid tenant on a vendor-less deployment is not a tenant with connectors.
+    expect(page).not.toBe(offered);
+  });
+});
+
+/**
+ * **The operator grant (`/admin?op=grant_internal_tier`).**
+ *
+ * The founder owns this deployment and is blocked by a paywall they own:
+ * billing is inert here (a placeholder webhook secret, no checkout trio), so no
+ * account can ever become paid through Stripe. The grant is the deliberate way
+ * through, and the two properties that make it safe are *who may ask* and
+ * *what it is visible as afterwards*.
+ */
+describe('the operator tier grant', () => {
+  const authorized = { authorization: `Bearer ${ADMIN_CREDENTIAL}` };
+
+  /** `/admin` takes its arguments in the query string; the write needs POST. */
+  function adminPost(op: string, tenantId?: string): Request {
+    const query = tenantId === undefined ? `op=${op}` : `op=${op}&tenant_id=${tenantId}`;
+    return new Request(`${ORIGIN}/admin?${query}`, {
+      method: 'POST',
+      headers: { origin: ORIGIN, ...authorized },
+    });
+  }
+
+  test('grants the paid capability, and the connector route lets the tenant through', async () => {
+    await reset();
+    const cookie = await signedIn('free');
+
+    // Free, and refused, before the grant.
+    const before = await app()(post('/api/connectors', { source: 'gmail' }, { cookie }));
+    expect(before.status).toBe(402);
+
+    const granted = await app()(adminPost('grant_internal_tier', TENANT));
+    expect(granted.status).toBe(200);
+    expect(await granted.json()).toMatchObject({
+      ok: true,
+      content: { tenant_id: TENANT, tier: 'internal' },
+    });
+
+    const after = await app()(post('/api/connectors', { source: 'gmail' }, { cookie }));
+    expect(after.status).toBe(200);
+    expect(recorded.minted).toEqual([{ tenantId: TENANT, source: 'gmail' }]);
+  });
+
+  /**
+   * **Both readers, because a grant that moves one is half a grant.** The
+   * connector gate reads the subscription in the identity database; the
+   * consolidation cycle reads `control.tenant.tier`. The row below is what
+   * `src/control/tier.ts` reads, and `internal` is what it maps to `paid`.
+   */
+  test('moves the column the consolidation cycle reads, and leaves billing’s alone', async () => {
+    await reset();
+    await signedIn('free');
+    await app()(adminPost('grant_internal_tier', TENANT));
+
+    const control = await controlSql<{ tier: string }[]>`
+      SELECT tier::text AS tier FROM control.tenant WHERE tenant_id = ${TENANT}`;
+    expect(control[0]?.tier).toBe('internal');
+
+    // Not `paid`: the identity store's own CHECK says a paid subscription names
+    // a vendor object, precisely so a comp cannot be mistaken for one. Nobody
+    // subscribed, and the row keeps saying so.
+    const subscription = await sql<{ tier: string; status: string }[]>`
+      SELECT tier::text AS tier, status::text AS status FROM account.subscription`;
+    expect(subscription[0]).toMatchObject({ tier: 'free', status: 'none' });
+  });
+
+  test('is visible afterwards, by tenant and in the fleet’s own counts', async () => {
+    await reset();
+    await signedIn('free');
+    await app()(adminPost('grant_internal_tier', TENANT));
+
+    const status = await app()(
+      get(`/admin?op=tenant_status&tenant_id=${TENANT}`, authorized),
+    );
+    expect(await status.json()).toMatchObject({ content: { tenant_id: TENANT, tier: 'internal' } });
+
+    const fleet = (await (await app()(get('/admin?op=fleet_status', authorized))).json()) as {
+      content: { tenants: { state: string; tier: string; count: number }[] };
+    };
+    expect(fleet.content.tenants).toContainEqual({ state: 'ready', tier: 'internal', count: 1 });
+  });
+
+  test('is revocable, and a revoke cannot downgrade a paying customer', async () => {
+    await reset();
+    await signedIn('free');
+    await app()(adminPost('grant_internal_tier', TENANT));
+    const revoked = await app()(adminPost('revoke_internal_tier', TENANT));
+    expect(await revoked.json()).toMatchObject({ ok: true, content: { tier: 'free' } });
+
+    // A tenant the vendor made paid is not this surface's to take back: the
+    // webhook only writes on a delivery, so nothing would ever restore it.
+    await controlSql`UPDATE control.tenant SET tier = 'paid' WHERE tenant_id = ${TENANT}`;
+    const refused = await app()(adminPost('revoke_internal_tier', TENANT));
+    expect(refused.status).toBe(400);
+    const still = await controlSql<{ tier: string }[]>`
+      SELECT tier::text AS tier FROM control.tenant WHERE tenant_id = ${TENANT}`;
+    expect(still[0]?.tier).toBe('paid');
+  });
+
+  // ---- and the half that matters more: who cannot reach it. ---------------
+
+  test('an ordinary signed-in user cannot grant themselves anything', async () => {
+    await reset();
+    const cookie = await signedIn('free');
+    // A real session, the app's own origin, the exact operation — and no
+    // operator credential, which is the only thing `/admin` authenticates on.
+    const response = await app()(
+      new Request(`${ORIGIN}/admin?op=grant_internal_tier&tenant_id=${TENANT}`, {
+        method: 'POST',
+        headers: { origin: ORIGIN, cookie },
+      }),
+    );
+
+    expect(response.status).toBe(401);
+    const rows = await controlSql<{ tier: string }[]>`
+      SELECT tier::text AS tier FROM control.tenant WHERE tenant_id = ${TENANT}`;
+    expect(rows[0]?.tier).toBe('free');
+  });
+
+  test('a deployment with no admin credential has no grant at all', async () => {
+    await reset();
+    await signedIn('free');
+    const response = await app({ adminCredential: '' })(
+      new Request(`${ORIGIN}/admin?op=grant_internal_tier&tenant_id=${TENANT}`, {
+        method: 'POST',
+        headers: { origin: ORIGIN, authorization: 'Bearer anything' },
+      }),
+    );
+    expect(response.status).toBe(404);
+    const rows = await controlSql<{ tier: string }[]>`
+      SELECT tier::text AS tier FROM control.tenant WHERE tenant_id = ${TENANT}`;
+    expect(rows[0]?.tier).toBe('free');
+  });
+
+  /**
+   * A grant reachable by GET is a grant a bookmark, a copied URL in a ticket or
+   * a shell-history recall can issue — with the tenant id sitting in the query
+   * string of each. The credential is a header, so CSRF is not the hazard here;
+   * the link is.
+   */
+  test('a GET cannot grant, however good the credential is', async () => {
+    await reset();
+    await signedIn('free');
+    const response = await app()(
+      get(`/admin?op=grant_internal_tier&tenant_id=${TENANT}`, authorized),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'invalid_params' });
+    const rows = await controlSql<{ tier: string }[]>`
+      SELECT tier::text AS tier FROM control.tenant WHERE tenant_id = ${TENANT}`;
+    expect(rows[0]?.tier).toBe('free');
+  });
+
+  test('refuses a tenant that is not ready, rather than granting spend nobody can use', async () => {
+    await reset();
+    await signedIn('free');
+    // `ready_at` goes with the state: `only_served_tenants_carry_a_ready_at` is
+    // the schema refusing exactly the half-built row this case is about.
+    await controlSql`
+      UPDATE control.tenant SET state = 'provisioning', ready_at = NULL
+       WHERE tenant_id = ${TENANT}`;
+    const response = await app()(adminPost('grant_internal_tier', TENANT));
+    expect(response.status).toBe(400);
+    const rows = await controlSql<{ tier: string }[]>`
+      SELECT tier::text AS tier FROM control.tenant WHERE tenant_id = ${TENANT}`;
+    expect(rows[0]?.tier).toBe('free');
   });
 });
 

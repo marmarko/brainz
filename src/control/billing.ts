@@ -584,6 +584,135 @@ export async function recordCheckoutCustomer(
   return updated.length === 0 ? { ok: false, reason: 'not_this_account' } : { ok: true };
 }
 
+// ---------------------------------------------------------------------------
+// The operator grant.
+// ---------------------------------------------------------------------------
+
+/**
+ * The tier this control plane records, which is one value wider than a
+ * subscription's.
+ *
+ * `control/schema.sql` declares three and `account-schema.sql` declares two, and
+ * says why in as many words: *"a subscription is free or paid, and an internal
+ * tenant is one nobody subscribed for."*
+ */
+export type ControlTier = 'free' | 'paid' | 'internal';
+
+/**
+ * Grant a tenant the paid capability without a payment — the operator's own
+ * brain, a canary, a comp.
+ *
+ * **Why this function is in this module.** `src/worker/serve.ts` states the
+ * invariant it depends on: `control.tenant.tier` is *"the column
+ * `src/control/billing.ts` is the only thing allowed to write"*. A grant written
+ * anywhere else would make that sentence false, and the sentence is what makes
+ * "a subscription change means something" checkable. So the grant is here, next
+ * to the webhook, and every writer of that column is still in one file.
+ *
+ * **`internal`, never `paid`, and that is the auditability.** Writing `paid`
+ * would make a comp indistinguishable from a Stripe subscription in the one
+ * table an operator reads — which is precisely what
+ * `account.subscription`'s `paid_subscriptions_name_a_vendor_object` CHECK
+ * refuses to allow in the identity store, for the reason stated there: *"a row
+ * could say `paid` with nothing behind it … and it would be indistinguishable
+ * from a deliberate comp."* This honours that constraint rather than working
+ * around it: the identity row keeps saying `free`/`none`, because it is true —
+ * nobody subscribed — and the grant lives in the column that has a value for
+ * exactly this state. `/admin`'s `tenant_status` reads `tier` back, and
+ * `fleet_status` groups by it, so a granted tenant is visible by name and the
+ * fleet's count of them is visible without one.
+ *
+ * **It is not a tier the cycle has to learn about.** `consolidationTierOf`
+ * already maps every non-`free` value to `paid`, deliberately, because internal
+ * tenants *"are the tenants that most need the model phases to run"* — so this
+ * grant reaches the consolidation reader through code that predates it. The
+ * connector reader is {@link effectiveTierOf} below.
+ *
+ * Idempotent, and it refuses a tenant that is not `ready`: granting paid
+ * capability to a half-provisioned or deleting brain is a state no operator
+ * means to create, and it would be read back by the cycle as a tenant worth
+ * spending money on.
+ */
+export async function grantOperatorTier(
+  controlSql: SQL,
+  request: { readonly tenantId: string; readonly now: Date },
+): Promise<
+  | { readonly ok: true; readonly tenantId: string; readonly tier: 'internal' }
+  | { readonly ok: false; readonly reason: 'unknown_tenant' | 'not_ready' }
+> {
+  const rows = await controlSql<{ state: string }[]>`
+    SELECT state::text AS state FROM control.tenant WHERE tenant_id = ${request.tenantId}`;
+  const found = rows[0];
+  if (found === undefined) return { ok: false, reason: 'unknown_tenant' };
+  if (found.state !== 'ready') return { ok: false, reason: 'not_ready' };
+
+  await controlSql`
+    UPDATE control.tenant
+       SET tier = 'internal'::control.tenant_tier, updated_at = ${request.now}
+     WHERE tenant_id = ${request.tenantId}`;
+  return { ok: true, tenantId: request.tenantId, tier: 'internal' };
+}
+
+/**
+ * Take an operator grant back.
+ *
+ * **Only an `internal` row**, and the predicate is in the `WHERE` rather than
+ * above it. A revoke that also matched `paid` would downgrade a paying customer
+ * through the operator surface, on a mistyped tenant id, with no vendor event to
+ * put it back — the webhook only writes on a *delivery*, so nothing would ever
+ * restore it. What this can undo is exactly what it granted.
+ */
+export async function revokeOperatorTier(
+  controlSql: SQL,
+  request: { readonly tenantId: string; readonly now: Date },
+): Promise<
+  | { readonly ok: true; readonly tenantId: string; readonly tier: 'free' }
+  | { readonly ok: false; readonly reason: 'unknown_tenant' | 'not_granted' }
+> {
+  const rows = await controlSql<{ tier: string }[]>`
+    SELECT tier::text AS tier FROM control.tenant WHERE tenant_id = ${request.tenantId}`;
+  const found = rows[0];
+  if (found === undefined) return { ok: false, reason: 'unknown_tenant' };
+
+  const reverted = await controlSql<{ tenant_id: string }[]>`
+    UPDATE control.tenant
+       SET tier = 'free'::control.tenant_tier, updated_at = ${request.now}
+     WHERE tenant_id = ${request.tenantId}
+       AND tier = 'internal'::control.tenant_tier
+    RETURNING tenant_id`;
+  if (reverted.length === 0) return { ok: false, reason: 'not_granted' };
+  return { ok: true, tenantId: request.tenantId, tier: 'free' };
+}
+
+/**
+ * The tier a **capability gate** should be shown, which is the subscription's
+ * unless an operator granted one.
+ *
+ * **Two readers, one grant.** A tier lives in two databases on purpose: the
+ * consolidation cycle reads `control.tenant.tier` (`src/control/tier.ts`) so it
+ * does not depend on the identity store being reachable, and the connector gate
+ * reads `account.subscription.tier` because it is deciding about an account. A
+ * grant that moved one and not the other is half a grant — the founder's brain
+ * would consolidate with model phases and still be refused a connector, which is
+ * the exact shape of the paywall this exists to get past.
+ *
+ * `connectorGate` itself is untouched: it still refuses everything that is not
+ * `paid`. What changed is what gets handed to it, and the widening is one value
+ * wide and lives here.
+ */
+export async function effectiveTierOf(
+  controlSql: SQL,
+  tenantId: string,
+  subscribed: BillingTier,
+): Promise<BillingTier> {
+  // The subscription is the authority when it already says paid; the grant is
+  // only ever the *other* way of being paid, never a way of being free.
+  if (subscribed === 'paid') return 'paid';
+  const rows = await controlSql<{ tier: string }[]>`
+    SELECT tier::text AS tier FROM control.tenant WHERE tenant_id = ${tenantId}`;
+  return rows[0]?.tier === 'internal' ? 'paid' : 'free';
+}
+
 /** Called when an account is created, so every account has a subscription row. */
 export async function openFreeSubscription(
   sql: SQL,

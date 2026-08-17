@@ -230,7 +230,20 @@ the code rather than this file: `providersReachable()` is pinned by
 | `BRAINZ_NEON_SUSPEND_TIMEOUT` | — | — | ✓ | account-dependent | Only takes `vendor-default`, which sends no suspend interval. A free-plan Neon account answers `412 modifying the suspend interval is not permitted` and creates nothing, so if the first live signup fails that way, this is the escape hatch. |
 | `BRAINZ_POOL_TARGET` | — | — | ✓ | no (`0`) | `0` provisions synchronously on signup. Above zero, signups claim from a warm pool. |
 | `BRAINZ_TENANT_ID_PREFIX` | — | — | ✓ | no | A marker on tenant ids this deployment mints (a canary, an internal fixture). |
-| `BRAINZ_ADMIN_CREDENTIAL` | — | — | ✓ | no | Unset means `/admin` answers `404` — an admin surface whose credential is unset is one open to everybody. |
+| `BRAINZ_ADMIN_CREDENTIAL` | — | — | ✓ | no | Unset means `/admin` answers `404` — an admin surface whose credential is unset is one open to everybody. Set it if you intend to grant a tier (below). |
+| `BRAINZ_PIPEDREAM_PROJECT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET` / `_ENVIRONMENT` | — | — | ✓ | all four or none | The connector vendor. **None at all is a supported deployment**: `/api/connectors` answers `501 unavailable` and chat exports and folder imports still work. A *partial* set refuses at start naming the missing variable, because a half-configured vendor reaches the network with an empty credential and reports the refusal as a vendor outage. `_ENVIRONMENT` takes only `development` or `production` — they are separate keyspaces at the vendor, and the wrong one attaches every user's mailbox to the wrong project. |
+| `BRAINZ_PIPEDREAM_API_BASE` | — | — | ✓ | no | The vendor's API base. Absent takes theirs; setting it is how a test points the process at a double. |
+
+**The connector credential goes to the web fleet and to no other, including not
+the worker fleet** — which is the one that would poll. That absence is deliberate
+and current rather than an oversight: a poll resumes from a cursor kept in the
+tenant's object prefix, reaching one needs a `ScopedCredentialMinter`, and `src/`
+has no production implementation of that port. The worker registers the
+`ingest_pull` handler with its source seam absent, so a planted job fails
+visibly instead of sitting `due` forever, and nothing enqueues one. The four
+variables join `WORKER_FLEET_VARIABLES` on the day a minter lands;
+`test/fleet/router-env.test.ts` asserts the absence in both directions until
+then.
 
 Absent from **every** manifest, so do not bother setting them here:
 `BRAINZ_SECRETS_FILE` (the image chooses the path — setting it is ignored, with a
@@ -427,6 +440,64 @@ Do not accept a green cron history as evidence on its own — see
 `wakeWorkerFleet` in `src/mcp/router.ts` for why a failed wake is reported as a
 failed invocation rather than swallowed, and check that the *container* logged
 `listening` with `"service":"worker"`.
+
+## Granting an account the paid tier without a payment
+
+Billing is inert on a deployment with no checkout trio and a webhook secret that
+verifies nothing: every account is free forever, and connectors are paid-only for
+a reason that is unit economics rather than capability (`connectorGate` in
+`src/web/app.ts` states it). The operator's own brain, a canary or a comp
+therefore needs a way through that Stripe is not going to provide.
+
+It is an `/admin` operation, so it needs `BRAINZ_ADMIN_CREDENTIAL` set, and it is
+a **POST**:
+
+```bash
+ORIGIN=https://brainz-fleet.<your-subdomain>.workers.dev
+TENANT=t-...                      # from `?op=fleet_status`, or the signup's own row
+
+curl -sS -X POST \
+  -H "Authorization: Bearer $BRAINZ_ADMIN_CREDENTIAL" \
+  -H "Origin: $ORIGIN" \
+  "$ORIGIN/admin?op=grant_internal_tier&tenant_id=$TENANT"
+# {"ok":true,"content":{"tenant_id":"t-…","tier":"internal",
+#  "grants":["consolidation_model_phases","connected_accounts"]}}
+```
+
+Three things about that command are load-bearing rather than ceremony:
+
+* **POST, not GET.** The surface refuses the two tier operations on any other
+  method. The credential is a header, so a browser cannot be tricked into
+  presenting it — what a GET would allow is a *link*: a bookmark, a copied URL in
+  a ticket, or a shell-history recall issuing a grant, with the tenant id in the
+  query string of each.
+* **`Origin` must equal `BRAINZ_WEB_ORIGIN`.** The app refuses every
+  state-changing request that does not carry it, and a header that is absent is
+  not a header that agrees.
+* **The tier is `internal`, never `paid`.** `account.subscription` carries a
+  CHECK that a paid row names a vendor object, exactly so a comp cannot be
+  mistaken for a subscription; the grant honours it by moving the control plane's
+  own third value instead. The identity row keeps saying `free`, which is true —
+  nobody subscribed.
+
+It grants two things at once, which is why the answer names both: the
+consolidation cycle's model phases (`src/control/tier.ts` maps `internal` to
+`paid`) and connected accounts (`effectiveTierOf` in `src/control/billing.ts`).
+
+Afterwards it is visible through the same surface — by tenant, and in the fleet's
+own counts:
+
+```bash
+curl -sS -H "Authorization: Bearer $BRAINZ_ADMIN_CREDENTIAL" \
+  "$ORIGIN/admin?op=tenant_status&tenant_id=$TENANT"      # "tier":"internal"
+curl -sS -H "Authorization: Bearer $BRAINZ_ADMIN_CREDENTIAL" \
+  "$ORIGIN/admin?op=fleet_status"                          # a count under tier "internal"
+```
+
+`op=revoke_internal_tier` takes it back, and **only** an `internal` row: a
+mistyped tenant id cannot downgrade a paying customer, because nothing would ever
+put that back — the webhook writes on a delivery, and a cancelled grant produces
+none.
 
 ## Tearing it down
 

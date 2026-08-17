@@ -38,6 +38,7 @@ import {
 } from '../../src/control/secrets.ts';
 import {
   ADMIN_OPERATIONS,
+  ADMIN_WRITE_OPERATIONS,
   WIRE_TOOL_NAMES,
   adminDispatch,
   adminToolVerdict,
@@ -106,9 +107,44 @@ describe('the surface is not simply refusing everything', () => {
     for (const operation of ADMIN_OPERATIONS) {
       const result = await adminDispatch(
         { controlSql },
+        {
+          name: operation,
+          args: { tenant_id: TENANT },
+          // The two tier operations change a column, so they are only accepted
+          // over POST — see `ADMIN_WRITE_OPERATIONS`. Passing it for every
+          // operation here keeps this test about "the surface answers" rather
+          // than about the method gate, which has its own cases below.
+          write: true,
+        },
+      );
+      expect(result).toMatchObject({ ok: true });
+    }
+  });
+
+  /**
+   * **The method gate, driven at the seam that owns it.**
+   *
+   * A grant reachable by GET is a grant a bookmark or a copied URL in a ticket
+   * can issue, with the tenant id in the query string of both. The credential
+   * is a header, so CSRF is not the hazard here — the link is.
+   */
+  test('a write operation refuses without a method that authorised one', async () => {
+    for (const operation of ADMIN_WRITE_OPERATIONS) {
+      const refused = await adminDispatch(
+        { controlSql },
         { name: operation, args: { tenant_id: TENANT } },
       );
-      expect(result.ok).toBe(true);
+      expect(refused).toMatchObject({ ok: false, code: 'invalid_params' });
+    }
+
+    // And the reads are unaffected: adding a gate for the writes must not make
+    // the operator surface unusable for the four operations that only count.
+    for (const operation of ADMIN_OPERATIONS.filter((name) => !ADMIN_WRITE_OPERATIONS.has(name))) {
+      const result = await adminDispatch(
+        { controlSql },
+        { name: operation, args: { tenant_id: TENANT } },
+      );
+      expect({ operation, ok: result.ok }).toEqual({ operation, ok: true });
     }
   });
 

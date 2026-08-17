@@ -39,6 +39,8 @@
 
 import type { SQL } from 'bun';
 
+import { grantOperatorTier, revokeOperatorTier } from '../control/billing.ts';
+
 /**
  * The nine names on the wire, plus `synthesize`, exactly as
  * `src/mcp/tools/index.ts` lists them.
@@ -76,15 +78,45 @@ export const ADMIN_TOOL_SCOPE: Readonly<Record<string, 'denied'>> = Object.freez
   Object.fromEntries(WIRE_TOOL_NAMES.map((name) => [name, 'denied'])) as Record<string, 'denied'>,
 );
 
-/** The fleet operations `/admin` may run. Every answer is a number or a state. */
+/**
+ * The fleet operations `/admin` may run. Every answer is a number or a state,
+ * and every argument is a tenant id — never a word a user wrote.
+ *
+ * The last two move one column, and they are the only writes on this surface.
+ * See {@link ADMIN_WRITE_OPERATIONS}.
+ */
 export const ADMIN_OPERATIONS = [
   'fleet_status',
   'tenant_status',
   'pool_status',
   'queue_status',
+  'grant_internal_tier',
+  'revoke_internal_tier',
 ] as const;
 
 export type AdminOperation = (typeof ADMIN_OPERATIONS)[number];
+
+/**
+ * The operations that change something, and the only ones a GET may not run.
+ *
+ * **Why the distinction is enforced here rather than left to the router.** This
+ * surface is authenticated by a bearer credential in a header, so a browser
+ * cannot be tricked into presenting it and CSRF is not the hazard — the hazard
+ * is a *link*. A grant reachable by GET is a grant that can be issued by a
+ * bookmark, a shell-history recall, a copied URL in a ticket, or a retry of a
+ * request an operator meant to make once; and the tenant id sits in the query
+ * string of all of them. Requiring the method to say "this changes something"
+ * costs one flag and makes the operator's command say what it does.
+ *
+ * The refusal is `invalid_params` rather than a new code: the caller asked for a
+ * write in a shape this surface does not accept, which is what that code already
+ * means, and widening `AdminRefusalCode` for one case would put a fourth value
+ * in a union three call sites branch on.
+ */
+export const ADMIN_WRITE_OPERATIONS: ReadonlySet<string> = new Set<string>([
+  'grant_internal_tier',
+  'revoke_internal_tier',
+]);
 
 export type AdminRefusalCode = 'scope_denied' | 'unknown_operation' | 'invalid_params';
 
@@ -140,6 +172,15 @@ export interface AdminRequest {
   /** A tool name or an operation name; the caller does not get to say which. */
   readonly name: string;
   readonly args?: Record<string, unknown>;
+  /**
+   * Whether the caller's transport authorised a state change — `POST`, and
+   * nothing else. Absent reads as `false`, which is the direction that matters:
+   * a caller that forgot to pass it gets a refusal on the write operations
+   * rather than a grant.
+   */
+  readonly write?: boolean;
+  /** Injected so a grant's `updated_at` is the request's instant, not the row's. */
+  readonly now?: Date;
 }
 
 /**
@@ -155,6 +196,18 @@ export async function adminDispatch(deps: AdminDeps, request: AdminRequest): Pro
     return adminToolVerdict(request.name);
   }
 
+  // Before the switch, so a write requested in a readable shape is refused
+  // without reaching the statement that would perform it.
+  if (ADMIN_WRITE_OPERATIONS.has(request.name) && request.write !== true) {
+    return {
+      ok: false,
+      code: 'invalid_params',
+      message: `${JSON.stringify(request.name)} changes a tenant's tier and is only accepted over POST.`,
+    };
+  }
+
+  const now = request.now ?? new Date();
+
   switch (request.name as AdminOperation) {
     case 'fleet_status':
       return { ok: true, content: await fleetStatus(deps.controlSql) };
@@ -163,8 +216,8 @@ export async function adminDispatch(deps: AdminDeps, request: AdminRequest): Pro
     case 'queue_status':
       return { ok: true, content: await queueStatus(deps.controlSql) };
     case 'tenant_status': {
-      const tenantId = request.args?.['tenant_id'];
-      if (typeof tenantId !== 'string' || tenantId.length === 0) {
+      const tenantId = namedTenant(request);
+      if (tenantId === null) {
         return { ok: false, code: 'invalid_params', message: 'tenant_id is required.' };
       }
       const status = await tenantStatus(deps.controlSql, tenantId);
@@ -172,6 +225,57 @@ export async function adminDispatch(deps: AdminDeps, request: AdminRequest): Pro
         ? { ok: false, code: 'invalid_params', message: 'No such tenant.' }
         : { ok: true, content: status };
     }
+    case 'grant_internal_tier': {
+      const tenantId = namedTenant(request);
+      if (tenantId === null) {
+        return { ok: false, code: 'invalid_params', message: 'tenant_id is required.' };
+      }
+      // Through `billing.ts`, which is the only module allowed to write that
+      // column — see `grantOperatorTier`. This surface decides *who may ask*;
+      // it does not carry a second copy of what the column means.
+      const granted = await grantOperatorTier(deps.controlSql, { tenantId, now });
+      return granted.ok
+        ? {
+            ok: true,
+            content: {
+              tenant_id: granted.tenantId,
+              tier: granted.tier,
+              // Said out loud in the answer, because an operator granting this
+              // is granting model spend and connector access at once, and the
+              // second one is the half that is easy to forget.
+              grants: ['consolidation_model_phases', 'connected_accounts'],
+            },
+          }
+        : { ok: false, code: 'invalid_params', message: refusalText(granted.reason) };
+    }
+    case 'revoke_internal_tier': {
+      const tenantId = namedTenant(request);
+      if (tenantId === null) {
+        return { ok: false, code: 'invalid_params', message: 'tenant_id is required.' };
+      }
+      const revoked = await revokeOperatorTier(deps.controlSql, { tenantId, now });
+      return revoked.ok
+        ? { ok: true, content: { tenant_id: revoked.tenantId, tier: revoked.tier } }
+        : { ok: false, code: 'invalid_params', message: refusalText(revoked.reason) };
+    }
+  }
+}
+
+function namedTenant(request: AdminRequest): string | null {
+  const tenantId = request.args?.['tenant_id'];
+  return typeof tenantId === 'string' && tenantId.length > 0 ? tenantId : null;
+}
+
+/** A sentence per refusal code. No tenant id, no row content — the caller sent
+ * the id and does not need it read back to them. */
+function refusalText(reason: 'unknown_tenant' | 'not_ready' | 'not_granted'): string {
+  switch (reason) {
+    case 'unknown_tenant':
+      return 'No such tenant.';
+    case 'not_ready':
+      return 'That tenant is not ready; a tier on a half-provisioned brain is spend nobody can use.';
+    case 'not_granted':
+      return 'That tenant carries no operator grant. A paid subscription is the vendor’s to cancel.';
   }
 }
 

@@ -55,7 +55,12 @@ import {
   signUpWithPassword,
   type HashCost,
 } from '../control/accounts.ts';
-import { openFreeSubscription, subscriptionOf, type BillingTier } from '../control/billing.ts';
+import {
+  effectiveTierOf,
+  openFreeSubscription,
+  subscriptionOf,
+  type BillingTier,
+} from '../control/billing.ts';
 import { applyBillingEvent, recordCheckoutCustomer } from '../control/billing.ts';
 import type { CheckoutPort } from '../control/checkout.ts';
 import type { BrainProvisioner } from '../control/provisioner.ts';
@@ -206,7 +211,19 @@ export interface WebAppDeps {
   /** The fleet's `/mcp` URL, for the connect flow's install link. */
   readonly mcpUrl: string;
   readonly byok: ProviderKeyWriter;
-  readonly connectors: ConnectorVendor;
+  /**
+   * The connector vendor. **Absent disables the connector routes rather than
+   * faking them**, which is the rule `checkout` and `severance` already follow —
+   * and a deployment without one is an ordinary state rather than a
+   * misconfiguration: chat exports and folder imports (R8a) need no vendor, and
+   * a self-hoster may never connect one.
+   *
+   * What it replaced is why the shape is this one. `src/web/serve.ts` used to
+   * supply a vendor whose every method threw a bare `Error` from inside the
+   * request, so the route answered a generic 500 — a deployment fact presented
+   * to the user as an outage, and to the operator as a stack trace.
+   */
+  readonly connectors?: ConnectorVendor;
   /**
    * How a signup becomes a brain (`src/control/provisioner.ts`).
    *
@@ -565,7 +582,13 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       // Everything the admin surface may do, and every refusal it owes, lives in
       // `admin.ts`. This handler carries no scope logic of its own — a second
       // place to decide what `/admin` may read is a second place to get it wrong.
-      const result = await adminDispatch({ controlSql: deps.controlSql }, { name, args });
+      const result = await adminDispatch(
+        { controlSql: deps.controlSql },
+        // `write` is the request's method and nothing else. The surface's write
+        // operations refuse without it (`admin.ts:ADMIN_WRITE_OPERATIONS`), so a
+        // grant cannot be issued by following a link.
+        { name, args, write: request.method === 'POST', now: now() },
+      );
       return result.ok ? json(result) : json(result, result.code === 'scope_denied' ? 403 : 400);
     }
 
@@ -850,6 +873,32 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       });
     }
 
+    /**
+     * The refusal a deployment with no connector vendor owes, and it comes
+     * **before** the tier gate.
+     *
+     * The order is the whole of it. `connectorGate` answers `402 tier_required`
+     * with copy that asks the user to pay, and on a deployment holding no vendor
+     * credential no amount of paying makes a connector work — so tier-first
+     * charges somebody for a capability the deployment does not have, and they
+     * only learn otherwise on the retry after they have paid. Vendor-first says
+     * the true thing first. On a deployment that *is* configured this changes
+     * nothing: the check passes and the tier gate is the answer, which is what
+     * `test/fleet/signup.test.ts` observes.
+     */
+    function connectorUnavailable(): Response {
+      return json(
+        {
+          ok: false,
+          code: 'unavailable',
+          message:
+            'This deployment has no connector vendor configured, so connected accounts are not ' +
+            'available on it. Chat exports and folder imports need no connection.',
+        },
+        501,
+      );
+    }
+
     async function handleConnect(request: Request, session: Session): Promise<Response> {
       const fields = await body(request);
       const source = stringOf(fields, 'source');
@@ -857,14 +906,17 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         return json({ ok: false, code: 'unknown_source' }, 400);
       }
 
+      const vendor = deps.connectors;
+      if (vendor === undefined) return connectorUnavailable();
+
       const tenantId = await tenantOf(session.accountId);
       if (tenantId === null) return json({ ok: false, code: 'no_brain_yet' }, 409);
 
       const subscription = await subscriptionOf(deps.sql, session.accountId);
-      const gate = connectorGate(subscription.tier);
+      const gate = connectorGate(await effectiveTierOf(deps.controlSql, tenantId, subscription.tier));
       if (gate !== null) return json(gate, 402);
 
-      const minted = await deps.connectors.mintClaimUrl({
+      const minted = await vendor.mintClaimUrl({
         tenantId,
         source: source as ConnectorSourceName,
       });
@@ -880,10 +932,20 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       if (!(CONNECTOR_SOURCES as readonly string[]).includes(source)) {
         return json({ ok: false, code: 'unknown_source' }, 400);
       }
+      // The same refusal, in the same order, and not because the two routes are
+      // symmetrical for symmetry's sake: a disconnect is *tell the vendor and
+      // stop the polling*, and a deployment with no vendor can do neither half
+      // — no `ingest_pull` job can exist without a connection the vendor
+      // brokered. Answering `ok: true` with `vendor_deleted: false` would be the
+      // `applied: true` lie one unit over, on the operation a user reaches for
+      // when they want something to stop.
+      const configured = deps.connectors;
+      if (configured === undefined) return connectorUnavailable();
+
       const tenantId = await tenantOf(session.accountId);
       if (tenantId === null) return json({ ok: false, code: 'no_brain_yet' }, 409);
 
-      const vendor = await deps.connectors.disconnect({
+      const vendor = await configured.disconnect({
         tenantId,
         source: source as ConnectorSourceName,
       });
@@ -1198,13 +1260,21 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     async function renderDashboard(session: Session): Promise<Response> {
       const subscription = await subscriptionOf(deps.sql, session.accountId);
       const brain = await brainOf(deps.sql, session.accountId);
+      const tenantId = brain?.tenantId ?? null;
+      // The same two questions `handleConnect` asks, in the same order, so the
+      // page cannot offer a button whose route answers 501. A tier that is paid
+      // on a deployment holding no vendor is still not a connector.
+      const tier =
+        tenantId === null
+          ? subscription.tier
+          : await effectiveTierOf(deps.controlSql, tenantId, subscription.tier);
       return html(
         renderPage({
           kind: 'dashboard',
           tier: subscription.tier,
           status: subscription.status,
-          tenantId: brain?.tenantId ?? null,
-          connectorsAvailable: connectorGate(subscription.tier) === null,
+          tenantId,
+          connectorsAvailable: deps.connectors !== undefined && connectorGate(tier) === null,
           sources: [...CONNECTOR_SOURCES],
           providers: [...BYOK_PROVIDERS],
         }),
