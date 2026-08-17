@@ -66,7 +66,7 @@ import type { CheckoutPort } from '../control/checkout.ts';
 import type { BrainProvisioner } from '../control/provisioner.ts';
 import type { ProviderId } from '../ai/keys.ts';
 import { CONNECT_STEPS, claudeCodeCommand, connectionStatus, installLink } from './connect.ts';
-import { adminDispatch } from './admin.ts';
+import { adminDispatch, createBrainOwnerDirectory } from './admin.ts';
 import { renderPage } from './pages.ts';
 
 export const SESSION_COOKIE = 'bz_session';
@@ -583,7 +583,14 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       // `admin.ts`. This handler carries no scope logic of its own — a second
       // place to decide what `/admin` may read is a second place to get it wrong.
       const result = await adminDispatch(
-        { controlSql: deps.controlSql },
+        {
+          controlSql: deps.controlSql,
+          // **The identity handle stops here.** `deps.sql` reaches every
+          // account's address; what is handed across is a port that answers a
+          // domain and a digest, so no `/admin` operation — this one or a later
+          // one — is given a mailbox to publish. See `admin.ts:BrainOwnerDirectory`.
+          owners: createBrainOwnerDirectory(deps.sql),
+        },
         // `write` is the request's method and nothing else. The surface's write
         // operations refuse without it (`admin.ts:ADMIN_WRITE_OPERATIONS`), so a
         // grant cannot be issued by following a link.

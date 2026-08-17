@@ -229,8 +229,8 @@ the code rather than this file: `providersReachable()` is pinned by
 | `BRAINZ_NEON_REGION_ID` / `_PG_VERSION` / `_API_BASE` | — | — | ✓ | no | Where the project lands, which Postgres, and (for tests) which endpoint. |
 | `BRAINZ_NEON_SUSPEND_TIMEOUT` | — | — | ✓ | account-dependent | Only takes `vendor-default`, which sends no suspend interval. A free-plan Neon account answers `412 modifying the suspend interval is not permitted` and creates nothing, so if the first live signup fails that way, this is the escape hatch. |
 | `BRAINZ_POOL_TARGET` | — | — | ✓ | no (`0`) | `0` provisions synchronously on signup. Above zero, signups claim from a warm pool. |
-| `BRAINZ_TENANT_ID_PREFIX` | — | — | ✓ | no | A marker on tenant ids this deployment mints (a canary, an internal fixture). |
-| `BRAINZ_ADMIN_CREDENTIAL` | — | — | ✓ | no | Unset means `/admin` answers `404` — an admin surface whose credential is unset is one open to everybody. Set it if you intend to grant a tier (below). |
+| `BRAINZ_TENANT_ID_PREFIX` | — | — | ✓ | no | A marker on tenant ids this **deployment** mints (a canary, an internal fixture). It marks deployments, not tenants within one — two tenants minted by the same deployment carry the same prefix, so it cannot tell a throwaway from a real user's brain. For that, see [Before you delete a tenant](#before-you-delete-a-tenant-whose-brain-is-it). |
+| `BRAINZ_ADMIN_CREDENTIAL` | — | — | ✓ | strongly recommended | Unset means `/admin` answers `404` — an admin surface whose credential is unset is one open to everybody. Set it if you intend to grant a tier (below), and set it before you delete anything: without it there is no way to ask which tenants a person owns. |
 | `BRAINZ_PIPEDREAM_PROJECT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET` / `_ENVIRONMENT` | — | — | ✓ | all four or none | The connector vendor. **None at all is a supported deployment**: `/api/connectors` answers `501 unavailable` and chat exports and folder imports still work. A *partial* set refuses at start naming the missing variable, because a half-configured vendor reaches the network with an empty credential and reports the refusal as a vendor outage. `_ENVIRONMENT` takes only `development` or `production` — they are separate keyspaces at the vendor, and the wrong one attaches every user's mailbox to the wrong project. |
 | `BRAINZ_PIPEDREAM_API_BASE` | — | — | ✓ | no | The vendor's API base. Absent takes theirs; setting it is how a test points the process at a double. |
 
@@ -454,7 +454,8 @@ a **POST**:
 
 ```bash
 ORIGIN=https://brainz-fleet.<your-subdomain>.workers.dev
-TENANT=t-...                      # from `?op=fleet_status`, or the signup's own row
+TENANT=t-...                      # from `?op=tenant_directory`; `?op=fleet_status`
+                                  # counts tenants and names none of them
 
 curl -sS -X POST \
   -H "Authorization: Bearer $BRAINZ_ADMIN_CREDENTIAL" \
@@ -499,6 +500,77 @@ mistyped tenant id cannot downgrade a paying customer, because nothing would eve
 put that back — the webhook writes on a delivery, and a cancelled grant produces
 none.
 
+## Before you delete a tenant: whose brain is it?
+
+**Read this before running anything in the next section, and before deleting a
+project in the substrate vendor's console.**
+
+A tenant's vendor project name is derived from its tenant id and nothing else. So
+in the console — which is the list an operator actually deletes from — a
+throwaway and a person's brain are the same string, and a `*`-matched cleanup
+deletes both. That has happened on this codebase: a batch delete by tenant-id
+prefix took out three test tenants and one real user's brain, and it was
+recoverable only because that brain happened to be empty.
+
+`BRAINZ_TENANT_ID_PREFIX` does not save you here and is not meant to. It marks
+the tenants a **deployment** mints; the throwaways in that incident were minted
+by the same deployment as the brain that mattered, so all four carried the same
+prefix. A prefix cannot separate two tenants it gives the same prefix to.
+
+What can is `op=tenant_directory`. It is a read, so a plain GET does it:
+
+```bash
+ORIGIN=https://brainz-fleet.<your-subdomain>.workers.dev
+
+curl -sS -H "Authorization: Bearer $BRAINZ_ADMIN_CREDENTIAL" \
+  "$ORIGIN/admin?op=tenant_directory" |
+  jq -r '.content.tenants[]
+         | [ .tenant_id, .state, (.last_activity // "never"),
+             (if .owner then "OWNED " + .owner.domain + " " + .owner.digest
+              else "unowned" end) ]
+         | @tsv'
+```
+
+```
+t-aaa111  ready  never                     OWNED example.com 72497f475e4f
+t-bbb222  ready  2026-08-16T12:00:00.000Z  unowned
+```
+
+**Read the last column, not the third one.** In the incident, the brain that was
+deleted said `never`. It had been provisioned and not yet used, which is what a
+brand-new real account looks like and also what a throwaway looks like — the
+activity column cannot tell them apart and neither can the console. The word
+`OWNED` is the one that can. This is also why the operation grades nothing and
+prints no "safe to delete" verdict: every heuristic such a verdict could be built
+from said *disposable* about the row that mattered.
+
+**No address comes back, on purpose.** The response carries the mail domain and
+twelve hex characters of a digest, never a mailbox — a response that listed
+customer addresses would put them into your shell history, your scrollback and
+whatever ticket you pasted the output into. To check a tenant against an address
+you already hold, compute the same digest locally and compare:
+
+```bash
+EMAIL=someone@example.com
+printf '%s' "$EMAIL" | tr 'A-Z' 'a-z' | shasum -a 256 | cut -c1-12
+# 72497f475e4f  → matches t-aaa111 above
+```
+
+The `tr` is load-bearing: addresses are stored lowercased, so a digest computed
+over `Someone@Example.com` matches nothing and reads as "not this tenant" —
+a false negative in exactly the direction that deletes somebody's brain.
+
+`total` and `truncated` are in the response body. The listing is capped, so on a
+larger fleet check `truncated` before concluding that a tenant is not there; ask
+for a page with `&limit=N` (`N` above the cap is clamped to it, not refused). If
+the operation answers `400` saying the owner lookup is unavailable, that is
+deliberate — it means the identity database could not be reached, and a
+directory that cannot see owners refuses rather than reporting every brain as
+unowned.
+
+`op=tenant_status&tenant_id=…` still answers the operational detail for one
+tenant once you know which one you mean.
+
 ## Tearing it down
 
 **`wrangler delete` removes the Worker and leaves the container application and
@@ -536,6 +608,13 @@ Outside Cloudflare, the tenant Neon projects and the control-plane database are
 still there, and deleting the fleet does not touch them. That is deliberate — a
 brain outliving its serving infrastructure is the correct direction — but it
 means "I deleted the deploy" is not "I stopped paying".
+
+**And it means the next thing an operator does is open the vendor console and
+delete projects by name — which is the step that has already destroyed a real
+user's brain once.** Resolve every project you are about to delete to an owner
+first: [Before you delete a tenant](#before-you-delete-a-tenant-whose-brain-is-it).
+A project whose tenant the directory reports as `OWNED` is somebody's, however
+empty and however recently created it looks.
 
 ## Known limits
 

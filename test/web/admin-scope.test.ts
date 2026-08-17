@@ -56,6 +56,18 @@ import {
 const ADMIN_CREDENTIAL = 'bzadm_the_web_apps_operator_credential';
 const TENANT = 'alice';
 
+/**
+ * The owner port, answering that it saw no brains — which is the fleet state
+ * this fixture is actually in, since it seeds a control plane and no identity
+ * database at all.
+ *
+ * It is a stub here on purpose. This file is about scope: what `/admin` may
+ * *name*, and what it is refused. What the directory may *say about a person* is
+ * `test/web/tenant-directory.test.ts`, against real rows in both databases —
+ * and a stub asserting privacy properties would be a test of the stub.
+ */
+const noOwners = { owners: () => Promise.resolve({ ok: true as const, owners: [] }) };
+
 let fixture: ControlFixture;
 let controlSql: SQL;
 
@@ -82,7 +94,7 @@ describe('the /admin surface knows every tool name and denies the lot', () => {
   });
 
   test('R11: recall is refused with scope_denied, by name', async () => {
-    const refusal = await adminDispatch({ controlSql }, { name: 'recall', args: { query: 'anything' } });
+    const refusal = await adminDispatch({ controlSql, owners: noOwners }, { name: 'recall', args: { query: 'anything' } });
 
     expect(refusal).toMatchObject({ ok: false, code: 'scope_denied', tool: 'recall' });
   });
@@ -96,7 +108,7 @@ describe('the /admin surface knows every tool name and denies the lot', () => {
 
   test('every wire tool is denied, not just the obvious readers', async () => {
     for (const name of WIRE_TOOL_NAMES) {
-      const refusal = await adminDispatch({ controlSql }, { name });
+      const refusal = await adminDispatch({ controlSql, owners: noOwners }, { name });
       expect(refusal).toMatchObject({ ok: false, code: 'scope_denied', tool: name });
     }
   });
@@ -106,7 +118,7 @@ describe('the surface is not simply refusing everything', () => {
   test('its own fleet operations answer', async () => {
     for (const operation of ADMIN_OPERATIONS) {
       const result = await adminDispatch(
-        { controlSql },
+        { controlSql, owners: noOwners },
         {
           name: operation,
           args: { tenant_id: TENANT },
@@ -131,7 +143,7 @@ describe('the surface is not simply refusing everything', () => {
   test('a write operation refuses without a method that authorised one', async () => {
     for (const operation of ADMIN_WRITE_OPERATIONS) {
       const refused = await adminDispatch(
-        { controlSql },
+        { controlSql, owners: noOwners },
         { name: operation, args: { tenant_id: TENANT } },
       );
       expect(refused).toMatchObject({ ok: false, code: 'invalid_params' });
@@ -141,7 +153,7 @@ describe('the surface is not simply refusing everything', () => {
     // the operator surface unusable for the four operations that only count.
     for (const operation of ADMIN_OPERATIONS.filter((name) => !ADMIN_WRITE_OPERATIONS.has(name))) {
       const result = await adminDispatch(
-        { controlSql },
+        { controlSql, owners: noOwners },
         { name: operation, args: { tenant_id: TENANT } },
       );
       expect({ operation, ok: result.ok }).toEqual({ operation, ok: true });
@@ -149,7 +161,7 @@ describe('the surface is not simply refusing everything', () => {
   });
 
   test('a fleet answer is counters, and carries nothing a user wrote', async () => {
-    const result = await adminDispatch({ controlSql }, { name: 'tenant_status', args: { tenant_id: TENANT } });
+    const result = await adminDispatch({ controlSql, owners: noOwners }, { name: 'tenant_status', args: { tenant_id: TENANT } });
     if (!result.ok) throw new Error('tenant_status was refused');
 
     expect(Object.keys(result.content).sort()).toEqual([
