@@ -248,7 +248,7 @@ export const SHARED_COMPONENTS: readonly RegisterEntry[] = [
       'Every tenant who has connected a source. Pipedream holds live OAuth tokens to those users’ mailboxes, calendars and drives, and the project key addresses every external user in the project — so it is inside the trust boundary in the strongest sense: an account erasure that does not delete the Pipedream external user leaves live tokens to an erased user’s mailbox at a vendor.',
     rotation_owner: 'control-plane operator on call',
     rotation:
-      'Rotated in the Pipedream dashboard and re-put into the control plane’s store. Per-user tokens are revoked individually as part of the account-erasure runbook rather than by rotating this key.',
+      'Rotated in the Pipedream dashboard and re-put into the control plane’s store. **Two fleets hold the project key** — the web app mints connect links and reconciles authorizations on a dashboard render, the worker fleet reconciles on its tick and polls — so a rotation has to reach both manifests; the MCP fleet holds none of it. Per-user tokens are revoked individually as part of the account-erasure runbook rather than by rotating this key.',
     evidence: { hosts: ['api.pipedream.com', 'pipedream.com'] },
   },
   {
@@ -312,7 +312,7 @@ export const SHARED_COMPONENTS: readonly RegisterEntry[] = [
     shared_by: 'all_tenants',
     transmits_user_content: false,
     blast_radius:
-      'Every tenant’s account row, tier, spend counter and connection metadata, plus — now that it is a deployed container rather than a process nobody started — the identity database’s credential, the billing vendor’s key and the substrate vendor’s organisation key, none of which any other fleet holds. Deliberately NOT every tenant’s content: the control-plane database is content-free by rule and by test, and the `/admin` credential has zero content-read scope — asserted by a CI case expecting `scope_denied` on `recall`, and, one layer down, by holding no resolve permission on any tenant secret namespace.',
+      'Every tenant’s account row, tier, spend counter and connection metadata, plus — now that it is a deployed container rather than a process nobody started — the identity database’s credential, the billing vendor’s key and the substrate vendor’s organisation key, none of which any other fleet holds. Deliberately NOT every tenant’s content: the control-plane database is content-free by rule and by test, and the `/admin` credential has zero content-read scope — asserted by a CI case expecting `scope_denied` on `recall`, and, one layer down, by holding no resolve permission on any tenant secret namespace. **The control plane holds one further class, sealed rather than absent, and it is worth naming rather than folding into “metadata”:** each connected source’s `ConnectorState` (`control.connector_link`) carries the provider’s own sync cursor and the mailbox the provider names, in an AES-256-GCM envelope bound to `connector/<tenant>/<source>` — the same treatment, under the same key, as the tenant connection strings the secret store keeps here. So a dump of this database yields ciphertext for that class too, and the rule it satisfies is the generalised one: the control plane holds nothing a reader of the control plane can use.',
     rotation_owner: 'control-plane operator on call',
     rotation:
       'Replaced by deploy, like the other two fleets. Session secrets rotate with it; the `/admin` credential is rotated through the control plane, and the vendor keys through their vendors.',

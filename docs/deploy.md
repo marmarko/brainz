@@ -232,19 +232,32 @@ the code rather than this file: `providersReachable()` is pinned by
 | `BRAINZ_POOL_TARGET` | — | — | ✓ | no (`0`) | `0` provisions synchronously on signup. Above zero, signups claim from a warm pool. |
 | `BRAINZ_TENANT_ID_PREFIX` | — | — | ✓ | no | A marker on tenant ids this **deployment** mints (a canary, an internal fixture). It marks deployments, not tenants within one — two tenants minted by the same deployment carry the same prefix, so it cannot tell a throwaway from a real user's brain. For that, see [Before you delete a tenant](#before-you-delete-a-tenant-whose-brain-is-it). |
 | `BRAINZ_ADMIN_CREDENTIAL` | — | — | ✓ | strongly recommended | Unset means `/admin` answers `404` — an admin surface whose credential is unset is one open to everybody. Set it if you intend to grant a tier (below), and set it before you delete anything: without it there is no way to ask which tenants a person owns. |
-| `BRAINZ_PIPEDREAM_PROJECT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET` / `_ENVIRONMENT` | — | — | ✓ | all four or none | The connector vendor. **None at all is a supported deployment**: `/api/connectors` answers `501 unavailable` and chat exports and folder imports still work. A *partial* set refuses at start naming the missing variable, because a half-configured vendor reaches the network with an empty credential and reports the refusal as a vendor outage. `_ENVIRONMENT` takes only `development` or `production` — they are separate keyspaces at the vendor, and the wrong one attaches every user's mailbox to the wrong project. |
-| `BRAINZ_PIPEDREAM_API_BASE` | — | — | ✓ | no | The vendor's API base. Absent takes theirs; setting it is how a test points the process at a double. |
+| `BRAINZ_PIPEDREAM_PROJECT_ID` / `_CLIENT_ID` / `_CLIENT_SECRET` / `_ENVIRONMENT` | — | ✓ | ✓ | all four or none | The connector vendor. **None at all is a supported deployment**: `/api/connectors` answers `501 unavailable` and chat exports and folder imports still work. A *partial* set refuses at start naming the missing variable, because a half-configured vendor reaches the network with an empty credential and reports the refusal as a vendor outage. `_ENVIRONMENT` takes only `development` or `production` — they are separate keyspaces at the vendor, and the wrong one attaches every user's mailbox to the wrong project. |
+| `BRAINZ_PIPEDREAM_API_BASE` | — | ✓ | ✓ | no | The vendor's API base. Absent takes theirs; setting it is how a test points the process at a double. |
 
-**The connector credential goes to the web fleet and to no other, including not
-the worker fleet** — which is the one that would poll. That absence is deliberate
-and current rather than an oversight: a poll resumes from a cursor kept in the
-tenant's object prefix, reaching one needs a `ScopedCredentialMinter`, and `src/`
-has no production implementation of that port. The worker registers the
-`ingest_pull` handler with its source seam absent, so a planted job fails
-visibly instead of sitting `due` forever, and nothing enqueues one. The four
-variables join `WORKER_FLEET_VARIABLES` on the day a minter lands;
-`test/fleet/router-env.test.ts` asserts the absence in both directions until
-then.
+**The connector credential goes to the two fleets that talk to the vendor, and
+never to the MCP one.** This paragraph used to read *"to the web fleet and to no
+other, including not the worker fleet"*, and gave the reason: a poll resumes from
+a cursor kept in the tenant's object prefix, reaching one needs a
+`ScopedCredentialMinter`, and `src/` has no production implementation of that
+port — so the worker registered the `ingest_pull` handler with its source seam
+absent and nothing enqueued one. It promised the four variables would join
+`WORKER_FLEET_VARIABLES` on the day the lane could run. That day is here: the
+connector's state moved to the control plane, sealed
+(`src/control/connector-store.sql`), which every fleet already holds a handle to,
+so the worker fleet composes a real connector runtime, reconciles authorizations
+on its tick and polls the connections that result.
+
+**The MCP fleet still gets none of them**, and that is now the whole of what this
+rule protects: it is the process that parses attacker-supplied content, and it
+mints no connect link, reconciles nothing and polls nothing, so a vendor
+credential there would be authority it cannot exercise sitting in the widest
+surface in the deployment. `test/fleet/router-env.test.ts` asserts all three
+directions.
+
+Nothing new to `wrangler secret put`: the four secrets already exist on the
+Worker, and which container receives them is decided by the manifests in
+`src/mcp/router.ts` rather than by a second `put`.
 
 Absent from **every** manifest, so do not bother setting them here:
 `BRAINZ_SECRETS_FILE` (the image chooses the path — setting it is ignored, with a
