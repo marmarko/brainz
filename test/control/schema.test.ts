@@ -958,7 +958,10 @@ const SAMPLE_ENVELOPE = await seal(
 );
 
 const BEARER_SHAPED_PROBES: readonly string[] = [
-  't-779dac5aa50b7de1c59c1fb7.aGVsbG8gdGhlcmUgZnJpZW5kIHRoaXMgaXMgbm90IHJlYWw',
+  // The `<tenant-id>.<random>` shape `mintTenantBearer` produces. The id half
+  // is all zeroes on purpose: this repository is public, and a real tenant id
+  // is an account identifier even when the token beside it is invented.
+  't-0000000000000000000000.aGVsbG8gdGhlcmUgZnJpZW5kIHRoaXMgaXMgbm90IHJlYWw',
   'brz-this-is-not-a-credential-0000',
   'sk-this-is-not-a-credential-00000',
   'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
