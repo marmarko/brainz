@@ -653,6 +653,15 @@ interface SealedDomainEntry {
  * that `test/control/secret-durability.test.ts` opens what it wrote.
  */
 const SEALED_ENVELOPE_DOMAINS: readonly SealedDomainEntry[] = [
+  // Ordered by the file the domain is declared in, because that is the order
+  // `textDomains()` walks (`SQL_FILES` is sorted, and `control/oauth-store.sql`
+  // sorts before `control/secret-store.sql`). The registry test compares the two
+  // lists element by element, so a new entry goes where its file goes.
+  {
+    domain: 'control.oauth_envelope',
+    because:
+      "it holds an AES-256-GCM envelope under the same key and the same module as `control.sealed_envelope`, bound by AAD to its own row key (`oauth-client/<id>`, `oauth-code/<digest>`, `oauth-refresh/<digest>`) so a row transplanted onto another key fails to open. **The argument for registering it is a storability one, not a confidentiality one, and the two are not the same sentence.** An OAuth client here is public by construction — `token_endpoint_auth_method: none`, no client secret, and its redirect URIs are already the deployment's own allowlist — so nothing about it is secret; it is sealed because a `redirect_uri` is a URL and a `client_name` is prose, and this guard makes both structurally unstorable in the clear. The code and refresh bodies carry the grant (tenant, fence origins, write origin) and do have a confidentiality argument on top. What the codes and refresh tokens THEMSELVES are is not stored at all: only `sha256` of them, in `control.oauth_digest`, which is the rule `account.session` already applies. The bound is 2048 for the reason the entry below gives",
+  },
   {
     domain: 'control.sealed_envelope',
     because:

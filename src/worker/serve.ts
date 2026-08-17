@@ -45,6 +45,10 @@ import {
 import { createConsolidateHandler } from './consolidate/cycle.ts';
 import { createExportHandler, enqueueDueExports } from './export.ts';
 import { createSchemaSweepPorts } from '../control/schema-sweep.ts';
+import {
+  ensureAuthorizationStoreSchema,
+  purgeExpiredAuthorizationState,
+} from '../control/oauth-pg.ts';
 import { createConsolidateWorld } from '../control/tier.ts';
 import { fleetIdentity } from '../control/secrets.ts';
 import { createTenantStorage } from '../control/storage.ts';
@@ -106,6 +110,14 @@ export async function startWorkerFleet(
   const leaseSql = new SQL(env['BRAINZ_CONTROL_DATABASE_URL'] as string, { max: 2 });
   const secrets = await openSecretStore(env, controlSql);
   const gateway = openFleetGateway(env, { controlSql, keys: secrets.providerKeys });
+
+  // **Applied here as well as in the MCP fleet, and not for this fleet's own
+  // reads — it has none.** The sweep below is the only thing here that touches
+  // those tables, and a worker that boots before any MCP instance has ever
+  // started would otherwise fail every tick on `relation does not exist`. The
+  // ensure is idempotent and advisory-locked, so whichever fleet gets there
+  // first does the work and the others ask a question and move on.
+  await ensureAuthorizationStoreSchema(controlSql);
 
   const queue = createJobQueue({ sql: controlSql });
   const leases = createLeaseChannel({ sql: leaseSql });
@@ -314,6 +326,18 @@ export async function startWorkerFleet(
       { now },
     );
     await runner.runOnce({ now });
+    // The OAuth store's hygiene, last: nothing in the flow's correctness waits
+    // on it — every read applies its own expiry bound, so an unswept row is
+    // never honoured — but a table that only grows is the thing that pages
+    // somebody at 3am, and an abandoned consent screen leaves a code behind.
+    //
+    // **This fleet, rather than the MCP one, because this is the fleet with a
+    // cadence.** A Cloudflare cron wakes it every thirty minutes whether or not
+    // anybody is using their connector; the MCP instances scale to zero, so a
+    // timer there would only run while the flow was busy. The revocation arm
+    // keeps its own, much longer, derived retention — see
+    // `oauth-pg.ts:REVOCATION_RETENTION_SECONDS`.
+    await purgeExpiredAuthorizationState(controlSql, { now });
   }
 
   const stopHeartbeat = runner.start();

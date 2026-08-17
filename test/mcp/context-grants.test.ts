@@ -434,7 +434,7 @@ describe('a work-scoped grant can be obtained through the real OAuth flow', () =
     const { createMcpServer } = await import('../../src/mcp/server.ts');
     const { registerClient } = await import('../../src/mcp/oauth.ts');
     const redirectUri = 'https://claude.ai/api/mcp/auth_callback';
-    const registered = registerClient(
+    const registered = await registerClient(
       fixture.deps.store,
       { clientName: 'test-connector', redirectUris: [redirectUri] },
       { allowlist: { redirectUris: [redirectUri], maxRegistrationsPerHour: 10 }, now: fixture.now() },
@@ -469,7 +469,7 @@ describe('a work-scoped grant can be obtained through the real OAuth flow', () =
       expect(response.status).toBe(302);
 
       const code = new URL(response.headers.get('location') ?? '').searchParams.get('code') ?? '';
-      const record = fixture.deps.store.takeCode(code);
+      const record = await fixture.deps.store.takeCode(code);
       expect(record).toBeDefined();
       expect(record?.scope).toBe('narrowed');
       expect(record?.origins).toEqual(['work:*']);
@@ -501,7 +501,7 @@ describe('a work-scoped grant can be obtained through the real OAuth flow', () =
       const response = await flow(null);
       expect(response.status).toBe(302);
       const code = new URL(response.headers.get('location') ?? '').searchParams.get('code') ?? '';
-      const record = fixture.deps.store.takeCode(code);
+      const record = await fixture.deps.store.takeCode(code);
       expect(record?.scope).toBe('whole_brain');
       expect(record?.origins).toEqual([]);
     },

@@ -37,6 +37,7 @@ import {
 import { dropFixtureDatabase, provisionFixture, type SchemaFixture } from '../schema/fixture.ts';
 import {
   FAKE_CF_ACCOUNT_ID,
+  FAKE_SEALING_KEY,
   startService,
   writeSecretsFile,
   type RunningService,
@@ -94,6 +95,12 @@ function mcpEnv(): Record<string, string> {
     BRAINZ_CONTROL_DATABASE_URL: control.dsn,
     BRAINZ_SECRET_BACKEND: 'file',
     BRAINZ_SECRETS_FILE: secretsFile,
+    // The authorization store's key. It is here although the SECRET backend is
+    // the file one, because the two are independent choices: the OAuth flow's
+    // clients, codes, refresh tokens and revocations go to the control plane
+    // whatever a deployment does about tenant secrets, and a fleet with no key
+    // for them refuses to start rather than quietly forgetting connectors.
+    BRAINZ_SECRET_ENCRYPTION_KEY: FAKE_SEALING_KEY,
       BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
   };
 }

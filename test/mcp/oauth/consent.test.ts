@@ -73,9 +73,9 @@ function counting(store: AuthorizationStore): {
       ...store,
       putClient: (record) => store.putClient(record),
       getClient: (id) => store.getClient(id),
-      putCode(code, record) {
+      async putCode(code, record) {
         codes.push({ code, record });
-        store.putCode(code, record);
+        await store.putCode(code, record);
       },
       takeCode: (code) => store.takeCode(code),
     },
@@ -157,12 +157,12 @@ beforeAll(async () => {
     allowlist: { redirectUris: [REDIRECT, OTHER_REDIRECT], maxRegistrationsPerHour: 50 },
     now: fixture.now(),
   };
-  const registered = registerClient(
+  const registered = await registerClient(
     fixture.deps.store,
     { clientName: 'Claude', redirectUris: [REDIRECT] },
     allowlist,
   );
-  const other = registerClient(
+  const other = await registerClient(
     fixture.deps.store,
     { clientName: 'Another Connector', redirectUris: [OTHER_REDIRECT] },
     allowlist,

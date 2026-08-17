@@ -322,7 +322,21 @@ export async function authenticate(
   // A self-contained token cannot be withdrawn by rewriting it, so revocation
   // is a list and it is consulted on every call — including the ones that would
   // otherwise never touch the store.
-  if (deps.store.isRevoked(claims.tenantId, claims.grantId)) {
+  //
+  // **The list is durable now, and this call is a control-plane round trip.**
+  // It used to be a `Set` lookup in the same container that recorded it, which
+  // was fast and wrong: `/revoke` and this read reached the same memory only
+  // because `edge.ts` pinned both to the tenant's instance, and neither survived
+  // that instance sleeping. What is added is one indexed probe on a pool this
+  // process already holds, beside the tenant-secret resolve above it. Nothing is
+  // cached: the only direction worth caching is `false`, and a cached `false`
+  // bounds how quickly a revocation takes effect by its TTL — which is the hole
+  // being closed, re-opened for a millisecond.
+  //
+  // **Not wrapped in a try/catch, deliberately.** A store that cannot answer
+  // must not be read as "not revoked": a rejection propagates out of this
+  // function and the call fails, which is the fail-closed direction.
+  if (await deps.store.isRevoked(claims.tenantId, claims.grantId)) {
     return {
       ok: false,
       refusal: {

@@ -46,6 +46,18 @@ const TEST_TIMEOUT_MS = 60_000;
 const PERSONAL = 'personal:mail';
 const WORK = 'work:mail';
 
+/**
+ * Grant ids in the shape `oauth.ts:mintGrantId` actually produces.
+ *
+ * They used to be `g-victim` and friends — readable, and no longer usable as
+ * probes: the durable store refuses an id no mint could have produced, so a
+ * revocation of `g-victim` would be dropped for the wrong reason and these
+ * cases would pass while proving nothing about who may retire whose grant.
+ */
+const VICTIM_GRANT = 'g_victim0000000000';
+const STRANGER_GRANT = 'g_nottheirs0000000';
+const OWN_GRANT = 'g_mine000000000000';
+
 const SECRET_LINE = 'The personal severance figure is four hundred thousand dollars.';
 const SECRET_SUBJECT = 'Re: the personal severance offer, confidential';
 
@@ -540,12 +552,12 @@ describe('revocation is not an open endpoint', () => {
       new Request('https://mcp.brainz.test/revoke', {
         method: 'POST',
         headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: 'grant_id=g-victim',
+        body: `grant_id=${VICTIM_GRANT}`,
       }),
     );
 
     expect(response.status).toBe(401);
-    expect(fixture.store.isRevoked(fixture.tenantId, 'g-victim')).toBe(false);
+    expect(await fixture.store.isRevoked(fixture.tenantId, VICTIM_GRANT)).toBe(false);
   });
 
   test('one tenant cannot retire another tenant\u2019s grant', async () => {
@@ -575,14 +587,14 @@ describe('revocation is not an open endpoint', () => {
           'content-type': 'application/x-www-form-urlencoded',
           authorization: `Bearer ${otherBearer}`,
         },
-        body: 'grant_id=g-not-theirs',
+        body: `grant_id=${STRANGER_GRANT}`,
       }),
     );
 
     // RFC 7009: still a 200, because the endpoint must not become an oracle for
     // which grant ids exist. What must not happen is the retirement itself.
     expect(response.status).toBe(200);
-    expect(fixture.store.isRevoked(fixture.tenantId, 'g-not-theirs')).toBe(false);
+    expect(await fixture.store.isRevoked(fixture.tenantId, STRANGER_GRANT)).toBe(false);
 
     // And the victim's credential still works, which is the property a status
     // code cannot show.
@@ -618,11 +630,11 @@ describe('revocation is not an open endpoint', () => {
           'content-type': 'application/x-www-form-urlencoded',
           authorization: `Bearer ${fixture.bearer}`,
         },
-        body: 'grant_id=g-mine',
+        body: `grant_id=${OWN_GRANT}`,
       }),
     );
 
     expect(response.status).toBe(200);
-    expect(fixture.store.isRevoked(fixture.tenantId, 'g-mine')).toBe(true);
+    expect(await fixture.store.isRevoked(fixture.tenantId, OWN_GRANT)).toBe(true);
   });
 });

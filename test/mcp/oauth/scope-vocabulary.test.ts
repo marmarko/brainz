@@ -50,7 +50,7 @@ let clientId: string;
 
 beforeAll(async () => {
   fixture = await createMcpFixture('mcp_scope_vocab');
-  const registered = registerClient(
+  const registered = await registerClient(
     fixture.deps.store,
     { clientName: 'Claude', redirectUris: [REDIRECT] },
     { allowlist: { redirectUris: [REDIRECT], maxRegistrationsPerHour: 50 }, now: fixture.now() },
@@ -86,7 +86,7 @@ async function flow(scope: string | null): Promise<{ status: number; record?: Co
   );
   if (response.status !== 302) return { status: response.status };
   const code = new URL(response.headers.get('location') ?? '').searchParams.get('code') ?? '';
-  const record = fixture.deps.store.takeCode(code);
+  const record = await fixture.deps.store.takeCode(code);
   return { status: response.status, ...(record === undefined ? {} : { record }) };
 }
 
@@ -187,7 +187,7 @@ describe('the token response', () => {
    * `brainz:context:work` was answered `work:*`, this server's internal fence
    * grammar, which is not a string it can interpret or ask for again.
    */
-  test('speaks the vocabulary the documents publish, not the fence grammar', () => {
+  test('speaks the vocabulary the documents publish, not the fence grammar', async () => {
     const store = createInMemoryAuthorizationStore();
     const base = {
       grantId: 'g-1',
@@ -196,14 +196,14 @@ describe('the token response', () => {
       endpoint: 'mcp' as const,
     };
 
-    const whole = issueTokens(store, {
+    const whole = await issueTokens(store, {
       grant: { ...base, scope: 'whole_brain', origins: [], writeOrigin: 'personal:agent' },
       signingKey: 'k',
       now: 0,
     });
     expect(whole.scope).toBe(ACCESS_SCOPES.join(' '));
 
-    const narrowed = issueTokens(store, {
+    const narrowed = await issueTokens(store, {
       grant: { ...base, scope: 'narrowed', origins: ['work:*'], writeOrigin: 'work:agent' },
       signingKey: 'k',
       now: 0,

@@ -55,11 +55,25 @@
  *     signed-in browser to issue — `SameSite=Lax` admits top-level cross-site
  *     navigations by design, since that is the shape an OAuth redirect has.
  *
- * **The store is an interface with an in-memory implementation.** The durable
- * binding is deliberately absent: the control plane's alphabets cannot hold a
- * redirect URI or a code challenge, and U15 owns the identity store those rows
- * belong in. What is fixed here is the *shape* — every operation the flow needs,
- * expressed so a durable backend is a drop-in rather than a redesign.
+ * **The store is an interface with two implementations, and the durable one is
+ * the deployed default.** It used to be in-memory only, on the argument that
+ * "the control plane's alphabets cannot hold a redirect URI or a code
+ * challenge". That argument was true about the alphabets and wrong about the
+ * conclusion, and what it cost was the reported incident: `serve.ts` composed
+ * `createInMemoryAuthorizationStore()`, `McpFleet.sleepAfter` is fifteen
+ * minutes, and `edge.ts:FLOW_INSTANCE` puts the whole flow on one Durable
+ * Object — so a registered client, every refresh token and **every revocation**
+ * were lost each time that instance slept or was replaced. The founder
+ * connected Claude, came back later, and was told the account was authorized
+ * but the connector could not connect.
+ *
+ * `src/control/oauth-pg.ts` is the durable backend and `src/control/oauth-store.sql`
+ * is where the alphabet problem is actually solved: the rows that genuinely
+ * cannot be spelled in the control plane's grammar — a redirect URI, a client
+ * name, a record body — are sealed envelopes, which is the exception that
+ * database already registered for tenant secrets. The in-memory store stays,
+ * for tests and for a single-instance self-hoster, and is selected **by name**
+ * rather than fallen into.
  */
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
@@ -335,6 +349,64 @@ export type OAuthError =
   | 'invalid_scope'
   | 'rate_limited';
 
+/**
+ * The two handles this module mints, and the patterns that admit them.
+ *
+ * **Why a pattern exists at all now.** While the store was a `Map`, an id was
+ * whatever the mint produced and nothing else ever had to recognise one. A
+ * durable store has to give these columns an alphabet — the control plane's
+ * content-free guard requires it — and the moment there is an alphabet there are
+ * two ways to get it wrong, in opposite directions. Too loose, and
+ * `control.oauth_revocation` is a free write amplifier for prose, because
+ * `/revoke` takes `grant_id` straight off a form body. Too tight, and a REAL
+ * revocation of a REAL grant is refused by a CHECK — the security property
+ * failing open, rebuilt inside the fix for it.
+ *
+ * So the mint and the admission are one pattern each, exported together, and
+ * `test/mcp/oauth/durable-store.test.ts` mints a thousand ids and asserts every
+ * one of them is admitted. A future change to the entropy width moves both or
+ * neither.
+ */
+export const CLIENT_ID_PATTERN = /^bzc_[A-Za-z0-9_-]{16,80}$/;
+export const GRANT_ID_PATTERN = /^g_[A-Za-z0-9_-]{8,80}$/;
+
+export function mintClientId(random: (n: number) => Uint8Array = randomBytes): string {
+  return `bzc_${base64url(random(16))}`;
+}
+
+export function mintGrantId(random: (n: number) => Uint8Array = randomBytes): string {
+  return `g_${base64url(random(12))}`;
+}
+
+export function isMintableClientId(clientId: string): boolean {
+  return CLIENT_ID_PATTERN.test(clientId);
+}
+
+export function isMintableGrantId(grantId: string): boolean {
+  return GRANT_ID_PATTERN.test(grantId);
+}
+
+/**
+ * What a registration may carry, bounded here rather than at the column.
+ *
+ * A durable store seals the client record into one bounded envelope, so an
+ * unbounded `client_name` becomes a CHECK violation — a `500` from a registration
+ * endpoint, for a request that is simply too big. RFC 7591 already has the right
+ * answer for that (`invalid_client_metadata`), and it belongs at the validator
+ * rather than at the backend, so the in-memory store and the durable one refuse
+ * the same registrations.
+ *
+ * **{@link MAX_REDIRECT_URIS} is the one that is not obvious.** The allowlist
+ * checks each URI for membership and says nothing about how many times one may
+ * appear, so a registration repeating an *allowed* redirect a thousand times
+ * passes every check this module had and inflates the record until the column
+ * refuses it. A client with more than a handful of redirects is not a shape any
+ * connector has.
+ */
+export const MAX_CLIENT_NAME_LENGTH = 128;
+export const MAX_REDIRECT_URI_LENGTH = 512;
+export const MAX_REDIRECT_URIS = 8;
+
 export interface ClientRecord {
   readonly clientId: string;
   readonly clientName: string;
@@ -369,16 +441,32 @@ export interface RefreshRecord {
   readonly expiresAt: number;
 }
 
+/**
+ * **Every method is `async`, and that is a consequence rather than a style.**
+ *
+ * The shape used to be synchronous because the only implementation was a `Map`.
+ * That was the tell: a store nothing can await is a store nothing durable can
+ * implement, and the port's own header called the durable backend a "drop-in"
+ * while the signature made one impossible. Every caller of every method below
+ * was already inside an `async` function — `server.ts`'s four handlers,
+ * `dispatch.ts`'s `authenticate` — so the change is an `await` at each call site
+ * and no restructuring anywhere.
+ *
+ * The ordering that comes with it is load-bearing: `authorize` must await
+ * `putCode` before it returns the redirect, and `issueTokens` must await
+ * `putRefresh` before it returns the tokens. A credential handed to a client
+ * before it is banked is the original failure in miniature.
+ */
 export interface AuthorizationStore {
-  putClient(record: ClientRecord): void;
-  getClient(clientId: string): ClientRecord | undefined;
-  noteRegistration(atMs: number): void;
-  registrationsSince(sinceMs: number): number;
-  putCode(code: string, record: CodeRecord): void;
+  putClient(record: ClientRecord): Promise<void>;
+  getClient(clientId: string): Promise<ClientRecord | undefined>;
+  noteRegistration(atMs: number): Promise<void>;
+  registrationsSince(sinceMs: number): Promise<number>;
+  putCode(code: string, record: CodeRecord): Promise<void>;
   /** Single-use: the record is removed by this call, successful redeem or not. */
-  takeCode(code: string): CodeRecord | undefined;
-  putRefresh(tokenHash: string, record: RefreshRecord): void;
-  takeRefresh(tokenHash: string): RefreshRecord | undefined;
+  takeCode(code: string): Promise<CodeRecord | undefined>;
+  putRefresh(tokenHash: string, record: RefreshRecord): Promise<void>;
+  takeRefresh(tokenHash: string): Promise<RefreshRecord | undefined>;
   /**
    * Retire one grant, **of one tenant**.
    *
@@ -388,9 +476,20 @@ export interface AuthorizationStore {
    * any authenticated tenant can write into somebody else's row of. Revocation
    * ids are unguessable, which bounds that and does not close it: they turn up
    * in support transcripts, client logs and screen shares.
+   *
+   * A `grantId` outside {@link GRANT_ID_PATTERN} is **ignored, not raised**: the
+   * argument arrives from a form body, and RFC 7009 requires this endpoint to
+   * answer 200 whether or not the token was known, so a refusal would be an
+   * oracle and a throw would be a 500 for a request that is merely nonsense.
    */
-  revokeGrant(tenantId: string, grantId: string): void;
-  isRevoked(tenantId: string, grantId: string): boolean;
+  revokeGrant(tenantId: string, grantId: string): Promise<void>;
+  /**
+   * **This one may never invent an answer.** `dispatch.ts` reads it on every
+   * tool call and treats `false` as "carry on", so an implementation that
+   * flattened a backend failure into `false` would serve a revoked grant for as
+   * long as its store was unwell. A store that cannot answer must reject.
+   */
+  isRevoked(tenantId: string, grantId: string): Promise<boolean>;
 }
 
 /**
@@ -413,38 +512,42 @@ export function createInMemoryAuthorizationStore(): AuthorizationStore {
   const registrations: number[] = [];
 
   return {
-    putClient(record) {
+    async putClient(record) {
       clients.set(record.clientId, record);
     },
-    getClient(clientId) {
+    async getClient(clientId) {
       return clients.get(clientId);
     },
-    noteRegistration(atMs) {
+    async noteRegistration(atMs) {
       registrations.push(atMs);
     },
-    registrationsSince(sinceMs) {
+    async registrationsSince(sinceMs) {
       return registrations.filter((at) => at >= sinceMs).length;
     },
-    putCode(code, record) {
+    async putCode(code, record) {
       codes.set(code, record);
     },
-    takeCode(code) {
+    async takeCode(code) {
       const record = codes.get(code);
       codes.delete(code);
       return record;
     },
-    putRefresh(tokenHash, record) {
+    async putRefresh(tokenHash, record) {
       refresh.set(tokenHash, record);
     },
-    takeRefresh(tokenHash) {
+    async takeRefresh(tokenHash) {
       const record = refresh.get(tokenHash);
       refresh.delete(tokenHash);
       return record;
     },
-    revokeGrant(tenantId, grantId) {
+    async revokeGrant(tenantId, grantId) {
+      // The same admission the durable store applies, so the two do not
+      // disagree about what a revocation of nonsense does. A `Set` would happily
+      // hold a megabyte of prose the moment `/revoke` was pointed at it.
+      if (!isValidTenantId(tenantId) || !isMintableGrantId(grantId)) return;
       revoked.add(revocationKey(tenantId, grantId));
     },
-    isRevoked(tenantId, grantId) {
+    async isRevoked(tenantId, grantId) {
       return revoked.has(revocationKey(tenantId, grantId));
     },
   };
@@ -477,15 +580,43 @@ export type RegistrationOutcome =
   | { readonly ok: true; readonly client: RegisteredClient }
   | { readonly ok: false; readonly error: OAuthError; readonly description: string };
 
-export function registerClient(
+export async function registerClient(
   store: AuthorizationStore,
   request: { readonly clientName: string; readonly redirectUris: readonly string[] },
   options: { readonly allowlist: RegistrationAllowlist; readonly now: number; readonly random?: (n: number) => Uint8Array },
-): RegistrationOutcome {
+): Promise<RegistrationOutcome> {
   const random = options.random ?? randomBytes;
 
   if (request.redirectUris.length === 0) {
     return { ok: false, error: 'invalid_client_metadata', description: 'at least one redirect_uri is required' };
+  }
+
+  // Bounded before anything is stored. A durable store seals this record into
+  // one bounded envelope, so an unbounded name or a repeated redirect is a
+  // CHECK violation surfacing as a `500` on a registration endpoint — RFC 7591
+  // already has the right answer, and it belongs here so both stores give it.
+  if (request.clientName.length > MAX_CLIENT_NAME_LENGTH) {
+    return {
+      ok: false,
+      error: 'invalid_client_metadata',
+      description: `client_name may not exceed ${MAX_CLIENT_NAME_LENGTH} characters`,
+    };
+  }
+  if (request.redirectUris.length > MAX_REDIRECT_URIS) {
+    return {
+      ok: false,
+      error: 'invalid_client_metadata',
+      description: `at most ${MAX_REDIRECT_URIS} redirect_uris may be registered`,
+    };
+  }
+  for (const uri of request.redirectUris) {
+    if (uri.length > MAX_REDIRECT_URI_LENGTH) {
+      return {
+        ok: false,
+        error: 'invalid_client_metadata',
+        description: `a redirect_uri may not exceed ${MAX_REDIRECT_URI_LENGTH} characters`,
+      };
+    }
   }
 
   const allowed = new Set(options.allowlist.redirectUris);
@@ -499,18 +630,21 @@ export function registerClient(
   }
 
   const windowStart = options.now - 60 * 60 * 1000;
-  if (store.registrationsSince(windowStart) >= options.allowlist.maxRegistrationsPerHour) {
+  if ((await store.registrationsSince(windowStart)) >= options.allowlist.maxRegistrationsPerHour) {
     return { ok: false, error: 'rate_limited', description: 'too many registrations in the last hour' };
   }
 
-  const clientId = `bzc_${base64url(random(16))}`;
-  store.putClient({
+  const clientId = mintClientId(random);
+  // Awaited before the client information response is assembled: a client told
+  // its `client_id` before the row exists is the failure this store was built
+  // for, reproduced one function lower down.
+  await store.putClient({
     clientId,
     clientName: request.clientName,
     redirectUris: [...request.redirectUris],
     registeredAt: options.now,
   });
-  store.noteRegistration(options.now);
+  await store.noteRegistration(options.now);
 
   return {
     ok: true,
@@ -556,8 +690,11 @@ export type AuthorizeOutcome =
   | { readonly ok: true; readonly code: string; readonly redirectTo: string }
   | { readonly ok: false; readonly error: OAuthError; readonly description: string };
 
-export function authorize(store: AuthorizationStore, request: AuthorizeRequest): AuthorizeOutcome {
-  const client = store.getClient(request.clientId);
+export async function authorize(
+  store: AuthorizationStore,
+  request: AuthorizeRequest,
+): Promise<AuthorizeOutcome> {
+  const client = await store.getClient(request.clientId);
   if (client === undefined) {
     return { ok: false, error: 'invalid_client', description: 'unknown client_id' };
   }
@@ -602,7 +739,12 @@ export function authorize(store: AuthorizationStore, request: AuthorizeRequest):
   const code = base64url(random(32));
   const ttl = (request.ttlSeconds ?? DEFAULT_CODE_TTL_SECONDS) * 1000;
 
-  store.putCode(code, {
+  // Awaited before the redirect is composed. A browser sent to the client with
+  // a code the store has not banked is an `invalid_grant` at the token endpoint
+  // — a routing fault wearing a client error, which is the hardest kind to find
+  // from the outside, and exactly what the in-memory store produced across two
+  // instances.
+  await store.putCode(code, {
     clientId: request.clientId,
     redirectUri: request.redirectUri,
     codeChallenge: request.codeChallenge,
@@ -611,7 +753,7 @@ export function authorize(store: AuthorizationStore, request: AuthorizeRequest):
     origins: [...request.origins],
     writeOrigin: request.writeOrigin,
     endpoint: request.endpoint,
-    grantId: `g_${base64url(random(12))}`,
+    grantId: mintGrantId(random),
     issuedAt: request.now,
     expiresAt: request.now + ttl,
   });
@@ -632,13 +774,16 @@ export type RedeemOutcome =
   | { readonly ok: true; readonly grant: Omit<GrantClaims, 'issuedAt' | 'expiresAt'> }
   | { readonly ok: false; readonly error: OAuthError; readonly description: string };
 
-export function redeemAuthorizationCode(
+export async function redeemAuthorizationCode(
   store: AuthorizationStore,
   request: RedeemRequest,
-): RedeemOutcome {
+): Promise<RedeemOutcome> {
   // Taken unconditionally: a wrong verifier burns the code rather than leaving
-  // it available for the next guess.
-  const record = store.takeCode(request.code);
+  // it available for the next guess. **Single-use is the store's guarantee, not
+  // this function's** — the durable implementation takes it with one
+  // `DELETE … RETURNING` so that two simultaneous redemptions of one consent
+  // cannot both be served, which a read-then-delete would allow.
+  const record = await store.takeCode(request.code);
   const refused: RedeemOutcome = {
     ok: false,
     error: 'invalid_grant',
@@ -688,7 +833,7 @@ export interface IssuedTokens {
   readonly scope: string;
 }
 
-export function issueTokens(
+export async function issueTokens(
   store: AuthorizationStore,
   options: {
     readonly grant: Omit<GrantClaims, 'issuedAt' | 'expiresAt'>;
@@ -698,7 +843,7 @@ export function issueTokens(
     readonly refreshTtlSeconds?: number;
     readonly random?: (n: number) => Uint8Array;
   },
-): IssuedTokens {
+): Promise<IssuedTokens> {
   const random = options.random ?? randomBytes;
   const accessTtl = options.accessTtlSeconds ?? DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
   const refreshTtl = options.refreshTtlSeconds ?? DEFAULT_REFRESH_TOKEN_TTL_SECONDS;
@@ -710,7 +855,10 @@ export function issueTokens(
   };
 
   const refreshToken = `bzr_${base64url(random(32))}`;
-  store.putRefresh(hashToken(refreshToken), {
+  // Awaited before the token response is assembled: a refresh token a client
+  // holds and the store does not is the reported failure — an established
+  // connector that breaks after fifteen idle minutes.
+  await store.putRefresh(hashToken(refreshToken), {
     clientId: options.grant.clientId,
     tenantId: options.grant.tenantId,
     scope: options.grant.scope,
@@ -808,14 +956,14 @@ export function verifyConsentToken(presented: string, sessionKey: string): boole
   return constantTimeEqual(presented, consentToken(sessionKey));
 }
 
-export function redeemRefreshToken(
+export async function redeemRefreshToken(
   store: AuthorizationStore,
   request: { readonly refreshToken: string; readonly clientId: string; readonly now: number },
-): RedeemOutcome {
+): Promise<RedeemOutcome> {
   // Rotation: taken on use, and a new one is issued alongside the next access
   // token. A refresh token presented twice is therefore refused, which is what
   // makes theft detectable instead of silent.
-  const record = store.takeRefresh(hashToken(request.refreshToken));
+  const record = await store.takeRefresh(hashToken(request.refreshToken));
   const refused: RedeemOutcome = {
     ok: false,
     error: 'invalid_grant',
@@ -825,7 +973,9 @@ export function redeemRefreshToken(
   if (record === undefined) return refused;
   if (record.expiresAt <= request.now) return refused;
   if (record.clientId !== request.clientId) return refused;
-  if (store.isRevoked(record.tenantId, record.grantId)) return refused;
+  // Not caught. A store that cannot answer must not be read as "not revoked" —
+  // this check is what stops a retired connector from renewing itself forever.
+  if (await store.isRevoked(record.tenantId, record.grantId)) return refused;
 
   return {
     ok: true,

@@ -18,15 +18,22 @@
  * implementation of each port does the deployed process get", which is a
  * question no unit test can answer on its behalf.
  *
- * **Two ports are wired to in-memory implementations, deliberately and
- * visibly.** The authorization store and the access log have no durable
- * implementation in this repo yet (`oauth.ts` and `access-log.ts` each say so in
- * their own headers, and the access log's retention policy has a legal half that
- * is not settled). Wiring them here to the in-memory implementations is honest
- * about a single-instance alpha and is wrong for a multi-instance fleet: an
- * OAuth code minted on one instance cannot be redeemed on another, and the
- * access log does not survive a restart. Both are `record`-shaped ports, so the
- * durable versions are substitutions here rather than redesigns.
+ * **One port is still wired to an in-memory implementation, deliberately and
+ * visibly: the access log.** It has no durable implementation in this repo yet
+ * (`access-log.ts` says so in its own header, and its retention policy has a
+ * legal half that is not settled), so it does not survive a restart. It is a
+ * `record`-shaped port, so the durable version is a substitution here rather
+ * than a redesign.
+ *
+ * **The authorization store was the other one, and it is no longer.** Wiring it
+ * to a `Map` was described here as "honest about a single-instance alpha", and
+ * the honesty was real while the consequence was not survivable: `McpFleet`
+ * sleeps after fifteen minutes, `edge.ts:FLOW_INSTANCE` puts the whole flow on
+ * one Durable Object, and every deploy replaces it — so a registered client was
+ * forgotten, an established connector's refresh token died after fifteen idle
+ * minutes, and **a revocation the user asked for came back to life**. The
+ * founder hit all three. `authorization-store.ts` chooses the backend now, the
+ * durable one is the default, and the in-memory one is selected by name.
  */
 
 import { SQL } from 'bun';
@@ -34,7 +41,7 @@ import { SQL } from 'bun';
 import { createMcpServer, type ResourceOwners } from './server.ts';
 import { createInMemoryAccessLog } from './access-log.ts';
 import { createControlSignals, createPostgresSignalSink } from './control-signals.ts';
-import { createInMemoryAuthorizationStore } from './oauth.ts';
+import { openAuthorizationStore } from './authorization-store.ts';
 import { createSettingsBackend } from './settings.ts';
 import { hashToken } from './oauth.ts';
 import { createTenantConnections } from './tenant-db.ts';
@@ -80,6 +87,11 @@ export async function startMcpFleet(env: Environment): Promise<McpFleetProcess> 
   const identityUrl = optional(env, 'BRAINZ_IDENTITY_DATABASE_URL');
   const identity = identityUrl === undefined ? undefined : new SQL(identityUrl, { max: 4 });
 
+  // Before the server is built, and awaited: a fleet whose authorization store
+  // cannot be reached must refuse to start rather than answer the first connect
+  // flow with a 500 — `env.ts` puts the whole weight on refusing to start.
+  const store = await openAuthorizationStore(env, controlSql);
+
   const connections = createTenantConnections({ secrets: secrets.store, now: Date.now });
   const signals = createControlSignals({
     sink: createPostgresSignalSink(controlSql),
@@ -89,7 +101,7 @@ export async function startMcpFleet(env: Environment): Promise<McpFleetProcess> 
   const server = createMcpServer({
     secrets: secrets.store,
     connections,
-    store: createInMemoryAuthorizationStore(),
+    store,
     accessLog: createInMemoryAccessLog(),
     signals,
     gateway,

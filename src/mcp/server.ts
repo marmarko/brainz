@@ -64,7 +64,13 @@ import { sameOriginRefusal } from '../web/app.ts';
 // The five-character escaper, from the module that already owns it. A local copy
 // would be the second implementation of the one primitive standing between a
 // database-fed string and a rendered page.
-import { escapeHtml } from '../web/pages.ts';
+//
+// `BRAIN_SETUP_PATH` is here for a sharper version of the same reason: this
+// fleet tells a user with no brain where to go, and the page they are sent to is
+// served by the *other* fleet. A literal written here would be a claim about a
+// process this one cannot see — which is how this page came to say "open your
+// dashboard — it can build one" about a dashboard that could not.
+import { BRAIN_SETUP_PATH, escapeHtml } from '../web/pages.ts';
 import { PROTOCOL_VERSION } from './envelope.ts';
 import { readClientCapabilities, UI_EXTENSION } from './client-capabilities.ts';
 import { listResources, readResource } from './resources.ts';
@@ -350,7 +356,7 @@ async function handleRegister(deps: ServerDeps, request: Request): Promise<Respo
     return Response.json({ error: 'invalid_client_metadata' }, { status: 400 });
   }
 
-  const outcome = registerClient(
+  const outcome = await registerClient(
     deps.store,
     { clientName: body.client_name ?? 'unnamed', redirectUris: body.redirect_uris ?? [] },
     { allowlist: deps.registrationAllowlist, now: deps.now().getTime() },
@@ -461,7 +467,7 @@ async function handleAuthorize(deps: ServerDeps, request: Request, url: URL): Pr
   // A consent screen naming an unregistered client, or a redirect target that is
   // not the registered string, is a phishing page this server wrote and signed
   // with its own origin.
-  const client = deps.store.getClient(params.get('client_id') ?? '');
+  const client = await deps.store.getClient(params.get('client_id') ?? '');
   if (client === undefined) return oauthError('invalid_client', 'unknown client_id', 400);
   const redirectUri = params.get('redirect_uri') ?? '';
   if (!client.redirectUris.includes(redirectUri)) {
@@ -510,7 +516,7 @@ async function mintAuthorizationCode(
   const requested = parseRequestedScope(params.get('scope'), deps.writeOrigin ?? DEFAULT_WRITE_ORIGIN);
   if (!requested.ok) return oauthError('invalid_scope', requested.reason, 400);
 
-  const outcome = authorize(deps.store, {
+  const outcome = await authorize(deps.store, {
     clientId: params.get('client_id') ?? '',
     redirectUri: params.get('redirect_uri') ?? '',
     codeChallenge: params.get('code_challenge') ?? '',
@@ -568,14 +574,26 @@ function signIn(deps: ServerDeps, url: URL): Response {
  * the dashboard and a user who is told nothing has no reason to go there.
  */
 function noBrainYet(deps: ServerDeps): Response {
-  const base = (deps.webAppBaseUrl ?? deps.issuer).replace(/\/+$/, '');
+  return noBrainYetPage((deps.webAppBaseUrl ?? deps.issuer).replace(/\/+$/, ''));
+}
+
+/**
+ * The page itself, taking the web app's base URL and nothing else.
+ *
+ * Exported and pure so the claim it makes can be checked against the fleet that
+ * has to honour it: `test/web/app.test.ts` renders this, follows the link out of
+ * it, and asserts the page on the other side actually carries the form. A test
+ * that read this file's text instead would have agreed with the sentence rather
+ * than with the product.
+ */
+export function noBrainYetPage(base: string): Response {
   return htmlPage(
     'No brain to connect — brainz',
     `<h1>There is no brain here yet</h1>
 <p>You are signed in, but this account has no brain for a connector to reach. That happens when
 provisioning has not finished, or when it failed during signup.</p>
-<p><a href="${escapeHtml(`${base}/dashboard`)}">Open your dashboard</a> — it can build one — and then
-start the connection again from the beginning.</p>
+<p><a href="${escapeHtml(`${base}${BRAIN_SETUP_PATH}`)}">Build your brain</a> — it takes about
+fifteen seconds — and then start the connection again from the beginning.</p>
 <p class="note">Nothing was granted, and no connection was made.</p>`,
     409,
   );
@@ -698,7 +716,7 @@ async function handleToken(deps: ServerDeps, request: Request): Promise<Response
 
   const redeemed =
     grantType === 'authorization_code'
-      ? redeemAuthorizationCode(deps.store, {
+      ? await redeemAuthorizationCode(deps.store, {
           code: form.get('code') ?? '',
           codeVerifier: form.get('code_verifier') ?? '',
           redirectUri: form.get('redirect_uri') ?? '',
@@ -706,7 +724,7 @@ async function handleToken(deps: ServerDeps, request: Request): Promise<Response
           now,
         })
       : grantType === 'refresh_token'
-        ? redeemRefreshToken(deps.store, { refreshToken: form.get('refresh_token') ?? '', clientId, now })
+        ? await redeemRefreshToken(deps.store, { refreshToken: form.get('refresh_token') ?? '', clientId, now })
         : null;
 
   if (redeemed === null) {
@@ -719,7 +737,7 @@ async function handleToken(deps: ServerDeps, request: Request): Promise<Response
   const resolved = await deps.secrets.resolve(fleetIdentity(redeemed.grant.tenantId), redeemed.grant.tenantId);
   if (!resolved.ok) return Response.json({ error: 'invalid_grant' }, { status: 400 });
 
-  const tokens = issueTokens(deps.store, {
+  const tokens = await issueTokens(deps.store, {
     grant: redeemed.grant,
     signingKey: deriveSigningKey(resolved.secret.bearerGrant),
     now,
@@ -764,7 +782,7 @@ async function handleRevoke(deps: ServerDeps, request: Request): Promise<Respons
 
   const form = new URLSearchParams(await request.text());
   const grantId = form.get('grant_id') ?? '';
-  if (grantId.length > 0) deps.store.revokeGrant(tenantId, grantId);
+  if (grantId.length > 0) await deps.store.revokeGrant(tenantId, grantId);
   // RFC 7009: revocation answers 200 whether or not the token was known, so the
   // endpoint is not an oracle for which grant ids exist.
   return new Response(null, { status: 200 });

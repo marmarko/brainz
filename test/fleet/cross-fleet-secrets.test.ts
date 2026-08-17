@@ -192,6 +192,13 @@ function mcpEnv(extra: Record<string, string>): Record<string, string> {
     BRAINZ_PUBLIC_ORIGIN: `https://${ISSUER_HOST}`,
     BRAINZ_CONTROL_DATABASE_URL: control.dsn,
     BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
+    // **Present even in the file-secret-backend case below, and that is the
+    // point.** The durable authorization store is not conditional on which
+    // SECRET backend a deployment chose — it needs the control plane, which
+    // every process already opens, and this key. A deployment that wants the
+    // per-container `Map` back has to say `BRAINZ_AUTHORIZATION_BACKEND=memory`
+    // out loud; nothing here falls into it because a variable was missing.
+    BRAINZ_SECRET_ENCRYPTION_KEY: FAKE_SEALING_KEY,
     ...extra,
   };
 }

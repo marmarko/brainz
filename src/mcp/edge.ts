@@ -51,25 +51,49 @@ const PUBLIC_FLOW_PATHS: ReadonlySet<string> = new Set([
   '/register',
   '/authorize',
   '/token',
-  // `/revoke` is deliberately NOT here. It requires the tenant's bearer, so it
-  // has a tenant to route by — and it must use it: the revocation list is the
-  // one piece of flow state `dispatch` reads, on the *tenant's* instance, on
-  // every call. Sent to the shared flow instance a revocation would be recorded
-  // somewhere no tool call ever looks, and the endpoint would answer 200 while
-  // the grant kept working.
+  // `/revoke` is deliberately NOT here, and **the reason has changed even
+  // though the answer has not.** It used to be a correctness requirement: the
+  // revocation list was a `Set` in one container, `dispatch` read it on the
+  // *tenant's* instance, and a revocation sent to the shared flow instance
+  // would be recorded somewhere no tool call ever looks — the endpoint would
+  // answer 200 while the grant kept working. That argument assumed the store
+  // persists and is shared, and it was assuming something that was not true:
+  // the `Set` did not survive the instance either, so the grant came back to
+  // life anyway on the next sleep.
+  //
+  // The list is now `control.oauth_revocation` (`src/control/oauth-pg.ts`),
+  // which every instance of every fleet reads. So a revocation recorded
+  // ANYWHERE is honoured EVERYWHERE, and the locality this line used to buy is
+  // no longer load-bearing. It stays here on three smaller grounds: `/revoke`
+  // authenticates with the tenant's bearer, so it has a tenant to route by and
+  // no reason not to use it; sending an authenticated write to one shared
+  // Durable Object would concentrate every tenant's revocations on a single
+  // instance for no benefit; and changing a routing table is a change with a
+  // failure mode and no upside. What is gone is the *silent* failure — this
+  // line is now a routing preference rather than the only thing standing
+  // between a user and a connector they thought they had closed.
 ]);
 
 /**
  * The instance every hop of the authorization flow lands on.
  *
- * `/authorize` carries the tenant's bearer and could be routed by tenant like
- * everything else — and must not be. The registration, the single-use code and
- * the refresh record are one store, and a flow whose three hops address three
- * instances fails at the token endpoint as `invalid_grant`: a routing fault
- * wearing a client error, which is the hardest kind to find from the outside.
- * One name for the whole flow is what makes the store's locality a property
- * rather than a coincidence. (It is also the seam a durable store replaces —
- * when one exists, this constant is what stops mattering.)
+ * The unauthenticated hops have no tenant to route by, so they need *a* name;
+ * this is it. What it used to be doing on top of that was holding the flow's
+ * three hops against one `Map`, because the registration, the single-use code
+ * and the refresh record were one container's memory and a flow addressing
+ * three instances fails at the token endpoint as `invalid_grant` — a routing
+ * fault wearing a client error. The comment ended by naming its own successor:
+ * *"it is also the seam a durable store replaces — when one exists, this
+ * constant is what stops mattering."*
+ *
+ * **One exists.** `src/control/oauth-pg.ts` puts all three in the control plane,
+ * so the flow no longer needs to land anywhere in particular and this constant
+ * no longer carries the correctness of the token exchange. It still routes
+ * `/authorize` here rather than by tenant, for the smaller reason: it is one
+ * warm instance for hops that would otherwise wake a container per tenant per
+ * connect. And `/authorize`'s *browser* leg needs the identity database, which
+ * only the MCP fleet's manifest carries — so the flow instance is also the one
+ * shape in which every hop is served by a process that has what the hop needs.
  */
 export const FLOW_INSTANCE = 'oauth-flow';
 
@@ -102,6 +126,10 @@ const WEB_PATHS: ReadonlySet<string> = new Set([
   '/login',
   '/signup',
   '/dashboard',
+  // Where a signed-in account with no brain is offered one. It is also where
+  // this fleet's own no-brain answer sends a stuck user, so an origin that did
+  // not route it would 404 the destination of a link this deployment prints.
+  '/brain',
   '/connect',
   '/password/reset',
   '/password/sent',
