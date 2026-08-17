@@ -1925,6 +1925,28 @@ describe('the status beside each source says only what this brain can know', () 
    * finished at the provider is told exactly that, rather than being shown a
    * page that looks as though nothing happened.
    */
+  /**
+   * **The panel's own note has to agree with what the panel now does.**
+   *
+   * It used to say the consent happens at the vendor and *"nothing tells this
+   * page about it"* — true when written, and false the moment a dashboard render
+   * began asking the vendor about this tenant's unfinished connects. A user
+   * reading it is told the one thing that would make them give up: that coming
+   * back here is pointless. That is the same dead affordance the panel exists to
+   * stop being, in prose rather than in markup, and prose is where it survives a
+   * suite that only asserts per-source status lines.
+   *
+   * Pinned on the claim rather than the sentence: what must not reappear is the
+   * assertion that this page cannot find out.
+   */
+  test('the panel does not tell the user that coming back here is pointless', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).not.toContain('nothing tells this page about it');
+    expect(page).toContain('You do not have to come back here after authorizing');
+  });
+
   test('a connect the user has not finished reads as started, not as connected', async () => {
     await reset();
     const cookie = await signedIn('paid');

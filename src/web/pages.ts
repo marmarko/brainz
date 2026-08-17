@@ -398,9 +398,11 @@ that is a separate step, on purpose.</p>`,
 <p class="note">Connecting opens a consent screen at the connector vendor. The link it gives you is a
 capability — anyone who has it can attach their account to this brain — so it expires in ten minutes
 and works once. It is shown on one page, once, and is not stored anywhere you can go back to.</p>
-<p class="note">This brain finds out that a source is attached by polling it. Until the first check has
-run, a source you have just connected still reads as not connected here — the consent happens at the
-connector vendor, and nothing tells this page about it.</p>`
+<p class="note">You do not have to come back here after authorizing. The consent happens at the connector
+vendor and the vendor does not report it, so this brain goes and asks — loading this page asks about
+any connect you have started, and it asks again on its own within about half an hour. Authorize and
+return here and the source reads as connected straight away; authorize and close the tab and it
+appears by itself.</p>`
         : `<p>Connected accounts are on the paid plan. Each connected mailbox carries a monthly fee from the
 connector vendor whether or not the brain is used, which the free plan cannot carry.</p>
 <p class="note">Chat exports and folder imports are included on every plan and need no connection at all.</p>`;
