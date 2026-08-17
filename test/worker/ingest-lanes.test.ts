@@ -67,6 +67,7 @@ import {
   createControlPlaneTiers,
   createPostgresConnectorLinks,
   ensureConnectorLinkSchema,
+  fenceConnectorLink,
   markConnectPending,
   type ConnectorLinks,
 } from '../../src/control/connector-pg.ts';
@@ -1207,6 +1208,107 @@ describe('an authorization at the vendor becomes a connection this fleet polls',
       }
 
       expect(vendor.asked).toEqual([]);
+      expect(await pullJobs()).toEqual([]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  /**
+   * **The gate is consulted, and the proof is a tenant it refuses.**
+   *
+   * `reconcileConnectors` builds its state through `connectSource` precisely so
+   * the connection arrives with `cursor: null`, `pullModeFor` answers
+   * `backfill`, and U8's first-import gate still sees the run. The case above
+   * shows the pull *completing*, which is what a bypassed gate looks like too —
+   * a mailbox with nothing in it costs nothing, so a gate that was never called
+   * and a gate that approved are the same green.
+   *
+   * So this drives the tenant the gate must refuse: the cap is spent, and the
+   * adopted connection's very first pull has to come back `budget_exhausted`
+   * rather than importing. Delete the `gateFirstImport` call from `runPull` and
+   * the case above stays green while this one goes red, which is the only
+   * arrangement in which "the gate is consulted" is a claim a suite can hold.
+   *
+   * The adoption itself is asserted alongside deliberately: the money refusal
+   * belongs to the *import*, not to the connection. A run that answered a spent
+   * cap by discarding the link would make the user press connect again after
+   * every exhausted window, and would re-mint a vendor link to do it.
+   */
+  test(
+    'an adopted connection’s first pull is refused by the gate when the cap is spent',
+    async () => {
+      await paid();
+      await markConnectPending(controlSql, { tenantId: TENANT, source: 'gmail', now: NOW });
+      // Spent, in the window the gate reads. Not a cap of zero on a fresh
+      // window — `readHeadroom` treats a lapsed window as zero spend, so the
+      // clock has to be inside it for this to be the refusal it looks like.
+      await controlSql`
+        UPDATE control.tenant
+           SET spend_cap_micro_usd = 1000,
+               spend_micro_usd = 1000,
+               spend_window_started_at = ${NOW}
+         WHERE tenant_id = ${TENANT}`;
+
+      const fleet = await fleetOver(seamsOver(lister([attached()])));
+      try {
+        await fleet.tick(NOW);
+      } finally {
+        await fleet.stop();
+      }
+
+      // The connection was still made. A spent cap is a reason not to import,
+      // never a reason to throw away an authorization the user completed.
+      expect((await linkRow()).state).toMatch(/^v1[.]/);
+      expect(await pullJobs()).toEqual([{ target: 'gmail', trigger: 'connector_cadence' }]);
+
+      // And the pull the cadence queued was refused by the gate, by name.
+      //
+      // Read from the tenant's own `ingest_log` rather than `control.job`: the
+      // job is `done`, and correctly so — the handler ran, reached a verdict and
+      // has nothing to retry, which is exactly what a refusal is. The refusal
+      // lives where the run does.
+      const runs = (await brainSql`
+        SELECT outcome::text AS outcome, failure_code::text AS failure
+          FROM ingest_log WHERE source_type = 'email'`) as Array<{
+        outcome: string;
+        failure: string | null;
+      }>;
+      expect(runs).toEqual([{ outcome: 'failed', failure: 'budget_exhausted' }]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  /**
+   * **Disconnect through the function the button actually calls.**
+   *
+   * The case above simulates the disconnect with the `UPDATE` that
+   * `fenceConnectorLink` performs. That is the right shape and it is a copy: it
+   * would keep passing if the real function stopped clearing `pending_since`,
+   * stopped advancing the fence, or were rewritten to do neither — which is the
+   * edit most likely to be made by someone who reads the fence as belt-and-
+   * braces. This drives `fenceConnectorLink` itself, so the deployed
+   * `/api/connectors DELETE` path and the tick that follows it are one claim.
+   */
+  test(
+    'a disconnect through the real function leaves the next tick nothing to reconnect',
+    async () => {
+      await paid();
+      await markConnectPending(controlSql, { tenantId: TENANT, source: 'gmail', now: NOW });
+      await fenceConnectorLink(controlSql, { tenantId: TENANT, source: 'gmail', now: NOW });
+      const vendor = lister([attached()]);
+
+      const fleet = await fleetOver(seamsOver(vendor));
+      try {
+        await fleet.tick(NOW);
+      } finally {
+        await fleet.stop();
+      }
+
+      // Not asked, because clearing the intent is what bounds the asking; and
+      // not connected, because the fence is what refuses a pass already holding
+      // a listing. Both halves, since they cover different passes.
+      expect(vendor.asked).toEqual([]);
+      expect((await linkRow()).state).toBeNull();
       expect(await pullJobs()).toEqual([]);
     },
     TEST_TIMEOUT_MS,
