@@ -164,7 +164,20 @@ ARG BUN_VERSION=1.3.14
 # and the whole point of the change is the markup a warm instance keeps not
 # sending. Deploy with the deterministic reload (`containers delete` then
 # `deploy`) against the web fleet, not by waiting.
-ARG FLEET_CONFIG_EPOCH=10
+# 10 -> 11: reconciliation -- an authorization completed at the vendor becomes a
+# connection this brain polls. This one is BOTH halves of the usual reason.
+# Code: the web fleet records the connect intent and reconciles on a dashboard
+# render, the worker fleet reconciles on its tick and now composes a real
+# connector runtime, so a warm instance of either keeps running the version
+# where an attached mailbox is invisible. Manifest: `WORKER_FLEET_VARIABLES`
+# gained the vendor's four variables, and `selectContainerEnv` copies a manifest
+# once, when the Durable Object is constructed -- so the worker container reads
+# them only after it is replaced. The secrets themselves were already set, so
+# `wrangler secret list` looks identical before and after and there is nothing
+# to re-put: exactly the epoch-3 shape recorded in `docs/deploy.md`. Deploy with
+# the deterministic reload (`containers delete` then `deploy`) against the
+# worker AND web fleets, not by waiting.
+ARG FLEET_CONFIG_EPOCH=11
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
