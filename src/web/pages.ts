@@ -14,6 +14,24 @@
  * fed by a signup form.
  */
 
+/**
+ * Where a signed-in account with no brain is offered one.
+ *
+ * **A constant because two fleets name this page.** The MCP fleet renders the
+ * no-brain answer on `/authorize` and has to tell the user where to go; the web
+ * fleet serves the page they are being sent to. They are separate processes, so
+ * the only things that can hold the sentence and the destination together are a
+ * shared literal and a test that follows the link across the boundary
+ * (`test/web/app.test.ts`). Before this existed the MCP page said *"open your
+ * dashboard — it can build one"* and the dashboard could not.
+ *
+ * `src/web/app.ts` dispatches on the literal rather than on this constant, and
+ * deliberately: `test/mcp/router.test.ts` derives the app's route table by
+ * reading `path === '…'` out of that file, and a route spelled as an identifier
+ * would be invisible to the edge's routing guard.
+ */
+export const BRAIN_SETUP_PATH = '/brain';
+
 export type Page =
   | {
       readonly kind: 'login';
@@ -46,6 +64,23 @@ export type Page =
       readonly command: string;
       readonly steps: readonly string[];
       readonly connected: boolean;
+    }
+  | {
+      /**
+       * The page a signed-in account with no brain is sent to — see
+       * {@link BRAIN_SETUP_PATH}.
+       */
+      readonly kind: 'brain_setup';
+      readonly languages: readonly { readonly value: string; readonly label: string }[];
+      /**
+       * What went wrong on the press that led back here. Absent on the first
+       * render.
+       *
+       * A sentence rather than a code: the router's `{ok:false,code:…}` body is
+       * what a `fetch` gets, and rendering it to a browser is how an error
+       * becomes a stack trace with nothing in it a user can do.
+       */
+      readonly problem?: string;
     };
 
 /** HTML-escape. Five characters, applied to every interpolation without exception. */
@@ -68,6 +103,7 @@ const STYLE = `
   button { margin-top: 1rem; cursor: pointer; }
   code { padding: 0.15rem 0.35rem; background: rgba(127,127,127,0.15); border-radius: 3px; }
   .note { opacity: 0.75; font-size: 0.9rem; }
+  .problem { border-left: 3px solid currentColor; padding-left: 0.75rem; }
   ol { padding-left: 1.25rem; }
   .connected { font-weight: 600; }
 `;
@@ -78,6 +114,40 @@ function shell(title: string, main: string): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(title)}</title><style>${STYLE}</style></head>
 <body><main>${main}</main></body></html>`;
+}
+
+/**
+ * KTD9's choice, rendered once for both pages that ask it.
+ *
+ * **Two pages ask, so one function answers.** Signup asks it and the recovery
+ * page asks it again — the choice lives only in `account.brain` and a signup
+ * whose provisioning failed wrote no row, so there is nothing to remember. A
+ * second copy of the markup is a second place for the list, the wording and the
+ * empty-first-option rule to drift.
+ *
+ * **The empty first option is the part that matters.** A `select` whose first
+ * option is a real language *is* a default: the browser selects it with no
+ * `selected` attribute anywhere and `required` never fires, because something is
+ * always chosen. That is KTD9's silent anglicisation arriving through markup
+ * rather than through code — every user who submits without reading gets
+ * English, and the failure is invisible afterwards because search still works,
+ * just worse. An empty, disabled, selected placeholder makes `required` mean
+ * what it says.
+ */
+function languageChoice(
+  languages: readonly { readonly value: string; readonly label: string }[],
+): string {
+  const options = languages
+    .map(
+      (language) =>
+        `<option value="${escapeHtml(language.value)}">${escapeHtml(language.label)}</option>`,
+    )
+    .join('');
+  return `  <label for="fts_language">What language is most of your mail and your notes in?</label>
+  <select id="fts_language" name="fts_language" required><option value="" disabled selected>Choose a language</option>${options}</select>
+  <p class="note">This decides how your brain indexes words, and it is set once when the brain is built.
+  We do not guess it, because guessing wrong is invisible — everything would still work, and search
+  would quietly be worse forever.</p>`;
 }
 
 export function renderPage(page: Page): string {
@@ -109,12 +179,6 @@ ${
       // KTD9's choice, made by the person it is about. The API refuses a signup
       // without it rather than defaulting to English, so a page with no field
       // for it would make the product unusable through its own front door.
-      const options = page.languages
-        .map(
-          (language) =>
-            `<option value="${escapeHtml(language.value)}">${escapeHtml(language.label)}</option>`,
-        )
-        .join('');
       return shell(
         'Create an account — brainz',
         `<h1>Create your brain</h1>
@@ -123,13 +187,11 @@ ${
   <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="new-password" minlength="12" required>
   <p class="note">Twelve characters or more. A phrase is easier to remember and harder to guess than a
   short password with punctuation in it.</p>
-  <label for="fts_language">What language is most of your mail and your notes in?</label>
-  <select id="fts_language" name="fts_language" required>${options}</select>
-  <p class="note">This decides how your brain indexes words, and it is set once when the brain is built.
-  We do not guess it, because guessing wrong is invisible — everything would still work, and search
-  would quietly be worse forever.</p>
+${languageChoice(page.languages)}
   <button type="submit">Create account</button>
 </form>
+<p class="note">Building your brain takes about fifteen seconds, and this page will sit still until it
+is done.</p>
 <p class="note"><a href="/login">Already have an account?</a></p>`,
       );
     }
@@ -211,6 +273,33 @@ your own spend cap, but billed to you rather than to us.</p>
 <h2>Export</h2>
 <p class="note">Scheduled self-export lands with the lifecycle unit; the button is not wired to a store yet
 and says so rather than pretending to save.</p>`,
+      );
+    }
+
+    case 'brain_setup': {
+      // The refusal, above the form rather than below it, and in a sentence
+      // rather than a code. This page is reached by somebody whose signup
+      // already failed once; the second failure has to read as a thing that
+      // happened to them and not as a body they were handed.
+      const problem =
+        page.problem === undefined
+          ? ''
+          : `<p class="problem"><strong>${escapeHtml(page.problem)}</strong></p>\n`;
+      return shell(
+        'Build your brain — brainz',
+        `<h1>Build your brain</h1>
+<p>You are signed in, and this account has no brain yet. That happens when provisioning failed while
+you were signing up — the account was created, the brain was not. This page is how you get one.</p>
+${problem}<form method="post" action="/api/brain">
+${languageChoice(page.languages)}
+  <button type="submit">Build my brain</button>
+</form>
+<p class="note">Building takes about fifteen seconds. Nothing moves on this page while it happens —
+that is the wait, not a hang. <strong>Press the button once.</strong> A second press while the first
+is still working is refused rather than obeyed, because two brains for one account is a bill you did
+not agree to and a database nobody would ever look in.</p>
+<p class="note">Nothing you have already sent us is lost by waiting: your account, your password and
+your plan are all in place already. The brain is the only piece missing.</p>`,
       );
     }
 

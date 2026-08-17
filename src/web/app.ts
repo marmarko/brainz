@@ -67,7 +67,7 @@ import type { BrainProvisioner } from '../control/provisioner.ts';
 import type { ProviderId } from '../ai/keys.ts';
 import { CONNECT_STEPS, claudeCodeCommand, connectionStatus, installLink } from './connect.ts';
 import { adminDispatch, createBrainOwnerDirectory } from './admin.ts';
-import { renderPage } from './pages.ts';
+import { BRAIN_SETUP_PATH, renderPage } from './pages.ts';
 
 export const SESSION_COOKIE = 'bz_session';
 
@@ -399,8 +399,60 @@ function html(body: string, status = 200): Response {
   });
 }
 
+/**
+ * What a provisioning refusal says, per caller.
+ *
+ * Two sentences rather than one because the two callers are in different
+ * situations, and the difference is not cosmetic: the signup path answers
+ * somebody who is not signed in and whose next step genuinely is to sign in,
+ * while the retry answers somebody who is *already* signed in and looking at the
+ * page — telling them to sign in is an instruction they cannot follow, on the
+ * one screen where they are already stuck.
+ */
+const SIGNUP_PROVISIONING_UNAVAILABLE =
+  'Your account exists, but we could not build your brain just now. Sign in and try again.';
+
+const RETRY_PROVISIONING_UNAVAILABLE =
+  'We could not build your brain just now. Nothing was half-built and nothing was charged — ' +
+  'the fault is on our side. Try again in a few minutes; if it keeps failing, it will keep ' +
+  'failing until we fix it, and your account is safe in the meantime.';
+
+const LANGUAGE_REQUIRED = 'Choose the language your notes and mail are mostly written in.';
+
+/**
+ * The refusal a second press gets while the first is still working.
+ *
+ * Provisioning takes about fifteen seconds against a real substrate, which is
+ * long enough that a user with no feedback presses again — and two presses that
+ * both got through would claim two pool projects for one account: one brain the
+ * account points at, one paid for and unreachable by anybody. The idempotent
+ * read at the top of the retry does not cover this, because the second press
+ * arrives *before* the first has written a row.
+ */
+const PROVISIONING_IN_PROGRESS =
+  'A brain is already being built for this account, from a request a few seconds ago. This press ' +
+  'did not start a second one and did not cancel the first. Give it fifteen seconds and reload ' +
+  'this page.';
+
 export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Response> {
   const now = deps.now ?? (() => new Date());
+
+  /**
+   * Accounts with a provision in flight, for {@link PROVISIONING_IN_PROGRESS}.
+   *
+   * **In the process, and honest about it.** The edge routes every web path to
+   * one named instance (`src/mcp/edge.ts:WEB_INSTANCE`), so within this
+   * deployment's shape a set in this closure is the whole fleet. It is a guard
+   * against a double-press, not a distributed lock: two web processes would need
+   * the claim to live in the identity database, and the day that shape arrives
+   * this is the line that has to change.
+   *
+   * **The alternative was worse than the bug.** Coalescing the second press onto
+   * the first request's outcome would answer a user who chose German with a
+   * brain built in French, and a language substituted silently is the one
+   * failure KTD9 exists to refuse.
+   */
+  const building = new Set<string>();
 
   async function sessionOf(request: Request): Promise<Session | null> {
     const token = readCookie(request.headers.get('cookie'), SESSION_COOKIE);
@@ -542,7 +594,23 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       return handleSubjectErasure(request, session);
     }
 
+    // ---- The pages. -------------------------------------------------------
+    //
+    // **An account with no brain is sent to the one page that can give it
+    // one**, rather than shown a dashboard about a brain it does not have.
+    // Every affordance on that dashboard — connectors, a provider key, spend, an
+    // export — is an action whose route answers `no_brain_yet` 409, and the
+    // connect flow behind it dead-ends at the MCP fleet's own no-brain page. A
+    // page of dead buttons is what turned a recoverable state into a closed loop
+    // for a real user: they read it as "there is nothing here for me" and
+    // stopped looking, which is exactly what a page with nothing on it for them
+    // says.
+    //
+    // The redirect runs both ways: an account that *has* a brain is not offered
+    // a form to build a second one, so a stale bookmark or a back button lands
+    // on the dashboard instead of on an affordance whose route would refuse it.
     if (path === '/' || path === '/dashboard') return renderDashboard(session);
+    if (path === '/brain') return renderBrainSetup(session);
     if (path === '/connect') return renderConnect(session);
 
     return json({ ok: false, code: 'not_found', message: 'No such page.' }, 404);
@@ -638,7 +706,12 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       // it happens here and its failure is reported rather than deferred to a
       // background job this system does not have.
       const brain = await provisionBrain(created.accountId, ftsLanguage);
-      if (!brain.ok) return brain.response;
+      if (!brain.ok) {
+        return json(
+          { ok: false, code: 'provisioning_unavailable', message: SIGNUP_PROVISIONING_UNAVAILABLE },
+          503,
+        );
+      }
 
       const session = await createSession(deps.sql, { accountId: created.accountId, now: now() });
       const cookie = { 'set-cookie': sessionCookie(session.token, Math.floor(ABSOLUTE_SESSION_MS / 1000)) };
@@ -672,24 +745,13 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     async function provisionBrain(
       accountId: string,
       ftsLanguage: string,
-    ): Promise<{ readonly ok: true; readonly tenantId: string } | { readonly ok: false; readonly response: Response }> {
+    ): Promise<{ readonly ok: true; readonly tenantId: string } | { readonly ok: false }> {
+      // The reason is never echoed to either caller. It names substrate and pool
+      // state, which is deployment shape rather than something the person on the
+      // other end can act on, and this is a public origin. The operator's copy
+      // goes to stderr in `serve.ts:reportedProvisioner`.
       const provisioned = await deps.provisioner.provision({ ftsLanguage });
-      if (!provisioned.ok) {
-        // The reason is not echoed. It names substrate and pool state, which is
-        // deployment shape rather than something the person signing up can act
-        // on, and this is a public origin.
-        return {
-          ok: false,
-          response: json(
-            {
-              ok: false,
-              code: 'provisioning_unavailable',
-              message: 'Your account exists, but we could not build your brain just now. Sign in and try again.',
-            },
-            503,
-          ),
-        };
-      }
+      if (!provisioned.ok) return { ok: false };
 
       const linked = await attachBrain(deps.sql, {
         accountId,
@@ -697,19 +759,7 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         ftsLanguage,
         now: now(),
       });
-      if (!linked.ok) {
-        return {
-          ok: false,
-          response: json(
-            {
-              ok: false,
-              code: 'provisioning_unavailable',
-              message: 'Your account exists, but we could not build your brain just now. Sign in and try again.',
-            },
-            503,
-          ),
-        };
-      }
+      if (!linked.ok) return { ok: false };
       return { ok: true, tenantId: provisioned.tenantId };
     }
 
@@ -720,11 +770,27 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
      * works, and there is no route that can ever give that account a brain. It
      * is idempotent by reading `account.brain` first — a second call must not
      * spend a second pool project on an account that already has one.
+     *
+     * **It answers a browser and a `fetch` differently, and it has to.** The
+     * page at {@link BRAIN_SETUP_PATH} is a plain HTML form, because the app's
+     * own content-security policy carries no `script-src` and a scripted submit
+     * would be blocked by it. So a form post that answered with `{"ok":false,…}`
+     * would render that object as text in a browser window: the user who has
+     * already had one thing fail is handed a body, on a page with no way back to
+     * the form. Form posts therefore get a page and a redirect; JSON callers get
+     * the typed body they have always got, unchanged
+     * (`test/fleet/signup.test.ts` is one of them).
      */
     async function handleProvisionRetry(request: Request, session: Session): Promise<Response> {
       const existing = await brainOf(deps.sql, session.accountId);
       if (existing !== null) {
-        return json({ ok: true, tenant_id: existing.tenantId, created: false });
+        // A press that arrives after the brain exists is not an error — it is
+        // the second half of a double-submit, or a refresh. The browser goes to
+        // the dashboard, which is now a page about something real.
+        return (
+          afterForm(request, '/dashboard', {}) ??
+          json({ ok: true, tenant_id: existing.tenantId, created: false })
+        );
       }
 
       // **The language is asked again rather than remembered.** A signup whose
@@ -735,18 +801,51 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       // through the back door, on exactly the accounts nobody is watching.
       const chosen = stringOf(await body(request), 'fts_language');
       if (chosen.length === 0) {
-        return json(
-          {
-            ok: false,
-            code: 'fts_language_required',
-            message: 'Choose the language your notes and mail are mostly written in.',
-          },
-          400,
-        );
+        return refusedBuild(request, 'fts_language_required', LANGUAGE_REQUIRED, 400);
       }
 
-      const brain = await provisionBrain(session.accountId, chosen);
-      return brain.ok ? json({ ok: true, tenant_id: brain.tenantId, created: true }, 201) : brain.response;
+      if (building.has(session.accountId)) {
+        return refusedBuild(request, 'provisioning_in_progress', PROVISIONING_IN_PROGRESS, 409);
+      }
+
+      building.add(session.accountId);
+      let brain;
+      try {
+        brain = await provisionBrain(session.accountId, chosen);
+      } finally {
+        // In a `finally` so a provisioner that throws leaves the account able to
+        // try again. A guard that can wedge an account is a worse bug than the
+        // one it prevents.
+        building.delete(session.accountId);
+      }
+
+      if (!brain.ok) {
+        return refusedBuild(request, 'provisioning_unavailable', RETRY_PROVISIONING_UNAVAILABLE, 503);
+      }
+      // Where signup lands, for the same reason: a brain nothing is connected to
+      // is not yet the product.
+      return (
+        afterForm(request, '/connect', {}) ??
+        json({ ok: true, tenant_id: brain.tenantId, created: true }, 201)
+      );
+    }
+
+    /**
+     * One refusal, in the two shapes its two kinds of caller can read.
+     *
+     * The page is re-rendered with the problem on it rather than redirected to,
+     * so the status code survives — a browser that was told `303` would report a
+     * failed provision as a success in every log and every dev tools panel — and
+     * so the form is one press away rather than a back button.
+     */
+    function refusedBuild(
+      request: Request,
+      code: string,
+      message: string,
+      status: number,
+    ): Response {
+      if (isFormPost(request)) return html(brainSetupPage(message), status);
+      return json({ ok: false, code, message }, status);
     }
 
     async function handleLogin(request: Request): Promise<Response> {
@@ -1264,10 +1363,30 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       );
     }
 
+    /** The recovery page, and the redirect that makes anyone stuck arrive at it. */
+    async function renderBrainSetup(session: Session): Promise<Response> {
+      if ((await tenantOf(session.accountId)) !== null) return seeOther('/dashboard');
+      return html(brainSetupPage());
+    }
+
+    function brainSetupPage(problem?: string): string {
+      return renderPage({
+        kind: 'brain_setup',
+        languages: [...FTS_LANGUAGE_CHOICES],
+        ...(problem === undefined ? {} : { problem }),
+      });
+    }
+
+    /** 303, so a browser following it does so with a GET. */
+    function seeOther(location: string): Response {
+      return new Response(null, { status: 303, headers: { location } });
+    }
+
     async function renderDashboard(session: Session): Promise<Response> {
       const subscription = await subscriptionOf(deps.sql, session.accountId);
       const brain = await brainOf(deps.sql, session.accountId);
       const tenantId = brain?.tenantId ?? null;
+      if (tenantId === null) return seeOther(BRAIN_SETUP_PATH);
       // The same two questions `handleConnect` asks, in the same order, so the
       // page cannot offer a button whose route answers 501. A tier that is paid
       // on a deployment holding no vendor is still not a connector.
@@ -1290,10 +1409,11 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
 
     async function renderConnect(session: Session): Promise<Response> {
       const tenantId = await tenantOf(session.accountId);
-      const status =
-        tenantId === null
-          ? { state: 'never_connected' as const, firstSeenAt: null, lastSeenAt: null }
-          : await connectionStatus(deps.controlSql, tenantId);
+      // Instructions for connecting an assistant to a brain that does not exist
+      // end at the MCP fleet's 409 — after the user has installed a connector
+      // and granted it consent. The brain comes first.
+      if (tenantId === null) return seeOther(BRAIN_SETUP_PATH);
+      const status = await connectionStatus(deps.controlSql, tenantId);
       return html(
         renderPage({
           kind: 'connect',

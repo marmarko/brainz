@@ -17,6 +17,7 @@ import type { SQL } from 'bun';
 import { ABSOLUTE_SESSION_MS, attachBrain } from '../../src/control/accounts.ts';
 import type { ProviderId } from '../../src/ai/keys.ts';
 import {
+  FTS_LANGUAGE_CHOICES,
   SESSION_COOKIE,
   connectorGate,
   createWebApp,
@@ -24,7 +25,10 @@ import {
   sameOriginRefusal,
 } from '../../src/web/app.ts';
 import { CONNECT_STEPS, installLink } from '../../src/web/connect.ts';
-import { escapeHtml } from '../../src/web/pages.ts';
+import { BRAIN_SETUP_PATH, escapeHtml } from '../../src/web/pages.ts';
+// The other fleet's page, imported rather than described: the sentence it prints
+// is a claim about a page this one serves, and the two are separate processes.
+import { noBrainYetPage } from '../../src/mcp/server.ts';
 import {
   connect as connectControl,
   createControlPlane,
@@ -80,19 +84,29 @@ function app(
     connectors?: boolean;
     /** Make provisioning fail, so the signup handler's refusal arm is reachable. */
     provisioning?: 'ok' | 'fails';
+    /**
+     * Hold every provision open until this resolves.
+     *
+     * Real provisioning takes about fifteen seconds, and the fixture's answers
+     * immediately — so without a gate the window a second press lands in does
+     * not exist in a test, and a single-flight guard could be deleted with the
+     * suite still green. The recording happens *before* the wait, so a test can
+     * observe that the first request is inside the window before it makes the
+     * second.
+     */
+    gate?: Promise<void>;
   } = {},
 ) {
   return createWebApp({
     sql,
     controlSql,
     provisioner: {
-      provision(request: { ftsLanguage: string }) {
+      async provision(request: { ftsLanguage: string }) {
         recorded.provisioned.push({ ...request });
-        return Promise.resolve(
-          overrides.provisioning === 'fails'
-            ? ({ ok: false, reason: 'no_substrate_configured' } as const)
-            : ({ ok: true, tenantId: PROVISIONED_TENANT, via: 'synchronous' } as const),
-        );
+        if (overrides.gate !== undefined) await overrides.gate;
+        return overrides.provisioning === 'fails'
+          ? ({ ok: false, reason: 'no_substrate_configured' } as const)
+          : ({ ok: true, tenantId: PROVISIONED_TENANT, via: 'synchronous' } as const);
       },
     },
     origin: ORIGIN,
@@ -898,11 +912,31 @@ describe('the rendered forms can drive the API they post to', () => {
   test('every form on every page posts to a route that exists', async () => {
     await reset();
     const cookie = await signedIn();
+    // The recovery page renders for an account with no brain and redirects for
+    // one that has it, so it needs a session of its own to be covered here at
+    // all — and it is exactly the page whose form nothing was checking.
+    const stuckFailed = await app({ provisioning: 'fails' })(
+      post('/api/signup', {
+        email: 'stranded@example.com',
+        password: 'correct horse battery staple',
+        fts_language: 'simple',
+      }),
+    );
+    expect(stuckFailed.status).toBe(503);
+    const stuck = cookieOf(
+      await app()(
+        post('/api/login', {
+          email: 'stranded@example.com',
+          password: 'correct horse battery staple',
+        }),
+      ),
+    );
     const pages = [
       await (await app()(get('/login'))).text(),
       await (await app()(get('/signup'))).text(),
       await (await app()(get('/dashboard', { cookie }))).text(),
       await (await app()(get('/password/reset'))).text(),
+      await (await app()(get(BRAIN_SETUP_PATH, { cookie: stuck }))).text(),
     ];
 
     const actions = new Set<string>();
@@ -1038,6 +1072,281 @@ describe('the session cookie outlives the idle window', () => {
     const cookie = response.headers.get('set-cookie') ?? '';
     const maxAge = Number(/Max-Age=(\d+)/.exec(cookie)?.[1] ?? '0');
     expect(maxAge).toBe(Math.floor(ABSOLUTE_SESSION_MS / 1000));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The account a failed signup leaves behind, and the way out of it.
+//
+// `POST /api/brain` has existed since the retry was written and nothing rendered
+// a form or a link to it: the documented recovery was reachable only by hand,
+// from a browser console. What that costs is not hypothetical — a founder whose
+// brain was destroyed signed in, found a dashboard about a brain they did not
+// have, and had no affordance anywhere in the product that could build one.
+//
+// So these assert the *affordance*, not the route. A test that posted to
+// `/api/brain` would have passed on the day the defect shipped.
+// ---------------------------------------------------------------------------
+
+describe('a signed-in account with no brain', () => {
+  const STUCK = 'stuck@example.com';
+  const PASSWORD = 'correct horse battery staple';
+
+  /**
+   * The state a failed signup leaves: the address is taken, the password works,
+   * and there is no `account.brain` row.
+   */
+  async function stranded(): Promise<string> {
+    const failed = await app({ provisioning: 'fails' })(
+      post('/api/signup', { email: STUCK, password: PASSWORD, fts_language: 'simple' }),
+    );
+    expect(failed.status).toBe(503);
+    // No session either — provisioning is refused before the cookie is written.
+    expect(failed.headers.get('set-cookie')).toBeNull();
+
+    const signedIn = await app()(post('/api/login', { email: STUCK, password: PASSWORD }));
+    expect(signedIn.status).toBe(200);
+    // The failed attempt is not the subject of any assertion below.
+    recorded.provisioned = [];
+    return cookieOf(signedIn);
+  }
+
+  test('is offered a brain on the page it actually lands on', async () => {
+    await reset();
+    const cookie = await stranded();
+
+    // Every page a signed-in user reaches by default. A dashboard about a brain
+    // that does not exist is a page whose every button answers `no_brain_yet`,
+    // and the connect flow behind it dead-ends at the MCP fleet's 409.
+    for (const path of ['/', '/dashboard', '/connect']) {
+      const response = await app()(get(path, { cookie }));
+      expect({ path, status: response.status }).toEqual({ path, status: 303 });
+      expect({ path, to: response.headers.get('location') }).toEqual({ path, to: BRAIN_SETUP_PATH });
+    }
+
+    const page = await app()(get(BRAIN_SETUP_PATH, { cookie }));
+    expect(page.status).toBe(200);
+    const text = await page.text();
+    // The affordance itself: a form on the page, posting to the route that
+    // provisions. A link to documentation would satisfy a weaker assertion.
+    expect(text).toContain('action="/api/brain"');
+    expect(text).toContain('method="post"');
+  });
+
+  test('and an account that has one is not shown a form to build a second', async () => {
+    await reset();
+    const cookie = await signedIn();
+    const response = await app()(get(BRAIN_SETUP_PATH, { cookie }));
+    expect(response.status).toBe(303);
+    expect(response.headers.get('location')).toBe('/dashboard');
+  });
+
+  describe('the form asks for the language, the way signup does', () => {
+    test('it offers the API’s own list rather than a second copy of it', async () => {
+      await reset();
+      const cookie = await stranded();
+      const text = await (await app()(get(BRAIN_SETUP_PATH, { cookie }))).text();
+
+      expect(text).toContain('name="fts_language"');
+      for (const language of FTS_LANGUAGE_CHOICES) {
+        expect({ value: language.value, offered: text.includes(`value="${language.value}"`) }).toEqual({
+          value: language.value,
+          offered: true,
+        });
+      }
+    });
+
+    test('and preselects nothing — a default here is KTD9’s anglicisation by other means', async () => {
+      await reset();
+      const cookie = await stranded();
+      const pages = [
+        await (await app()(get(BRAIN_SETUP_PATH, { cookie }))).text(),
+        // The front door has the same hazard and the same fix: a browser selects
+        // the first option of a `select` on its own, so a list whose first entry
+        // is a real language *is* a default, however absent the word `selected`.
+        await (await app()(get('/signup'))).text(),
+      ];
+      for (const page of pages) {
+        const options = [...page.matchAll(/<option value="([^"]*)"([^>]*)>/g)];
+        expect(options.length).toBeGreaterThan(FTS_LANGUAGE_CHOICES.length - 1);
+        const first = options[0];
+        expect(first?.[1]).toBe('');
+        expect(first?.[2] ?? '').toContain('selected');
+        // …and no real language is preselected either.
+        for (const option of options.slice(1)) {
+          expect({ value: option[1], selected: (option[2] ?? '').includes('selected') }).toEqual({
+            value: option[1],
+            selected: false,
+          });
+        }
+      }
+    });
+
+    test('a build with no language is refused, and nothing is provisioned', async () => {
+      await reset();
+      const cookie = await stranded();
+
+      const refused = await app()(form('/api/brain', {}, { cookie }));
+      expect(refused.status).toBe(400);
+      // The refusal a browser can read, and the form again so the fix is one
+      // press away rather than a back button and a re-typed URL.
+      expect(refused.headers.get('content-type')).toContain('text/html');
+      const text = await refused.text();
+      expect(text).toContain('action="/api/brain"');
+      expect(text).not.toContain('"code":');
+      // The half that makes the refusal a control rather than a message.
+      expect(recorded.provisioned).toEqual([]);
+
+      // A `fetch` still gets the typed body it has always got.
+      const asJson = await app()(post('/api/brain', {}, { cookie }));
+      expect(asJson.status).toBe(400);
+      expect(await asJson.json()).toMatchObject({ code: 'fts_language_required' });
+      expect(recorded.provisioned).toEqual([]);
+    });
+  });
+
+  test('a build that works lands the browser on the connect flow, not on a JSON body', async () => {
+    await reset();
+    const cookie = await stranded();
+
+    const built = await app()(form('/api/brain', { fts_language: 'french' }, { cookie }));
+    expect(built.status).toBe(303);
+    expect(built.headers.get('location')).toBe('/connect');
+    // The language the user chose, carried through to the thing that was built.
+    expect(recorded.provisioned).toEqual([{ ftsLanguage: 'french' }]);
+
+    const me = (await (await app()(get('/api/me', { cookie }))).json()) as {
+      brain: { tenant_id: string; fts_language: string } | null;
+    };
+    expect(me.brain).toEqual({ tenant_id: PROVISIONED_TENANT, fts_language: 'french' });
+
+    // And the page that offered the form now sends them on rather than offering
+    // to build a second one.
+    const again = await app()(get(BRAIN_SETUP_PATH, { cookie }));
+    expect(again.status).toBe(303);
+    expect(again.headers.get('location')).toBe('/dashboard');
+  });
+
+  test('a build that fails says what to do about it, rather than answering with a body', async () => {
+    await reset();
+    const cookie = await stranded();
+
+    // One instance for both presses: the in-flight guard lives in the running
+    // process, and a guard released only on success would wedge this account
+    // into `already building` for the lifetime of the deployment — a worse bug
+    // than the double-press it exists to refuse.
+    const failing = app({ provisioning: 'fails' });
+    const failed = await failing(form('/api/brain', { fts_language: 'french' }, { cookie }));
+    expect(failed.status).toBe(503);
+    expect(failed.headers.get('content-type')).toContain('text/html');
+    const text = await failed.text();
+    // Not swallowed: the page says a build was attempted and did not happen.
+    expect(text).toContain('could not build your brain');
+    // Actionable, and the retry is on the page rather than in a support article.
+    expect(text).toContain('action="/api/brain"');
+    expect(text).not.toContain('provisioning_unavailable');
+    // The copy a signed-in user cannot act on. `Sign in and try again` is the
+    // signup path's sentence and it is nonsense to somebody already signed in.
+    expect(text).not.toContain('Sign in and try again');
+
+    // Again, on the same instance: still a build that failed, never `409`.
+    const retried = await failing(form('/api/brain', { fts_language: 'french' }, { cookie }));
+    expect(retried.status).toBe(503);
+    expect(recorded.provisioned).toEqual([{ ftsLanguage: 'french' }, { ftsLanguage: 'french' }]);
+
+    const asJson = await app({ provisioning: 'fails' })(
+      post('/api/brain', { fts_language: 'french' }, { cookie }),
+    );
+    expect(asJson.status).toBe(503);
+    expect(await asJson.json()).toMatchObject({ code: 'provisioning_unavailable' });
+  });
+
+  test('a second press while the first is still building does not buy a second brain', async () => {
+    await reset();
+    const cookie = await stranded();
+
+    // Provisioning takes about fifteen seconds against a real substrate. A page
+    // that appears to hang is one a user presses again, and two pool projects
+    // for one account is real money plus an orphan nobody is looking for.
+    let build = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      build = resolve;
+    });
+    // One app instance: the guard lives in the running process, and two
+    // instances would be two processes as far as it is concerned.
+    const handle = app({ gate });
+
+    const first = handle(form('/api/brain', { fts_language: 'french' }, { cookie }));
+    // Wait until the first request is genuinely inside the window rather than
+    // guessing at a delay.
+    while (recorded.provisioned.length === 0) await Bun.sleep(1);
+
+    const second = handle(form('/api/brain', { fts_language: 'german' }, { cookie }));
+    // Not awaited yet, and the gate is released below before it is: a press that
+    // got through the guard would be *inside* the provisioner right now, and a
+    // test that awaited it would report that as a timeout rather than as the
+    // second brain it is.
+    await Bun.sleep(50);
+    // Not a second project, and not the second tab's language quietly
+    // substituted for the first tab's either.
+    expect(recorded.provisioned).toEqual([{ ftsLanguage: 'french' }]);
+
+    build();
+    const refused = await second;
+    expect(refused.status).toBe(409);
+    expect(await refused.text()).toContain('already being built');
+
+    const settled = await first;
+    expect(settled.status).toBe(303);
+    expect(settled.headers.get('location')).toBe('/connect');
+    expect(recorded.provisioned).toEqual([{ ftsLanguage: 'french' }]);
+
+    // …and the guard is released, so a later press is answered by the idempotent
+    // read rather than by a wedged account.
+    const later = await handle(form('/api/brain', { fts_language: 'french' }, { cookie }));
+    expect(later.status).toBe(303);
+    expect(later.headers.get('location')).toBe('/dashboard');
+    expect(recorded.provisioned).toEqual([{ ftsLanguage: 'french' }]);
+  });
+
+  /**
+   * The two fleets have to agree, and they are two processes.
+   *
+   * `/authorize` on the MCP fleet renders the no-brain page; the page that can
+   * build one is on the web fleet. Today that page says *"Open your dashboard —
+   * it can build one"*, and the dashboard cannot: a stuck user is sent to a page
+   * with nothing on it for them, which is worse than saying nothing because they
+   * stop looking.
+   *
+   * So this follows the link across the boundary rather than reading either side
+   * alone. No redirect hop is allowed: a page that merely *leads* to the
+   * affordance is the sentence that was false.
+   */
+  test('the page the MCP fleet sends a stuck user to is the page that can build one', async () => {
+    await reset();
+    const cookie = await stranded();
+
+    const rendered = noBrainYetPage(ORIGIN);
+    expect(rendered.status).toBe(409);
+    const page = await rendered.text();
+    // The state it is about, kept in the words `test/mcp/oauth/consent.test.ts`
+    // asserts on.
+    expect(page.toLowerCase()).toContain('no brain');
+
+    const paths = [...page.matchAll(/href="([^"]+)"/g)]
+      .map((match) => match[1] ?? '')
+      .filter((href) => href.startsWith(ORIGIN))
+      .map((href) => new URL(href).pathname);
+    expect(paths.length).toBeGreaterThan(0);
+
+    for (const path of paths) {
+      const response = await app()(get(path, { cookie }));
+      expect({ path, status: response.status }).toEqual({ path, status: 200 });
+      expect({ path, offers: (await response.text()).includes('action="/api/brain"') }).toEqual({
+        path,
+        offers: true,
+      });
+    }
   });
 });
 
