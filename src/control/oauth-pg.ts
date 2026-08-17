@@ -481,7 +481,7 @@ export async function ensureAuthorizationStoreSchema(sql: SQL): Promise<void> {
 }
 
 async function storePresent(sql: SQL | TransactionSQL): Promise<boolean> {
-  // The revocation table is the probe because it is the last one the DDL
+  // The registration table is the probe because it is the last one the DDL
   // creates: a partially-applied file would otherwise report present.
   const rows = (await sql`
     SELECT to_regclass('control.oauth_registration') IS NOT NULL AS present

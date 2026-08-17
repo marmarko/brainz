@@ -21,8 +21,10 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import {
   deriveSigningKey,
   mintAccessToken,
+  type AuthorizationStore,
   type GrantClaims,
 } from '../../src/mcp/oauth.ts';
+import { dispatch } from '../../src/mcp/dispatch.ts';
 import { advertisedTools, TOOL_NAMES } from '../../src/mcp/tools/index.ts';
 import { agentOriginFor, classOf } from '../../src/mcp/grant-scope.ts';
 import { AGENT_ORIGIN, createMcpFixture, seedEntity, seedFact, seedPage, type McpFixture } from './fixture.ts';
@@ -666,6 +668,40 @@ describe('auth refusals are typed, and they are refusals everywhere', () => {
       expect(result.ok).toBe(false);
       expect(result.error?.code).toBe('unauthorized');
     }
+  });
+
+  test('a revocation store that cannot answer refuses the call rather than admitting it', async () => {
+    // **The boundary, not the store.** `oauth-pg.ts:isRevoked` rejects when its
+    // database is unwell, and `test/mcp/oauth/durable-store.test.ts` pins that.
+    // What that cannot show is what THIS function does with the rejection —
+    // and a `try/catch` here returning `false` reads like ordinary resilience
+    // while serving every revoked grant in the deployment for as long as the
+    // control plane is unwell. The list is durable now, which means it is
+    // reachable over a network, which means "cannot answer" is a state that
+    // will actually happen.
+    //
+    // The assertion is the property rather than the shape: whether the failure
+    // surfaces as a rejection or as a typed refusal, both are fail-closed and
+    // both are acceptable. `ok: true` is the only forbidden outcome.
+    const unwell: AuthorizationStore = {
+      ...fixture.store,
+      isRevoked() {
+        return Promise.reject(new Error('the control plane is unreachable'));
+      },
+    };
+    const authorization = `Bearer ${tokenFor([PERSONAL], { grantId: 'g_unwellstore00000' })}`;
+    const call = { tool: 'recall', args: { query: 'renewal' }, authorization };
+
+    const outcome = await dispatch({ ...fixture.deps, store: unwell }, call).then(
+      (result) => ({ refused: !result.ok }),
+      () => ({ refused: true }),
+    );
+    expect(outcome.refused).toBe(true);
+
+    // The control: the same call through the healthy store succeeds, so what
+    // the refusal above is about is the store and not the request.
+    const healthy = await dispatch(fixture.deps, call);
+    expect(healthy.ok).toBe(true);
   });
 });
 
