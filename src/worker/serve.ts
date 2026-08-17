@@ -37,13 +37,31 @@ import { SQL } from 'bun';
 import { createJobQueue, createLeaseChannel } from './queue.ts';
 import { createJobRunner } from './runner.ts';
 import { ALPHA_SCHEDULER, runSchedulerTick } from './scheduler.ts';
+import {
+  connectorSourceOpener,
+  enqueueDuePulls,
+  type ConnectorRuntime,
+} from './connectors.ts';
 import { createConsolidateHandler } from './consolidate/cycle.ts';
 import { createExportHandler, enqueueDueExports } from './export.ts';
 import { createSchemaSweepPorts } from '../control/schema-sweep.ts';
 import { createConsolidateWorld } from '../control/tier.ts';
 import { fleetIdentity } from '../control/secrets.ts';
+import { createTenantStorage } from '../control/storage.ts';
+import { createImportHandler, type TenantRuntime } from '../ingest/import/run.ts';
+import {
+  createChatExportMaterializer,
+  createImportMaterializer,
+} from '../ingest/import/materialize.ts';
+import type { RawStore } from '../ingest/import/raw.ts';
+import { createIngestPullHandler } from '../ingest/pipedream/pull.ts';
 import { DEFAULT_STEAL_GRACE_MS } from './locks.ts';
-import { openControlPlane, openFleetGateway, openSecretStore } from '../fleet/compose.ts';
+import {
+  fleetRoutingProfile,
+  openControlPlane,
+  openFleetGateway,
+  openSecretStore,
+} from '../fleet/compose.ts';
 import { announceListening, integer, port, refuseToStart, type Environment } from '../fleet/env.ts';
 
 /** How often the loop ticks. A minute is well inside the alpha's 24h ceiling. */
@@ -56,7 +74,33 @@ export interface WorkerFleetProcess {
   stop(): Promise<void>;
 }
 
-export async function startWorkerFleet(env: Environment): Promise<WorkerFleetProcess> {
+/**
+ * The capabilities this process cannot build out of its environment.
+ *
+ * **One member, and it is a parameter rather than a variable because there is no
+ * variable that would produce it.** A {@link ConnectorRuntime} needs the
+ * tenant's object prefix, which needs a prefix-scoped credential, which needs a
+ * `ScopedCredentialMinter` — and `src/` has no production implementation of that
+ * port, so no value of any environment variable composes one. Reading a
+ * credential out of `env` and calling it scoped would be the lie
+ * `src/control/storage.ts` rule 4 exists to prevent.
+ *
+ * `import.meta.main` passes nothing, so the deployed process runs with it
+ * absent, which is the honest state. What the parameter buys is that both halves
+ * of the connector lane — the handler's `openSource` seam and the cadence pass
+ * — are wired to the *same* supplier, and that a tick with a supplier present is
+ * observable. Without it, deleting the cadence pass from the tick would change
+ * nothing any test could see, which is how this lane got into the state it was
+ * in.
+ */
+export interface WorkerFleetSeams {
+  readonly connectors?: ConnectorRuntime;
+}
+
+export async function startWorkerFleet(
+  env: Environment,
+  seams: WorkerFleetSeams = {},
+): Promise<WorkerFleetProcess> {
   const controlSql = openControlPlane(env);
   // The dedicated lease channel (H4). Its own handle, never the work one.
   const leaseSql = new SQL(env['BRAINZ_CONTROL_DATABASE_URL'] as string, { max: 2 });
@@ -140,10 +184,100 @@ export async function startWorkerFleet(env: Environment): Promise<WorkerFleetPro
     },
   });
 
+  /**
+   * The two ingest lanes, and the seam each is missing.
+   *
+   * **Both handlers are registered, and both are registered *because* their
+   * suppliers are absent rather than in spite of it.** `createJobRunner` scopes
+   * its claim to the handler keys it is given, so an unregistered kind is not
+   * safe — it is a row that sits `due` forever, invisible to the dead-letter
+   * list an operator reads. A registered handler whose seam refuses fails the
+   * job, walks the backoff ladder and lands somewhere a human can see it, which
+   * is the same choice `createExportHandler` makes about a destination it cannot
+   * build and the same one `TenantNotConsolidableError` makes about a tenant it
+   * cannot open.
+   *
+   * **What is absent, and it is one thing wearing two hats.** Both lanes need
+   * the tenant's object prefix — the connector's cursor lives at
+   * `{tenant}/connectors/<source>`, a deferred import's manifest and preserved
+   * payload at `{tenant}/imports/` and `{tenant}/raw/` — and reaching one needs
+   * a prefix-scoped credential from a `ScopedCredentialMinter`, of which `src/`
+   * has no production implementation. So neither lane can be *enqueued* on this
+   * deployment either: `enqueueDuePulls` is a no-op without a runtime, and the
+   * gate cannot defer an import whose manifest it cannot write. Nothing
+   * dead-letters today because nothing is queued; what changes when a minter
+   * lands is a composition argument here, not a handler.
+   *
+   * The storage accessor **is** built, with a refusing minter — the shape
+   * `web/serve.ts` uses and for the same reason: deriving a key needs no minter,
+   * and a fleet that wired the in-memory one as production would be handing out
+   * credentials no object store honours.
+   */
+  const storage = prefixSource();
+  const rawStore = absentRawStore();
+  const profile = fleetRoutingProfile(env);
+
+  async function openIngestTenant(tenantId: string): Promise<IngestTenant> {
+    const connection = await connectTenant(tenantId);
+    return {
+      runtime: {
+        sql: connection.sql,
+        gateway,
+        tenantId,
+        caller: fleetIdentity(tenantId),
+      },
+      close: connection.close,
+    };
+  }
+
+  const ingestPullHandler = createIngestPullHandler({
+    control: controlSql,
+    profile,
+    openTenant: async (tenantId) => (await openIngestTenant(tenantId)).runtime,
+    closeTenant: (tenant) => tenant.sql.close(),
+    // Absent on this deployment. See the block above, and `connectors.ts`.
+    openSource: connectorSourceOpener(seams.connectors),
+    onResult(result, lease) {
+      process.stdout.write(
+        `${JSON.stringify({
+          event: 'pull',
+          tenant: lease.tenantId,
+          source: lease.target,
+          outcome: result.outcome,
+          written: result.counts.written,
+          quarantined: result.counts.quarantined,
+          suppressed: result.counts.suppressed,
+          stop_reason: result.stopReason ?? null,
+        })}\n`,
+      );
+    },
+  });
+
+  const importHandler = createImportHandler({
+    control: controlSql,
+    storage,
+    rawStore,
+    profile,
+    openTenant: async (tenantId) => (await openIngestTenant(tenantId)).runtime,
+    closeTenant: (tenant) => tenant.sql.close(),
+    // `chat_export` is the target this deployment could serve the moment the
+    // object store lands; `folder` is absent for a reason that is not the object
+    // store at all — a container has no access to the user's filesystem. Both
+    // refusals are `materialize.ts`'s, so the two reasons stay separate.
+    materialize: createImportMaterializer({
+      chat_export: createChatExportMaterializer({ rawStore, storage }),
+    }),
+  });
+
   const runner = createJobRunner({
     queue,
     leases,
-    handlers: { consolidate: createConsolidateHandler(ports), export: exportHandler },
+    handlers: {
+      consolidate: createConsolidateHandler(ports),
+      export: exportHandler,
+      ingest_pull: ingestPullHandler,
+      import: importHandler,
+    },
     owner: `worker-${process.pid}`,
     concurrency: integer(env, 'BRAINZ_WORKER_CONCURRENCY', 4),
   });
@@ -164,6 +298,21 @@ export async function startWorkerFleet(env: Environment): Promise<WorkerFleetPro
     // tenant's export is scheduled onto the slot its consolidation already
     // wakes, so this adds a job and not a wake — see `export.ts`.
     await enqueueDueExports({ sql: controlSql, queue }, { now });
+    // The connector cadence, which cannot ride the consolidation slot the export
+    // lane rides — gmail's is 300 seconds against a daily ceiling. It costs one
+    // control-plane query and, per tenant, a listing that wakes nothing; a
+    // tenant's own database is opened only when that listing says a source is
+    // already due. See `connectors.ts`. A deployment with no connector runtime
+    // — which is this one — returns before the first query.
+    await enqueueDuePulls(
+      {
+        sql: controlSql,
+        queue,
+        openTenant: connectTenant,
+        ...(seams.connectors === undefined ? {} : { runtime: seams.connectors }),
+      },
+      { now },
+    );
     await runner.runOnce({ now });
   }
 
@@ -209,6 +358,58 @@ export async function startWorkerFleet(env: Environment): Promise<WorkerFleetPro
       await leaseSql.close();
     },
   };
+}
+
+/** One tenant's ingest runtime, and the handle discipline the rest of this file uses. */
+interface IngestTenant {
+  readonly runtime: TenantRuntime;
+  close(): Promise<void>;
+}
+
+/**
+ * The storage accessor, with a minter that refuses.
+ *
+ * Deriving a key needs no credential — `manifestKeyFor` and `rawKeyFor` are pure
+ * functions of the accessor's own layout — so the import handler can compute
+ * exactly where a manifest *would* be. What it cannot do is mint the credential
+ * to read it, and the refusal below is why: `createInMemoryCredentialMinter`
+ * says in its own header that it is not R2's scheme, and a fleet that wired it
+ * as production would hand out credentials no object store honours. Same
+ * construction, same reason, as `src/web/serve.ts:prefixSource`.
+ */
+function prefixSource(): ReturnType<typeof createTenantStorage> {
+  return createTenantStorage({
+    minter: {
+      mint() {
+        return Promise.reject(
+          new Error(
+            'no object-storage credential minter is configured; this fleet derives keys and never mints',
+          ),
+        );
+      },
+    },
+  });
+}
+
+/**
+ * The object store this deployment does not have.
+ *
+ * **Not an in-memory store standing in.** A `Map` here would make the import
+ * handler *succeed*: `readManifest` would answer `null` for a job whose manifest
+ * a different container wrote, and the handler would throw the "no manifest"
+ * error — or worse, on a machine where the same instance wrote it, the import
+ * would run and its raw payload would die with the container. That is the
+ * per-container tmpfile the durable secret store exists to end, rebuilt one
+ * layer up. A refusal names the missing piece instead.
+ */
+function absentRawStore(): RawStore {
+  const refuse = (): Promise<never> =>
+    Promise.reject(
+      new Error(
+        'no object store is configured on this deployment; `src/control/storage.ts` has no production credential minter',
+      ),
+    );
+  return { put: refuse, get: refuse };
 }
 
 if (import.meta.main) {

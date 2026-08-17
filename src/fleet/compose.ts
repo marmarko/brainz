@@ -254,7 +254,16 @@ function hostedKeys(env: Environment): Partial<Record<ProviderId, string>> {
  * supplies no keys, and the key resolver answers `no_key_available` at call
  * time rather than this file inventing a credential at startup.
  */
-export function openFleetGateway(env: Environment, deps: GatewayDeps): ModelGateway {
+/**
+ * Which routing profile this deployment runs.
+ *
+ * Lifted out of {@link openFleetGateway} because a second consumer arrived: the
+ * ingest runners take a `NamedProfile` directly — the first-import estimate
+ * prices the profile's own embedding seat, so a runner composed against a
+ * different profile than the gateway would gate on one price and spend at
+ * another. One reader, one refusal, one profile per process.
+ */
+export function fleetRoutingProfile(env: Environment): NamedProfile {
   const name = (optional(env, 'BRAINZ_ROUTING_PROFILE') ?? 'hosted') as RoutingProfileName;
   const profile = PROFILES[name];
   if (profile === undefined) {
@@ -263,6 +272,11 @@ export function openFleetGateway(env: Environment, deps: GatewayDeps): ModelGate
       `names no routing profile; known profiles are ${Object.keys(PROFILES).join(', ')}`,
     );
   }
+  return profile;
+}
+
+export function openFleetGateway(env: Environment, deps: GatewayDeps): ModelGateway {
+  const profile = fleetRoutingProfile(env);
 
   return createModelGateway({
     profile,
