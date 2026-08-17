@@ -143,7 +143,11 @@ ARG BUN_VERSION=1.3.14
 # the writer is only gone once the platform has replaced it — so the epoch is
 # the instrument here rather than a side effect. A bump whose whole purpose is
 # instance replacement is a legitimate use of this knob; nothing else moves.
-ARG FLEET_CONFIG_EPOCH=6
+# 6 -> 7: the Pipedream credentials joined the web fleet's manifest and the
+# worker fleet gained the ingest_pull and import handlers. Both are invisible to
+# a warm instance -- the first is a manifest change (nothing to re-put, so
+# `wrangler secret list` looks identical), the second is code inside the image.
+ARG FLEET_CONFIG_EPOCH=7
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
