@@ -621,6 +621,11 @@ is one this server registered in advance — if it is not somewhere you expect, 
 <p class="note">Nothing is granted until you press that. Closing this page grants nothing, and so does
 arriving here from a link you did not follow deliberately.</p>`,
     200,
+    // The registered callback's origin, because the POST answers 303 to it and
+    // `form-action` is enforced against that redirect. `view.redirectUri` is the
+    // value already checked against the registered client, so this names the one
+    // destination this server had agreed to — not one the request chose.
+    new URL(view.redirectUri).origin,
   );
 }
 
@@ -639,7 +644,24 @@ function scopeSentence(scoped: ScopedClaims): string {
  * An HTML answer from the MCP surface, with the same posture the web app's pages
  * carry: no third-party anything, and a policy that says so.
  */
-function htmlPage(title: string, main: string, status: number): Response {
+/**
+ * @param formTarget An extra origin this page's form may submit to, beyond
+ *   `'self'`. Omitted for every page whose form stays here.
+ *
+ *   **A browser enforces `form-action` against the redirect too**, not only the
+ *   POST. The consent form posts to this origin — so `'self'` reads as
+ *   sufficient — and the POST answers `303` to the client's registered
+ *   callback. Under `'self'` alone the code is minted and banked, the browser
+ *   refuses to follow the redirect that would deliver it, and the flow dies one
+ *   hop from done with nothing wrong on the server. The user sees only "the
+ *   request has been blocked".
+ *
+ *   Callers pass the origin of the **registered** redirect URI, never one out of
+ *   the request: the policy may name the place this server had already agreed to
+ *   deliver the credential to, and nowhere else.
+ */
+function htmlPage(title: string, main: string, status: number, formTarget?: string): Response {
+  const formAction = formTarget === undefined ? "'self'" : `'self' ${formTarget}`;
   return new Response(
     `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -657,7 +679,7 @@ function htmlPage(title: string, main: string, status: number): Response {
       status,
       headers: {
         'content-type': 'text/html; charset=utf-8',
-        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+        'content-security-policy': `default-src 'none'; style-src 'unsafe-inline'; form-action ${formAction}`,
         'referrer-policy': 'same-origin',
         'x-content-type-options': 'nosniff',
         // A consent page is per-session and carries a token bound to it. A cache

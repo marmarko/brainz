@@ -232,9 +232,44 @@ describe('a signed-in browser', () => {
     const response = await serverWith({ owners: owners() }).fetch(browse());
     const policy = response.headers.get('content-security-policy') ?? '';
     expect(policy).toContain("default-src 'none'");
-    expect(policy).toContain("form-action 'self'");
     // A cached consent page is the next visitor holding this session's token.
     expect(response.headers.get('cache-control')).toContain('no-store');
+  });
+
+  /**
+   * **`form-action` is checked against the redirect, not just the POST.**
+   *
+   * The consent form posts to this origin, so `'self'` looks sufficient and is
+   * not: the POST answers `303` to the client's registered callback, and a
+   * browser enforces `form-action` against the *redirect target* as well. Under
+   * `form-action 'self'` alone the code is minted, banked and then never
+   * delivered — the user sees "the request has been blocked" from their own
+   * browser and the flow dies one hop from done, with nothing wrong on the
+   * server. Observed against the live deployment on 2026-08-17.
+   *
+   * The origin comes from `view.redirectUri`, which is the value already checked
+   * against the *registered* client — so this widens the policy to exactly the
+   * place this server had already agreed to send the credential, and nowhere
+   * else. Taking it from the request instead would let an attacker name their
+   * own origin and have the policy bless it.
+   */
+  test('admits the registered callback as a form target, because the 303 goes there', async () => {
+    const response = await serverWith({ owners: owners() }).fetch(browse());
+    const policy = response.headers.get('content-security-policy') ?? '';
+    const formAction = policy.split(';').map((d) => d.trim()).find((d) => d.startsWith('form-action'));
+    expect(formAction).toBeDefined();
+    expect(formAction).toContain("'self'");
+    expect(formAction).toContain(new URL(REDIRECT).origin);
+  });
+
+  test('and admits nothing beyond that origin — not the whole web, not a bare scheme', async () => {
+    const response = await serverWith({ owners: owners() }).fetch(browse());
+    const policy = response.headers.get('content-security-policy') ?? '';
+    const formAction = policy.split(';').map((d) => d.trim()).find((d) => d.startsWith('form-action')) ?? '';
+    expect(formAction).not.toContain('*');
+    expect(formAction).not.toMatch(/\bhttps:(?!\/\/)/);
+    // Exactly two sources: `'self'` and the one registered origin.
+    expect(formAction.split(/\s+/).slice(1)).toHaveLength(2);
   });
 
   /**
