@@ -177,7 +177,14 @@ ARG BUN_VERSION=1.3.14
 # to re-put: exactly the epoch-3 shape recorded in `docs/deploy.md`. Deploy with
 # the deterministic reload (`containers delete` then `deploy`) against the
 # worker AND web fleets, not by waiting.
-ARG FLEET_CONFIG_EPOCH=11
+# 11 -> 12: the connector panel's own note, which epoch 11 left saying that
+# nothing tells the dashboard about an authorization -- the sentence the same
+# epoch made false. Pure markup inside the image, so the failure mode is the
+# quiet one this epoch counter exists for: a warm web instance keeps serving the
+# paragraph that tells a founder not to bother coming back, on the page that now
+# adopts their connection when they do. Web fleet only; the worker serves no
+# markup. Deterministic reload (`containers delete` then `deploy`).
+ARG FLEET_CONFIG_EPOCH=12
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
