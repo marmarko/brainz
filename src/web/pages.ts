@@ -15,7 +15,15 @@
  */
 
 export type Page =
-  | { readonly kind: 'login' }
+  | {
+      readonly kind: 'login';
+      /**
+       * Where to go after signing in, when something sent the user here
+       * mid-flow. Already validated by `app.ts:returnPathAfterLogin` — this
+       * page escapes it and does not re-decide it.
+       */
+      readonly next?: string;
+    }
   | {
       readonly kind: 'signup';
       readonly languages: readonly { readonly value: string; readonly label: string }[];
@@ -79,8 +87,18 @@ export function renderPage(page: Page): string {
         'Sign in — brainz',
         `<h1>brainz</h1>
 <p class="note">Your brain, wherever your assistant is.</p>
+${
+  page.next === undefined
+    ? ''
+    : '<p class="note">Sign in to finish connecting your assistant. You will be brought back to the ' +
+      'consent step, not to your dashboard.</p>'
+}
 <form method="post" action="/api/login">
-  <label for="email">Email</label><input id="email" name="email" type="email" autocomplete="username" required>
+${
+  page.next === undefined
+    ? ''
+    : `  <input type="hidden" name="next" value="${escapeHtml(page.next)}">\n`
+}  <label for="email">Email</label><input id="email" name="email" type="email" autocomplete="username" required>
   <label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>
   <button type="submit">Sign in</button>
 </form>

@@ -25,11 +25,13 @@
  * enforces — S256 only, exact redirect matching, single-use codes — and this
  * file's job is not to quietly relax any of them on the wire.
  *
- * **The resource owner, in alpha, is whoever holds the tenant's provisioned
- * bearer.** `/authorize` therefore authenticates with it rather than rendering a
- * consent screen: alpha is one founder and two known clients, and a login page
- * with no identity system behind it would be theatre. U15 replaces this step
- * with a real session without changing the token surface.
+ * **The resource owner arrives one of two ways, and the difference is whether
+ * the credential is ambient.** A machine presents the tenant's provisioned
+ * bearer in a header — deliberate by construction, since no page can attach one
+ * to a navigation it provoked — and gets a code. A *browser* presents the web
+ * app's session cookie, which is ambient, so it gets a consent page and the code
+ * is minted by the POST that page submits. Both end at one minting function.
+ * See {@link handleAuthorize}.
  */
 
 import { dispatch, type DispatchDeps, type DispatchResult } from './dispatch.ts';
@@ -37,6 +39,7 @@ import { SERVER_INSTRUCTIONS, INSTRUCTIONS_RELEASE } from './instructions.ts';
 import {
   authorize,
   authorizationServerMetadata,
+  consentToken,
   deriveSigningKey,
   issueTokens,
   protectedResourceMetadata,
@@ -45,10 +48,23 @@ import {
   registerClient,
   stripBearer,
   tenantOfToken,
+  verifyConsentToken,
   verifyTenantBearer,
+  type ClientRecord,
   type RegistrationAllowlist,
 } from './oauth.ts';
-import { parseRequestedScope } from './grant-scope.ts';
+import { parseRequestedScope, type ScopedClaims } from './grant-scope.ts';
+// **The CSRF posture is the web app's, imported rather than re-decided.** The
+// session layer already chose it — `SameSite=Lax` plus an `Origin` check where
+// *absent* is refused — and a second implementation of that decision on this
+// surface is how the two stop agreeing. If this import's module-graph cost ever
+// matters (it links the web app into the MCP container), the fix is to move
+// `sameOriginRefusal` somewhere both units own, never to write a second one.
+import { sameOriginRefusal } from '../web/app.ts';
+// The five-character escaper, from the module that already owns it. A local copy
+// would be the second implementation of the one primitive standing between a
+// database-fed string and a rendered page.
+import { escapeHtml } from '../web/pages.ts';
 import { PROTOCOL_VERSION } from './envelope.ts';
 import { readClientCapabilities, UI_EXTENSION } from './client-capabilities.ts';
 import { listResources, readResource } from './resources.ts';
@@ -56,10 +72,53 @@ import { inputSchemaFor, listedTools, type Endpoint } from './tools/index.ts';
 import { fleetIdentity } from '../control/secrets.ts';
 import { DEFAULT_WRITE_ORIGIN } from './dispatch.ts';
 
+/**
+ * Who the browser at `/authorize` is, once its session has been resolved.
+ *
+ * `tenantId` is `null` for an account whose brain has not been provisioned —
+ * a real state (`/api/brain` exists to retry it), and the one an
+ * `accountId → tenantId` lookup that returned a string would have to invent.
+ */
+export interface ResolvedOwner {
+  readonly accountId: string;
+  /** The brain this account owns, or `null` when it has none yet. */
+  readonly tenantId: string | null;
+  /**
+   * An opaque value that changes with the session and never leaves this process.
+   *
+   * The consent form's anti-CSRF token is derived from it (`oauth.ts:consentToken`),
+   * which is the whole reason it is on this type: the token has to be bound to
+   * *this* session, and this surface must not hold the session credential to do
+   * it. A digest of the session token is the intended implementation.
+   */
+  readonly sessionKey: string;
+}
+
+/**
+ * The resource owner, resolved from the web app's session cookie.
+ *
+ * **A port, and it takes the raw `Cookie` header on purpose.** The cookie's name
+ * is the web app's business (`src/web/app.ts:SESSION_COOKIE`), the session table
+ * is the identity database's, and this surface holds neither — R11 keeps the
+ * identity store off the MCP fleet's manifest. So the composition root supplies
+ * an implementation and this file learns only who the browser is.
+ *
+ * **Absent is not an error, it is a deployment fact.** A fleet wired to no
+ * implementation cannot authenticate a browser at all, and `/authorize` answers
+ * exactly what it answered before this existed: the `401` that starts discovery.
+ * The alternative — a friendly page saying interactive login is unavailable —
+ * would be a new sentence describing the same missing capability.
+ */
+export interface ResourceOwners {
+  resolve(cookieHeader: string | null): Promise<ResolvedOwner | null>;
+}
+
 export interface ServerDeps extends Omit<DispatchDeps, 'endpoint'> {
   /** The public origin this server is reachable at. Used in discovery documents. */
   readonly issuer: string;
   readonly registrationAllowlist: RegistrationAllowlist;
+  /** How a browser's session cookie becomes an account and a brain. */
+  readonly resourceOwners?: ResourceOwners;
 }
 
 export interface McpServer {
@@ -307,25 +366,136 @@ async function handleRegister(deps: ServerDeps, request: Request): Promise<Respo
 }
 
 /**
- * The authorization endpoint.
+ * The authorization endpoint — **two ways in, one code-minting function.**
  *
- * The resource owner authenticates with the tenant's provisioned bearer, and the
- * grant that results carries the **whole brain** — an empty `origins` array is
- * dispatch's marker for that, and narrowing it is U15's consent screen to build.
- * Issuing a narrower grant here without a UI to choose it would be a scope the
- * user never saw and could not change.
+ * **The machine way.** A caller holding the tenant's provisioned bearer presents
+ * it in the `Authorization` header and a code is minted. That is how every test
+ * in this repo and every non-browser client operates, and it is safe as a `GET`
+ * for the reason the browser way is not: an `Authorization` header is not
+ * ambient. No page can cause a browser to attach one to a navigation it
+ * provoked, so a request carrying a valid bearer was made deliberately.
+ *
+ * **The browser way, which is what Claude's connector actually does.** It opens
+ * `/authorize` in a window. A browser has no bearer, so before this the endpoint
+ * answered `401` and the connector could not begin — the whole flow ended at its
+ * first hop. It now resolves the web app's session cookie, and:
+ *
+ *   * **No session → the login page, carrying a return path.** Landing a user on
+ *     a dashboard after they were sent somewhere to authorise something is
+ *     losing the thing they were doing.
+ *   * **A session whose account has no brain → a page that says so.** Not a
+ *     `500`, and not a consent screen for a brain that does not exist:
+ *     provisioning can fail (`/api/brain` is the retry) and this is the state
+ *     that leaves behind.
+ *   * **A session with a brain → a consent page, and a `GET` mints nothing.**
+ *     A cookie is ambient and `SameSite=Lax` admits top-level cross-site
+ *     navigations *by design*, because that is the shape an OAuth redirect has.
+ *     So a `GET` that minted because a cookie was present would be a credential
+ *     any page could cause a logged-in browser to issue. The code is minted by a
+ *     `POST` carrying `oauth.ts:consentToken` — bound to the session, delivered
+ *     only inside a page from this origin — and the `Origin` check the session
+ *     layer already decided on, where absent is refused.
+ *
+ * Both ways end at {@link mintAuthorizationCode}. Two mint sites is two places
+ * for the redirect check, the PKCE check and the scope decision to drift.
  */
 async function handleAuthorize(deps: ServerDeps, request: Request, url: URL): Promise<Response> {
-  const presented = stripBearer(request.headers.get('authorization') ?? '');
-  const tenantId = tenantOfToken(presented);
-  if (tenantId === null) return unauthorized(deps);
+  const params = url.searchParams;
 
-  const resolved = await deps.secrets.resolve(fleetIdentity(tenantId), tenantId);
-  if (!resolved.ok || !verifyTenantBearer(presented, resolved.secret.bearerGrant)) {
-    return unauthorized(deps);
+  // ---- The machine way. --------------------------------------------------
+  //
+  // Anything in the header is treated as an attempt to use it: a malformed or
+  // wrong bearer is refused here rather than falling through to the browser
+  // path, so a bad credential cannot become an anonymous request that gets a
+  // login page instead of the `401` a client is waiting to see.
+  const presented = stripBearer(request.headers.get('authorization') ?? '');
+  if (presented.length > 0) {
+    const tenantId = tenantOfToken(presented);
+    if (tenantId === null) return unauthorized(deps);
+    const resolved = await deps.secrets.resolve(fleetIdentity(tenantId), tenantId);
+    if (!resolved.ok || !verifyTenantBearer(presented, resolved.secret.bearerGrant)) {
+      return unauthorized(deps);
+    }
+    // 302, as it has always been. The machine path is a `GET` and its callers
+    // read that status.
+    return mintAuthorizationCode(deps, params, tenantId, 302);
   }
 
-  const params = url.searchParams;
+  // ---- The browser way. --------------------------------------------------
+  const owners = deps.resourceOwners;
+  if (owners === undefined) return unauthorized(deps);
+  const owner = await owners.resolve(request.headers.get('cookie'));
+
+  if (request.method === 'POST') {
+    // The CSRF posture, in the order it has to run: an unacceptable `Origin`
+    // is refused before the session is consulted, so a cross-site POST cannot
+    // even learn whether the browser it rode in on was signed in.
+    const refusal = sameOriginRefusal(request, deps.issuer);
+    if (refusal !== null) {
+      return oauthError('invalid_request', refusal, 403);
+    }
+    // An expired session is a sign-in, not a `500` and not a mint. The browser
+    // gets the login page and the return path brings it back to this consent.
+    if (owner === null) return signIn(deps, url);
+    const form = new URLSearchParams(await request.text());
+    if (!verifyConsentToken(form.get('consent') ?? '', owner.sessionKey)) {
+      return oauthError(
+        'invalid_request',
+        'this consent was not the one this session was shown',
+        403,
+      );
+    }
+    if (owner.tenantId === null) return noBrainYet(deps);
+    // 303 rather than 302: the browser must follow this with a `GET`, and the
+    // one thing worse than a lost consent is a re-posted one.
+    return mintAuthorizationCode(deps, params, owner.tenantId, 303);
+  }
+
+  if (request.method !== 'GET') {
+    return new Response('method not allowed', { status: 405, headers: { allow: 'GET, POST' } });
+  }
+
+  if (owner === null) return signIn(deps, url);
+
+  // **Everything the page will name is validated before the page is rendered.**
+  // A consent screen naming an unregistered client, or a redirect target that is
+  // not the registered string, is a phishing page this server wrote and signed
+  // with its own origin.
+  const client = deps.store.getClient(params.get('client_id') ?? '');
+  if (client === undefined) return oauthError('invalid_client', 'unknown client_id', 400);
+  const redirectUri = params.get('redirect_uri') ?? '';
+  if (!client.redirectUris.includes(redirectUri)) {
+    return oauthError('invalid_request', 'redirect_uri does not match a registered value', 400);
+  }
+  const requested = parseRequestedScope(params.get('scope'), deps.writeOrigin ?? DEFAULT_WRITE_ORIGIN);
+  if (!requested.ok) return oauthError('invalid_scope', requested.reason, 400);
+
+  if (owner.tenantId === null) return noBrainYet(deps);
+
+  return consentPage({
+    client,
+    redirectUri,
+    query: url.search,
+    scoped: requested.scoped,
+    sessionKey: owner.sessionKey,
+  });
+}
+
+/**
+ * **The one place a code is minted**, reached by the bearer path and by the
+ * consent POST alike.
+ *
+ * The tenant is a parameter because the two ways in establish it differently —
+ * one verifies a bearer, the other resolves a session — and *nothing else*
+ * differs. In particular the scope decision happens here, so a consent page
+ * cannot describe one grant while the mint issues another.
+ */
+async function mintAuthorizationCode(
+  deps: ServerDeps,
+  params: URLSearchParams,
+  tenantId: string,
+  status: 302 | 303,
+): Promise<Response> {
   const endpoint = params.get('resource')?.endsWith('/openai') === true ? 'openai' : 'mcp';
 
   // **U18: this is where a work-connector grant becomes obtainable.** Before it,
@@ -337,13 +507,8 @@ async function handleAuthorize(deps: ServerDeps, request: Request, url: URL): Pr
   // every connector shipping today sends no scope; an *unrecognised* token is
   // refused rather than defaulted, because a client that asked for a slice and
   // silently received the brain has been over-granted invisibly from both ends.
-  const requested = parseRequestedScope(
-    params.get('scope'),
-    deps.writeOrigin ?? DEFAULT_WRITE_ORIGIN,
-  );
-  if (!requested.ok) {
-    return Response.json({ error: 'invalid_scope', error_description: requested.reason }, { status: 400 });
-  }
+  const requested = parseRequestedScope(params.get('scope'), deps.writeOrigin ?? DEFAULT_WRITE_ORIGIN);
+  if (!requested.ok) return oauthError('invalid_scope', requested.reason, 400);
 
   const outcome = authorize(deps.store, {
     clientId: params.get('client_id') ?? '',
@@ -360,10 +525,147 @@ async function handleAuthorize(deps: ServerDeps, request: Request, url: URL): Pr
     now: deps.now().getTime(),
   });
 
-  if (!outcome.ok) {
-    return Response.json({ error: outcome.error, error_description: outcome.description }, { status: 400 });
+  if (!outcome.ok) return oauthError(outcome.error, outcome.description, 400);
+  return new Response(null, { status, headers: { location: outcome.redirectTo } });
+}
+
+function oauthError(error: string, description: string, status: number): Response {
+  return Response.json({ error, error_description: description }, { status });
+}
+
+/**
+ * Where the browser goes when it has no session, and where it comes back to.
+ *
+ * **The return path is the requirement.** Without it a user who followed a
+ * connector's link signs in and arrives at a dashboard, with no sign that they
+ * were halfway through authorising something and no way back to it but the
+ * connector's own retry. It is a path rather than a URL because the login page
+ * refuses anything else (`src/web/app.ts:returnPathAfterLogin`) — an open
+ * redirector on the login form would be a nastier bug than the one being fixed.
+ *
+ * **The web app is assumed to share this origin**, which is how the deployment
+ * is actually shaped: the edge path-routes `/login` and `/authorize` to
+ * different containers behind one host, and that is also what makes the session
+ * cookie reach this endpoint at all. A split-origin deployment would need a
+ * cross-origin handshake, not a redirect, and it would fail visibly here rather
+ * than quietly — the cookie would never arrive and this would loop.
+ */
+function signIn(deps: ServerDeps, url: URL): Response {
+  const base = (deps.webAppBaseUrl ?? deps.issuer).replace(/\/+$/, '');
+  const next = `${url.pathname}${url.search}`;
+  return new Response(null, {
+    status: 302,
+    headers: { location: `${base}/login?next=${encodeURIComponent(next)}` },
+  });
+}
+
+/**
+ * The honest answer for a session whose account has no brain.
+ *
+ * A `409` rather than a `500` (nothing failed) and rather than a `200` (the
+ * request cannot be satisfied). The page says which of the two states this is —
+ * provisioning has not run, or it ran and failed — because the retry lives on
+ * the dashboard and a user who is told nothing has no reason to go there.
+ */
+function noBrainYet(deps: ServerDeps): Response {
+  const base = (deps.webAppBaseUrl ?? deps.issuer).replace(/\/+$/, '');
+  return htmlPage(
+    'No brain to connect — brainz',
+    `<h1>There is no brain here yet</h1>
+<p>You are signed in, but this account has no brain for a connector to reach. That happens when
+provisioning has not finished, or when it failed during signup.</p>
+<p><a href="${escapeHtml(`${base}/dashboard`)}">Open your dashboard</a> — it can build one — and then
+start the connection again from the beginning.</p>
+<p class="note">Nothing was granted, and no connection was made.</p>`,
+    409,
+  );
+}
+
+interface ConsentView {
+  readonly client: ClientRecord;
+  readonly redirectUri: string;
+  /** The original query string, replayed on the form's action. */
+  readonly query: string;
+  readonly scoped: ScopedClaims;
+  readonly sessionKey: string;
+}
+
+/**
+ * The consent page.
+ *
+ * **The parameters travel on the form's `action`, not in hidden fields.** For a
+ * `POST` the browser keeps the action's query string, so the handler parses one
+ * set of parameters from one place on both methods — and a hidden field is no
+ * more trustworthy than a query parameter anyway, which is why the `POST` path
+ * re-validates every one of them at the mint rather than believing this page.
+ *
+ * The only thing the form carries is the consent token, which is the only thing
+ * on the page an attacker's copy could not have.
+ */
+function consentPage(view: ConsentView): Response {
+  const name = view.client.clientName;
+  return htmlPage(
+    'Connect to brainz',
+    `<h1>Connect ${escapeHtml(name)} to your brain?</h1>
+<p><strong>${escapeHtml(name)}</strong> is asking for access to this brain.</p>
+<h2>What it will be able to do</h2>
+<p>${escapeHtml(scopeSentence(view.scoped))}</p>
+<h2>Where you will be sent back to</h2>
+<p><code>${escapeHtml(view.redirectUri)}</code></p>
+<p class="note">Check that address. It is the only place the resulting credential is delivered, and it
+is one this server registered in advance — if it is not somewhere you expect, close this page.</p>
+<form method="post" action="/authorize${escapeHtml(view.query)}">
+  <input type="hidden" name="consent" value="${escapeHtml(consentToken(view.sessionKey))}">
+  <button type="submit">Connect</button>
+</form>
+<p class="note">Nothing is granted until you press that. Closing this page grants nothing, and so does
+arriving here from a link you did not follow deliberately.</p>`,
+    200,
+  );
+}
+
+/** What the grant on offer amounts to, in a sentence a person can act on. */
+function scopeSentence(scoped: ScopedClaims): string {
+  if (scoped.scope === 'whole_brain') {
+    return 'Read everything in this brain, and add to it. This is the whole brain, not a part of it.';
   }
-  return new Response(null, { status: 302, headers: { location: outcome.redirectTo } });
+  return (
+    `Read and add to these parts of this brain only: ${scoped.origins.join(', ')}. ` +
+    `Anything filed anywhere else stays out of reach.`
+  );
+}
+
+/**
+ * An HTML answer from the MCP surface, with the same posture the web app's pages
+ * carry: no third-party anything, and a policy that says so.
+ */
+function htmlPage(title: string, main: string, status: number): Response {
+  return new Response(
+    `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title><style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.6 system-ui, sans-serif; max-width: 44rem; margin: 3rem auto; padding: 0 1.25rem; }
+  h1 { font-size: 1.5rem; } h2 { font-size: 1.1rem; margin-top: 2rem; }
+  button { font: inherit; padding: 0.5rem 1rem; margin-top: 1rem; cursor: pointer; }
+  code { padding: 0.15rem 0.35rem; background: rgba(127,127,127,0.15); border-radius: 3px; word-break: break-all; }
+  .note { opacity: 0.75; font-size: 0.9rem; }
+</style></head>
+<body><main>${main}</main></body></html>`,
+    {
+      status,
+      headers: {
+        'content-type': 'text/html; charset=utf-8',
+        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+        'referrer-policy': 'same-origin',
+        'x-content-type-options': 'nosniff',
+        // A consent page is per-session and carries a token bound to it. A cache
+        // that kept one would hand the next visitor somebody else's.
+        'cache-control': 'no-store',
+      },
+    },
+  );
 }
 
 async function handleToken(deps: ServerDeps, request: Request): Promise<Response> {

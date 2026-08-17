@@ -382,6 +382,41 @@ export function contextGrant(contextClass: string): ScopedClaims | null {
 export const CONTEXT_SCOPE_PREFIX = 'brainz:context:';
 
 /**
+ * The context classes the discovery documents name.
+ *
+ * A short closed list rather than "any well-formed class": {@link contextGrant}
+ * will build a grant for any class that satisfies the grammar, but *advertising*
+ * a class is a product statement about what the brain is divided into, and the
+ * product has two halves. Exported so `oauth.ts` publishes these rather than
+ * writing the strings again — the prefix has one definition and so does the set.
+ */
+export const ADVERTISED_CONTEXT_CLASSES: readonly string[] = ['personal', 'work'];
+
+/** `brainz:context:personal`, `brainz:context:work` — the advertised vocabulary. */
+export const CONTEXT_SCOPES: readonly string[] = ADVERTISED_CONTEXT_CLASSES.map(
+  (contextClass) => `${CONTEXT_SCOPE_PREFIX}${contextClass}`,
+);
+
+/**
+ * The access half of the vocabulary: what a credential may *do*, as against
+ * which slice of the brain it may see.
+ *
+ * **This server mints exactly one access shape — read and write together — and
+ * these two tokens are the name of it.** They were already in
+ * `/.well-known/oauth-protected-resource` before anything parsed them, so every
+ * client that reads that document (Claude's connector does) sends them; the
+ * parser refused them, and the connector died at the authorization step. The
+ * fix is not to skip tokens the parser does not know. It is to say what these
+ * two mean, and to answer only when the answer is exactly what was asked for —
+ * see {@link parseRequestedScope}.
+ */
+export const ACCESS_SCOPE_READ = 'brain.read';
+export const ACCESS_SCOPE_WRITE = 'brain.write';
+
+/** The complete access pair, which is the only complete request for it. */
+export const ACCESS_SCOPES: readonly string[] = [ACCESS_SCOPE_READ, ACCESS_SCOPE_WRITE];
+
+/**
  * Read a requested scope off an OAuth `scope` parameter.
  *
  * **Absent means the whole brain, and one unrecognised token means refuse.**
@@ -396,6 +431,38 @@ export const CONTEXT_SCOPE_PREFIX = 'brainz:context:';
  * which is expressible — but it is not a shape any product surface asks for, and
  * a parser that silently supports an unasked-for combination is a parser whose
  * behaviour nobody has decided.
+ *
+ * ---------------------------------------------------------------------------
+ * THE ACCESS PAIR, AND WHY ACCEPTING IT IS NOT A WIDENING
+ * ---------------------------------------------------------------------------
+ *
+ * `brain.read` and `brain.write` are now recognised. **No credential became
+ * mintable that was not mintable before**, and that is the whole test of whether
+ * this is a widening. The pair together denotes precisely the grant a request
+ * with *no* scope has always received — the whole brain, readable and writable —
+ * so a client naming it receives what it named. What changed is that the request
+ * is now understood instead of refused.
+ *
+ * **Either token alone is refused, and that refusal is the point.** This server
+ * has one credential shape: `GrantClaims` carries an origin fence and no
+ * read/write axis at all, and `dispatch.ts` enforces no such axis. So a
+ * `brain.read`-only grant is not something it can mint — and answering that
+ * request with a read *and write* credential is exactly the silent over-grant
+ * this parser exists to refuse, in the direction that matters most (the client
+ * believes it handed its user a reader). `brain.write` alone is refused by the
+ * same rule for the same reason, read the other way: the caller would receive a
+ * credential that reads everything it did not ask to read.
+ *
+ * Making `brain.read` real means giving a credential a read-only property and
+ * teaching dispatch to refuse `remember`/`forget` under it. That is a change to
+ * the credential and to the dispatcher, and it is filed rather than faked: a
+ * scope that is advertised and honoured *nowhere* is worse than a scope that is
+ * refused with a sentence saying why.
+ *
+ * The two halves compose. `brain.read brain.write brainz:context:work` is the
+ * work connector, read and write — decided here rather than left to be
+ * discovered, because this module's own rule is that a combination nobody
+ * decided is a combination nobody can rely on.
  */
 export type RequestedScope =
   | { readonly ok: true; readonly scoped: ScopedClaims }
@@ -415,16 +482,41 @@ export function parseRequestedScope(
   if (tokens.length === 0) return { ok: true, scoped: whole };
 
   const contexts: string[] = [];
+  let read = false;
+  let write = false;
   for (const token of tokens) {
+    if (token === ACCESS_SCOPE_READ) {
+      read = true;
+      continue;
+    }
+    if (token === ACCESS_SCOPE_WRITE) {
+      write = true;
+      continue;
+    }
     if (!token.startsWith(CONTEXT_SCOPE_PREFIX)) {
       return { ok: false, reason: `unknown scope ${JSON.stringify(token)}` };
     }
     contexts.push(token.slice(CONTEXT_SCOPE_PREFIX.length));
   }
 
+  // Half the access pair is a request this server cannot answer exactly, and an
+  // inexact answer here is a credential that does more (or sees more) than the
+  // client told its user it would.
+  if (read !== write) {
+    const asked = read ? ACCESS_SCOPE_READ : ACCESS_SCOPE_WRITE;
+    return {
+      ok: false,
+      reason:
+        `${JSON.stringify(asked)} alone is not a credential this server mints — it issues read and write ` +
+        `together, so answering would grant more than was asked for. Request ` +
+        `${JSON.stringify(ACCESS_SCOPES.join(' '))}, or no scope at all, for the same grant.`,
+    };
+  }
+
   if (contexts.length > 1) {
     return { ok: false, reason: 'only one context may be requested per grant' };
   }
+  if (contexts.length === 0) return { ok: true, scoped: whole };
 
   const scoped = contextGrant(contexts[0] ?? '');
   if (scoped === null) {

@@ -697,6 +697,73 @@ describe('the rendered forms can drive the API they post to', () => {
     expect(response.headers.get('set-cookie') ?? '').toContain(SESSION_COOKIE);
   });
 
+  /**
+   * The return path, which exists for exactly one caller: `/authorize` on the
+   * MCP fleet redirects an unauthenticated browser here mid-flow. Without it the
+   * user signs in, lands on a dashboard, and the connection they were halfway
+   * through authorising is gone with no sign it was ever in progress.
+   *
+   * The refusals are the interesting half. A login form that redirects wherever
+   * it is told is an open redirector, and the classic use is a phishing link
+   * that passes through the real sign-in page — same origin, real form — and
+   * lands on the attacker's.
+   */
+  describe('signing in mid-flow', () => {
+    const RETURN = '/authorize?client_id=bzc_1&state=s&redirect_uri=https%3A%2F%2Fclaude.ai%2Fcb';
+
+    test('the login page carries the return path through the form', async () => {
+      const page = await (
+        await app()(get(`/login?next=${encodeURIComponent(RETURN)}`))
+      ).text();
+      expect(page).toContain('name="next"');
+      // Escaped, not interpolated: the value arrives on a query string.
+      expect(page).toContain(escapeHtml(RETURN));
+    });
+
+    test('and the login lands back there rather than on the dashboard', async () => {
+      await reset();
+      await signedIn();
+      await app()(post('/api/logout', {}, {}));
+
+      const response = await app()(
+        form('/api/login', {
+          email: 'alice@example.com',
+          password: 'correct horse battery staple',
+          next: RETURN,
+        }),
+      );
+      expect(response.status).toBe(303);
+      expect(response.headers.get('location')).toBe(RETURN);
+    });
+
+    test.each([
+      ['an absolute URL', 'https://evil.example/steal'],
+      ['a protocol-relative URL', '//evil.example/steal'],
+      ['a backslash host', '/\\evil.example/steal'],
+      ['some other page of ours', '/dashboard?x=1'],
+      ['a path that merely contains the prefix', '/redirect?to=/authorize?a=b'],
+      ['an encoded prefix', '%2Fauthorize%3Fclient_id%3Dx'],
+    ])('refuses %s and goes to the dashboard instead', async (_name, next) => {
+      await reset();
+      await signedIn();
+      await app()(post('/api/logout', {}, {}));
+
+      const response = await app()(
+        form('/api/login', {
+          email: 'alice@example.com',
+          password: 'correct horse battery staple',
+          next,
+        }),
+      );
+      expect(response.status).toBe(303);
+      expect(response.headers.get('location')).toBe('/dashboard');
+
+      // …and the login page does not echo it into the form either.
+      const page = await (await app()(get(`/login?next=${encodeURIComponent(next)}`))).text();
+      expect(page).not.toContain('name="next"');
+    });
+  });
+
   test('the signup page offers the language choice the API requires', async () => {
     // The API refuses a signup with no language, per KTD9. A page with no field
     // for it would make the product unusable through its own front door.

@@ -50,6 +50,10 @@
  *     rather than licensing a brute force.
  *   * *DCR behind a single-tenant allowlist and a registration rate limit.*
  *     Open dynamic registration on a public issuer is a free write amplifier.
+ *   * *A browser's consent is a POST carrying {@link consentToken}.* A code
+ *     minted because a cookie was present is a credential any page can cause a
+ *     signed-in browser to issue — `SameSite=Lax` admits top-level cross-site
+ *     navigations by design, since that is the shape an OAuth redirect has.
  *
  * **The store is an interface with an in-memory implementation.** The durable
  * binding is deliberately absent: the control plane's alphabets cannot hold a
@@ -70,7 +74,14 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 // rather than remembered.
 import { constantTimeEqual } from '../control/accounts.ts';
 import { isValidTenantId } from '../control/secrets.ts';
-import { grantScopeViolations, type GrantScope } from './grant-scope.ts';
+import {
+  ACCESS_SCOPES,
+  CONTEXT_SCOPES,
+  CONTEXT_SCOPE_PREFIX,
+  classesOf,
+  grantScopeViolations,
+  type GrantScope,
+} from './grant-scope.ts';
 import type { Endpoint } from './tools/index.ts';
 
 // ---------------------------------------------------------------------------
@@ -524,9 +535,11 @@ export interface AuthorizeRequest {
   /**
    * The resource owner, already authenticated by the caller.
    *
-   * In alpha the login credential is the tenant's provisioned bearer, verified
-   * by `server.ts` before this function is reached. U15 replaces that step with
-   * a real session without changing anything below.
+   * Established by `server.ts` before this function is reached, one of two ways:
+   * a machine's provisioned bearer, verified; or a browser's web-app session,
+   * resolved and then *consented to* on a POST. Neither is a request parameter,
+   * and that is the property this field depends on — a tenant read off the query
+   * string would make the fence below a caller's choice.
    */
   readonly tenantId: string;
   /** U18's explicit marker. `narrowed` with no origins is refused below. */
@@ -713,8 +726,86 @@ export function issueTokens(
     token_type: 'Bearer',
     expires_in: accessTtl,
     refresh_token: refreshToken,
-    scope: options.grant.origins.join(' '),
+    scope: scopeStringOf(options.grant),
   };
+}
+
+/**
+ * The `scope` a token response echoes, in the vocabulary the documents publish.
+ *
+ * It used to be `origins.join(' ')`, which put this server's internal fence
+ * grammar on the wire — a client that asked for `brainz:context:work` was
+ * answered `work:*`, a string it has no way to interpret and no way to ask for
+ * again. RFC 6749 makes this field the server's statement of what was granted,
+ * so it has to be sayable in the same language the request was written in, or
+ * the reconciliation of the two discovery documents stops one step short of the
+ * wire.
+ *
+ * Every grant this server mints reads and writes, so the access pair is always
+ * present; a narrowed grant adds the context it is narrowed to.
+ */
+export function scopeStringOf(grant: Pick<GrantClaims, 'scope' | 'origins'>): string {
+  const contexts =
+    grant.scope === 'narrowed'
+      ? classesOf(grant.origins).map((contextClass) => `${CONTEXT_SCOPE_PREFIX}${contextClass}`)
+      : [];
+  return [...ACCESS_SCOPES, ...contexts].join(' ');
+}
+
+// ---------------------------------------------------------------------------
+// Consent.
+// ---------------------------------------------------------------------------
+
+/**
+ * The label the anti-CSRF consent token is derived under.
+ *
+ * Domain-separated for the reason {@link SIGNING_KEY_LABEL} is: the session key
+ * this is keyed by is also the key other things could be derived from, and two
+ * derivations sharing a key and differing in nothing are one derivation.
+ */
+const CONSENT_TOKEN_LABEL = 'brainz/mcp/consent/v1';
+
+/**
+ * The token a consent form carries, bound to the browser's session.
+ *
+ * **Why a token at all, when the cookie is `SameSite=Lax` and the POST already
+ * checks `Origin`.** A code minted because a cookie was present is a credential
+ * any page can cause a logged-in browser to mint: `SameSite=Lax` permits
+ * top-level cross-site *navigations*, which is precisely how an OAuth redirect
+ * arrives, so a `GET /authorize` that minted would be exploitable by a link. The
+ * mint therefore moves to a POST, and the POST carries something the attacker's
+ * page cannot obtain — this, which is only ever delivered inside a page served
+ * from this origin and readable only by script the same-origin policy admits.
+ *
+ * **One-way from the session, so the form does not carry the credential.** It is
+ * `HMAC(sessionKey, label)`, the same construction `deriveSigningKey` uses on a
+ * bearer: an attacker who scrapes the token out of a page cannot run it
+ * backwards into the session it was bound to.
+ *
+ * It is per-session rather than per-request deliberately. Binding the client id
+ * and the redirect target as well would add nothing here — an attacker who
+ * cannot read the token cannot post *any* request with it — and a token that
+ * changes per request is a token that breaks the back button.
+ */
+export function consentToken(sessionKey: string): string {
+  return createHmac('sha256', sessionKey).update(CONSENT_TOKEN_LABEL).digest('hex');
+}
+
+/**
+ * Verify a consent token against the session it should have been bound to.
+ *
+ * **The empty check is defensive and, stated plainly, not provable today.**
+ * `verifyTenantBearer` needs its equivalent because it compares a presented
+ * value against a *stored* one and both can be empty; this compares against an
+ * HMAC, which is never the empty string, so an unfilled form field is already
+ * refused by the compare itself. It is here so that a later edit which compares
+ * against something stored — the shape that reopens the hazard — does not have
+ * to rediscover it. No test kills it, and pretending otherwise would be worse
+ * than saying so.
+ */
+export function verifyConsentToken(presented: string, sessionKey: string): boolean {
+  if (presented.length === 0 || sessionKey.length === 0) return false;
+  return constantTimeEqual(presented, consentToken(sessionKey));
 }
 
 export function redeemRefreshToken(
@@ -761,13 +852,45 @@ export function hashToken(token: string): string {
 // Discovery metadata.
 // ---------------------------------------------------------------------------
 
+/**
+ * The scope vocabulary, published **once** and read by both documents.
+ *
+ * The two documents used to carry different lists — `['brain.read',
+ * 'brain.write']` here and `['brainz:context:personal', 'brainz:context:work']`
+ * on the authorization server — and neither list was the one
+ * `parseRequestedScope` honoured. Claude reads the resource document, sent what
+ * it found, and was refused `invalid_scope` by its own issuer. Two hand-written
+ * lists in one file is how that happens, so there is now one list and a test
+ * that asserts every token in it is a token the parser accepts.
+ *
+ * **The context scopes are deliberately not in it.** A client that concatenates
+ * `scopes_supported` into a request — which is exactly what Claude does, and why
+ * both `brain.read` and `brain.write` arrived together — would ask for two
+ * contexts at once, and `parseRequestedScope` refuses that on purpose (a grant
+ * covering two classes is a shape no product surface asks for). An advertised
+ * vocabulary that cannot be requested as advertised is worse than one a client
+ * is told about somewhere it will not splice. They travel on their own
+ * namespaced field below instead.
+ */
+export const SUPPORTED_SCOPES: readonly string[] = ACCESS_SCOPES;
+
+/**
+ * The extension field the context vocabulary is discoverable on.
+ *
+ * Namespaced because RFC 8414 lets a server add metadata and does not let it
+ * redefine a registered field: a generic client must be able to ignore this
+ * entirely, and one that reads it learns the vocabulary without being invited to
+ * concatenate it.
+ */
+export const CONTEXT_SCOPES_METADATA_FIELD = 'brainz_context_scopes_supported';
+
 /** RFC 9728 — what a 401 points a client at. */
 export function protectedResourceMetadata(issuer: string, resource: string): Record<string, unknown> {
   return {
     resource,
     authorization_servers: [issuer],
     bearer_methods_supported: ['header'],
-    scopes_supported: ['brain.read', 'brain.write'],
+    scopes_supported: [...SUPPORTED_SCOPES],
   };
 }
 
@@ -786,11 +909,16 @@ export function authorizationServerMetadata(issuer: string): Record<string, unkn
     // refuses is a bug report waiting to happen.
     code_challenge_methods_supported: ['S256'],
     token_endpoint_auth_methods_supported: ['none'],
+    // The same list the resource document publishes, from the same constant.
+    // Two documents describing one resource must not disagree about what may be
+    // asked for, and the way to make that structural rather than remembered is
+    // for there to be one list.
+    scopes_supported: [...SUPPORTED_SCOPES],
     /**
-     * U18's context grants, advertised so a client can discover the vocabulary
-     * rather than guess it. Omitting `scope` still grants the whole brain —
-     * which is why these are advertised as *supported* rather than required.
+     * U18's context grants, discoverable but not spliceable — see
+     * {@link SUPPORTED_SCOPES}. Omitting `scope` still grants the whole brain,
+     * which is why these are *supported* rather than required.
      */
-    scopes_supported: ['brainz:context:personal', 'brainz:context:work'],
+    [CONTEXT_SCOPES_METADATA_FIELD]: [...CONTEXT_SCOPES],
   };
 }

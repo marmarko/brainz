@@ -333,6 +333,31 @@ export function sameOriginRefusal(request: Request, origin: string): string | nu
   return null;
 }
 
+/**
+ * Where a login lands, when something sent the user here mid-flow.
+ *
+ * **The one caller that matters is the OAuth consent hop.** `/authorize` on the
+ * MCP fleet redirects an unauthenticated browser to `/login?next=/authorize?…`;
+ * without this the user signs in, arrives at a dashboard, and the connection
+ * they were halfway through authorising is simply gone — they have no way of
+ * knowing it was ever in progress.
+ *
+ * **It is an allowlist of one shape, not a URL validator, and that is
+ * deliberate.** A login form that redirects to a caller-supplied destination is
+ * an open redirector: the classic use is a phishing link that passes through the
+ * real sign-in page — same origin, real padlock, real form — and lands on the
+ * attacker's. Every generic defence for that is a parser argument (`//evil.example`
+ * is protocol-relative, `/\evil.example` is a path some browsers normalise into a
+ * host, `%2F%2F` decodes after the check that read it). So this refuses
+ * everything that is not literally the one path this product needs to return to.
+ */
+export const RETURN_PATH_PREFIX = '/authorize?';
+
+export function returnPathAfterLogin(next: string | null): string | null {
+  if (next === null) return null;
+  return next.startsWith(RETURN_PATH_PREFIX) ? next : null;
+}
+
 // ---------------------------------------------------------------------------
 // The app.
 // ---------------------------------------------------------------------------
@@ -451,7 +476,14 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     // who follows "forgotten your password?" from a bookmark must reach the
     // page, not the router's 404 — and a reset link arrives in mail, which is
     // exactly where a stale session is likely to be sitting.
-    if (path === '/login') return html(renderPage({ kind: 'login' }));
+    if (path === '/login') {
+      // The return path travels through the form as a hidden field, because the
+      // form posts to `/api/login` and the query string on this page does not
+      // survive that hop. Refused values become absent rather than an error: a
+      // login page is not the place to explain that somebody's link was odd.
+      const next = returnPathAfterLogin(url.searchParams.get('next'));
+      return html(renderPage({ kind: 'login', ...(next === null ? {} : { next }) }));
+    }
     if (path === '/signup') return html(renderPage({ kind: 'signup', languages: [...FTS_LANGUAGE_CHOICES] }));
     if (path === '/password/reset') return html(renderPage({ kind: 'reset_request' }));
     if (path === '/password/sent') return html(renderPage({ kind: 'reset_sent' }));
@@ -701,7 +733,11 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       // login that reused a caller-supplied cookie is how it lands.
       const session = await createSession(deps.sql, { accountId: outcome.accountId, now: now() });
       const cookie = { 'set-cookie': sessionCookie(session.token, Math.floor(ABSOLUTE_SESSION_MS / 1000)) };
-      return afterForm(request, '/dashboard', cookie) ?? json({ ok: true }, 200, cookie);
+      // Back to whatever sent them here, when that is the one destination this
+      // app returns to — see `returnPathAfterLogin`. Anything else, including
+      // anything absolute, becomes the dashboard rather than a refusal.
+      const next = returnPathAfterLogin(stringOf(fields, 'next'));
+      return afterForm(request, next ?? '/dashboard', cookie) ?? json({ ok: true }, 200, cookie);
     }
 
     async function handleLogout(request: Request): Promise<Response> {
