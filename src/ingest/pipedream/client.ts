@@ -842,7 +842,20 @@ export function createPipedreamClient(options: {
       const response = await transport.send({
         method: 'DELETE',
         url: `${base}/connect/${config.projectId}/users/${request.externalUserId}`,
-        headers: { authorization: `Bearer ${authorized.value}` },
+        // **`x-pd-environment`, and its absence was not a subtlety.** Every
+        // other call to this vendor names the environment because the two are
+        // separate keyspaces; this one did not, and the vendor does not guess —
+        // it refuses with `400 {"error":"Environment missing"}`. That is no
+        // verdict at all to `classifyDeletion`, so the client reported
+        // `provider_error`, `ConnectorVendor.disconnect` threw, and
+        // `/api/connectors DELETE` answered `500` to every user who pressed
+        // disconnect. The mailbox stayed attached at the vendor and stayed
+        // billed. Observed against the live project on 2026-08-17: the same
+        // external user answers `400` without this header and `204` with it.
+        headers: {
+          authorization: `Bearer ${authorized.value}`,
+          'x-pd-environment': config.environment,
+        },
       });
       if (response.status === 401) accessToken = null;
 

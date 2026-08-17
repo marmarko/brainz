@@ -518,6 +518,37 @@ describe("R12's erasure leg", () => {
     expect(call?.url).toContain('tenant-a');
   });
 
+  /**
+   * **The header this call omitted, and what the omission cost.**
+   *
+   * The listing sends `x-pd-environment` and this did not. Against the live
+   * vendor that is not a keyspace mix-up that quietly deletes the wrong record —
+   * it is a flat refusal, `400 {"error":"Environment missing"}`, which
+   * `classifyDeletion` reads as no verdict and the client reports as
+   * `provider_error`. So `ConnectorVendor.disconnect` threw on every call and
+   * `/api/connectors DELETE` answered `500` for every user, on every deployment:
+   * the disconnect button could not reach the vendor at all, and the mailbox it
+   * was pressed for stayed attached and stayed billed.
+   *
+   * Observed live on 2026-08-17 against the production project — the same
+   * external user answers `400` without the header and `204` with it.
+   *
+   * A scripted-transport case cannot see a missing header (the double answers
+   * whatever it was told to), which is exactly how this survived a suite that
+   * already asserted the method, the URL and the reported evidence. So the
+   * assertion is on what is *sent*, the way the listing's is.
+   */
+  test('the deletion names the environment it is deleting in', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/users/tenant-a', { status: 204, body: '' });
+    const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
+
+    await client.deleteExternalUser({ externalUserId: 'tenant-a' });
+
+    const call = transport.requests.at(-1);
+    expect(call?.headers['x-pd-environment']).toBe(CONFIG.environment);
+  });
+
   test('a deletion that did not happen is not reported as one', async () => {
     const transport = withToken(createScriptedTransport());
     transport.on('/users/tenant-a', { status: 500, body: { error: 'boom' } });
