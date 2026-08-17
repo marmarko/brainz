@@ -15,6 +15,13 @@
  */
 
 /**
+ * Imported rather than restated: the connector panel's vocabulary is decided
+ * where the control plane is read, and a second copy of the state union here is
+ * a second place for it to drift.
+ */
+import type { ConnectorStatus } from './connector-panel.ts';
+
+/**
  * Where a signed-in account with no brain is offered one.
  *
  * **A constant because two fleets name this page.** The MCP fleet renders the
@@ -31,6 +38,15 @@
  * would be invisible to the edge's routing guard.
  */
 export const BRAIN_SETUP_PATH = '/brain';
+
+/**
+ * Where the connector controls post.
+ *
+ * A constant because three pages name it — the dashboard's control, the
+ * disconnect confirmation's control, and the test that follows every form
+ * action on every page to a route that exists.
+ */
+export const CONNECTORS_PATH = '/api/connectors';
 
 export type Page =
   | {
@@ -55,7 +71,14 @@ export type Page =
       readonly status: string;
       readonly tenantId: string | null;
       readonly connectorsAvailable: boolean;
-      readonly sources: readonly string[];
+      /**
+       * One entry per offered source, each carrying what this brain can
+       * actually say about it. Empty when {@link connectorsAvailable} is false —
+       * the gate's explanation is rendered instead, and **no control is
+       * rendered at all**, because a button whose route answers 402 is the dead
+       * affordance this page exists to stop having.
+       */
+      readonly connectors: readonly ConnectorStatus[];
       readonly providers: readonly string[];
     }
   | {
@@ -81,6 +104,46 @@ export type Page =
        * becomes a stack trace with nothing in it a user can do.
        */
       readonly problem?: string;
+    }
+  | {
+      /**
+       * The answer to a form connect: the vendor's link, as a link.
+       *
+       * **Not a redirect, and the reason is the app's own policy.** See
+       * `app.ts:handleConnect` — `form-action` is enforced by the document that
+       * carries the form, which is the dashboard, which renders before any
+       * claim URL exists. This page is served in place of the redirect that
+       * would be blocked.
+       */
+      readonly kind: 'connector_claim';
+      readonly source: string;
+      readonly claimUrl: string;
+      readonly expiresAt: Date;
+    }
+  | {
+      /** What a disconnect asks before it revokes anything. */
+      readonly kind: 'connector_confirm_disconnect';
+      readonly source: string;
+    }
+  | {
+      /** What a disconnect did, in the vendor's own vocabulary. */
+      readonly kind: 'connector_disconnected';
+      readonly source: string;
+      readonly pollingStopped: number;
+      readonly vendorDeleted: boolean;
+      readonly tokensRevoked: string;
+    }
+  | {
+      /**
+       * A connector refusal a browser can read.
+       *
+       * The `refusedBuild` shape one section over, for the same reason: a form
+       * post answered with `{"ok":false,…}` renders that object as text in a
+       * browser window, on a page with no way back.
+       */
+      readonly kind: 'connector_notice';
+      readonly heading: string;
+      readonly message: string;
     };
 
 /** HTML-escape. Five characters, applied to every interpolation without exception. */
@@ -106,6 +169,12 @@ const STYLE = `
   .problem { border-left: 3px solid currentColor; padding-left: 0.75rem; }
   ol { padding-left: 1.25rem; }
   .connected { font-weight: 600; }
+  .sources { list-style: none; padding-left: 0; }
+  .sources > li { border-top: 1px solid rgba(127,127,127,0.3); padding: 0.75rem 0; }
+  .sources form { display: flex; gap: 0.5rem; }
+  .sources button { width: auto; }
+  .source-name { font-weight: 600; text-transform: capitalize; }
+  .failing { border-left: 3px solid currentColor; padding-left: 0.75rem; }
 `;
 
 function shell(title: string, main: string): string {
@@ -148,6 +217,70 @@ function languageChoice(
   <p class="note">This decides how your brain indexes words, and it is set once when the brain is built.
   We do not guess it, because guessing wrong is invisible — everything would still work, and search
   would quietly be worse forever.</p>`;
+}
+
+/**
+ * A moment, in the one format that cannot be misread.
+ *
+ * ISO rather than "3 hours ago": the server renders once and the page is then
+ * read at an unknown later time, so a relative phrase is a number that starts
+ * lying the moment it is sent.
+ */
+function moment(at: Date): string {
+  return `<time datetime="${escapeHtml(at.toISOString())}">${escapeHtml(at.toISOString())}</time>`;
+}
+
+/**
+ * What one source's status says, in a sentence rather than a struct.
+ *
+ * The four states come from `connector-panel.ts`, whose header carries the
+ * reason each is the most this app can honestly claim. The copy's job is to not
+ * over-claim them: `unknown` is *as far as this brain can tell*, because
+ * attached-but-never-polled and never-attached are the same rows.
+ */
+function connectorStatusSentence(status: ConnectorStatus): string {
+  switch (status.state) {
+    case 'failing':
+      return (
+        `<p class="failing">Connected, and <strong>no longer being polled</strong>. The last check ended in ` +
+        `<code>${escapeHtml(status.failureCode ?? 'an unrecorded failure')}</code>` +
+        `${status.lastCheckedAt === null ? '' : ` at ${moment(status.lastCheckedAt)}`}, and it stopped ` +
+        `retrying. Disconnecting and connecting again is the way to restart it.</p>`
+      );
+    case 'checking':
+      return (
+        `<p>Connected. A check is queued or running now` +
+        `${status.lastCheckedAt === null ? ', and none has finished yet' : `; last checked ${moment(status.lastCheckedAt)}`}.</p>`
+      );
+    case 'connected':
+      return `<p>Connected. Last checked ${status.lastCheckedAt === null ? 'at an unrecorded time' : moment(status.lastCheckedAt)}.</p>`;
+    case 'unknown':
+      return `<p>Not connected, as far as this brain can tell — nothing has ever been polled for it.</p>`;
+  }
+}
+
+/**
+ * One source: what it is, what is known about it, and the two things that can
+ * be done to it.
+ *
+ * **One form, two named submits, no script.** The app's policy has no
+ * `script-src`, so the control cannot be a `fetch` and cannot be a button that
+ * "does" anything: it is a form, and which button was pressed arrives as
+ * `intent` because a browser sends the name and value of the submit that fired
+ * and of no other. A form submitted by the Enter key sends neither, which is
+ * why `app.ts` reads an absent intent as `connect` — the non-destructive half.
+ */
+function connectorRow(status: ConnectorStatus): string {
+  const source = escapeHtml(status.source);
+  return `<li>
+  <p class="source-name">${source}</p>
+  ${connectorStatusSentence(status)}
+  <form method="post" action="${CONNECTORS_PATH}">
+    <input type="hidden" name="source" value="${source}">
+    <button type="submit" name="intent" value="connect">Connect ${source}</button>
+    <button type="submit" name="intent" value="disconnect">Disconnect ${source}</button>
+  </form>
+</li>`;
 }
 
 export function renderPage(page: Page): string {
@@ -233,20 +366,24 @@ that is a separate step, on purpose.</p>`,
       );
 
     case 'dashboard': {
-      const sources = page.sources
-        .map((source) => `<li>${escapeHtml(source)}</li>`)
-        .join('');
       const providers = page.providers
         .map((provider) => `<option value="${escapeHtml(provider)}">${escapeHtml(provider)}</option>`)
         .join('');
       // The gate's copy names the actual reason. "Upgrade for more" tells a user
       // nothing they can act on; a monthly per-connection vendor fee is a fact
       // they can weigh.
+      //
+      // **And the gated render carries no control at all.** Not a disabled one,
+      // not a differently-worded one: a form whose route answers 402 or 501 is
+      // the dead affordance the whole panel exists to stop being.
       const connectors = page.connectorsAvailable
-        ? `<ul>${sources}</ul>
+        ? `<ul class="sources">${page.connectors.map(connectorRow).join('')}</ul>
 <p class="note">Connecting opens a consent screen at the connector vendor. The link it gives you is a
 capability — anyone who has it can attach their account to this brain — so it expires in ten minutes
-and works once.</p>`
+and works once. It is shown on one page, once, and is not stored anywhere you can go back to.</p>
+<p class="note">This brain finds out that a source is attached by polling it. Until the first check has
+run, a source you have just connected still reads as not connected here — the consent happens at the
+connector vendor, and nothing tells this page about it.</p>`
         : `<p>Connected accounts are on the paid plan. Each connected mailbox carries a monthly fee from the
 connector vendor whether or not the brain is used, which the free plan cannot carry.</p>
 <p class="note">Chat exports and folder imports are included on every plan and need no connection at all.</p>`;
@@ -325,5 +462,76 @@ granted until you say so.</p>
 <p class="note">Then <code>/mcp</code> in a session to sign in.</p>`,
       );
     }
+
+    case 'connector_claim': {
+      const source = escapeHtml(page.source);
+      // **A link, not a redirect, and not a control that could be re-fired.**
+      // `rel="noreferrer"` on top of the response's own `referrer-policy`:
+      // two independent statements of the same rule, because the one that
+      // travels with the markup survives a later edit to the header helper.
+      return shell(
+        `Connect ${page.source} — brainz`,
+        `<h1>Connect ${source}</h1>
+<p>Follow this link to ${source}'s consent screen at the connector vendor:</p>
+<p><a href="${escapeHtml(page.claimUrl)}" rel="noreferrer">Connect ${source} at the connector vendor &rarr;</a></p>
+<p class="note">That link is a capability, not an address. Anyone who has it can attach <em>their</em>
+${source} account to <em>this</em> brain, so it expires at ${moment(page.expiresAt)} and works once.
+Do not paste it anywhere — not into a chat, not into a note, not to yourself.</p>
+<p class="note">This page is not stored: reloading it will not bring the link back, and neither will
+the back button. If you need another, press Connect on the dashboard again — the one above stops
+working when a new one is made.</p>
+<p><a href="/dashboard">Back to your dashboard</a></p>`,
+      );
+    }
+
+    case 'connector_confirm_disconnect': {
+      const source = escapeHtml(page.source);
+      // The confirmation is a form carrying the answer, rather than a link: a
+      // link that disconnected would be a GET that changes state, which is the
+      // thing a prefetcher, a link scanner or a mail client fires without a
+      // person being involved.
+      return shell(
+        `Disconnect ${page.source} — brainz`,
+        `<h1>Disconnect ${source}?</h1>
+<p>This asks the connector vendor to delete the account behind ${source} and stops this brain polling
+it. Anything already brought in stays in your brain — this is about the connection, not about what it
+collected.</p>
+<p class="note">Reconnecting afterwards means going through the vendor's consent screen again. Nothing
+here deletes what was ingested; the export and erasure controls are the ones that do that.</p>
+<form method="post" action="${CONNECTORS_PATH}">
+  <input type="hidden" name="source" value="${source}">
+  <input type="hidden" name="intent" value="disconnect">
+  <input type="hidden" name="confirm" value="${source}">
+  <button type="submit">Disconnect ${source}</button>
+</form>
+<p><a href="/dashboard">No, keep it connected</a></p>`,
+      );
+    }
+
+    case 'connector_disconnected': {
+      const source = escapeHtml(page.source);
+      // Reported exactly as the vendor reported it. `unverified` stays
+      // `unverified`: "no live credential remains anywhere" is a sentence that
+      // ends up in a privacy policy, and this page is not where it gets made up.
+      return shell(
+        `${page.source} disconnected — brainz`,
+        `<h1>${source} disconnected</h1>
+<p>The connector vendor was asked to delete the account behind ${source} and answered
+<code>${page.vendorDeleted ? 'deleted' : 'nothing to delete'}</code>.</p>
+<p>${page.pollingStopped === 0 ? 'No poll was queued for it.' : `${page.pollingStopped} queued or running ${page.pollingStopped === 1 ? 'check was' : 'checks were'} stopped.`}</p>
+<p class="note">Token revocation at the vendor is reported as
+<code>${escapeHtml(page.tokensRevoked)}</code>. We report what the vendor reports rather than
+claiming more than it told us.</p>
+<p><a href="/dashboard">Back to your dashboard</a></p>`,
+      );
+    }
+
+    case 'connector_notice':
+      return shell(
+        `${page.heading} — brainz`,
+        `<h1>${escapeHtml(page.heading)}</h1>
+<p class="problem">${escapeHtml(page.message)}</p>
+<p><a href="/dashboard">Back to your dashboard</a></p>`,
+      );
   }
 }

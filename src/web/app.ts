@@ -67,6 +67,7 @@ import type { BrainProvisioner } from '../control/provisioner.ts';
 import type { ProviderId } from '../ai/keys.ts';
 import { CONNECT_STEPS, claudeCodeCommand, connectionStatus, installLink } from './connect.ts';
 import { adminDispatch, createBrainOwnerDirectory } from './admin.ts';
+import { connectorStatuses } from './connector-panel.ts';
 import { BRAIN_SETUP_PATH, renderPage } from './pages.ts';
 
 export const SESSION_COOKIE = 'bz_session';
@@ -386,7 +387,22 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
   });
 }
 
-function html(body: string, status = 200): Response {
+/**
+ * @param extra Headers this one page needs beyond the posture every page has.
+ *
+ *   **The policy itself is never widened here, and that is the ruling rather
+ *   than an omission.** `form-action` is enforced by the document that *carries*
+ *   the form — so the only policy that could permit a form post to reach the
+ *   connector vendor is the dashboard's, which is rendered long before any
+ *   vendor URL exists. `src/mcp/server.ts:htmlPage` can widen because it knows
+ *   the registered callback's origin before it renders the consent form; this
+ *   surface never does. So no connector page redirects: the vendor is reached
+ *   by a link, which no shipped CSP directive governs.
+ *
+ *   What `extra` is for is the other half — `cache-control: no-store` and a
+ *   page-local `referrer-policy` on the one page that carries a capability.
+ */
+function html(body: string, status = 200, extra: Record<string, string> = {}): Response {
   return new Response(body, {
     status,
     headers: {
@@ -395,6 +411,7 @@ function html(body: string, status = 200): Response {
       'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
       'referrer-policy': 'same-origin',
       'x-content-type-options': 'nosniff',
+      ...extra,
     },
   });
 }
@@ -579,8 +596,10 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     if (path === '/api/me') return handleMe(session);
     if (path === '/api/spend') return handleSpend(session);
     if (path === '/api/connect') return handleConnectInfo(session);
-    if (path === '/api/connectors' && request.method === 'POST') return handleConnect(request, session);
-    if (path === '/api/connectors' && request.method === 'DELETE') return handleDisconnect(request, session);
+    if (path === '/api/connectors' && request.method === 'POST') return handleConnectors(request, session);
+    if (path === '/api/connectors' && request.method === 'DELETE') {
+      return handleDisconnect(request, session, await body(request));
+    }
     if (path === '/api/byok' && request.method === 'POST') return handleByok(request, session);
     if (path === '/api/byok' && request.method === 'DELETE') return handleByokRevoke(request, session);
     if (path === '/api/billing/checkout' && request.method === 'POST') return handleCheckout(session);
@@ -992,51 +1011,199 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
      * nothing: the check passes and the tier gate is the answer, which is what
      * `test/fleet/signup.test.ts` observes.
      */
-    function connectorUnavailable(): Response {
-      return json(
-        {
-          ok: false,
-          code: 'unavailable',
-          message:
-            'This deployment has no connector vendor configured, so connected accounts are not ' +
-            'available on it. Chat exports and folder imports need no connection.',
-        },
+    function connectorUnavailable(request: Request): Response {
+      return refusedConnector(
+        request,
+        'unavailable',
+        'Connectors are unavailable here',
+        'This deployment has no connector vendor configured, so connected accounts are not ' +
+          'available on it. Chat exports and folder imports need no connection.',
         501,
       );
     }
 
-    async function handleConnect(request: Request, session: Session): Promise<Response> {
+    /**
+     * One connector refusal, in the two shapes its two kinds of caller can read.
+     *
+     * `refusedBuild` one section over, for the reason its own comment gives: a
+     * form post answered with `{"ok":false,…}` renders that object as text in a
+     * browser window. The status is preserved rather than redirected away from,
+     * so a refusal is not logged as a success.
+     */
+    function refusedConnector(
+      request: Request,
+      code: string,
+      heading: string,
+      message: string,
+      status: number,
+    ): Response {
+      if (isFormPost(request)) {
+        return html(renderPage({ kind: 'connector_notice', heading, message }), status);
+      }
+      return json({ ok: false, code, message }, status);
+    }
+
+    /**
+     * `POST /api/connectors`, for both of the things a page can ask it.
+     *
+     * **An HTML form can send GET and POST and nothing else**, so `DELETE` — the
+     * verb the API has always used to disconnect — is unreachable from the
+     * product's own front door. The intent travels in the body instead, as the
+     * `name`/`value` of whichever submit button was pressed; a browser sends
+     * exactly one of those and never the other.
+     *
+     * **An absent intent is a connect.** A form submitted with the Enter key
+     * sends no submit button at all, and every JSON caller that predates this
+     * sends `{source}` alone. The default has to be the half that revokes
+     * nothing.
+     *
+     * The body is read **here**, once, and handed down: `Request` bodies are
+     * single-use streams, so a dispatcher that re-read it in each arm would give
+     * the second arm an empty object.
+     */
+    async function handleConnectors(request: Request, session: Session): Promise<Response> {
       const fields = await body(request);
+      const intent = stringOf(fields, 'intent');
+      if (intent === 'disconnect') return handleDisconnect(request, session, fields);
+      if (intent !== '' && intent !== 'connect') {
+        return refusedConnector(
+          request,
+          'unknown_intent',
+          'That is not something this page can do',
+          'A connector control asks to connect or to disconnect, and this asked for neither. ' +
+            'Nothing was changed.',
+          400,
+        );
+      }
+      return handleConnect(request, session, fields);
+    }
+
+    /**
+     * Whether a URL the vendor answered is one this app is willing to put behind
+     * an `href`.
+     *
+     * **`escapeHtml` is not this check and cannot be.** There is nothing to
+     * escape in `javascript:alert(1)` — it survives every one of the five
+     * replacements intact and lands in the attribute exactly as written. The
+     * scheme is the control, and it is applied to the one string on these pages
+     * that a third party chooses.
+     */
+    function isFollowableLink(url: string): boolean {
+      try {
+        const parsed = new URL(url);
+        return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+      } catch {
+        return false;
+      }
+    }
+
+    async function handleConnect(
+      request: Request,
+      session: Session,
+      fields: Record<string, unknown>,
+    ): Promise<Response> {
       const source = stringOf(fields, 'source');
       if (!(CONNECTOR_SOURCES as readonly string[]).includes(source)) {
-        return json({ ok: false, code: 'unknown_source' }, 400);
+        return refusedConnector(
+          request,
+          'unknown_source',
+          'No such connector',
+          'This brain does not offer a connector by that name.',
+          400,
+        );
       }
 
       const vendor = deps.connectors;
-      if (vendor === undefined) return connectorUnavailable();
+      if (vendor === undefined) return connectorUnavailable(request);
 
       const tenantId = await tenantOf(session.accountId);
-      if (tenantId === null) return json({ ok: false, code: 'no_brain_yet' }, 409);
+      if (tenantId === null) {
+        return refusedConnector(
+          request,
+          'no_brain_yet',
+          'This account has no brain yet',
+          'A connector attaches an account to a brain, and there is not one here to attach it to.',
+          409,
+        );
+      }
 
       const subscription = await subscriptionOf(deps.sql, session.accountId);
       const gate = connectorGate(await effectiveTierOf(deps.controlSql, tenantId, subscription.tier));
-      if (gate !== null) return json(gate, 402);
+      if (gate !== null) {
+        // The dashboard renders no control for a gated account, so reaching this
+        // means the tier changed under a page that was already open. The honest
+        // reason travels, not "upgrade for more".
+        return isFormPost(request)
+          ? html(
+              renderPage({
+                kind: 'connector_notice',
+                heading: 'Connected accounts are on the paid plan',
+                message: gate.message,
+              }),
+              402,
+            )
+          : json(gate, 402);
+      }
 
       const minted = await vendor.mintClaimUrl({
         tenantId,
         source: source as ConnectorSourceName,
       });
+
+      if (!isFollowableLink(minted.claimUrl)) {
+        // A vendor answer this app will not render as a link, and will not pass
+        // on as one either. 502 rather than 500: the fault is upstream and the
+        // operator reading it should look there.
+        return refusedConnector(
+          request,
+          'unusable_claim_url',
+          'The connector vendor answered something unusable',
+          'The vendor returned a connect link this app will not follow. Nothing was connected. ' +
+            'Try again in a few minutes.',
+          502,
+        );
+      }
+
       // The claim URL is a capability, not display copy: whoever holds it can
       // attach *their* mailbox to *this* brain. It is returned once, to the
       // authenticated owner, and is never logged.
-      return json({ ok: true, claim_url: minted.claimUrl, expires_at: minted.expiresAt });
+      //
+      // **A browser gets a page, not a redirect.** See `html`'s note: the
+      // dashboard's `form-action 'self'` governs this submission and cannot name
+      // an origin that did not exist when it was rendered. The page carries the
+      // link, `no-store` so nothing keeps it, and `no-referrer` so following it
+      // tells the vendor nothing about where it came from.
+      if (isFormPost(request)) {
+        return html(
+          renderPage({
+            kind: 'connector_claim',
+            source,
+            claimUrl: minted.claimUrl,
+            expiresAt: minted.expiresAt,
+          }),
+          200,
+          { 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' },
+        );
+      }
+      return json({ ok: true, claim_url: minted.claimUrl, expires_at: minted.expiresAt }, 200, {
+        'cache-control': 'no-store',
+      });
     }
 
-    async function handleDisconnect(request: Request, session: Session): Promise<Response> {
-      const fields = await body(request);
+    async function handleDisconnect(
+      request: Request,
+      session: Session,
+      fields: Record<string, unknown>,
+    ): Promise<Response> {
       const source = stringOf(fields, 'source');
       if (!(CONNECTOR_SOURCES as readonly string[]).includes(source)) {
-        return json({ ok: false, code: 'unknown_source' }, 400);
+        return refusedConnector(
+          request,
+          'unknown_source',
+          'No such connector',
+          'This brain does not offer a connector by that name.',
+          400,
+        );
       }
       // The same refusal, in the same order, and not because the two routes are
       // symmetrical for symmetry's sake: a disconnect is *tell the vendor and
@@ -1046,10 +1213,46 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       // `applied: true` lie one unit over, on the operation a user reaches for
       // when they want something to stop.
       const configured = deps.connectors;
-      if (configured === undefined) return connectorUnavailable();
+      if (configured === undefined) return connectorUnavailable(request);
 
       const tenantId = await tenantOf(session.accountId);
-      if (tenantId === null) return json({ ok: false, code: 'no_brain_yet' }, 409);
+      if (tenantId === null) {
+        return refusedConnector(
+          request,
+          'no_brain_yet',
+          'This account has no brain yet',
+          'There is no brain here for a connector to be detached from.',
+          409,
+        );
+      }
+
+      /**
+       * **The confirmation, and it is on the POST path only.**
+       *
+       * A disconnect revokes the vendor's external user and stops the polling.
+       * It is not an erasure — nothing already ingested is touched — but it is
+       * the kind of thing a stray press should not do, and the POST path is the
+       * one a stray press reaches: it exists so that a *button on a page* can
+       * get here, and a page has back buttons, double-taps and re-submissions.
+       *
+       * `DELETE` is deliberately exempt and byte-identical to what it always
+       * was. A caller that chose that verb, on that route, with that body, has
+       * already been explicit; adding a token for it to echo would be a
+       * ceremony, not a safeguard.
+       */
+      if (request.method === 'POST' && stringOf(fields, 'confirm') !== source) {
+        if (isFormPost(request)) {
+          return html(renderPage({ kind: 'connector_confirm_disconnect', source }), 200);
+        }
+        return json(
+          {
+            ok: false,
+            code: 'confirm_required',
+            message: `Send "confirm" equal to "${source}" to disconnect it, or use DELETE.`,
+          },
+          400,
+        );
+      }
 
       const vendor = await configured.disconnect({
         tenantId,
@@ -1070,6 +1273,17 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
           AND state IN ('due', 'running')
         RETURNING job_id::text AS job_id`;
 
+      if (isFormPost(request)) {
+        return html(
+          renderPage({
+            kind: 'connector_disconnected',
+            source,
+            pollingStopped: stopped.length,
+            vendorDeleted: vendor.deleted,
+            tokensRevoked: vendor.tokensRevoked,
+          }),
+        );
+      }
       return json({
         ok: true,
         polling_stopped: stopped.length,
@@ -1394,14 +1608,21 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         tenantId === null
           ? subscription.tier
           : await effectiveTierOf(deps.controlSql, tenantId, subscription.tier);
+      const connectorsAvailable = deps.connectors !== undefined && connectorGate(tier) === null;
+      // Only asked for when there is a panel to put it in: a gated account is
+      // rendered no control and no status, so reading the queue for it would be
+      // a control-plane round trip whose answer nothing displays.
+      const connectors = connectorsAvailable
+        ? await connectorStatuses(deps.controlSql, { tenantId, sources: CONNECTOR_SOURCES })
+        : [];
       return html(
         renderPage({
           kind: 'dashboard',
           tier: subscription.tier,
           status: subscription.status,
           tenantId,
-          connectorsAvailable: deps.connectors !== undefined && connectorGate(tier) === null,
-          sources: [...CONNECTOR_SOURCES],
+          connectorsAvailable,
+          connectors,
           providers: [...BYOK_PROVIDERS],
         }),
       );

@@ -25,6 +25,7 @@ import {
   sameOriginRefusal,
 } from '../../src/web/app.ts';
 import { CONNECT_STEPS, installLink } from '../../src/web/connect.ts';
+import { redactClaimUrls } from '../../src/ingest/pipedream/client.ts';
 import { BRAIN_SETUP_PATH, escapeHtml } from '../../src/web/pages.ts';
 // The other fleet's page, imported rather than described: the sentence it prints
 // is a claim about a page this one serves, and the two are separate processes.
@@ -82,6 +83,16 @@ function app(
      * reach, not a comment.
      */
     connectors?: boolean;
+    /**
+     * What the vendor answers when asked to mint.
+     *
+     * A parameter rather than a constant because the claim URL is rendered as an
+     * `href` on a page this app serves, and the vendor chooses that string. A
+     * suite that only ever sees an `https:` link cannot tell a page that checks
+     * the scheme from one that does not — and `escapeHtml` does not stop
+     * `javascript:`, because there is nothing to escape in it.
+     */
+    claimUrl?: string;
     /** Make provisioning fail, so the signup handler's refusal arm is reachable. */
     provisioning?: 'ok' | 'fails';
     /**
@@ -132,7 +143,9 @@ function app(
             mintClaimUrl(request: { tenantId: string; source: string }) {
               recorded.minted.push({ ...request });
               return Promise.resolve({
-                claimUrl: `${ORIGIN}/connect/claim/00000000-0000-4000-8000-000000000001#abcdefghijklmnop`,
+                claimUrl:
+                  overrides.claimUrl ??
+                  `${ORIGIN}/connect/claim/00000000-0000-4000-8000-000000000001#abcdefghijklmnop`,
                 expiresAt: new Date(AT.getTime() + 600_000),
               });
             },
@@ -1436,4 +1449,366 @@ describe('context severance', () => {
     },
     60_000,
   );
+});
+
+// ---------------------------------------------------------------------------
+// The connector controls on the dashboard.
+//
+// **What was wrong.** The dashboard rendered `page.sources` as `<li>gmail</li>`
+// — three words, no form, no button, no link — beside copy describing an action
+// ("connecting opens a consent screen…") that had no control anywhere on the
+// page. `POST /api/connectors` worked, the vendor was live, the worker was
+// registered, and the founder went to connect Gmail and found nothing to click.
+//
+// **Why a test asserting the word `gmail` would have stayed green.** It was on
+// the page. So every assertion below is about a *control*: a form whose action
+// is the route, followed the way the "every form on every page" test above
+// follows one — and, for the free tier, the absence of a control rather than
+// different copy.
+// ---------------------------------------------------------------------------
+
+/** Every `<form action="…">` on a page, with the hidden fields it carries. */
+function formsOn(page: string): { action: string; fields: Record<string, string> }[] {
+  const found: { action: string; fields: Record<string, string> }[] = [];
+  for (const match of page.matchAll(/<form[^>]*action="([^"]+)"[^>]*>([\s\S]*?)<\/form>/g)) {
+    const fields: Record<string, string> = {};
+    for (const input of (match[2] ?? '').matchAll(
+      /<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>/g,
+    )) {
+      fields[input[1] ?? ''] = input[2] ?? '';
+    }
+    found.push({ action: match[1] ?? '', fields });
+  }
+  return found;
+}
+
+const SOURCES = ['gmail', 'calendar', 'drive'] as const;
+
+describe('the dashboard offers a control per connector, not a list of words', () => {
+  test('every source has a form whose action is the route that connects it', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+
+    const connectors = formsOn(page).filter((f) => f.action === '/api/connectors');
+    // One per source, and each names its own source in a field rather than
+    // relying on a button label the server never sees.
+    expect(connectors.map((f) => f.fields['source']).sort()).toEqual([...SOURCES].sort());
+    // A control, not a word: the page must carry a submit for each direction.
+    for (const source of SOURCES) {
+      expect(page).toContain(`name="intent" value="connect"`);
+      expect(page).toContain(`name="intent" value="disconnect"`);
+      expect(page).toContain(`value="${source}"`);
+    }
+  });
+
+  test('following each rendered form reaches a route that exists', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+
+    for (const rendered of formsOn(page).filter((f) => f.action === '/api/connectors')) {
+      const response = await app()(form(rendered.action, rendered.fields, { cookie }));
+      // Not the router's 404, and not a 405 for a method the form cannot send.
+      expect(`${rendered.fields['source']} -> ${response.status}`).not.toContain('-> 404');
+      expect(`${rendered.fields['source']} -> ${response.status}`).not.toContain('-> 405');
+    }
+  });
+
+  /**
+   * **The trap, and the whole reason this is not a five-line change.**
+   *
+   * The app's policy is `default-src 'none'` with no `script-src` and
+   * `form-action 'self'`. A browser enforces `form-action` against the
+   * *redirect* a form POST answers, not only against the POST — that is what
+   * `src/mcp/server.ts:htmlPage` widens the consent page's policy for. The
+   * consent page can widen it because it knows the registered callback's origin
+   * *before* it renders the form. This page cannot: the vendor's URL does not
+   * exist until the mint, and the mint happens on the POST.
+   *
+   * So the POST must answer a page carrying the link, never a redirect to it.
+   */
+  test('a form connect answers a page carrying the link, and never a redirect to it', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const response = await app()(form('/api/connectors', { source: 'gmail' }, { cookie }));
+
+    expect(response.status).toBe(200);
+    // The failure this replaces: a 303 to the vendor, minted and undeliverable.
+    expect(response.status).toBeLessThan(300);
+    expect(response.headers.get('location')).toBeNull();
+    expect(response.headers.get('content-type')).toContain('text/html');
+
+    const page = await response.text();
+    const claim = `${ORIGIN}/connect/claim/00000000-0000-4000-8000-000000000001#abcdefghijklmnop`;
+    expect(page).toContain(`href="${escapeHtml(claim)}"`);
+    expect(recorded.minted).toEqual([{ tenantId: TENANT, source: 'gmail' }]);
+  });
+
+  test('the page carrying a capability refuses to be stored, and names no referrer', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const response = await app()(form('/api/connectors', { source: 'gmail' }, { cookie }));
+
+    // A ten-minute single-use capability in a page a session restore could
+    // re-render is the capability handed to whoever gets the machine next.
+    expect(response.headers.get('cache-control')).toContain('no-store');
+    // The link leaves this origin. `same-origin` already sends nothing
+    // cross-origin; this page says it locally so a later relaxation of the
+    // global policy cannot quietly start telling the vendor where the user
+    // came from.
+    expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(await response.text()).toContain('rel="noreferrer"');
+  });
+
+  test('the capability never reaches a URL — not the address bar, not history', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const response = await app()(form('/api/connectors', { source: 'gmail' }, { cookie }));
+    expect(response.headers.get('location')).toBeNull();
+
+    // And the dashboard itself never carries one, so the page a browser *does*
+    // keep is a page with no capability on it.
+    const dashboard = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(dashboard).not.toContain('/connect/claim/');
+  });
+
+  test('a link the vendor answered that is not http(s) is not rendered as one', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const hostile = app({ claimUrl: 'javascript:alert(document.cookie)' });
+    const response = await hostile(form('/api/connectors', { source: 'gmail' }, { cookie }));
+
+    const page = await response.text();
+    // `escapeHtml` has nothing to escape in `javascript:` — the scheme check is
+    // the control, and without it the vendor chooses what a click on this page
+    // executes.
+    expect(page).not.toContain('href="javascript:');
+    expect(page).not.toContain('javascript:alert');
+    expect(response.status).toBe(502);
+  });
+});
+
+describe('disconnect, from a page that can only GET and POST', () => {
+  test('the disconnect control asks before it revokes anything', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const response = await app()(
+      form('/api/connectors', { source: 'gmail', intent: 'disconnect' }, { cookie }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/html');
+    const page = await response.text();
+    // The confirmation is a form of its own, carrying the answer back.
+    const asked = formsOn(page).filter((f) => f.action === '/api/connectors');
+    expect(asked.length).toBe(1);
+    expect(asked[0]?.fields).toMatchObject({ source: 'gmail', confirm: 'gmail', intent: 'disconnect' });
+    // Nothing happened yet: no vendor call, no job touched.
+    expect(recorded.disconnected).toEqual([]);
+  });
+
+  test('the confirmed disconnect revokes at the vendor and stops the polling', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await controlSql`
+      INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason, run_at, created_at, updated_at)
+      VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'gmail', 'due', 'connector_cadence', ${AT}, ${AT}, ${AT})`;
+
+    const response = await app()(
+      form(
+        '/api/connectors',
+        { source: 'gmail', intent: 'disconnect', confirm: 'gmail' },
+        { cookie },
+      ),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/html');
+    expect(recorded.disconnected).toEqual([{ tenantId: TENANT, source: 'gmail' }]);
+    const rows = await controlSql<{ state: string }[]>`
+      SELECT state::text AS state FROM control.job WHERE target = 'gmail'`;
+    expect(rows[0]?.state).toBe('discarded');
+    // And it says what happened rather than handing back a JSON body.
+    const page = await response.text();
+    expect(page).not.toStartWith('{');
+    expect(page).toContain('gmail');
+  });
+
+  test('a POST disconnect whose confirmation does not match the source revokes nothing', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const response = await app()(
+      post(
+        '/api/connectors',
+        { source: 'gmail', intent: 'disconnect', confirm: 'drive' },
+        { cookie },
+      ),
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'confirm_required' });
+    expect(recorded.disconnected).toEqual([]);
+  });
+
+  test('DELETE is unchanged — an API caller that was explicit stays explicit', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const response = await app()(
+      new Request(`${ORIGIN}/api/connectors`, {
+        method: 'DELETE',
+        headers: { origin: ORIGIN, cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ source: 'gmail' }),
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, tokens_revoked: 'unverified' });
+    expect(recorded.disconnected).toEqual([{ tenantId: TENANT, source: 'gmail' }]);
+  });
+
+  test('an absent intent is a connect — the JSON callers that never sent one still work', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const response = await app()(post('/api/connectors', { source: 'gmail' }, { cookie }));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true });
+    expect(recorded.disconnected).toEqual([]);
+  });
+});
+
+describe('the tier gate stays, and it is the control that is absent', () => {
+  test('a free account is offered no connector control at all', async () => {
+    await reset();
+    const cookie = await signedIn('free');
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+
+    // Not "different copy" — no control. A button that 402s is the dead
+    // affordance this whole change exists to remove.
+    expect(formsOn(page).filter((f) => f.action === '/api/connectors')).toEqual([]);
+    expect(page).not.toContain('name="intent"');
+    // The honest explanation stays.
+    expect(page).toContain('monthly fee');
+  });
+
+  test('a deployment with no vendor is offered no connector control at all', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const page = await (await app({ connectors: false })(get('/dashboard', { cookie }))).text();
+    expect(formsOn(page).filter((f) => f.action === '/api/connectors')).toEqual([]);
+  });
+
+  test('and a form post from a free account is refused as a page, not as a body', async () => {
+    await reset();
+    const cookie = await signedIn('free');
+    const response = await app()(form('/api/connectors', { source: 'gmail' }, { cookie }));
+
+    // The status survives — a 303 would report a refusal as a success in every
+    // log — and the browser gets a sentence rather than `{"ok":false,…}`.
+    expect(response.status).toBe(402);
+    expect(response.headers.get('content-type')).toContain('text/html');
+    const page = await response.text();
+    expect(page).not.toStartWith('{');
+    expect(page).toContain('monthly fee');
+    expect(recorded.minted).toEqual([]);
+  });
+});
+
+describe('the status beside each source says only what this brain can know', () => {
+  test('with nothing polled it says so rather than claiming a connection', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).toContain('Not connected');
+  });
+
+  test('an open pull is the evidence of attachment, and reads as one', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await controlSql`
+      INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason, run_at, created_at, updated_at)
+      VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'gmail', 'due', 'connector_cadence', ${AT}, ${AT}, ${AT})`;
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).toContain('Connected');
+  });
+
+  test('a dead-lettered lane reads as failing, and names the code', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await controlSql`
+      INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason,
+                               run_at, created_at, updated_at, finished_at, dead_lettered_at, failure_code)
+      VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'drive', 'dead', 'connector_cadence',
+              ${AT}, ${AT}, ${AT}, ${AT}, ${AT}, 'handler_error')`;
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).toContain('handler_error');
+    expect(page).toContain('no longer being polled');
+  });
+
+  /**
+   * The rule `sourceStaleness` states for its own view, applied here: the most
+   * recent *terminal* run wins, so a later success clears the code instead of
+   * being reached past. A staleness display nobody can clear is one nobody
+   * reads.
+   */
+  test('a success after a dead lane clears it rather than being reached past', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await controlSql`
+      INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason,
+                               run_at, created_at, updated_at, finished_at, dead_lettered_at, failure_code)
+      VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'drive', 'dead', 'connector_cadence',
+              ${AT}, ${AT}, ${AT}, ${AT}, ${AT}, 'handler_error')`;
+    await controlSql`
+      INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason,
+                               run_at, created_at, updated_at, finished_at)
+      VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'drive', 'done', 'connector_cadence',
+              ${AT}, ${AT}, ${AT}, ${new Date(AT.getTime() + 60_000)})`;
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).not.toContain('handler_error');
+    expect(page).toContain('Last checked');
+  });
+
+  /**
+   * A disconnect writes `discarded` rows. Reading those as evidence of anything
+   * would make the act of disconnecting render as a failure on the next page
+   * load — the user pressed stop and is told something is broken.
+   */
+  test('the rows a disconnect writes are not read as a failure', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await controlSql`
+      INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason,
+                               run_at, created_at, updated_at, finished_at)
+      VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'calendar', 'discarded', 'connector_cadence',
+              ${AT}, ${AT}, ${AT}, ${AT})`;
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    // Three sources, and calendar is back to the state it was in before it was
+    // ever connected.
+    expect([...page.matchAll(/Not connected/g)].length).toBe(3);
+  });
+});
+
+/**
+ * **Why `redactClaimUrls` is not the control on this surface, written down as a
+ * check rather than as a comment.**
+ *
+ * `CLAIM_URL_PATTERN` matches what `client.ts:mintClaimUrl` produces —
+ * `/connect/claim/<uuid>#<secret>` — which is brainz's own claim scheme, and
+ * `src/web/connectors.ts` deliberately does not use it. What this app hands out
+ * is the *vendor's* connect link, and that pattern does not match it. Wiring
+ * redaction onto this page would therefore pass the real capability straight
+ * through while reading, to the next person, as though it were covered.
+ *
+ * The controls that do apply are the ones the pages and headers above assert:
+ * never logged, ten-minute vendor TTL, `no-store`, `no-referrer`, and never in
+ * a URL.
+ */
+describe('the claim URL is a capability, and the redactor is not what guards it', () => {
+  test('the vendor link this app hands out is not what redactClaimUrls matches', () => {
+    const vendorLink = 'https://pipedream.com/_static/connect.html?token=ctok_abc&app=gmail';
+    expect(redactClaimUrls(vendorLink)).toBe(vendorLink);
+    // And the brainz-scheme URL it *does* match, so the assertion above is
+    // about the pattern's scope rather than about a broken redactor.
+    const brainzClaim = `${ORIGIN}/connect/claim/00000000-0000-4000-8000-000000000001#abcdefghijklmnop`;
+    expect(redactClaimUrls(brainzClaim)).toBe('[redacted-claim-url]');
+  });
 });
