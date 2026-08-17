@@ -74,6 +74,17 @@
 # pinning is the next tightening step once the image is in a registry.
 ARG BUN_VERSION=1.3.14
 
+# Bumped to force a new container image version, which is the only mechanism
+# that replaces running instances. A `wrangler secret put` publishes a new
+# Worker version, but a Container's `envVars` are built when its Durable Object
+# is constructed and are kept for the life of the instance -- so a config change
+# reaches a warm instance only when it is replaced, and an unchanged image gives
+# the platform no reason to replace one. Observed 2026-08-17: the OAuth
+# allowlist stayed empty through two deploys while seven instances kept serving
+# the environment they booted with. Bump this when a secret must take effect now
+# rather than after `sleepAfter` of idle.
+ARG FLEET_CONFIG_EPOCH=1
+
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
 # so nothing from the install step (build caches, dev dependencies, git
@@ -102,6 +113,13 @@ RUN bun install --frozen-lockfile --production \
 FROM oven/bun:${BUN_VERSION}-slim AS runtime
 
 WORKDIR /app
+
+# Consumed as a label so the epoch actually reaches the image config. An `ARG`
+# no layer reads changes no digest, the platform sees the same image, and
+# nothing is replaced — which is the failure this knob exists to fix, so it
+# would be a particularly quiet way to get it wrong.
+ARG FLEET_CONFIG_EPOCH
+LABEL app.brainz.config-epoch="${FLEET_CONFIG_EPOCH}"
 
 ENV NODE_ENV=production \
     PORT=8080
