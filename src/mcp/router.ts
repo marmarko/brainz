@@ -130,13 +130,43 @@ const SHARED_FLEET_VARIABLES: readonly string[] = [
 ];
 
 /**
- * The MCP fleet's own, all four of them the public surface's business.
+ * The MCP fleet's own — the public surface's business, plus the one credential
+ * that is here against the grain of everything above.
  *
  * `BRAINZ_PUBLIC_ORIGIN` is the issuer a connector binds to out of the discovery
  * documents; the two `OAUTH` variables are the dynamic-registration allowlist,
  * which is empty and therefore fail-closed when unset; `BRAINZ_WEB_APP_BASE_URL`
  * is where a consent screen sends a user. A batch process answers none of those
  * requests, so none of these travel to it.
+ *
+ * **`BRAINZ_IDENTITY_DATABASE_URL` is a deliberate widening, and the argument it
+ * overrode is the one written at the top of this file.** That argument — the
+ * process parsing attacker-supplied content must not hold the credential store
+ * of every account — is still true, and the cost of this line is exactly what it
+ * says: a compromise of an MCP instance now reaches accounts, password digests
+ * and sessions, which it previously could not.
+ *
+ * What overrode it is a routing fact rather than a preference. `edge.ts`
+ * classifies `/authorize` as a `flow` path and sends it to `McpFleet`, because
+ * the authorization store its three hops share lives on one instance there. So
+ * `src/mcp/serve.ts:sessionResourceOwners` — the function that turns the web
+ * app's session cookie into a resource owner — runs in THIS process. Withhold
+ * the DSN and it is never constructed, `deps.resourceOwners` is `undefined`, and
+ * the browser leg of `/authorize` answers `401`: the connector's first hop, so
+ * no browser can complete a connect flow at all. A consent screen that is
+ * deployed and cannot read a session is not a narrower attack surface; it is a
+ * feature that does not exist.
+ *
+ * **The narrower design is real and is not this one.** Move the consent surface
+ * to the web fleet and have the two fleets exchange a signed assertion over the
+ * shared secret store, and this line comes back out. That needs a new web path
+ * and an `edge.ts` entry, which is a build rather than a manifest edit; it is
+ * written up beside the code that would consume it, in `serve.ts`.
+ *
+ * **The widening is one variable wide.** Billing, the substrate's key and the
+ * operator credential stay on {@link WEB_FLEET_VARIABLES} alone, and
+ * `test/fleet/router-env.test.ts` asserts that in both directions so this does
+ * not decay into a merged manifest.
  */
 export const MCP_FLEET_VARIABLES: readonly string[] = [
   ...SHARED_FLEET_VARIABLES,
@@ -144,6 +174,9 @@ export const MCP_FLEET_VARIABLES: readonly string[] = [
   'BRAINZ_OAUTH_REDIRECT_URIS',
   'BRAINZ_OAUTH_MAX_REGISTRATIONS_PER_HOUR',
   'BRAINZ_WEB_APP_BASE_URL',
+  // Read the paragraph above before deleting this line — and before copying it
+  // onto another manifest.
+  'BRAINZ_IDENTITY_DATABASE_URL',
 ];
 
 /**
@@ -151,14 +184,21 @@ export const MCP_FLEET_VARIABLES: readonly string[] = [
  * the loop ticks. Both are `src/worker/serve.ts`'s and meaningless to a process
  * that runs no scheduler.
  *
- * Not here, and each for a reason worth reading before adding it back:
- * `BRAINZ_IDENTITY_DATABASE_URL` and the Stripe credentials belong to
- * `src/web/serve.ts`, which is now the third container class below — they travel
- * on {@link WEB_FLEET_VARIABLES} and must not be copied onto this manifest or
- * the MCP one; a Neon API key is read by the provisioner, which likewise only
- * the web process composes; R2 credentials are read by nothing in `src/` yet,
- * because `createTenantObjectStore` has no production credential minter. Each
- * joins a manifest when the process that reads it is deployed, and
+ * Not here, and each for a reason worth reading before adding it back: the
+ * Stripe credentials belong to `src/web/serve.ts` and travel on
+ * {@link WEB_FLEET_VARIABLES} alone; a Neon API key is read by the provisioner,
+ * which likewise only the web process composes; R2 credentials are read by
+ * nothing in `src/` yet, because `createTenantObjectStore` has no production
+ * credential minter.
+ *
+ * `BRAINZ_IDENTITY_DATABASE_URL` is absent for a different reason than it used
+ * to be, and the difference matters. It is no longer "the web fleet's alone" —
+ * {@link MCP_FLEET_VARIABLES} now carries it, because `/authorize` is routed
+ * there. It is absent *here* because this process serves no browser: it answers
+ * no request that could present a session cookie, so a session store on this
+ * manifest would be a credential it holds and cannot use.
+ *
+ * Each joins a manifest when the process that reads it is deployed, and
  * `test/fleet/router-env.test.ts` asserts the absences in both directions.
  */
 export const WORKER_FLEET_VARIABLES: readonly string[] = [
@@ -179,15 +219,19 @@ export const WORKER_FLEET_VARIABLES: readonly string[] = [
  * it can use. The two variables the three fleets genuinely share are named
  * individually below, with the reason each is needed.
  *
- * **The identity database and the Stripe secrets live here and nowhere else.**
- * `router.ts` used to say both were absent from every manifest because the web
- * process "is not one of the container classes this config deploys". That
- * sentence retired the moment `WebFleet` landed; leaving it beside a manifest
- * that now carries them would be a false explanation next to new behaviour. What
- * survives from it is the constraint, which is the half that mattered: identity
- * and billing credentials reach the web fleet ALONE. The MCP fleet parses
- * attacker-supplied content, so a credential it cannot use is a credential a
- * compromise cannot leak.
+ * **The billing secrets, the substrate's key and the operator credential live
+ * here and nowhere else.** The MCP fleet parses attacker-supplied content, so a
+ * credential it cannot use is a credential a compromise cannot leak — and it can
+ * use none of these: it takes no payment, provisions no project and serves no
+ * operator route.
+ *
+ * **The identity database is no longer in that sentence, and it is the one
+ * exception worth naming here rather than only where it was added.** It travels
+ * to {@link MCP_FLEET_VARIABLES} as well, because `edge.ts` routes `/authorize`
+ * to the MCP fleet and the consent screen there has to resolve the session this
+ * app's login page wrote. Two processes now hold the session store. The reasons,
+ * the cost and the narrower design that would take it back out are written
+ * against the manifest that gained it.
  */
 export const WEB_FLEET_VARIABLES: readonly string[] = [
   // Shared with the other two fleets, and only these two.

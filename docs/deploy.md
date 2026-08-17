@@ -164,6 +164,8 @@ bunx wrangler secret put BRAINZ_HOSTED_KEY_CLOUDFLARE
 
 # The web app, which is on this origin too. Without these the WebFleet
 # container refuses to start and `/signup` answers 502 through the edge.
+# The identity DSN is the one secret two fleets read: the web app owns it, and
+# the MCP fleet needs it because `/authorize` is routed there. See the table.
 bunx wrangler secret put BRAINZ_IDENTITY_DATABASE_URL
 bunx wrangler secret put BRAINZ_WEB_ORIGIN               # the SAME origin as BRAINZ_PUBLIC_ORIGIN
 bunx wrangler secret put BRAINZ_MCP_URL                  # that origin + /mcp
@@ -201,7 +203,7 @@ the code rather than this file: `providersReachable()` is pinned by
 | `BRAINZ_WEB_APP_BASE_URL` | ✓ | — | — | no | Where a consent screen sends a user. |
 | `BRAINZ_WORKER_CONCURRENCY` | — | ✓ | — | no (`4`) | Jobs one instance runs at once. |
 | `BRAINZ_WORKER_TICK_MS` | — | ✓ | — | no (`60000`) | The loop's period once the instance is awake. |
-| `BRAINZ_IDENTITY_DATABASE_URL` | — | — | ✓ | yes | `compose.ts:openIdentityStore` — accounts, password digests, sessions. The one database the other two fleets deliberately cannot reach. |
+| `BRAINZ_IDENTITY_DATABASE_URL` | ✓ | — | ✓ | yes on web; browser consent needs it on MCP | Accounts, password digests, sessions. On the web fleet via `compose.ts:openIdentityStore`; on the MCP fleet via `serve.ts:sessionResourceOwners`, because `edge.ts` routes `/authorize` to the MCP fleet and the consent screen has to read the session the login page wrote. **This is the deployment's widest credential and two processes hold it** — omit it from the MCP fleet and the browser leg of `/authorize` answers `401`, which is a connector flow no browser can begin. The worker fleet serves no browser and never gets it. |
 | `BRAINZ_WEB_ORIGIN` | — | — | ✓ | yes | The same-origin refusal's reference value. Wrong, and the CSRF check compares against a host nobody uses. |
 | `BRAINZ_MCP_URL` | — | — | ✓ | yes | What `/connect` hands the user to paste into their client. |
 | `BRAINZ_STRIPE_WEBHOOK_SECRET` | — | — | ✓ | yes | The billing webhook's signature. Required by the process even with no billing vendor configured: a webhook route that cannot verify is a route that accepts, so it fails closed at start. With a value that verifies nothing, every delivery is refused `400` — which is the correct state for a deployment that sells nothing yet. |
@@ -253,11 +255,19 @@ way to spend an hour debugging a value you can see in `wrangler secret list`.
 Bump it in the same commit as the secrets that need it:
 
 ```
-ARG FLEET_CONFIG_EPOCH=2      # ← bump, commit, then deploy
+ARG FLEET_CONFIG_EPOCH=3      # ← bump, commit, then deploy
 ```
 
 Observed on 2026-08-17: the OAuth allowlist stayed empty through two deploys
 while seven instances kept serving the environment they booted with.
+
+**A manifest change needs the bump just as much as a secret does, and hides
+better.** Epoch 3 added `BRAINZ_IDENTITY_DATABASE_URL` to `MCP_FLEET_VARIABLES`;
+the secret itself was already set, so `wrangler secret list` looked identical
+before and after and there was nothing to re-put. What changed was which
+variables `selectContainerEnv` copies — read once, when the Durable Object is
+constructed. Without the bump the browser leg of `/authorize` keeps answering
+`401` from warm instances and the deploy looks like it did nothing.
 
 ## 5. Verify that it serves
 

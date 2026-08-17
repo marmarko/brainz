@@ -68,10 +68,15 @@ export async function startMcpFleet(env: Environment): Promise<McpFleetProcess> 
   const secrets = openSecretStore(env);
   const gateway = openFleetGateway(env, { controlSql, keys: secrets.providerKeys });
 
-  // **Optional, and unset in the deployed fleet today — read the note on
-  // {@link sessionResourceOwners} before setting it.** `required` here would
-  // refuse to start every process that does not serve a browser flow, including
-  // the one the image currently runs.
+  // **Set in the deployed fleet, and still `optional` rather than `required`.**
+  // The deployment's manifest carries it (`router.ts:MCP_FLEET_VARIABLES`), so
+  // the browser leg is live — but a `required` here would refuse to start every
+  // process that serves no browser flow: a self-hosted single-tenant instance, a
+  // test harness, an operator running the image with a bearer-only client. The
+  // browser leg is a capability this process may or may not have, and `optional`
+  // is how that is spelled. What it must never become is silently absent in a
+  // deployment that means to serve consent — which is why the manifest is where
+  // the decision is written down and `router-env.test.ts` is what pins it.
   const identityUrl = optional(env, 'BRAINZ_IDENTITY_DATABASE_URL');
   const identity = identityUrl === undefined ? undefined : new SQL(identityUrl, { max: 4 });
 
@@ -141,18 +146,26 @@ export async function startMcpFleet(env: Environment): Promise<McpFleetProcess> 
 /**
  * The browser half of `/authorize`, over the identity database.
  *
- * **This is the one dependency of the consent flow that the deployment does not
- * currently supply, and it is a decision rather than an oversight to inherit.**
- * `src/mcp/router.ts:MCP_FLEET_VARIABLES` deliberately withholds
- * `BRAINZ_IDENTITY_DATABASE_URL` from this fleet — `test/fleet/router-env.test.ts`
- * asserts its absence in both directions, on the argument that the process
- * parsing attacker-supplied mail should not hold the credential store of every
- * account. Wiring a browser consent screen onto that same process is in tension
- * with it, and resolving the tension belongs to whoever owns the manifest: it is
- * either identity on this fleet, or the consent surface moves to the web fleet
- * and the two exchange a signed assertion. Until then this reads the variable if
- * it is set and the browser leg answers `401` if it is not, which is exactly what
- * it answered before the leg existed.
+ * **The tension this function used to leave open has been resolved, in the
+ * direction that costs something.** `src/mcp/router.ts:MCP_FLEET_VARIABLES` now
+ * carries `BRAINZ_IDENTITY_DATABASE_URL`, so this runs in the deployed fleet and
+ * a browser can complete a connect flow. It previously withheld it, on the
+ * argument that the process parsing attacker-supplied content should not hold
+ * the credential store of every account — an argument that was not wrong, and
+ * whose cost has simply been paid instead: an MCP instance compromise now
+ * reaches accounts, password digests and sessions.
+ *
+ * It was paid because `edge.ts` routes `/authorize` here. Without the DSN this
+ * function is never constructed, `deps.resourceOwners` is `undefined`, and the
+ * browser leg answers `401` — the connector's *first* hop, so the whole flow is
+ * unreachable from a browser rather than degraded.
+ *
+ * **The other design is still the better one and is still unbuilt.** Move the
+ * consent surface to the web fleet, which already owns identity, and have the
+ * two fleets exchange a signed assertion over the shared secret store; the MCP
+ * fleet then verifies an assertion instead of holding a database. It needs a new
+ * web path and a matching `edge.ts` entry — a build, not a manifest line — and
+ * when it lands, that manifest line comes back out.
  *
  * **The session token never leaves this function.** `sessionKey` is a digest of
  * it, so the consent token derived from that is bound to the session without the

@@ -84,11 +84,16 @@ function fakeDurableObjectContext(): unknown {
  * A Worker `env` shaped like a real one: two Durable Object namespace bindings,
  * every variable either fleet reads, and several a fleet must never receive.
  *
- * The last group is the point of the fixture. `BRAINZ_IDENTITY_DATABASE_URL`
- * and the Stripe credentials belong to the web process; `R2_SECRET_ACCESS_KEY`
- * and `NEON_API_KEY` are read by nothing in either fleet. A blanket forward of
- * `env` puts all four inside a container that parses attacker-supplied content,
+ * The last group is the point of the fixture. The Stripe credentials and the
+ * substrate's key belong to the web process alone; `R2_SECRET_ACCESS_KEY` and
+ * `NEON_API_KEY` are read by nothing in any fleet. A blanket forward of `env`
+ * puts all of them inside a container that parses attacker-supplied content,
  * which is the mutation this fixture exists to kill.
+ *
+ * `BRAINZ_IDENTITY_DATABASE_URL` is the one that moved, and it is not in that
+ * group any more: `/authorize` is routed to the MCP fleet (`edge.ts`), so the
+ * process that renders consent has to resolve the browser's session there. It
+ * therefore reaches two fleets and is asserted absent from the third.
  */
 const DO_BINDING = { idFromName: () => ({}), get: () => ({ fetch: async () => new Response() }) };
 
@@ -189,6 +194,10 @@ describe('each fleet receives the configuration its own process reads', () => {
       BRAINZ_OAUTH_MAX_REGISTRATIONS_PER_HOUR:
         WORKER_ENV.BRAINZ_OAUTH_MAX_REGISTRATIONS_PER_HOUR,
       BRAINZ_WEB_APP_BASE_URL: WORKER_ENV.BRAINZ_WEB_APP_BASE_URL,
+      // serve.ts: `sessionResourceOwners`, the browser half of `/authorize`.
+      // This endpoint is routed HERE, not to the web fleet, so the session the
+      // login page wrote is resolved by this process or by nothing.
+      BRAINZ_IDENTITY_DATABASE_URL: WORKER_ENV.BRAINZ_IDENTITY_DATABASE_URL,
     });
   });
 
@@ -295,19 +304,14 @@ describe('a container receives no binding and nothing it does not read', () => {
   });
 
   /**
-   * The web app is deployed now, so "no container holds the identity database"
-   * is no longer the claim — "exactly one does" is, and it is the narrower
-   * statement that has to be checked. The MCP fleet parses attacker-supplied
-   * content; a credential it cannot use is a credential a compromise there
-   * cannot leak.
+   * The billing vendor's key, the substrate's key and the operator credential
+   * reach the web fleet and nothing else. Note what is NOT in this list any
+   * more: the identity database, which has its own test below because it is the
+   * one variable whose blast radius genuinely widened.
    */
   test('the web process’s own configuration reaches the web fleet and no other', () => {
     for (const fleet of ['McpFleet', 'WorkerFleet'] as const) {
       const vars = envVarsOf(fleet);
-      expect({ fleet, identity: vars['BRAINZ_IDENTITY_DATABASE_URL'] }).toEqual({
-        fleet,
-        identity: undefined,
-      });
       expect({ fleet, stripe: vars['BRAINZ_STRIPE_SECRET_KEY'] }).toEqual({ fleet, stripe: undefined });
       expect({ fleet, hook: vars['BRAINZ_STRIPE_WEBHOOK_SECRET'] }).toEqual({ fleet, hook: undefined });
       expect({ fleet, neon: vars['BRAINZ_NEON_API_KEY'] }).toEqual({ fleet, neon: undefined });
@@ -316,9 +320,67 @@ describe('a container receives no binding and nothing it does not read', () => {
     }
 
     const web = envVarsOf('WebFleet');
-    expect(web['BRAINZ_IDENTITY_DATABASE_URL']).toBe(WORKER_ENV.BRAINZ_IDENTITY_DATABASE_URL);
     expect(web['BRAINZ_STRIPE_SECRET_KEY']).toBe(WORKER_ENV.BRAINZ_STRIPE_SECRET_KEY);
     expect(web['BRAINZ_NEON_API_KEY']).toBe(WORKER_ENV.BRAINZ_NEON_API_KEY);
+    expect(web['BRAINZ_ADMIN_CREDENTIAL']).toBe(WORKER_ENV.BRAINZ_ADMIN_CREDENTIAL);
+  });
+
+  /**
+   * **The identity database reaches two fleets, and that is a widening decided
+   * here rather than inherited.**
+   *
+   * It used to reach the web fleet alone, on the argument that the process
+   * parsing attacker-supplied content should not hold the credential store of
+   * every account. The argument is still true and the cost is still real. What
+   * overrode it is a routing fact: `edge.ts` classifies `/authorize` as `flow`
+   * and sends it to `McpFleet`, so `sessionResourceOwners` runs THERE. Withhold
+   * the DSN and `deps.resourceOwners` is `undefined`, which makes the browser
+   * leg answer `401` — the connector's first hop, and therefore no browser
+   * connect flow at all. A deployed consent screen that cannot read a session is
+   * not a smaller attack surface, it is a feature that does not exist.
+   *
+   * The narrower alternative is real and is not this: move the consent surface
+   * to the web fleet and have the two exchange a signed assertion over the
+   * shared secret store. It needs a new web path and an `edge.ts` entry, so it
+   * is a build rather than a manifest line — see `src/mcp/serve.ts`.
+   *
+   * **The worker fleet stays out**, and that is the half of the old invariant
+   * that survives intact: a batch process serves no browser, so a session store
+   * on its manifest is credential it holds and cannot use.
+   */
+  test('the identity database reaches the two fleets that serve a browser, and not the batch one', () => {
+    expect(envVarsOf('McpFleet')['BRAINZ_IDENTITY_DATABASE_URL']).toBe(
+      WORKER_ENV.BRAINZ_IDENTITY_DATABASE_URL,
+    );
+    expect(envVarsOf('WebFleet')['BRAINZ_IDENTITY_DATABASE_URL']).toBe(
+      WORKER_ENV.BRAINZ_IDENTITY_DATABASE_URL,
+    );
+    expect(envVarsOf('WorkerFleet')['BRAINZ_IDENTITY_DATABASE_URL']).toBeUndefined();
+  });
+
+  /**
+   * The widening is bounded to that one variable. Everything else the identity
+   * fleet holds — the billing vendor, the substrate, the operator credential —
+   * is still the web fleet's alone, so "the MCP fleet got identity" cannot decay
+   * into "the manifests were merged".
+   */
+  test('the MCP fleet gained the session store and nothing else beside it', () => {
+    const mcp = envVarsOf('McpFleet');
+    for (const name of [
+      'BRAINZ_STRIPE_SECRET_KEY',
+      'BRAINZ_STRIPE_API_BASE',
+      'BRAINZ_STRIPE_PRICE_ID',
+      'BRAINZ_STRIPE_WEBHOOK_SECRET',
+      'BRAINZ_NEON_API_KEY',
+      'BRAINZ_NEON_ORG_ID',
+      'BRAINZ_POOL_TARGET',
+      'BRAINZ_TENANT_ID_PREFIX',
+      'BRAINZ_ADMIN_CREDENTIAL',
+      'BRAINZ_WEB_ORIGIN',
+      'BRAINZ_MCP_URL',
+    ]) {
+      expect({ name, value: mcp[name] }).toEqual({ name, value: undefined });
+    }
   });
 
   /**

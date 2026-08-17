@@ -91,7 +91,15 @@ ARG BUN_VERSION=1.3.14
 # Without this bump the new secrets publish a Worker version, the running
 # instances keep the environment they booted with, and the next reader spends an
 # hour debugging a value they can see in `wrangler secret list`.
-ARG FLEET_CONFIG_EPOCH=2
+#
+# 2 -> 3: `BRAINZ_IDENTITY_DATABASE_URL` joined the MCP fleet's manifest, which
+# is what makes the browser leg of `/authorize` able to resolve a session at all.
+# The secret was already set on the Worker — only the manifest changed — so
+# nothing about this is visible in `wrangler secret list`, and every warm MCP
+# instance is holding an `envVars` built without it. Unbumped, the deploy would
+# publish a new Worker version, the running instances would keep serving the
+# consent screen a `401`, and the change would look like it did not work.
+ARG FLEET_CONFIG_EPOCH=3
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
