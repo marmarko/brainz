@@ -56,6 +56,18 @@ assumption is. The accepted ceiling: every signup, login and dashboard render fo
 the whole deployment is served by one container. See
 [Known limits](#known-limits) for what that store does *not* do on this platform.
 
+**`wrangler containers list` will show more instances than that, and it is not
+the count you decided.** Observed immediately after this deploy: `webfleet` 3
+live against `max_instances = 3`, `workerfleet` 7 against 20, `mcpfleet` 7
+against 50 — and the worker fleet is addressed by exactly one name
+(`worker-singleton`), so 7 cannot be "instances in use". Read it as capacity the
+platform provisioned, not as instances serving: a Durable Object id is served by
+one container instance, so the name is still what bounds concurrency, and idle
+capacity sheds on `sleepAfter`. Do not "fix" a count above one by lowering
+`max_instances` to one — that would make the ceiling the mechanism, and it
+couples instance replacement at deploy time to a number chosen for a different
+reason.
+
 ## Before you start
 
 * **A Workers *Paid* account.** Containers are not on the free plan. The deploy
