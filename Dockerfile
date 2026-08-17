@@ -2,13 +2,13 @@
 
 # The fleet image (U1 step 6).
 #
-# One image, two fleets. The MCP fleet and the worker fleet differ by
-# *entrypoint*, not by image: same dependency closure, same source tree, same
-# base layers, so a security update lands on both at once and the two can never
-# drift onto different Bun or library versions. Cloudflare Containers sets the
-# entrypoint per Container class (`entrypoint` on the class, see wrangler.toml),
-# which is what makes one image serving two fleets practical rather than a
-# packaging trick.
+# One image, three fleets. The MCP fleet, the worker fleet and the web app
+# differ by *entrypoint*, not by image: same dependency closure, same source
+# tree, same base layers, so a security update lands on all three at once and
+# they can never drift onto different Bun or library versions. Cloudflare
+# Containers sets the entrypoint per Container class (`entrypoint` on the class,
+# see wrangler.toml), which is what makes one image serving three fleets
+# practical rather than a packaging trick.
 #
 # The deployed runtime is a Phase 0 deliverable, not an assumption: U6's
 # connector connection, U9's week of polling and U13's two-week bake all verify
@@ -83,7 +83,15 @@ ARG BUN_VERSION=1.3.14
 # allowlist stayed empty through two deploys while seven instances kept serving
 # the environment they booted with. Bump this when a secret must take effect now
 # rather than after `sleepAfter` of idle.
-ARG FLEET_CONFIG_EPOCH=1
+#
+# 1 -> 2: the web fleet joined the deployment. Every warm MCP instance is holding
+# an environment built before `BRAINZ_WEB_APP_BASE_URL` was set — the value that
+# tells the consent screen where to send a user — and a container's `envVars` are
+# built when its Durable Object is constructed and kept for the instance's life.
+# Without this bump the new secrets publish a Worker version, the running
+# instances keep the environment they booted with, and the next reader spends an
+# hour debugging a value they can see in `wrangler secret list`.
+ARG FLEET_CONFIG_EPOCH=2
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
@@ -205,9 +213,10 @@ EXPOSE 8080
 # Readiness is Cloudflare's port poll against the Container class's
 # `pingEndpoint`, not a Docker HEALTHCHECK — the platform ignores the latter.
 
-# Default command is the MCP fleet, through the bootstrap. The worker fleet runs
-# this same image with `entrypoint` overridden on its Container class (see
-# `WorkerFleet` in src/mcp/router.ts) — and Cloudflare's `entrypoint` *replaces*
-# the container's command rather than adding to it, so that override names this
-# same bootstrap. Two explicit argvs, no merge semantics to be wrong about.
+# Default command is the MCP fleet, through the bootstrap. The worker fleet and
+# the web fleet run this same image with `entrypoint` overridden on their
+# Container classes (see `WorkerFleet` and `WebFleet` in src/mcp/router.ts) — and
+# Cloudflare's `entrypoint` *replaces* the container's command rather than adding
+# to it, so each override names this same bootstrap. Three explicit argvs, no
+# merge semantics to be wrong about.
 CMD ["/usr/local/bin/fleet-bootstrap", "bun", "run", "src/mcp/serve.ts"]

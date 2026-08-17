@@ -1,4 +1,4 @@
-# Cloudflare Containers configuration for both fleets (U1 step 6, KTD2).
+# Cloudflare Containers configuration for all three fleets (U1 step 6, KTD2).
 #
 # DEPLOYABLE. This file was written unbound — no route, no origin, no trigger —
 # because the Worker entrypoint and both Container classes landed in later units
@@ -143,6 +143,44 @@ image = "./Dockerfile"
 instance_type = "standard-1"
 max_instances = 20
 
+# --- Web fleet -------------------------------------------------------------
+#
+# DECISION 4 — the web app answers on THIS origin, and why it is not hosted
+# somewhere cheaper.
+#
+# A session cookie is scoped to an origin. `/authorize` renders consent for a
+# logged-in user, which means reading the session the login page wrote — and a
+# login page on another host writes a cookie this origin never receives. So the
+# web app is not merely *also* deployed; it is deployed here because that is the
+# only arrangement in which the consent screen has a session to read. Requests
+# reach it by PATH (`src/mcp/edge.ts` enumerates them), not by tenant: its front
+# door is `/signup`, which runs before any tenant exists.
+#
+# Same image, third entrypoint (`src/web/serve.ts`, set on the Container class in
+# src/mcp/router.ts). `sleepAfter` matches the MCP fleet's 15m rather than
+# inventing a third number: both are interactive, and that value encodes "a
+# person is waiting on the wake".
+#
+# **One instance, addressed by one name** (`web-singleton` in `edge.ts`). Not
+# because the app is stateful — sessions are rows in the identity database — but
+# because `src/control/secret-file.ts` assumes a single writer and the web
+# process is it: provisioning banks a new tenant's connection string through that
+# store. Two instances are two divergent stores of the same tenants' credentials.
+# The accepted ceiling is that every signup, login and dashboard render for the
+# whole deployment is served by one container; at alpha volume the wake cost
+# matters more than the throughput, and the fix when it stops being ample is the
+# managed secret store, not a second instance.
+#
+# `max_instances` is therefore a runaway guard rather than the mechanism — the
+# DO name is the mechanism, exactly as it is for the worker fleet's singleton. It
+# is small because nothing should be addressing this class by any other name;
+# a count above one in the dashboard means something is.
+[[containers]]
+class_name = "WebFleet"
+image = "./Dockerfile"
+instance_type = "standard-1"
+max_instances = 3
+
 # ---------------------------------------------------------------------------
 # Durable Object bindings. The DO is the addressing mechanism for Decision 1 —
 # the id derived from the tenant id is a DO id, and the container instance
@@ -156,9 +194,20 @@ class_name = "McpFleet"
 name = "WORKER_FLEET"
 class_name = "WorkerFleet"
 
+[[durable_objects.bindings]]
+name = "WEB_FLEET"
+class_name = "WebFleet"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["McpFleet", "WorkerFleet"]
+
+# A new class needs its own tag; `v1` is already applied to the deployed Worker
+# and editing it in place would be rewriting history the platform has, not
+# declaring a change. Appended rather than merged for the same reason.
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["WebFleet"]
 
 # ---------------------------------------------------------------------------
 # DECISION 3 — the cron that wakes the worker fleet.
@@ -199,8 +248,8 @@ crons = ["*/30 * * * *"]
 # here would be configuration nothing reads, and the honest thing is to say why
 # it is absent rather than to add one that looks like plumbing.
 #
-# The credentials that path needs are not in either fleet's env manifest either
-# (src/mcp/router.ts), and for a reason worth checking before adding them:
+# The credentials that path needs are on none of the three fleets' env manifests
+# either (src/mcp/router.ts), and for a reason worth checking before adding them:
 # `createTenantObjectStore` has no production composition root. Every caller needs
 # a prefix-scoped credential and the only `ScopedCredentialMinter` in `src/`
 # refuses. When a real minter lands, the credential joins a manifest, this comment
@@ -234,9 +283,12 @@ crons = ["*/30 * * * *"]
 # * **Secrets.** Unchanged in principle and now specific. Nothing
 #   credential-shaped belongs in this file; it is committed to a public repo.
 #   Every value is set with `wrangler secret put` and forwarded into the
-#   containers by name — the manifests are `MCP_FLEET_VARIABLES` and
-#   `WORKER_FLEET_VARIABLES` in src/mcp/router.ts, and `docs/deploy.md` lists
-#   every name in order. Note that per-tenant connection strings and bearer
+#   containers by name — the manifests are `MCP_FLEET_VARIABLES`,
+#   `WORKER_FLEET_VARIABLES` and `WEB_FLEET_VARIABLES` in src/mcp/router.ts, and
+#   `docs/deploy.md` lists every name in order. The identity database and the
+#   billing credentials are on the last of those three and on no other, which is
+#   the whole reason the manifests are written out by name rather than forwarded
+#   wholesale. Note that per-tenant connection strings and bearer
 #   grants travel as ONE secret (`BRAINZ_SECRETS_JSON`, materialised into a file
 #   by the image's bootstrap), which is an alpha shape with a 5 KB ceiling on it
 #   — the Dockerfile header states the limits and `docs/deploy.md` states the

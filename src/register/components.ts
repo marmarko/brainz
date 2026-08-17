@@ -307,16 +307,17 @@ export const SHARED_COMPONENTS: readonly RegisterEntry[] = [
   },
   {
     id: 'web-app',
-    name: 'Web app and control plane (`app.brainz.*`)',
+    name: 'Web app and control plane (`/signup`, `/dashboard`, `/admin`)',
     kind: 'web-app',
     shared_by: 'all_tenants',
     transmits_user_content: false,
     blast_radius:
-      'Every tenant’s account row, tier, spend counter and connection metadata. Deliberately NOT every tenant’s content: the control-plane database is content-free by rule and by test, and the `/admin` credential has zero content-read scope — asserted by a CI case expecting `scope_denied` on `recall`, and, one layer down, by holding no resolve permission on any tenant secret namespace.',
+      'Every tenant’s account row, tier, spend counter and connection metadata, plus — now that it is a deployed container rather than a process nobody started — the identity database’s credential, the billing vendor’s key and the substrate vendor’s organisation key, none of which any other fleet holds. Deliberately NOT every tenant’s content: the control-plane database is content-free by rule and by test, and the `/admin` credential has zero content-read scope — asserted by a CI case expecting `scope_denied` on `recall`, and, one layer down, by holding no resolve permission on any tenant secret namespace.',
     rotation_owner: 'control-plane operator on call',
-    rotation: 'Session secrets rotate on deploy; the `/admin` credential is rotated through the control plane.',
-    evidence: { hosts: ['app.brainz.test'] },
-    note: 'The host in source is the test origin; the deployed origin is set per environment.',
+    rotation:
+      'Replaced by deploy, like the other two fleets. Session secrets rotate with it; the `/admin` credential is rotated through the control plane, and the vendor keys through their vendors.',
+    evidence: { hosts: ['app.brainz.test'], bindings: ['WEB_FLEET', 'WebFleet'] },
+    note: 'It answers on the SAME public origin as the MCP surface, path-routed by the Worker, because a session cookie is scoped to an origin and the consent screen has to read the one the login page wrote. The host in source is the test origin; the deployed origin is set per environment.',
   },
   {
     id: 'claude-client',

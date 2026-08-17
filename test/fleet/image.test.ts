@@ -178,17 +178,31 @@ describe('the fleet image names entrypoints that listen', () => {
     expect(await Bun.file(`${REPO_ROOT}/${entry}`).exists()).toBe(true);
   });
 
-  test('the worker fleet overrides the entrypoint, and it is a different file', async () => {
+  test('the other two fleets override the entrypoint, each onto its own file', async () => {
     const router = await Bun.file(ROUTER).text();
-    const worker = entrypointOf(router, 'WorkerFleet');
     const cmd = cmdOf(await Bun.file(DOCKERFILE).text());
+    const cmdEntry = servingModuleOf(cmd);
 
-    // One image, two fleets. Without the override the worker fleet runs the
-    // MCP server: up, healthy, and running no consolidation cycles at all.
-    expect(worker).not.toBeNull();
-    const workerEntry = servingModuleOf(worker as string[]);
-    expect(workerEntry).not.toBe(servingModuleOf(cmd));
-    expect(await Bun.file(`${REPO_ROOT}/${workerEntry}`).exists()).toBe(true);
+    // One image, three fleets. Without the override a fleet runs the MCP
+    // server: up, healthy, and doing none of its own work — no consolidation
+    // cycle for the worker fleet, and for the web fleet a second copy of the
+    // MCP surface where the signup page should be.
+    for (const className of ['WorkerFleet', 'WebFleet'] as const) {
+      const override = entrypointOf(router, className);
+      expect({ className, overridden: override !== null }).toEqual({ className, overridden: true });
+      const entry = servingModuleOf(override as string[]);
+      expect({ className, entry }).not.toEqual({ className, entry: cmdEntry });
+      expect({ className, exists: await Bun.file(`${REPO_ROOT}/${entry}`).exists() }).toEqual({
+        className,
+        exists: true,
+      });
+    }
+
+    // And they are not each other's, which a copy-paste of the class would make
+    // them: two fleets on one entrypoint is one fleet with a spare bill.
+    expect(servingModuleOf(entrypointOf(router, 'WorkerFleet') as string[])).not.toBe(
+      servingModuleOf(entrypointOf(router, 'WebFleet') as string[]),
+    );
 
     // The MCP fleet deliberately names none: it runs the image's own CMD, so the
     // default lives in one place rather than in two that can drift.
@@ -205,20 +219,25 @@ describe('the fleet image names entrypoints that listen', () => {
   test('every start path runs the same bootstrap', async () => {
     const dockerfile = await Bun.file(DOCKERFILE).text();
     const router = await Bun.file(ROUTER).text();
-    const starts = [cmdOf(dockerfile), entrypointOf(router, 'WorkerFleet') as string[]];
+    const starts = [
+      cmdOf(dockerfile),
+      entrypointOf(router, 'WorkerFleet') as string[],
+      entrypointOf(router, 'WebFleet') as string[],
+    ];
     for (const argv of starts) expect(argv[0]).toBe(BOOTSTRAP_PATH);
     // And the image actually installs it at that path.
     expect(dockerfile).toContain(BOOTSTRAP_PATH);
   });
 
   test(
-    'both entrypoints refuse to start unconfigured rather than exiting zero',
+    'every entrypoint refuses to start unconfigured rather than exiting zero',
     async () => {
       const dockerfile = await Bun.file(DOCKERFILE).text();
       const router = await Bun.file(ROUTER).text();
       const entries = [
         servingModuleOf(cmdOf(dockerfile)),
         servingModuleOf(entrypointOf(router, 'WorkerFleet') as string[]),
+        servingModuleOf(entrypointOf(router, 'WebFleet') as string[]),
       ];
 
       for (const entry of entries) {

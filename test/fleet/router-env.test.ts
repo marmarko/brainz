@@ -33,8 +33,10 @@ import { REPO_ROOT } from './fixture.ts';
 interface RouterModule {
   readonly McpFleet: new (ctx: unknown, env: unknown) => { envVars: Record<string, string> };
   readonly WorkerFleet: new (ctx: unknown, env: unknown) => { envVars: Record<string, string> };
+  readonly WebFleet: new (ctx: unknown, env: unknown) => { envVars: Record<string, string> };
   readonly MCP_FLEET_VARIABLES: readonly string[];
   readonly WORKER_FLEET_VARIABLES: readonly string[];
+  readonly WEB_FLEET_VARIABLES: readonly string[];
   readonly WORKER_WAKE_INSTANCE: string;
   selectContainerEnv(env: unknown, names: readonly string[]): Record<string, string>;
   wakeWorkerFleet(fleet: {
@@ -42,6 +44,7 @@ interface RouterModule {
     get(id: unknown): { fetch(request: Request): Promise<Response> };
   }): Promise<void>;
   readonly default: {
+    fetch(request: Request, env: unknown): Promise<Response>;
     scheduled(
       controller: unknown,
       env: unknown,
@@ -92,6 +95,7 @@ const DO_BINDING = { idFromName: () => ({}), get: () => ({ fetch: async () => ne
 const WORKER_ENV = {
   MCP_FLEET: DO_BINDING,
   WORKER_FLEET: DO_BINDING,
+  WEB_FLEET: DO_BINDING,
 
   BRAINZ_CONTROL_DATABASE_URL: 'postgres://fake@127.0.0.1:1/control',
   BRAINZ_SECRETS_JSON: '{"secrets":{},"providerKeys":{}}',
@@ -108,11 +112,29 @@ const WORKER_ENV = {
   BRAINZ_WORKER_CONCURRENCY: '4',
   BRAINZ_WORKER_TICK_MS: '60000',
 
-  // Read by no fleet process. Present here because a forward of the whole `env`
-  // would carry them, and that has to fail.
+  // The web process's own, every one of them. They are the sharpest half of this
+  // fixture: identity and billing credentials now travel to a container, so
+  // "nothing extra reaches a fleet" has to be asserted against a `WebFleet` that
+  // legitimately receives them and an `McpFleet` that must not.
   BRAINZ_IDENTITY_DATABASE_URL: 'postgres://fake@127.0.0.1:1/identity',
-  BRAINZ_STRIPE_SECRET_KEY: 'sk_test_this_test_invented_it',
+  BRAINZ_WEB_ORIGIN: 'https://app.brainz.test',
   BRAINZ_MCP_URL: 'https://mcp.brainz.test/mcp',
+  BRAINZ_STRIPE_WEBHOOK_SECRET: 'whsec_this_test_invented_it',
+  BRAINZ_STRIPE_API_BASE: 'https://stripe.brainz.test/v1',
+  BRAINZ_STRIPE_SECRET_KEY: 'sk_test_this_test_invented_it',
+  BRAINZ_STRIPE_PRICE_ID: 'price_this_test_invented_it',
+  BRAINZ_NEON_API_KEY: 'not-a-real-neon-key',
+  BRAINZ_NEON_ORG_ID: 'org-this-test-invented',
+  BRAINZ_NEON_API_BASE: 'https://neon.brainz.test/api/v2',
+  BRAINZ_NEON_REGION_ID: 'aws-nowhere-1',
+  BRAINZ_NEON_PG_VERSION: '17',
+  BRAINZ_NEON_SUSPEND_TIMEOUT: 'vendor-default',
+  BRAINZ_POOL_TARGET: '0',
+  BRAINZ_TENANT_ID_PREFIX: 'canary',
+  BRAINZ_ADMIN_CREDENTIAL: 'not-a-real-admin-credential',
+
+  // Read by no fleet process at all. Present here because a forward of the whole
+  // `env` would carry them, and that has to fail.
   NEON_API_KEY: 'not-a-real-neon-key',
   R2_SECRET_ACCESS_KEY: 'not-a-real-r2-secret',
   // The image owns this path (see the Dockerfile's bootstrap); a fleet that
@@ -139,8 +161,13 @@ afterAll(() => {
   mock.restore();
 });
 
-function envVarsOf(fleet: 'McpFleet' | 'WorkerFleet'): Record<string, string> {
-  const Class = fleet === 'McpFleet' ? router.McpFleet : router.WorkerFleet;
+type FleetName = 'McpFleet' | 'WorkerFleet' | 'WebFleet';
+
+/** Every class this config deploys, so a loop over "the fleets" cannot omit one. */
+const FLEETS: readonly FleetName[] = ['McpFleet', 'WorkerFleet', 'WebFleet'];
+
+function envVarsOf(fleet: FleetName): Record<string, string> {
+  const Class = router[fleet];
   return new Class(fakeDurableObjectContext(), WORKER_ENV).envVars;
 }
 
@@ -179,9 +206,40 @@ describe('each fleet receives the configuration its own process reads', () => {
   });
 
   /**
-   * The two asymmetries, named rather than left to the `toEqual` above. A future
-   * edit that merges the manifests would keep both tests above passing only by
-   * accident; these say which direction each variable travels and why.
+   * The web app, whose manifest is the one that carries credentials the other
+   * two are deliberately denied. The exact set matters more here than anywhere:
+   * this is the process a stranger reaches at `/signup`, and it is the only one
+   * holding the identity database and the billing vendor's key.
+   */
+  test('the web fleet gets what src/web/serve.ts reads, and no model credential', () => {
+    expect(envVarsOf('WebFleet')).toEqual({
+      // Shared with the other two, and the only two that are.
+      BRAINZ_CONTROL_DATABASE_URL: WORKER_ENV.BRAINZ_CONTROL_DATABASE_URL,
+      BRAINZ_SECRETS_JSON: WORKER_ENV.BRAINZ_SECRETS_JSON,
+      // Its own.
+      BRAINZ_IDENTITY_DATABASE_URL: WORKER_ENV.BRAINZ_IDENTITY_DATABASE_URL,
+      BRAINZ_WEB_ORIGIN: WORKER_ENV.BRAINZ_WEB_ORIGIN,
+      BRAINZ_MCP_URL: WORKER_ENV.BRAINZ_MCP_URL,
+      BRAINZ_STRIPE_WEBHOOK_SECRET: WORKER_ENV.BRAINZ_STRIPE_WEBHOOK_SECRET,
+      BRAINZ_STRIPE_API_BASE: WORKER_ENV.BRAINZ_STRIPE_API_BASE,
+      BRAINZ_STRIPE_SECRET_KEY: WORKER_ENV.BRAINZ_STRIPE_SECRET_KEY,
+      BRAINZ_STRIPE_PRICE_ID: WORKER_ENV.BRAINZ_STRIPE_PRICE_ID,
+      BRAINZ_NEON_API_KEY: WORKER_ENV.BRAINZ_NEON_API_KEY,
+      BRAINZ_NEON_ORG_ID: WORKER_ENV.BRAINZ_NEON_ORG_ID,
+      BRAINZ_NEON_API_BASE: WORKER_ENV.BRAINZ_NEON_API_BASE,
+      BRAINZ_NEON_REGION_ID: WORKER_ENV.BRAINZ_NEON_REGION_ID,
+      BRAINZ_NEON_PG_VERSION: WORKER_ENV.BRAINZ_NEON_PG_VERSION,
+      BRAINZ_NEON_SUSPEND_TIMEOUT: WORKER_ENV.BRAINZ_NEON_SUSPEND_TIMEOUT,
+      BRAINZ_POOL_TARGET: WORKER_ENV.BRAINZ_POOL_TARGET,
+      BRAINZ_TENANT_ID_PREFIX: WORKER_ENV.BRAINZ_TENANT_ID_PREFIX,
+      BRAINZ_ADMIN_CREDENTIAL: WORKER_ENV.BRAINZ_ADMIN_CREDENTIAL,
+    });
+  });
+
+  /**
+   * The asymmetries, named rather than left to the `toEqual`s above. A future
+   * edit that merged the manifests would keep those passing only by accident;
+   * these say which direction each variable travels and why.
    */
   test('the OAuth issuer reaches the fleet that mints issuers, and no other', () => {
     expect(envVarsOf('McpFleet')['BRAINZ_PUBLIC_ORIGIN']).toBe(WORKER_ENV.BRAINZ_PUBLIC_ORIGIN);
@@ -204,18 +262,24 @@ describe('a container receives no binding and nothing it does not read', () => {
    * namespace is not a string, so a blanket forward is both a type error and a
    * live object handed across a process boundary.
    */
-  test('neither manifest names a Durable Object binding', () => {
-    for (const manifest of [router.MCP_FLEET_VARIABLES, router.WORKER_FLEET_VARIABLES]) {
+  test('no manifest names a Durable Object binding', () => {
+    for (const manifest of [
+      router.MCP_FLEET_VARIABLES,
+      router.WORKER_FLEET_VARIABLES,
+      router.WEB_FLEET_VARIABLES,
+    ]) {
       expect(manifest).not.toContain('MCP_FLEET');
       expect(manifest).not.toContain('WORKER_FLEET');
+      expect(manifest).not.toContain('WEB_FLEET');
     }
   });
 
-  test('and no binding survives into either fleet, whatever the manifest says', () => {
-    for (const fleet of ['McpFleet', 'WorkerFleet'] as const) {
+  test('and no binding survives into any fleet, whatever the manifest says', () => {
+    for (const fleet of FLEETS) {
       const vars = envVarsOf(fleet);
       expect(vars['MCP_FLEET']).toBeUndefined();
       expect(vars['WORKER_FLEET']).toBeUndefined();
+      expect(vars['WEB_FLEET']).toBeUndefined();
       for (const value of Object.values(vars)) expect(typeof value).toBe('string');
     }
   });
@@ -230,22 +294,64 @@ describe('a container receives no binding and nothing it does not read', () => {
     expect(() => router.selectContainerEnv(WORKER_ENV, ['MCP_FLEET'])).toThrow(/MCP_FLEET/);
   });
 
-  test('the web process’s own configuration reaches neither fleet', () => {
+  /**
+   * The web app is deployed now, so "no container holds the identity database"
+   * is no longer the claim — "exactly one does" is, and it is the narrower
+   * statement that has to be checked. The MCP fleet parses attacker-supplied
+   * content; a credential it cannot use is a credential a compromise there
+   * cannot leak.
+   */
+  test('the web process’s own configuration reaches the web fleet and no other', () => {
     for (const fleet of ['McpFleet', 'WorkerFleet'] as const) {
       const vars = envVarsOf(fleet);
-      // The identity database is `src/web/serve.ts`'s alone; no fleet entrypoint
-      // calls `openIdentityStore`.
-      expect(vars['BRAINZ_IDENTITY_DATABASE_URL']).toBeUndefined();
-      expect(vars['BRAINZ_STRIPE_SECRET_KEY']).toBeUndefined();
-      expect(vars['BRAINZ_MCP_URL']).toBeUndefined();
+      expect({ fleet, identity: vars['BRAINZ_IDENTITY_DATABASE_URL'] }).toEqual({
+        fleet,
+        identity: undefined,
+      });
+      expect({ fleet, stripe: vars['BRAINZ_STRIPE_SECRET_KEY'] }).toEqual({ fleet, stripe: undefined });
+      expect({ fleet, hook: vars['BRAINZ_STRIPE_WEBHOOK_SECRET'] }).toEqual({ fleet, hook: undefined });
+      expect({ fleet, neon: vars['BRAINZ_NEON_API_KEY'] }).toEqual({ fleet, neon: undefined });
+      expect({ fleet, mcpUrl: vars['BRAINZ_MCP_URL'] }).toEqual({ fleet, mcpUrl: undefined });
+      expect({ fleet, admin: vars['BRAINZ_ADMIN_CREDENTIAL'] }).toEqual({ fleet, admin: undefined });
+    }
+
+    const web = envVarsOf('WebFleet');
+    expect(web['BRAINZ_IDENTITY_DATABASE_URL']).toBe(WORKER_ENV.BRAINZ_IDENTITY_DATABASE_URL);
+    expect(web['BRAINZ_STRIPE_SECRET_KEY']).toBe(WORKER_ENV.BRAINZ_STRIPE_SECRET_KEY);
+    expect(web['BRAINZ_NEON_API_KEY']).toBe(WORKER_ENV.BRAINZ_NEON_API_KEY);
+  });
+
+  /**
+   * And the other direction, which is the one a "just spread the shared bundle"
+   * edit would break. `src/web/serve.ts` composes no gateway: it calls no model,
+   * so every hosted key on its manifest would be a credential the widest surface
+   * in the deployment holds and cannot use. The issuer is the same shape of
+   * mistake — a process that answers no discovery request publishes none.
+   */
+  test('no model credential and no issuer reaches the web fleet', () => {
+    const web = envVarsOf('WebFleet');
+    for (const name of [
+      'BRAINZ_HOSTED_KEY_CLOUDFLARE',
+      'BRAINZ_HOSTED_KEY_OPENAI',
+      'BRAINZ_HOSTED_KEY_GOOGLE',
+      'BRAINZ_HOSTED_KEY_SELF_HOST',
+      'BRAINZ_CF_ACCOUNT_ID',
+      'BRAINZ_ROUTING_PROFILE',
+      'BRAINZ_PUBLIC_ORIGIN',
+      'BRAINZ_OAUTH_REDIRECT_URIS',
+      'BRAINZ_WEB_APP_BASE_URL',
+      'BRAINZ_WORKER_TICK_MS',
+    ]) {
+      expect({ name, value: web[name] }).toEqual({ name, value: undefined });
     }
   });
 
   test('credentials no fleet process reads are not shipped into one', () => {
-    for (const fleet of ['McpFleet', 'WorkerFleet'] as const) {
+    for (const fleet of FLEETS) {
       const vars = envVarsOf(fleet);
-      // Provisioning is the web app's; `createBrainProvisioner`'s Neon port is
-      // optional and no fleet entrypoint supplies it.
+      // The unprefixed name is the probes' (`.env.example`), read by nothing
+      // under `src/`. The web app's substrate credential is
+      // `BRAINZ_NEON_API_KEY`, which is on its manifest and on no other.
       expect(vars['NEON_API_KEY']).toBeUndefined();
       // `createTenantObjectStore` has no production composition root — the only
       // minter in `src/` refuses. When one lands the variable joins a manifest
@@ -259,7 +365,7 @@ describe('a container receives no binding and nothing it does not read', () => {
    * file inside the build context. See the Dockerfile's bootstrap.
    */
   test('the secrets FILE path is never forwarded, only the content', () => {
-    for (const fleet of ['McpFleet', 'WorkerFleet'] as const) {
+    for (const fleet of FLEETS) {
       expect(envVarsOf(fleet)['BRAINZ_SECRETS_FILE']).toBeUndefined();
       expect(envVarsOf(fleet)['BRAINZ_SECRETS_JSON']).toBe(WORKER_ENV.BRAINZ_SECRETS_JSON);
     }
@@ -277,6 +383,62 @@ describe('a container receives no binding and nothing it does not read', () => {
     const selected = router.selectContainerEnv(sparse, router.WORKER_FLEET_VARIABLES);
     expect(selected).toEqual(sparse);
     expect(Object.keys(selected)).not.toContain('BRAINZ_CF_ACCOUNT_ID');
+  });
+});
+
+/**
+ * The two lines that connect a tested router to real namespaces.
+ *
+ * `edge.ts` is exhaustively tested against stubs and `router.ts` is not tested at
+ * all — it cannot be imported without workerd — so the hand-off between them is
+ * the seam with no coverage on either side. Handing `MCP_FLEET` to the edge's
+ * `web` argument would pass every test in `test/mcp/router.test.ts` (the stubs
+ * are indistinguishable) and serve the MCP surface's 404 at `/signup` in
+ * production. The mock that makes the Container classes constructible makes this
+ * checkable too, so it is checked.
+ */
+describe('the Worker hands the edge the bindings it names', () => {
+  function bindingSpies(): {
+    readonly env: Record<string, unknown>;
+    readonly addressed: { mcp: string[]; web: string[] };
+  } {
+    const addressed: { mcp: string[]; web: string[] } = { mcp: [], web: [] };
+    const spy = (into: string[]) => ({
+      idFromName: (name: string) => ({ name }),
+      get: (id: { name: string }) => {
+        into.push(id.name);
+        return { fetch: () => Promise.resolve(Response.json({ ok: true })) };
+      },
+    });
+    return {
+      env: { MCP_FLEET: spy(addressed.mcp), WEB_FLEET: spy(addressed.web) },
+      addressed,
+    };
+  }
+
+  test('a web path reaches the WEB_FLEET namespace, not the MCP one', async () => {
+    const { env, addressed } = bindingSpies();
+    const response = await router.default.fetch(
+      new Request('https://fleet.brainz.test/signup', {
+        headers: { 'cf-connecting-ip': '198.51.100.21' },
+      }),
+      env,
+    );
+    expect(response.status).toBe(200);
+    expect(addressed.web).toHaveLength(1);
+    expect(addressed.mcp).toEqual([]);
+  });
+
+  test('and a discovery path still reaches the MCP namespace', async () => {
+    const { env, addressed } = bindingSpies();
+    await router.default.fetch(
+      new Request('https://fleet.brainz.test/.well-known/oauth-protected-resource', {
+        headers: { 'cf-connecting-ip': '198.51.100.22' },
+      }),
+      env,
+    );
+    expect(addressed.mcp).toHaveLength(1);
+    expect(addressed.web).toEqual([]);
   });
 });
 

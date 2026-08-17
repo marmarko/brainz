@@ -40,6 +40,16 @@
  * request holding a forged token therefore reaches an instance and is refused
  * there; it never reaches a database.
  *
+ * THREE FLEETS, ONE ORIGIN, AND WHY THE WEB APP IS NOT SOMEWHERE ELSE
+ * -------------------------------------------------------------------
+ * A session cookie is scoped to an origin. The consent screen `/authorize`
+ * renders reads the session the login page wrote, so the web app has to answer
+ * on this origin or there is nothing for it to read — put it on a host of its
+ * own and the cookie is simply not sent. `WebFleet` below is therefore a third
+ * Container class on the same Worker, reached by path (`edge.ts`) rather than by
+ * tenant, because the surface that matters most (`/signup`) runs before any
+ * tenant exists.
+ *
  * THE LIMITER RUNS BEFORE THE INSTANCE
  * ------------------------------------
  * `/mcp` is a public origin in front of scale-to-zero containers billed per 10ms.
@@ -143,17 +153,95 @@ export const MCP_FLEET_VARIABLES: readonly string[] = [
  *
  * Not here, and each for a reason worth reading before adding it back:
  * `BRAINZ_IDENTITY_DATABASE_URL` and the Stripe credentials belong to
- * `src/web/serve.ts`, which is not one of the container classes this config
- * deploys; a Neon API key is read only by the provisioner's optional port, which
- * no fleet entrypoint supplies; R2 credentials are read by nothing in `src/` yet,
+ * `src/web/serve.ts`, which is now the third container class below — they travel
+ * on {@link WEB_FLEET_VARIABLES} and must not be copied onto this manifest or
+ * the MCP one; a Neon API key is read by the provisioner, which likewise only
+ * the web process composes; R2 credentials are read by nothing in `src/` yet,
  * because `createTenantObjectStore` has no production credential minter. Each
- * joins a manifest when a fleet process actually reads it, and
- * `test/fleet/router-env.test.ts` asserts their absence until then.
+ * joins a manifest when the process that reads it is deployed, and
+ * `test/fleet/router-env.test.ts` asserts the absences in both directions.
  */
 export const WORKER_FLEET_VARIABLES: readonly string[] = [
   ...SHARED_FLEET_VARIABLES,
   'BRAINZ_WORKER_CONCURRENCY',
   'BRAINZ_WORKER_TICK_MS',
+];
+
+/**
+ * The web fleet's own — `src/web/serve.ts` and nothing else reads any of these.
+ *
+ * **Written flat rather than spread over {@link SHARED_FLEET_VARIABLES}**, which
+ * is not tidiness. That bundle exists for the two fleets that call models: it
+ * carries the routing profile, the billing account and the hosted key pool, and
+ * the web app composes no gateway at all. Spreading it here to save two lines
+ * would put every model credential inside the process that serves a public
+ * signup form — the widest surface in the deployment — in exchange for nothing
+ * it can use. The two variables the three fleets genuinely share are named
+ * individually below, with the reason each is needed.
+ *
+ * **The identity database and the Stripe secrets live here and nowhere else.**
+ * `router.ts` used to say both were absent from every manifest because the web
+ * process "is not one of the container classes this config deploys". That
+ * sentence retired the moment `WebFleet` landed; leaving it beside a manifest
+ * that now carries them would be a false explanation next to new behaviour. What
+ * survives from it is the constraint, which is the half that mattered: identity
+ * and billing credentials reach the web fleet ALONE. The MCP fleet parses
+ * attacker-supplied content, so a credential it cannot use is a credential a
+ * compromise cannot leak.
+ */
+export const WEB_FLEET_VARIABLES: readonly string[] = [
+  // Shared with the other two fleets, and only these two.
+  //
+  // `compose.ts:openControlPlane` — accounts, tiers, spend counters, the
+  // provisioner's own bookkeeping.
+  'BRAINZ_CONTROL_DATABASE_URL',
+  // The secret store, as content rather than as a path (the image's bootstrap
+  // materialises it; see the Dockerfile). The web process is this store's WRITER:
+  // provisioning banks a new tenant's connection string and bearer through it.
+  // See `docs/deploy.md` for what that means on a platform with no shared volume
+  // — it is the sharpest limit this deployment has.
+  'BRAINZ_SECRETS_JSON',
+
+  // `compose.ts:openIdentityStore` — accounts, password digests, sessions. The
+  // one database the fleets deliberately cannot reach.
+  'BRAINZ_IDENTITY_DATABASE_URL',
+
+  // The app's own origin. It is the same-origin refusal's reference value, so a
+  // wrong one is a CSRF check comparing against a host nobody uses.
+  'BRAINZ_WEB_ORIGIN',
+  // What `/connect` hands the user to paste into their client. Not the issuer:
+  // that is `BRAINZ_PUBLIC_ORIGIN`, which is the MCP fleet's.
+  'BRAINZ_MCP_URL',
+
+  // The billing webhook's signature secret. Required by the process: a webhook
+  // route that cannot verify is a route that accepts, so it fails closed at
+  // start rather than at the first forged delivery.
+  'BRAINZ_STRIPE_WEBHOOK_SECRET',
+  // The checkout trio — all three or none, refused at start if partial, because
+  // a half-configured vendor is a checkout that reaches the network with an
+  // empty credential and reports the refusal as a vendor outage.
+  'BRAINZ_STRIPE_API_BASE',
+  'BRAINZ_STRIPE_SECRET_KEY',
+  'BRAINZ_STRIPE_PRICE_ID',
+
+  // The substrate a signup provisions onto. Without a key AND without a warm
+  // pool the process refuses to start, because every signup it could serve would
+  // answer 503 — see `neonSubstrate`. The rest are the knobs that decide where
+  // the project lands, on whose organisation it bills, and whether this
+  // account's plan lets the suspend interval be set at all.
+  'BRAINZ_NEON_API_KEY',
+  'BRAINZ_NEON_ORG_ID',
+  'BRAINZ_NEON_API_BASE',
+  'BRAINZ_NEON_REGION_ID',
+  'BRAINZ_NEON_PG_VERSION',
+  'BRAINZ_NEON_SUSPEND_TIMEOUT',
+  'BRAINZ_POOL_TARGET',
+  'BRAINZ_TENANT_ID_PREFIX',
+
+  // The operator surface's credential. Unset means `/admin` answers 404 — an
+  // admin surface whose credential is unset is one open to everybody, and the
+  // fail-closed direction is to not exist.
+  'BRAINZ_ADMIN_CREDENTIAL',
 ];
 
 /**
@@ -263,6 +351,33 @@ export class WorkerFleet extends FleetContainer {
 }
 
 /**
+ * The web app — signup, login, dashboard, billing, BYOK, erasure — as the third
+ * fleet on this origin.
+ *
+ * **The failure this closes.** `src/web/serve.ts` was a complete process that no
+ * deployment started: no Container class, no route, no manifest. U15's
+ * verification sentence is *"a stranger can sign up"* and there was nowhere for
+ * a stranger to do it. The consent screen the OAuth flow needs is the second
+ * half of the same gap: `/authorize` reads a session cookie, a cookie is scoped
+ * to an origin, so a web app hosted anywhere else can be perfectly healthy and
+ * still leave `/authorize` with nothing to read.
+ *
+ * **Same image, third entrypoint.** One dependency closure, one set of base
+ * layers, one bootstrap materialising the secret store — and a `sleepAfter` that
+ * matches the MCP fleet's rather than inventing a third number: both are
+ * interactive surfaces where the wake cost is paid by a person waiting on a
+ * page, which is the only property that value encodes.
+ */
+export class WebFleet extends FleetContainer {
+  override sleepAfter = '15m';
+
+  /** The bootstrap first, then the entrypoint — see {@link WorkerFleet}. */
+  override entrypoint = ['/usr/local/bin/fleet-bootstrap', 'bun', 'run', 'src/web/serve.ts'];
+
+  override envVars = selectContainerEnv(this.env, WEB_FLEET_VARIABLES);
+}
+
+/**
  * The instance every scheduled wake addresses.
  *
  * One name, so the cron wakes one worker instance rather than a new one per
@@ -326,7 +441,8 @@ const limiter: EdgeLimiter = createEdgeLimiter({ now: () => Date.now() });
 export default {
   fetch(request: Request, env: Env): Promise<Response> {
     return handleFleetRequest(request, {
-      fleet: env.MCP_FLEET as unknown as FleetBinding<unknown>,
+      mcp: env.MCP_FLEET as unknown as FleetBinding<unknown>,
+      web: env.WEB_FLEET as unknown as FleetBinding<unknown>,
       limiter,
     });
   },

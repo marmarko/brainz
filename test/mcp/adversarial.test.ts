@@ -370,6 +370,33 @@ describe('forget reaches no further than the fence that authorised it', () => {
 // ---------------------------------------------------------------------------
 
 describe('the edge runs where it is deployed', () => {
+  /**
+   * The web fleet, as the fleet these paths must never reach.
+   *
+   * The edge routes three fleets now, and the authorization flow is exactly
+   * where a path table gets that wrong: `/authorize` renders a consent screen,
+   * which is a page, and a page is the sort of thing somebody later decides
+   * belongs to the web app. It does not — the code it mints has to be minted in
+   * the store the token endpoint reads. So every flow assertion below carries
+   * the negative one with it, and this binding is how it is recorded rather than
+   * assumed.
+   */
+  function webNeverReached(): {
+    readonly addressed: string[];
+    idFromName(name: string): { name: string };
+    get(id: { name: string }): { fetch(): Promise<Response> };
+  } {
+    const addressed: string[] = [];
+    return {
+      addressed,
+      idFromName: (name: string) => ({ name }),
+      get: (id: { name: string }) => {
+        addressed.push(id.name);
+        return { fetch: (): Promise<Response> => Promise.resolve(Response.json({ ok: true })) };
+      },
+    };
+  }
+
   test('the Worker module graph uses no Bun-only global', () => {
     // `wrangler.toml` names `src/mcp/router.ts` as the Worker entry, and the
     // Worker runs in workerd, where `Bun` does not exist. A reference here is
@@ -401,6 +428,7 @@ describe('the edge runs where it is deployed', () => {
       }),
     };
     const limiter = createEdgeLimiter({ now: () => Date.now() });
+    const web = webNeverReached();
 
     for (const path of [
       '/.well-known/oauth-protected-resource',
@@ -414,13 +442,16 @@ describe('the edge runs where it is deployed', () => {
           headers: { 'cf-connecting-ip': '198.51.100.9' },
           body: '{}',
         }),
-        { fleet, limiter },
+        { mcp: fleet, web, limiter },
       );
       // A 401 here is a connector that can never begin: the flow's first three
       // hops carry no bearer by construction.
       expect({ path, status: response.status }).toEqual({ path, status: 200 });
     }
     expect(reached.length).toBe(4);
+    // And not one of them was answered by the web app, which serves pages and
+    // holds none of the flow's store.
+    expect(web.addressed).toEqual([]);
   });
 
   test('every hop of one authorization flow lands on the same instance', async () => {
@@ -433,6 +464,7 @@ describe('the edge runs where it is deployed', () => {
       },
     };
     const limiter = createEdgeLimiter({ now: () => Date.now() });
+    const web = webNeverReached();
     const bearer = mintTenantBearer('t-flow');
 
     for (const [path, credential] of [
@@ -444,7 +476,7 @@ describe('the edge runs where it is deployed', () => {
       if (credential !== null) headers.authorization = `Bearer ${credential}`;
       await handleFleetRequest(
         new Request(`https://mcp.brainz.test${path}`, { method: 'POST', headers, body: '{}' }),
-        { fleet, limiter },
+        { mcp: fleet, web, limiter },
       );
     }
 
@@ -458,6 +490,10 @@ describe('the edge runs where it is deployed', () => {
     // the three must be one name.
     expect(addressed.length).toBe(3);
     expect(new Set(addressed).size).toBe(1);
+    // On the MCP binding, all three. `/authorize` renders a consent screen and
+    // is still not the web app's: the code it mints lives in the store the
+    // token endpoint reads.
+    expect(web.addressed).toEqual([]);
   });
 
   test('a revocation lands on the instance whose store every tool call consults', async () => {
@@ -470,6 +506,7 @@ describe('the edge runs where it is deployed', () => {
       },
     };
     const limiter = createEdgeLimiter({ now: () => Date.now() });
+    const web = webNeverReached();
 
     await handleFleetRequest(
       new Request('https://mcp.brainz.test/revoke', {
@@ -480,13 +517,14 @@ describe('the edge runs where it is deployed', () => {
         },
         body: 'grant_id=g-anything',
       }),
-      { fleet, limiter },
+      { mcp: fleet, web, limiter },
     );
 
     // The revocation list is the one piece of flow state `dispatch` reads, and
     // it reads it on the tenant's own instance. A revocation recorded on the
     // shared flow instance answers 200 and changes nothing.
     expect(addressed).toEqual(['t-revoker']);
+    expect(web.addressed).toEqual([]);
   });
 });
 
