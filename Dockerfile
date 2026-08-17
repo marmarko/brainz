@@ -81,8 +81,18 @@ ARG BUN_VERSION=1.3.14
 # reaches a warm instance only when it is replaced, and an unchanged image gives
 # the platform no reason to replace one. Observed 2026-08-17: the OAuth
 # allowlist stayed empty through two deploys while seven instances kept serving
-# the environment they booted with. Bump this when a secret must take effect now
-# rather than after `sleepAfter` of idle.
+# the environment they booted with. Bump this whenever a config change has to
+# reach the fleet at all.
+#
+# **It is necessary and it is NOT sufficient, which the wording here used to get
+# wrong.** Bumping does not make a change "take effect now": it makes the change
+# eligible to take effect, and a warm instance still serves its old environment
+# until it next starts -- i.e. after `sleepAfter` of idle. Measured on
+# 2026-08-17 for 2 -> 3: digests moved and `wrangler containers list` cycled
+# through `provisioning` within two minutes, and `/authorize` kept answering the
+# pre-deploy `401` for another nineteen. Worse, checking keeps the old instance
+# alive, because `sleepAfter` runs from the last request. `docs/deploy.md` §4
+# carries the timings and the paths that share the instance.
 #
 # 1 -> 2: the web fleet joined the deployment. Every warm MCP instance is holding
 # an environment built before `BRAINZ_WEB_APP_BASE_URL` was set — the value that

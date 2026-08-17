@@ -240,10 +240,9 @@ bunx wrangler deploy
 
 `wrangler secret put` already published a new Worker version, so this step is
 about the *containers*: a running instance built its `envVars` when its Durable
-Object was constructed and keeps them until it is replaced. A fresh deploy
-replaces them. If you change a secret later, expect the change to reach an
-instance when it next starts — which for the MCP and web fleets is up to
-`sleepAfter` (15m) after they go idle.
+Object was constructed and keeps them until it is replaced. A change reaches an
+instance when it next **starts** — which for a warm MCP or web instance is after
+`sleepAfter` (15m) of idle, not when the deploy finishes.
 
 **And a deploy only replaces an instance if the image actually changed.** An
 unchanged image gives the platform no reason to replace anything, so a secret
@@ -268,6 +267,42 @@ before and after and there was nothing to re-put. What changed was which
 variables `selectContainerEnv` copies — read once, when the Durable Object is
 constructed. Without the bump the browser leg of `/authorize` keeps answering
 `401` from warm instances and the deploy looks like it did nothing.
+
+### The bump is necessary and it is NOT sufficient — read this before you conclude a deploy failed
+
+**A moved image digest does not mean a warm instance was replaced, and
+`wrangler containers list` cycling through `provisioning` does not either.**
+Both say the *application* is on a new version. A running instance is replaced
+when it next starts.
+
+Measured on 2026-08-17, epoch 2 → 3:
+
+| Time (UTC) | What was observed |
+|---|---|
+| 06:03 | `wrangler deploy`: all three image digests move (`06ff5c65…` → `b3056ce9…`) |
+| 06:04–06:05 | `wrangler containers list` shows all three cycling `provisioning` → `ready` |
+| 06:06, 06:07, 06:08 | `/authorize` still answers `401` — the pre-deploy `envVars` |
+| 06:08–06:27 | no request to any path routed to `oauth-flow` |
+| 06:27 | `/authorize` answers `302 → /login?next=…`. The new environment is live |
+
+**The trap is that verifying keeps the old instance alive.** `sleepAfter` is
+measured from the last request, and every probe resets it — so a tight
+check-and-retry loop against `/authorize` can hold a stale instance up
+indefinitely while its operator reads the unchanged answer as "the manifest
+change did not work" and starts editing code that was already correct.
+
+So, after a deploy whose point is an environment change:
+
+* Leave **every** path that routes to the instance alone — for `oauth-flow`
+  that is `/authorize`, `/register`, `/token` **and** both `/.well-known/…`
+  documents, since they share one Durable Object id.
+* Wait past `sleepAfter` (15m + margin) from the last such request.
+* Then probe **once**.
+
+`wrangler containers instances <ID>` does not settle this either: it lists the
+Durable Object names with a `CREATED` timestamp and a `STATE` that read
+`inactive` for instances that were demonstrably serving traffic. Treat it as the
+id inventory, not as liveness.
 
 ## 5. Verify that it serves
 
