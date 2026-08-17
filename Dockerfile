@@ -109,7 +109,14 @@ ARG BUN_VERSION=1.3.14
 # instance is holding an `envVars` built without it. Unbumped, the deploy would
 # publish a new Worker version, the running instances would keep serving the
 # consent screen a `401`, and the change would look like it did not work.
-ARG FLEET_CONFIG_EPOCH=3
+# 3 -> 4: BRAINZ_NEON_SUSPEND_TIMEOUT=vendor-default, plus the region and pg
+# version, joined the deployment. Without the first, every signup on a free-plan
+# Neon organisation answers 412 and creates nothing -- `src/web/serve.ts`
+# documents that exact refusal, and the shipped default is the one a free plan
+# cannot use. Observed live 2026-08-17 as `provisioning_unavailable` 503 on a
+# fresh signup while the canary tenant, whose credentials predated the store,
+# kept working perfectly.
+ARG FLEET_CONFIG_EPOCH=4
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
