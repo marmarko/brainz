@@ -97,6 +97,7 @@ beforeAll(async () => {
       BRAINZ_WEB_ORIGIN: WEB_ORIGIN,
       BRAINZ_IDENTITY_DATABASE_URL: identity.dsn,
       BRAINZ_CONTROL_DATABASE_URL: control.dsn,
+      BRAINZ_SECRET_BACKEND: 'file',
       BRAINZ_SECRETS_FILE: secretsFile,
       BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
       BRAINZ_MCP_URL: 'https://mcp.brainz.test/mcp',

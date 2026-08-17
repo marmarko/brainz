@@ -198,6 +198,18 @@ function parseListening(line: string): ListeningLine | null {
 export const FAKE_CF_ACCOUNT_ID = '0'.repeat(32);
 
 /**
+ * A sealing key that seals nothing anybody cares about.
+ *
+ * Thirty-two zero bytes, base64url — the shape
+ * `src/control/sealed.ts:importSealingKey` demands, and a value no deployment
+ * could ever hold by accident. Same rule as {@link FAKE_CF_ACCOUNT_ID}: this
+ * repository is public, the real key lives in `BRAINZ_SECRET_ENCRYPTION_KEY`,
+ * and gitleaks runs on every push. A test that generated a random key would be
+ * indistinguishable in a diff from one that pasted a live one.
+ */
+export const FAKE_SEALING_KEY = 'A'.repeat(43);
+
+/**
  * A secrets file in the shape `src/control/secret-file.ts` reads.
  *
  * Written by the test the way an operator or a pool filler writes it, so what

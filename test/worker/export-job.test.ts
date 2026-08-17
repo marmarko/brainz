@@ -416,6 +416,7 @@ describe('the running worker fleet is what enqueues it', () => {
       const fleet = await startWorkerFleet({
         PORT: '0',
         BRAINZ_CONTROL_DATABASE_URL: control.dsn,
+        BRAINZ_SECRET_BACKEND: 'file',
         BRAINZ_SECRETS_FILE: secretsFile,
       BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
         // Long enough that the only tick is the one driven below.

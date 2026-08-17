@@ -90,7 +90,7 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
   const appOrigin = origin(env, 'BRAINZ_WEB_ORIGIN');
   const sql = openIdentityStore(env);
   const controlSql = openControlPlane(env);
-  const secrets = openSecretStore(env);
+  const secrets = await openSecretStore(env, controlSql);
 
   // One resolver for both tenant-side ports, so "how this process reaches a
   // brain" has one implementation rather than two that can drift on the

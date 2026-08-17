@@ -65,7 +65,7 @@ export interface McpFleetProcess {
 export async function startMcpFleet(env: Environment): Promise<McpFleetProcess> {
   const issuer = origin(env, 'BRAINZ_PUBLIC_ORIGIN');
   const controlSql = openControlPlane(env);
-  const secrets = openSecretStore(env);
+  const secrets = await openSecretStore(env, controlSql);
   const gateway = openFleetGateway(env, { controlSql, keys: secrets.providerKeys });
 
   // **Set in the deployed fleet, and still `optional` rather than `required`.**

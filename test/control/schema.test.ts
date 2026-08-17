@@ -42,6 +42,7 @@
 
 import { describe, expect, test } from 'bun:test';
 
+import { importSealingKey, seal } from '../../src/control/sealed.ts';
 import { isValidTenantId } from '../../src/control/secrets.ts';
 
 const SRC_DIR = `${import.meta.dir}/../../src`;
@@ -611,6 +612,66 @@ interface AllowlistEntry {
  */
 const CONTENT_FREE_ALLOWLIST: readonly AllowlistEntry[] = [];
 
+interface SealedDomainEntry {
+  /** The domain's declared name, as written in the SQL. */
+  readonly domain: string;
+  /** Why a domain longer than a paragraph is still content-free. */
+  readonly because: string;
+}
+
+/**
+ * The sealed-envelope registry — the one way past the prose ceiling, and a
+ * **narrowing** of the old rule rather than a hole in it.
+ *
+ * The control plane's claim used to be "it holds ids, counters, timestamps and
+ * references", and this file's own header admitted the honest gap in it: *"a
+ * high-entropy bearer is shaped exactly like a slug, so no alphabet can exclude
+ * it… what keeps a bearer out is that these columns are references, which is
+ * U2's business, not the schema's."* That is a promise about the write path, and
+ * a promise about the write path is the sentence that precedes every incident.
+ *
+ * The durable secret store (`src/control/secret-store.sql`) had to put tenant
+ * credentials in this database — the file store cannot be shared between two
+ * container fleets, and a tenant whose credential lives in one container's
+ * temporary directory is a brain nobody can open once that container is
+ * replaced. So the rule generalises: **the control plane holds nothing a reader
+ * of the control plane can use.** A registered domain may exceed the prose
+ * ceiling, and in exchange it must reject, mechanically:
+ *
+ *   * every prose probe, as every text domain here must;
+ *   * every URL-shaped secret, as every text domain here must;
+ *   * and — new, and the part the old rule could not do — a **bare bearer
+ *     grant**, because the envelope shape requires a version prefix and two
+ *     segments that a slug does not have.
+ *
+ * The bar for an entry is the {@link CONTENT_FREE_ALLOWLIST}'s bar: the column
+ * must be structurally incapable of holding a user's words, and the entry must
+ * say where that is guaranteed. Note what the CHECK does and does not establish
+ * — it proves the *shape* of an envelope, not that the bytes inside were ever
+ * encrypted. What pays for that is that one module writes this column
+ * (`src/control/secret-pg.ts`, which seals through `src/control/sealed.ts`) and
+ * that `test/control/secret-durability.test.ts` opens what it wrote.
+ */
+const SEALED_ENVELOPE_DOMAINS: readonly SealedDomainEntry[] = [
+  {
+    domain: 'control.sealed_envelope',
+    because:
+      'it holds an AES-256-GCM envelope whose key lives only in the fleets\' environment and is never written to this database, so a dump, a backup or a leaked control-plane DSN yields ciphertext; the anchored pattern admits base64url and the two separators only — no `:`, no `@`, no `/`, no whitespace — so a connection string is unstorable, and the required `v1.` prefix plus two segments means a bare bearer grant is unstorable too, which is the class the reference columns could never exclude. The bound is 2048 rather than 256 because an envelope over a DSN and a bearer is ~360 characters and a rotation that violated a CHECK would be an outage; `src/control/secret-pg.ts` refuses an oversized plaintext before the column sees it',
+  },
+];
+
+/**
+ * The ceiling a sealed domain may reach. Still a bound, and still far below a
+ * document: it is sized for one envelope, not for a payload column that grew.
+ */
+const MAX_SEALED_DOMAIN_LENGTH = 2048;
+
+function sealedEntryFor(domain: string): SealedDomainEntry | undefined {
+  return SEALED_ENVELOPE_DOMAINS.find(
+    (entry) => entry.domain === domain || bareName(entry.domain) === bareName(domain),
+  );
+}
+
 interface TypeRef {
   readonly base: string;
   readonly args: readonly string[];
@@ -707,10 +768,16 @@ function judgeDomain(domain: DomainDecl): DomainVerdict {
   if (!Number.isFinite(length)) {
     return { safe: false, why: `domain ${domain.name} declares no length bound`, accepts: undefined };
   }
-  if (length > MAX_TEXT_DOMAIN_LENGTH) {
+  // A registered sealed domain is the one thing allowed past the prose ceiling,
+  // and it buys that with the probes below — including the bearer-shaped ones
+  // no other domain here is asked to reject. An unregistered domain that wants
+  // 2048 characters is refused exactly as before.
+  const ceiling =
+    sealedEntryFor(domain.name) === undefined ? MAX_TEXT_DOMAIN_LENGTH : MAX_SEALED_DOMAIN_LENGTH;
+  if (length > ceiling) {
     return {
       safe: false,
-      why: `domain ${domain.name} allows ${length} characters (ceiling ${MAX_TEXT_DOMAIN_LENGTH})`,
+      why: `domain ${domain.name} allows ${length} characters (ceiling ${ceiling})`,
       accepts: undefined,
     };
   }
@@ -864,6 +931,39 @@ const SECRET_SHAPED_PROBES: readonly string[] = [
   'https://api.example.invalid/v2/projects',
 ];
 
+/**
+ * Bare credentials, in the shape this system actually mints.
+ *
+ * The paragraph above admits that no alphabet can exclude a high-entropy bearer
+ * from a *reference* column, because a bearer looks like a slug. A sealed
+ * envelope column can exclude it, and must: the whole argument for letting
+ * secret material into this database is that only a sealed envelope fits, and a
+ * column that would also accept the plaintext it seals has not made that
+ * argument. `mintTenantBearer` produces the first shape; the others are what a
+ * hurried operator or a half-written migration would paste.
+ */
+/**
+ * An envelope the shipped sealing module actually produced, over a payload the
+ * size the store really holds. Built here rather than hand-written, so the SQL
+ * and `src/control/sealed.ts` cannot drift apart without this file noticing.
+ */
+const SAMPLE_ENVELOPE = await seal(
+  await importSealingKey('A'.repeat(43)),
+  'tenant/t-0000000000000000000000',
+  JSON.stringify({
+    connectionString:
+      'postgresql://brainz_owner:npg_0000000000000000@ep-example-00000000.eu-central-1.aws.neon.invalid/brainz?sslmode=require',
+    bearerGrant: 't-0000000000000000000000.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+  }),
+);
+
+const BEARER_SHAPED_PROBES: readonly string[] = [
+  't-779dac5aa50b7de1c59c1fb7.aGVsbG8gdGhlcmUgZnJpZW5kIHRoaXMgaXMgbm90IHJlYWw',
+  'brz-this-is-not-a-credential-0000',
+  'sk-this-is-not-a-credential-00000',
+  'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+];
+
 // ---------------------------------------------------------------------------
 // Fixtures for the go-red cases. A guard that has only ever been green has not
 // been shown to guard anything (the discipline `check-ledger.test.ts` sets).
@@ -907,11 +1007,34 @@ function domainVerdict(name: string): DomainVerdict {
   return verdict;
 }
 
-function textDomains(): { name: string; accepts: (value: string) => boolean }[] {
-  const out: { name: string; accepts: (value: string) => boolean }[] = [];
-  for (const declared of schema.domains) {
+interface ProbeableDomain {
+  readonly name: string;
+  readonly accepts: (value: string) => boolean;
+}
+
+function textDomainsOf(parsed: Schema): ProbeableDomain[] {
+  const out: ProbeableDomain[] = [];
+  for (const declared of parsed.domains) {
     const verdict = judgeDomain(declared);
     if (verdict.accepts) out.push({ name: declared.name, accepts: verdict.accepts });
+  }
+  return out;
+}
+
+/**
+ * Every text domain in **every** control-plane SQL file, not just this one.
+ *
+ * The probe tests used to read `schema.sql` alone, which was the same gap the
+ * per-file enumeration closed for columns: a future control-plane file — and
+ * `src/control/secret-store.sql` is now one — could declare a domain no probe
+ * ever ran at. A guard that only inspects the file it was written for is a guard
+ * with an expiry date.
+ */
+function textDomains(): ProbeableDomain[] {
+  const out: ProbeableDomain[] = [];
+  for (const [path, sql] of SQL_SOURCES) {
+    if (!path.startsWith(CONTROL_PREFIX)) continue;
+    for (const domain of textDomainsOf(parseSchema(sql))) out.push(domain);
   }
   return out;
 }
@@ -970,6 +1093,59 @@ describe('the control plane is content-free', () => {
   });
 });
 
+describe('a sealed envelope is the only secret the control plane may hold', () => {
+  function sealedDomains(): ProbeableDomain[] {
+    return textDomains().filter((domain) => sealedEntryFor(domain.name) !== undefined);
+  }
+
+  test('the registry is not empty, and every entry argues for itself', () => {
+    // The mirror of the empty-allowlist test: an empty registry here would mean
+    // the rule below is being asserted about nothing.
+    expect(SEALED_ENVELOPE_DOMAINS.length).toBeGreaterThan(0);
+    for (const entry of SEALED_ENVELOPE_DOMAINS) {
+      expect(entry.because.length).toBeGreaterThan(40);
+    }
+    expect(sealedDomains().map((d) => d.name)).toEqual(
+      SEALED_ENVELOPE_DOMAINS.map((entry) => entry.domain),
+    );
+  });
+
+  test('a sealed domain rejects a bare bearer grant, which no reference column can', () => {
+    const failures: string[] = [];
+    for (const domain of sealedDomains()) {
+      for (const probe of BEARER_SHAPED_PROBES) {
+        if (domain.accepts(probe)) failures.push(`${domain.name} accepts ${JSON.stringify(probe)}`);
+      }
+    }
+    expect(failures).toEqual([]);
+  });
+
+  test('a sealed domain accepts what the sealing module actually produces', () => {
+    // The other direction, and it is not symmetry for its own sake: a pattern
+    // tightened until nothing fits would pass every rejection test above and
+    // fail every insert in production. This is the pairing between the SQL and
+    // `src/control/sealed.ts` — one of them cannot move without the other.
+    const sealed = sealedDomains();
+    expect(sealed.length).toBeGreaterThan(0);
+    for (const domain of sealed) {
+      expect(domain.accepts(SAMPLE_ENVELOPE)).toBe(true);
+    }
+  });
+
+  test('no sealed column lives on the tenant row', () => {
+    // The tenant row keeps `connection_secret_ref` and `bearer_secret_ref`, and
+    // they still cannot hold a secret. Secret material lives in its own table
+    // with its own lifetime — a revoke is a DELETE there and leaves the tenant
+    // row intact — and putting an envelope on this row would make the two
+    // inseparable again.
+    const sealedNames = new Set(SEALED_ENVELOPE_DOMAINS.map((entry) => bareName(entry.domain)));
+    const found = table(TENANT_TABLE)
+      .columns.filter((c) => sealedNames.has(bareName(parseTypeRef(c.type).base)))
+      .map((c) => c.name);
+    expect(found).toEqual([]);
+  });
+});
+
 describe('the content-free guard goes red', () => {
   test('a raw text column fails, whatever it is called', () => {
     for (const name of ['summary', 'note', 'harmless_looking_id']) {
@@ -994,6 +1170,38 @@ describe('the content-free guard goes red', () => {
   test('a bounded varchar column fails — a length bound is not a content guarantee', () => {
     // The case a naive guard passes: 200 characters holds a whole paragraph.
     expect(findContentShapedColumns(fixture('note varchar(200),'))).toHaveLength(1);
+  });
+
+  test('an unregistered domain cannot buy itself the sealed ceiling', () => {
+    const oversized = parseSchema(`
+CREATE DOMAIN control.roomy AS varchar(2048)
+  CONSTRAINT roomy_is_pinned CHECK (VALUE ~ '^[A-Za-z0-9_-]{1,2048}$');
+`);
+    const verdict = judgeDomain(oversized.domains[0]!);
+    expect(verdict.safe).toBe(false);
+    expect(verdict.why).toContain(`ceiling ${MAX_TEXT_DOMAIN_LENGTH}`);
+  });
+
+  test('a sealed domain loosened to admit a connection string fails the probes', () => {
+    // The mutation to fear on this rule: somebody widens the alphabet to "fix"
+    // a value that would not store, and the column silently becomes able to
+    // hold the plaintext it exists to keep out.
+    const loosened = parseSchema(`
+CREATE DOMAIN control.sealed_envelope AS varchar(2048)
+  CONSTRAINT sealed_envelope_is_a_v1_envelope CHECK (VALUE ~ '^[ -~]{1,2048}$');
+`);
+    const verdict = judgeDomain(loosened.domains[0]!);
+    expect(verdict.safe).toBe(true); // … it satisfies the structural rule …
+    expect(verdict.accepts?.(SECRET_SHAPED_PROBES[0]!)).toBe(true); // … and the probe catches it
+    expect(verdict.accepts?.(BEARER_SHAPED_PROBES[0]!)).toBe(true);
+  });
+
+  test('a sealed domain tightened until nothing fits fails the acceptance case', () => {
+    const useless = parseSchema(`
+CREATE DOMAIN control.sealed_envelope AS varchar(2048)
+  CONSTRAINT sealed_envelope_is_a_v1_envelope CHECK (VALUE ~ '^v2[.][A-Za-z0-9_-]{16}$');
+`);
+    expect(judgeDomain(useless.domains[0]!).accepts?.(SAMPLE_ENVELOPE)).toBe(false);
   });
 
   test('a domain permissive enough to hold prose fails the probes', () => {

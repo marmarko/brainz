@@ -76,7 +76,11 @@ reason.
 * **Docker, running.** `wrangler deploy` builds the image locally and pushes it
   to Cloudflare's registry.
 * **A control-plane Postgres** (`control.*`, `src/control/schema.sql`) reachable
-  from the container over ordinary outbound TCP.
+  from the container over ordinary outbound TCP. It is also the secret store:
+  `src/control/secret-store.sql` is applied by the first fleet to start
+  (`ensureSecretStoreSchema`, under an advisory lock), so the role in that DSN
+  needs to be able to create a table and three domains in the `control` schema —
+  once.
 * **Bun ≥ 1.3** and this checkout.
 
 ```bash
@@ -158,9 +162,19 @@ variable that is not on one does not reach that container at all.
 # The fleets that serve MCP and run jobs.
 bunx wrangler secret put BRAINZ_PUBLIC_ORIGIN            # https://brainz-fleet.<your-subdomain>.workers.dev
 bunx wrangler secret put BRAINZ_CONTROL_DATABASE_URL
-bunx wrangler secret put BRAINZ_SECRETS_JSON
+# What opens the sealed rows in `control.tenant_secret`. Generate it with
+# `openssl rand -base64 32`, and keep it somewhere you keep things you cannot
+# regenerate: it never enters the database it opens, so losing it loses every
+# tenant's credentials. Every fleet needs the SAME one.
+bunx wrangler secret put BRAINZ_SECRET_ENCRYPTION_KEY
 bunx wrangler secret put BRAINZ_CF_ACCOUNT_ID
 bunx wrangler secret put BRAINZ_HOSTED_KEY_CLOUDFLARE
+
+# Only if you are upgrading a deployment that still has tenants inside the old
+# snapshot secret. It is imported once and can then be deleted — see
+# [Known limits](#known-limits). A fresh deployment sets neither this nor
+# BRAINZ_SECRET_BACKEND (which defaults to the durable `postgres` store).
+# bunx wrangler secret put BRAINZ_SECRETS_JSON
 
 # The web app, which is on this origin too. Without these the WebFleet
 # container refuses to start and `/signup` answers 502 through the edge.
@@ -190,7 +204,9 @@ the code rather than this file: `providersReachable()` is pinned by
 | Secret | MCP | Worker | Web | Required? | What reads it |
 |---|:--:|:--:|:--:|---|---|
 | `BRAINZ_CONTROL_DATABASE_URL` | ✓ | ✓ | ✓ | yes | `compose.ts:openControlPlane`; the worker opens a second handle for lease renewal (hazard H4). |
-| `BRAINZ_SECRETS_JSON` | ✓ | ✓ | ✓ | yes | The image's bootstrap writes it to a file and points `BRAINZ_SECRETS_FILE` at it. See [Known limits](#known-limits). |
+| `BRAINZ_SECRET_ENCRYPTION_KEY` | ✓ | ✓ | ✓ | yes on the default backend | AES-256-GCM, 32 bytes, base64. Opens `control.tenant_secret` (`src/control/secret-pg.ts`). The same value on all three fleets, or the fleet with the odd one out refuses every tenant. Never stored in the database it opens. |
+| `BRAINZ_SECRET_BACKEND` | ✓ | ✓ | ✓ | no (`postgres`) | `postgres` — the durable store, and the default — or `file` for a self-hoster with a real volume. An unknown value refuses at start; a missing key on `postgres` refuses at start. There is no fallback. |
+| `BRAINZ_SECRETS_JSON` | ✓ | ✓ | ✓ | **no** — migration only | A one-time bootstrap seed. Imported once per blob, never overwrites a durable entry, deletable once `control.secret_seed` has its digest. See [Known limits](#known-limits). |
 | `BRAINZ_CF_ACCOUNT_ID` | ✓ | ✓ | — | on the `hosted` profile | `compose.ts:selectFleetTransport` — the Cloudflare seats bill through `…/accounts/{id}/ai`. Not needed by `self-host`. |
 | `BRAINZ_HOSTED_KEY_CLOUDFLARE` | ✓ | ✓ | — | on the `hosted` profile | The pooled credential for eight of the nine model seats. |
 | `BRAINZ_HOSTED_KEY_OPENAI` | ✓ | ✓ | — | **no** — self-host only | No hosted route reaches OpenAI since the embedding seat moved to Cloudflare. Setting it on a hosted deployment does nothing. |
@@ -424,35 +440,50 @@ means "I deleted the deploy" is not "I stopped paying".
 
 ## Known limits
 
-**The secret store is a snapshot, and it is small.** `BRAINZ_SECRETS_JSON` is
-one Workers secret, capped at 5 KB. A tenant entry — namespace, connection
-string, bearer grant — is roughly 290 bytes of compact JSON, so the store holds
-somewhere around 15 to 17 tenants before the secret is refused. That is the
-alpha's ceiling, not the design's: `src/control/secret-file.ts` is one
-implementation of a `SecretBackend` port and the managed store replaces it
-without changing anything above that line.
+**The secret store used to be a snapshot, and that is fixed.** What follows is
+kept because it is the shape of the failure, and because a reader upgrading from
+an older deployment needs to recognise it.
 
-**And now that the web app is deployed here, the store is not shared with
-it — which is sharper than it sounds.** `secret-file.ts` assumes one writer (the
-web process) and readers on the same volume. Cloudflare Containers have no shared
-volume, and each container gets a fresh copy of `BRAINZ_SECRETS_JSON` written to
-its own temporary file at start. So a signup served by the web fleet provisions a
-real Neon project, banks the tenant's connection string into **that container's
-own copy**, and:
+`BRAINZ_SECRETS_JSON` was one Workers secret, capped at 5 KB — around 15 to 17
+tenants — materialised into each container's own temporary file at start.
+`secret-file.ts` assumes one writer and readers on the same volume, and
+Cloudflare Containers have no shared volume. So a signup served by the web fleet
+provisioned a real Neon project, banked the tenant's connection string into
+**that container's own copy**, and:
 
-* the MCP fleet cannot see it — that tenant's bearer resolves to nothing, and
-  every tool call answers `unauthorized`;
-* the web instance itself loses it when it is replaced or sleeps out
-  (`sleepAfter` 15m), so even the process that wrote it forgets.
+* the MCP fleet could not see it — that tenant's bearer resolved to nothing,
+  `POST /token` answered `{"error":"invalid_grant"}`, and every tool call
+  answered `unauthorized`;
+* the web instance itself lost it when it was replaced or slept out
+  (`sleepAfter` 15m), so even the process that wrote it forgot.
 
-The tenant's brain is real and its rows are safe — the Neon project and the
-control-plane row both survive. What is lost is the credential that reaches it.
-Until the managed secret store lands, a signup is only half-complete until an
-operator adds that tenant's entry to `BRAINZ_SECRETS_JSON` by hand, re-runs
-`wrangler secret put`, and redeploys with a bumped `FLEET_CONFIG_EPOCH`. That is
-a chore at alpha volume and it is not a design; it is the first thing the managed
-store fixes, and it is the single strongest argument for landing it before any
-real signup.
+The store is now the control-plane database, which both fleets already reach:
+`src/control/secret-pg.ts`, one row per namespace in `control.tenant_secret`,
+every value sealed with AES-256-GCM under `BRAINZ_SECRET_ENCRYPTION_KEY` and
+bound to the namespace it is stored under. A tenant provisioned by the web fleet
+is resolvable by the MCP fleet immediately, with no deploy, no `wrangler secret
+put` and no restart, and it survives the loss of every container.
+`test/fleet/cross-fleet-secrets.test.ts` drives exactly that across two spawned
+fleet processes, and keeps the old failure as a witness beside it.
+
+Two consequences worth knowing:
+
+* **The key is the thing to keep.** It never enters the database it opens, so a
+  control-plane dump, backup or leaked DSN yields ciphertext — and losing the key
+  loses every tenant's credentials as surely as losing the database would.
+  Generate it with `openssl rand -base64 32` and store it wherever you store the
+  things you cannot regenerate.
+* **`BRAINZ_SECRETS_JSON` is now a bootstrap seed.** The first fleet to start
+  imports it once, entry by entry, and it can never overwrite a durable entry or
+  resurrect a revoked one. Once
+  `SELECT digest FROM control.secret_seed` returns a row, delete the secret:
+  `bunx wrangler secret delete BRAINZ_SECRETS_JSON`. Leaving it set is a stale
+  copy of every tenant's credentials sitting in three containers' environments.
+
+**A self-hosted deployment with a real volume keeps the file backend**, by name:
+`BRAINZ_SECRET_BACKEND=file` plus a `BRAINZ_SECRETS_FILE` on that volume. It is
+never fallen back into — a missing variable refuses at start rather than quietly
+downgrading to a per-container store.
 
 **Two ports are in-memory inside the MCP fleet** (`src/mcp/serve.ts` says so in
 its own header): the OAuth authorization store and the access log. With more

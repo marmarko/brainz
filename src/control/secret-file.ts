@@ -40,14 +40,56 @@ import type { SecretBackend, TenantSecret } from './secrets.ts';
 /** Owner read/write. A secrets file the group can read is not a secrets file. */
 const FILE_MODE = 0o600;
 
-interface FileShape {
+/**
+ * The JSON shape, exported because it is no longer only this file's.
+ *
+ * `BRAINZ_SECRETS_JSON` is the same bytes, and the durable store imports it as a
+ * bootstrap seed (`secret-pg.ts:importSecretSeed`). One parser rather than two:
+ * a seed reader that admitted an entry this file skips — or skipped one it
+ * admits — would migrate a different set of tenants than the file backend
+ * serves, and nobody would notice until the missing one signed in.
+ */
+export interface SecretStoreShape {
   /** Namespace (`tenant/…`, `pool/…`) to the pair `secrets.ts` stores. */
   readonly secrets: Record<string, { connectionString: string; bearerGrant: string }>;
   /** Namespace (`provider-key/…`) to the key itself (R22's BYOK entries). */
   readonly providerKeys: Record<string, string>;
 }
 
+type FileShape = SecretStoreShape;
+
 const EMPTY: FileShape = { secrets: {}, providerKeys: {} };
+
+/**
+ * Parse the store's JSON, or throw.
+ *
+ * Not a shrug and not an empty store: a corrupt secrets blob read as "no
+ * tenants" is a fleet that answers `not_found` for every brain it holds, which
+ * reads as data loss and is a parse error. `source` names what was being read —
+ * a path for the file backend, a variable name for the seed — because that is
+ * what the operator has to go and fix.
+ */
+export function parseSecretStoreJson(text: string, source: string): SecretStoreShape {
+  if (text.trim().length === 0) return EMPTY;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new Error(
+      `${source} is not JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`${source} is not a JSON object`);
+  }
+
+  const record = parsed as Record<string, unknown>;
+  return {
+    secrets: sectionOfPairs(record['secrets']),
+    providerKeys: sectionOfStrings(record['providerKeys']),
+  };
+}
 
 export interface FileSecretStoreOptions {
   readonly path: string;
@@ -77,29 +119,7 @@ export function createFileSecretStore(options: FileSecretStoreOptions): FileSecr
   async function read(): Promise<FileShape> {
     const file = Bun.file(path);
     if (!(await file.exists())) return EMPTY;
-    const text = await file.text();
-    if (text.trim().length === 0) return EMPTY;
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch (error) {
-      // Not a shrug and not an empty store: a corrupt secrets file read as
-      // "no tenants" is a fleet that answers `not_found` for every brain it
-      // holds, which reads as data loss and is a parse error.
-      throw new Error(
-        `the secrets file at ${path} is not JSON: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    if (typeof parsed !== 'object' || parsed === null) {
-      throw new Error(`the secrets file at ${path} is not a JSON object`);
-    }
-
-    const record = parsed as Record<string, unknown>;
-    return {
-      secrets: sectionOfPairs(record['secrets']),
-      providerKeys: sectionOfStrings(record['providerKeys']),
-    };
+    return parseSecretStoreJson(await file.text(), `the secrets file at ${path}`);
   }
 
   /**

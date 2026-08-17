@@ -50,21 +50,32 @@
 # bootstrap overrides it. Neither half can come from the other, which is what
 # makes the wrong path unavailable rather than merely discouraged.
 #
-# The honest limits of this, written down rather than discovered later:
+# AND THAT WAS NOT ENOUGH, WHICH IS WHY THE DEFAULT BACKEND IS NO LONGER A FILE
+# ----------------------------------------------------------------------------
+# The two limits below were written here as honest caveats and then observed
+# live, as a stranger signing up and reaching `{"error":"invalid_grant"}`:
 #
 #   * It is a **snapshot**. A tenant provisioned after the secret was set is
 #     invisible to a running instance until the secret is re-put and the instance
 #     restarts. The web process is the only writer (see `secret-file.ts`), and it
 #     does not run in this container — on Cloudflare Containers there is no
-#     shared volume for it to write through.
-#   * A Workers secret is capped at 5 KB, so the store is bounded at roughly a
-#     dozen tenants. That ceiling is the alpha's, not the design's: the managed
-#     secret store `wrangler.toml` describes implements the same `SecretBackend`
-#     port and removes both limits at once.
+#     shared volume for it to write through. So the MCP fleet could not resolve
+#     a tenant the web fleet had provisioned seconds earlier, and the only copy
+#     of that tenant's credential lived in a container's temporary directory.
+#   * A Workers secret is capped at 5 KB, so the store was bounded at roughly a
+#     dozen tenants.
 #
-# A self-hosted deployment with a real volume opts out by overriding the
-# container command in its own compose file; the strict refusal below is for the
-# platform that has no volume to offer.
+# `src/control/secret-pg.ts` is the durable backend that removes both at once:
+# the same `SecretBackend` port, over the control-plane database both fleets
+# already hold, with every value sealed under a key that never enters that
+# database. It is the default (`BRAINZ_SECRET_BACKEND` unset ⇒ `postgres`), and
+# `BRAINZ_SECRETS_JSON` is demoted to a one-time bootstrap seed — imported once
+# per blob, never able to overwrite a durable entry, deletable afterwards.
+#
+# The file backend stays for the self-hoster with a real volume, chosen by name
+# (`BRAINZ_SECRET_BACKEND=file`) and never fallen back into: a deployment that
+# silently downgraded to a per-container store because a variable was missing is
+# the incident above, rediscovered in production.
 #
 # Build for Cloudflare Containers, which runs linux/amd64 only:
 #   docker build --platform linux/amd64 -t brainz-fleet .
@@ -116,7 +127,15 @@ ARG BUN_VERSION=1.3.14
 # cannot use. Observed live 2026-08-17 as `provisioning_unavailable` 503 on a
 # fresh signup while the canary tenant, whose credentials predated the store,
 # kept working perfectly.
-ARG FLEET_CONFIG_EPOCH=4
+#
+# 4 -> 5: the secret store moved off the per-container file and onto the control
+# plane (`BRAINZ_SECRET_BACKEND` defaults to `postgres`,
+# `BRAINZ_SECRET_ENCRYPTION_KEY` joins every manifest). Both are new variables,
+# so every warm instance is holding an `envVars` built without them: unbumped,
+# the deploy publishes a new Worker version and the running fleets keep resolving
+# tenants out of the snapshot they booted with — which is the bug this change
+# exists to end, still happening after the fix shipped.
+ARG FLEET_CONFIG_EPOCH=5
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
@@ -182,13 +201,28 @@ COPY --chmod=0755 <<'FLEET_BOOTSTRAP' /usr/local/bin/fleet-bootstrap
 # Materialise the secret store, then hand over. See the Dockerfile header.
 set -eu
 
-# A refusal, never a default. An empty store is not "no tenants yet" — it is a
-# fleet that answers `not_found` for every brain it holds, which reads as data
-# loss. The wording matches `src/fleet/env.ts:refuseToStart` so an operator sees
-# one phrase for every configuration refusal, whichever layer noticed.
+# What the blob is now: a bootstrap SEED, not the store.
+#
+# On the `file` backend it is still the whole store, and an absent one is not
+# "no tenants yet" — it is a fleet that answers `not_found` for every brain it
+# holds, which reads as data loss. So that case still refuses, in the wording
+# `src/fleet/env.ts:refuseToStart` uses, so an operator sees one phrase for every
+# configuration refusal whichever layer noticed.
+#
+# On the default `postgres` backend the store is the control-plane database and
+# the blob is optional: it is imported once, can never overwrite a durable entry
+# (`src/control/secret-pg.ts:importSecretSeed`), and a deployment that has
+# already migrated deletes the secret. Refusing here would make the migrated
+# state unreachable — the operator would have to keep a stale snapshot set
+# forever to satisfy a check about a store this image no longer uses.
 if [ -z "${BRAINZ_SECRETS_JSON:-}" ]; then
-  printf 'refusing to start: BRAINZ_SECRETS_JSON is required and was not set\n' >&2
-  exit 1
+  if [ "${BRAINZ_SECRET_BACKEND:-postgres}" = "file" ]; then
+    printf 'refusing to start: BRAINZ_SECRETS_JSON is required and was not set\n' >&2
+    exit 1
+  fi
+  # Nothing to materialise, and nothing to leave lying around. The fleet reads
+  # its store over the network.
+  exec "$@"
 fi
 
 # Ignored, and said out loud. Silently overriding it would leave an operator who

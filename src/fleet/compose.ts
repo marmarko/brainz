@@ -33,6 +33,12 @@ import {
   type RoutingProfileName,
 } from '../ai/routing.ts';
 import { createFileSecretStore } from '../control/secret-file.ts';
+import {
+  createPostgresSecretStore,
+  ensureSecretStoreSchema,
+  importSecretSeed,
+} from '../control/secret-pg.ts';
+import { importSealingKey } from '../control/sealed.ts';
 import { createTenantSecretStore } from '../control/secrets.ts';
 import type { PoolSecretStore, TenantSecretStore } from '../control/secrets.ts';
 import { FleetConfigError, optional, required, type Environment } from './env.ts';
@@ -60,20 +66,107 @@ export interface FleetSecrets {
   readonly providerKeys: ProviderKeyBackend;
 }
 
+/** The backends a deployment may choose between. Anything else is a refusal. */
+export const SECRET_BACKENDS = ['postgres', 'file'] as const;
+export type SecretBackendName = (typeof SECRET_BACKENDS)[number];
+
+export const DEFAULT_SECRET_BACKEND: SecretBackendName = 'postgres';
+
 /**
- * The secret store, over the file backend.
+ * The secret store, over whichever backend this deployment configured.
  *
- * `secrets.ts` ships only an in-memory backend and calls it unfit for
- * production, so a process composed without this would hold every tenant's
- * connection string in memory and lose them all on restart. See
- * `src/control/secret-file.ts` for what the file backend is and is not.
+ * **`postgres` is the default, and that is the whole point.** The file backend
+ * cannot serve a deployment whose processes do not share a volume: the web fleet
+ * banks a new tenant's connection string into its own container's temporary
+ * copy, the MCP fleet never sees it, and the credential dies with the instance
+ * — which is a real signup answering `invalid_grant` on `/token` and a paid Neon
+ * project holding a brain nobody can open. `src/control/secret-pg.ts` is the
+ * durable backend and this is where the deployed default points.
+ *
+ * **The file backend stays, and stays reachable.** A self-hoster with a real
+ * volume is exactly the deployment it fits, and KTD13's open-source promise
+ * depends on the non-Cloudflare path working. It is chosen by name
+ * (`BRAINZ_SECRET_BACKEND=file`), never fallen back into: a deployment that
+ * quietly downgraded to a per-container store because a variable was missing is
+ * the bug above, rediscovered by an operator in production.
+ *
+ * **Fail-closed in both directions.** An unknown backend name refuses; the
+ * `postgres` backend refuses without a sealing key; the `file` backend refuses
+ * without a path. Every refusal names the variable, because the operator reading
+ * it is looking at a container log with no other context.
  */
-export function openSecretStore(env: Environment): FleetSecrets {
-  const file = createFileSecretStore({ path: required(env, 'BRAINZ_SECRETS_FILE') });
+export async function openSecretStore(env: Environment, controlSql: SQL): Promise<FleetSecrets> {
+  const name = (optional(env, 'BRAINZ_SECRET_BACKEND') ?? DEFAULT_SECRET_BACKEND) as
+    | SecretBackendName
+    | string;
+
+  if (name === 'file') {
+    const file = createFileSecretStore({ path: required(env, 'BRAINZ_SECRETS_FILE') });
+    return {
+      store: createTenantSecretStore({ backend: file.secrets }),
+      providerKeys: file.providerKeys,
+    };
+  }
+
+  if (name !== 'postgres') {
+    throw new FleetConfigError(
+      'BRAINZ_SECRET_BACKEND',
+      `names no secret backend; known backends are ${SECRET_BACKENDS.join(', ')}`,
+    );
+  }
+
+  const key = await sealingKey(env);
+  // At start, not at the first resolve: the live control plane was created from
+  // `schema.sql` before this table existed, and a fleet that cannot create or
+  // reach its store must crash-loop visibly rather than answer one user's tool
+  // call with a 500.
+  await ensureSecretStoreSchema(controlSql);
+  const backend = createPostgresSecretStore({ sql: controlSql, key });
+
+  await importSeed(env, controlSql, key);
+
   return {
-    store: createTenantSecretStore({ backend: file.secrets }),
-    providerKeys: file.providerKeys,
+    store: createTenantSecretStore({ backend: backend.secrets }),
+    providerKeys: backend.providerKeys,
   };
+}
+
+async function sealingKey(env: Environment): Promise<CryptoKey> {
+  const configured = required(env, 'BRAINZ_SECRET_ENCRYPTION_KEY');
+  try {
+    return await importSealingKey(configured);
+  } catch (error) {
+    // Re-thrown as a config refusal so the log names the variable rather than a
+    // module. The detail never carries the value.
+    throw new FleetConfigError(
+      'BRAINZ_SECRET_ENCRYPTION_KEY',
+      error instanceof Error ? error.message.replace(/^the sealing key /, '') : String(error),
+    );
+  }
+}
+
+/**
+ * Import `BRAINZ_SECRETS_JSON`, if this deployment still carries one.
+ *
+ * The variable is no longer a store — it is a one-way bootstrap seed, imported
+ * once ever per blob and never able to overwrite an entry the durable store
+ * already holds (`secret-pg.ts:importSecretSeed`). It is read through the file
+ * the image's bootstrap materialises, because that bootstrap unsets the variable
+ * before handing over, and the seed is *optional*: a deployment that has already
+ * migrated deletes the secret and starts with nothing to import.
+ */
+async function importSeed(env: Environment, controlSql: SQL, key: CryptoKey): Promise<void> {
+  const path = optional(env, 'BRAINZ_SECRETS_FILE');
+  if (path === undefined) return;
+  const file = Bun.file(path);
+  if (!(await file.exists())) return;
+
+  await importSecretSeed({
+    sql: controlSql,
+    key,
+    text: await file.text(),
+    source: `the secret seed at ${path}`,
+  });
 }
 
 export interface GatewayDeps {

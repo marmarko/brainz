@@ -79,6 +79,7 @@ beforeAll(async () => {
     entry: 'src/worker/serve.ts',
     env: {
       BRAINZ_CONTROL_DATABASE_URL: control.dsn,
+      BRAINZ_SECRET_BACKEND: 'file',
       BRAINZ_SECRETS_FILE: secretsFile,
       BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
       // Fast enough that a case does not wait a minute for its tick.

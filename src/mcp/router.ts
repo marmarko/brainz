@@ -101,19 +101,34 @@ import { createEdgeLimiter, type EdgeLimiter } from './rate-limit.ts';
 /**
  * Read by both entrypoints, through `src/fleet/compose.ts`.
  *
- * `BRAINZ_SECRETS_JSON` is the odd one out and deliberately so: `compose.ts`
- * requires `BRAINZ_SECRETS_FILE` and `secret-file.ts` reads a *file*, but a
- * secrets file baked into an image is a credential in a build artefact and a
- * path supplied by configuration is a way to point a fleet at one. So the
- * content travels as a secret and the image's bootstrap materialises it, choosing
- * the path itself — see the Dockerfile. `BRAINZ_SECRETS_FILE` is therefore
- * absent from both manifests on purpose.
+ * **The secret store travels as a substrate, not as content.** It used to be
+ * `BRAINZ_SECRETS_JSON` alone: a snapshot of every tenant's connection string
+ * and bearer, materialised into each container's own temporary file at start.
+ * That is why a signup served by the web fleet was invisible to the MCP fleet —
+ * there is no shared volume, so the writer's copy was the only copy and it died
+ * with the instance. The store is now the control-plane database both fleets
+ * already hold, and what travels is the key that opens it
+ * (`BRAINZ_SECRET_ENCRYPTION_KEY`) plus the choice of backend.
+ *
+ * `BRAINZ_SECRETS_JSON` stays on the manifests as a **bootstrap seed** — the
+ * tenants that only ever existed inside it are imported once, by the first fleet
+ * that starts, and it can never overwrite a durable entry. Once
+ * `control.secret_seed` carries the blob's digest the secret can be deleted from
+ * the Worker and nothing changes. `BRAINZ_SECRETS_FILE` is still absent from
+ * every manifest on purpose: a path supplied by configuration is a way to point
+ * a fleet at a file baked into the image, so the image's bootstrap chooses it.
  */
 const SHARED_FLEET_VARIABLES: readonly string[] = [
   // compose.ts `openControlPlane` — and, in the worker, the second handle H4
-  // requires for lease renewal.
+  // requires for lease renewal. Also the durable secret store's substrate.
   'BRAINZ_CONTROL_DATABASE_URL',
-  // The secret store, as content rather than as a path.
+  // Which secret backend this deployment runs. Absent means `postgres`, which
+  // is the durable one; `file` is the self-hoster's, and must be asked for.
+  'BRAINZ_SECRET_BACKEND',
+  // What opens the sealed rows. Never written to the database it opens — that
+  // separation is the whole of what encryption at rest buys here.
+  'BRAINZ_SECRET_ENCRYPTION_KEY',
+  // The bootstrap seed, imported once. Not the store any more.
   'BRAINZ_SECRETS_JSON',
   // compose.ts `openFleetGateway`: which routing profile, and the account whose
   // Unified Billing the Cloudflare seats go through. Both fleets call models —
@@ -237,13 +252,17 @@ export const WEB_FLEET_VARIABLES: readonly string[] = [
   // Shared with the other two fleets, and only these two.
   //
   // `compose.ts:openControlPlane` — accounts, tiers, spend counters, the
-  // provisioner's own bookkeeping.
+  // provisioner's own bookkeeping, and the durable secret store's substrate.
   'BRAINZ_CONTROL_DATABASE_URL',
-  // The secret store, as content rather than as a path (the image's bootstrap
-  // materialises it; see the Dockerfile). The web process is this store's WRITER:
-  // provisioning banks a new tenant's connection string and bearer through it.
-  // See `docs/deploy.md` for what that means on a platform with no shared volume
-  // — it is the sharpest limit this deployment has.
+  // The web process is the secret store's WRITER: provisioning banks a new
+  // tenant's connection string and bearer through it. Which backend, and the
+  // key that seals what it writes. A web fleet on the `postgres` backend and an
+  // MCP fleet on `file` — or on a different key — is a signup the connector
+  // fleet cannot serve, which is why both variables travel to all three.
+  'BRAINZ_SECRET_BACKEND',
+  'BRAINZ_SECRET_ENCRYPTION_KEY',
+  // The bootstrap seed (see {@link SHARED_FLEET_VARIABLES}). Imported once,
+  // never authoritative, deletable once it has been.
   'BRAINZ_SECRETS_JSON',
 
   // `compose.ts:openIdentityStore` — accounts, password digests, sessions. The

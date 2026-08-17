@@ -288,9 +288,11 @@ crons = ["*/30 * * * *"]
 #   `docs/deploy.md` lists every name in order. The identity database and the
 #   billing credentials are on the last of those three and on no other, which is
 #   the whole reason the manifests are written out by name rather than forwarded
-#   wholesale. Note that per-tenant connection strings and bearer
-#   grants travel as ONE secret (`BRAINZ_SECRETS_JSON`, materialised into a file
-#   by the image's bootstrap), which is an alpha shape with a 5 KB ceiling on it
-#   — the Dockerfile header states the limits and `docs/deploy.md` states the
-#   arithmetic.
+#   wholesale. Per-tenant connection strings and bearer grants no longer
+#   travel at all: they live in the control-plane database, sealed under
+#   `BRAINZ_SECRET_ENCRYPTION_KEY` (`src/control/secret-pg.ts`), because a
+#   snapshot secret cannot be shared between three container fleets with no
+#   volume between them — the web fleet provisioned tenants the MCP fleet could
+#   not see. `BRAINZ_SECRETS_JSON` remains only as a one-time bootstrap seed and
+#   can be deleted once it has been imported.
 # ---------------------------------------------------------------------------

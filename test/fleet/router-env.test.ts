@@ -103,6 +103,14 @@ const WORKER_ENV = {
   WEB_FLEET: DO_BINDING,
 
   BRAINZ_CONTROL_DATABASE_URL: 'postgres://fake@127.0.0.1:1/control',
+  // The secret store's substrate choice and its key. Both must reach all three
+  // fleets: a web fleet writing sealed rows to the control plane while an MCP
+  // fleet reads a per-container file — or reads with a different key — is a
+  // signup the connector fleet cannot serve, which is the failure the durable
+  // store exists to end.
+  BRAINZ_SECRET_BACKEND: 'postgres',
+  BRAINZ_SECRET_ENCRYPTION_KEY: 'A'.repeat(43),
+  // No longer the store. A bootstrap seed, imported once, deletable afterwards.
   BRAINZ_SECRETS_JSON: '{"secrets":{},"providerKeys":{}}',
   BRAINZ_ROUTING_PROFILE: 'hosted',
   BRAINZ_CF_ACCOUNT_ID: '0'.repeat(32),
@@ -185,8 +193,11 @@ describe('each fleet receives the configuration its own process reads', () => {
       BRAINZ_CF_ACCOUNT_ID: WORKER_ENV.BRAINZ_CF_ACCOUNT_ID,
       BRAINZ_HOSTED_KEY_CLOUDFLARE: WORKER_ENV.BRAINZ_HOSTED_KEY_CLOUDFLARE,
       BRAINZ_HOSTED_KEY_OPENAI: WORKER_ENV.BRAINZ_HOSTED_KEY_OPENAI,
-      // The secret store, as content. The image's bootstrap turns it into the
-      // file `compose.ts` reads and chooses the path itself.
+      // The durable secret store: which backend, the key that opens it, and the
+      // blob that seeds it once. The image's bootstrap materialises the seed and
+      // chooses the path itself.
+      BRAINZ_SECRET_BACKEND: WORKER_ENV.BRAINZ_SECRET_BACKEND,
+      BRAINZ_SECRET_ENCRYPTION_KEY: WORKER_ENV.BRAINZ_SECRET_ENCRYPTION_KEY,
       BRAINZ_SECRETS_JSON: WORKER_ENV.BRAINZ_SECRETS_JSON,
       // serve.ts: the OAuth issuer and the registration allowlist.
       BRAINZ_PUBLIC_ORIGIN: WORKER_ENV.BRAINZ_PUBLIC_ORIGIN,
@@ -208,6 +219,8 @@ describe('each fleet receives the configuration its own process reads', () => {
       BRAINZ_CF_ACCOUNT_ID: WORKER_ENV.BRAINZ_CF_ACCOUNT_ID,
       BRAINZ_HOSTED_KEY_CLOUDFLARE: WORKER_ENV.BRAINZ_HOSTED_KEY_CLOUDFLARE,
       BRAINZ_HOSTED_KEY_OPENAI: WORKER_ENV.BRAINZ_HOSTED_KEY_OPENAI,
+      BRAINZ_SECRET_BACKEND: WORKER_ENV.BRAINZ_SECRET_BACKEND,
+      BRAINZ_SECRET_ENCRYPTION_KEY: WORKER_ENV.BRAINZ_SECRET_ENCRYPTION_KEY,
       BRAINZ_SECRETS_JSON: WORKER_ENV.BRAINZ_SECRETS_JSON,
       BRAINZ_WORKER_CONCURRENCY: WORKER_ENV.BRAINZ_WORKER_CONCURRENCY,
       BRAINZ_WORKER_TICK_MS: WORKER_ENV.BRAINZ_WORKER_TICK_MS,
@@ -224,6 +237,8 @@ describe('each fleet receives the configuration its own process reads', () => {
     expect(envVarsOf('WebFleet')).toEqual({
       // Shared with the other two, and the only two that are.
       BRAINZ_CONTROL_DATABASE_URL: WORKER_ENV.BRAINZ_CONTROL_DATABASE_URL,
+      BRAINZ_SECRET_BACKEND: WORKER_ENV.BRAINZ_SECRET_BACKEND,
+      BRAINZ_SECRET_ENCRYPTION_KEY: WORKER_ENV.BRAINZ_SECRET_ENCRYPTION_KEY,
       BRAINZ_SECRETS_JSON: WORKER_ENV.BRAINZ_SECRETS_JSON,
       // Its own.
       BRAINZ_IDENTITY_DATABASE_URL: WORKER_ENV.BRAINZ_IDENTITY_DATABASE_URL,

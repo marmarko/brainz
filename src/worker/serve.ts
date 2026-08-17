@@ -60,7 +60,7 @@ export async function startWorkerFleet(env: Environment): Promise<WorkerFleetPro
   const controlSql = openControlPlane(env);
   // The dedicated lease channel (H4). Its own handle, never the work one.
   const leaseSql = new SQL(env['BRAINZ_CONTROL_DATABASE_URL'] as string, { max: 2 });
-  const secrets = openSecretStore(env);
+  const secrets = await openSecretStore(env, controlSql);
   const gateway = openFleetGateway(env, { controlSql, keys: secrets.providerKeys });
 
   const queue = createJobQueue({ sql: controlSql });

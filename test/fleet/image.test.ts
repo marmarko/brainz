@@ -257,8 +257,8 @@ describe('the fleet image names entrypoints that listen', () => {
 describe('the image starts a fleet with a secret store it did not ship', () => {
   const STORE = '{"secrets":{},"providerKeys":{}}';
 
-  test('an unconfigured store is a refusal, in the same words the process uses', async () => {
-    const outcome = await runBootstrap({});
+  test('an unconfigured store is a refusal on the backend that needs one', async () => {
+    const outcome = await runBootstrap({ BRAINZ_SECRET_BACKEND: 'file' });
     expect(outcome.exitCode).not.toBe(0);
     // `refusing to start:` is `env.ts`'s phrasing. One phrase for every
     // configuration refusal, whichever layer noticed, because the operator
@@ -267,6 +267,27 @@ describe('the image starts a fleet with a secret store it did not ship', () => {
     expect(outcome.stderr).toContain('BRAINZ_SECRETS_JSON');
     // It refused instead of starting the fleet with an empty store.
     expect(outcome.stdout).toBe('');
+  });
+
+  /**
+   * The other side of the same rule, and the reason the refusal above had to
+   * become conditional.
+   *
+   * On the default backend the store is the control-plane database, and
+   * `BRAINZ_SECRETS_JSON` is only a bootstrap seed
+   * (`src/control/secret-pg.ts:importSecretSeed`). A deployment that has
+   * migrated deletes the secret — so refusing without one would make the
+   * migrated state unreachable, and force an operator to keep a stale snapshot
+   * of every tenant's credentials set forever to satisfy a check about a store
+   * this image no longer reads.
+   */
+  test('no seed is a normal start on the durable backend, and materialises nothing', async () => {
+    const outcome = await runBootstrap({});
+    expect(outcome.exitCode).toBe(0);
+    // Handed over to the fleet without inventing a path, and without leaving a
+    // file behind for anything to read.
+    expect(envLine(outcome.stdout, 'BRAINZ_SECRETS_FILE')).toBeUndefined();
+    expect(outcome.stderr).not.toContain('refusing to start');
   });
 
   test('a store that is not a JSON object is refused before the fleet starts', async () => {

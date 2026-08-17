@@ -92,6 +92,7 @@ function mcpEnv(): Record<string, string> {
   return {
     BRAINZ_PUBLIC_ORIGIN: `https://${ISSUER_HOST}`,
     BRAINZ_CONTROL_DATABASE_URL: control.dsn,
+    BRAINZ_SECRET_BACKEND: 'file',
     BRAINZ_SECRETS_FILE: secretsFile,
       BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
   };
@@ -157,6 +158,7 @@ describe('the worker fleet entrypoint serves', () => {
     async () => {
       const service = await start('src/worker/serve.ts', {
         BRAINZ_CONTROL_DATABASE_URL: control.dsn,
+        BRAINZ_SECRET_BACKEND: 'file',
         BRAINZ_SECRETS_FILE: secretsFile,
       BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
         // Long enough that no tick fires during the assertion below: this test
@@ -182,6 +184,7 @@ describe('the web entrypoint serves', () => {
         BRAINZ_WEB_ORIGIN: 'https://app.brainz.test',
         BRAINZ_IDENTITY_DATABASE_URL: identity.dsn,
         BRAINZ_CONTROL_DATABASE_URL: control.dsn,
+        BRAINZ_SECRET_BACKEND: 'file',
         BRAINZ_SECRETS_FILE: secretsFile,
       BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
         BRAINZ_MCP_URL: `https://${ISSUER_HOST}/mcp`,
