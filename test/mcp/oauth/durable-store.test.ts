@@ -306,18 +306,36 @@ describe('a code cannot be redeemed twice, under concurrency', () => {
     // one consent both walk through — two access tokens from one authorization.
     // Each take runs on its own connection, so the two really are concurrent
     // rather than serialised by a pool of one.
+    //
+    // **Both stores are built, and both connections are warmed, BEFORE either
+    // take is issued — and that is the whole difference between this case and a
+    // decorative one.** Written the obvious way, as
+    // `Promise.all([(await durableStore(a)).takeCode(…), (await durableStore(b)).takeCode(…)])`,
+    // the array's second element does not begin evaluating until its first has
+    // suspended, so the `await importSealingKey(…)` inside `durableStore(b)` —
+    // and, the first time a handle is used, the whole TCP+startup handshake —
+    // runs while connection `a`'s statement is already on the wire. The two
+    // takes are then sequential in every run, and a SELECT-then-DELETE
+    // implementation (sequentially correct, racy under load) passes. Measured:
+    // that shape survived this case and was caught only by the stampede below.
+    // Hoisting the construction out makes the two dispatches one synchronous
+    // tick, and the same mutation dies here.
     const a = new SQL(control.dsn, { max: 1 });
     const b = new SQL(control.dsn, { max: 1 });
     try {
       const record = codeRecord();
-      await (await durableStore(a)).putCode('code-contended', record);
+      const [first, second] = [await durableStore(a), await durableStore(b)];
+      await first.putCode('code-contended', record);
+      // Warm both connections: an unopened handle pays for its handshake inside
+      // the first statement, which would serialise the race by accident.
+      await Promise.all([a`SELECT 1`, b`SELECT 1`]);
 
-      const [first, second] = await Promise.all([
-        (await durableStore(a)).takeCode('code-contended'),
-        (await durableStore(b)).takeCode('code-contended'),
+      const taken = await Promise.all([
+        first.takeCode('code-contended'),
+        second.takeCode('code-contended'),
       ]);
 
-      const winners = [first, second].filter((taken) => taken !== undefined);
+      const winners = taken.filter((entry) => entry !== undefined);
       expect(winners).toHaveLength(1);
       expect(winners[0]?.grantId).toBe(record.grantId);
     } finally {

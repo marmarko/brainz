@@ -204,7 +204,8 @@ the code rather than this file: `providersReachable()` is pinned by
 | Secret | MCP | Worker | Web | Required? | What reads it |
 |---|:--:|:--:|:--:|---|---|
 | `BRAINZ_CONTROL_DATABASE_URL` | ✓ | ✓ | ✓ | yes | `compose.ts:openControlPlane`; the worker opens a second handle for lease renewal (hazard H4). |
-| `BRAINZ_SECRET_ENCRYPTION_KEY` | ✓ | ✓ | ✓ | yes on the default backend | AES-256-GCM, 32 bytes, base64. Opens `control.tenant_secret` (`src/control/secret-pg.ts`). The same value on all three fleets, or the fleet with the odd one out refuses every tenant. Never stored in the database it opens. |
+| `BRAINZ_SECRET_ENCRYPTION_KEY` | ✓ | ✓ | ✓ | yes on the default backend; **on MCP, yes on every backend** | AES-256-GCM, 32 bytes, base64. Opens `control.tenant_secret` (`src/control/secret-pg.ts`) and the sealed rows of the durable authorization store (`src/control/oauth-pg.ts`). The same value on all three fleets, or the fleet with the odd one out refuses every tenant. Never stored in the database it opens. The MCP fleet needs it even on `BRAINZ_SECRET_BACKEND=file`, because the two choices are independent — see [Known limits](#known-limits). |
+| `BRAINZ_AUTHORIZATION_BACKEND` | ✓ | — | — | no (`postgres`) | `postgres` — the durable OAuth store, and the default — or `memory` for a single-instance self-hoster. **Absent from `MCP_FLEET_VARIABLES` on purpose**, so it does not reach a Cloudflare container at all: the hosted fleet cannot be configured back into a per-container store. An unknown value refuses at start. |
 | `BRAINZ_SECRET_BACKEND` | ✓ | ✓ | ✓ | no (`postgres`) | `postgres` — the durable store, and the default — or `file` for a self-hoster with a real volume. An unknown value refuses at start; a missing key on `postgres` refuses at start. There is no fallback. |
 | `BRAINZ_SECRETS_JSON` | ✓ | ✓ | ✓ | **no** — migration only | A one-time bootstrap seed. Imported once per blob, never overwrites a durable entry, deletable once `control.secret_seed` has its digest. See [Known limits](#known-limits). |
 | `BRAINZ_CF_ACCOUNT_ID` | ✓ | ✓ | — | on the `hosted` profile | `compose.ts:selectFleetTransport` — the Cloudflare seats bill through `…/accounts/{id}/ai`. Not needed by `self-host`. |
@@ -663,9 +664,34 @@ Two consequences worth knowing:
 never fallen back into — a missing variable refuses at start rather than quietly
 downgrading to a per-container store.
 
-**Two ports are in-memory inside the MCP fleet** (`src/mcp/serve.ts` says so in
-its own header): the OAuth authorization store and the access log. With more
-than one MCP instance, a code minted on one cannot be redeemed on another. Under
-tenant affinity a single tenant's flow stays on one instance, and the OAuth flow
-is pinned to a single named instance for the same reason — but a restart mid-flow
-still loses it.
+**The OAuth authorization store used to be in-memory, and that is fixed.** Kept
+here because it is the shape of the failure and an operator upgrading needs to
+recognise it: `serve.ts` composed `createInMemoryAuthorizationStore()`, so the
+registered clients, the authorization codes, the refresh tokens and the
+revocation set were `Map`s and a `Set` inside one container. `sleepAfter` is 15
+minutes and the whole flow is pinned to one Durable Object, so all of it was lost
+every time that instance slept or was replaced. A connector was forgotten between
+sessions, an idle one broke after fifteen minutes, and **a grant the user revoked
+came back to life** — a security property failing open. Deleting a container
+application, which this file recommends, wiped it instantly.
+
+It is now `control.oauth_client`, `oauth_code`, `oauth_refresh`,
+`oauth_revocation` and `oauth_registration` in the control plane
+(`src/control/oauth-store.sql`, applied by `ensureAuthorizationStoreSchema` under
+its own advisory lock by whichever fleet starts first). Two consequences for a
+deployment:
+
+* **`BRAINZ_SECRET_ENCRYPTION_KEY` is now required on the MCP fleet even on the
+  `file` secret backend.** The two are independent choices: a file-backed
+  deployment still has a control plane, so it can hold its OAuth state durably,
+  and it needs the same key to seal the client and record bodies. A missing key
+  refuses at start rather than downgrading to a `Map`.
+  `BRAINZ_AUTHORIZATION_BACKEND=memory` is the opt-out and has to be spoken —
+  it is deliberately absent from `MCP_FLEET_VARIABLES`, so the Cloudflare
+  deployment cannot be configured back into a per-container store by anybody.
+* **The role in `BRAINZ_CONTROL_DATABASE_URL` creates five more tables and five
+  more domains**, once, alongside `src/control/secret-store.sql`.
+
+**One port is still in-memory inside the MCP fleet** (`src/mcp/serve.ts` says so
+in its own header): the access log. It does not survive a restart, and its
+retention policy has a legal half that is not settled.

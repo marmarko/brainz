@@ -147,7 +147,14 @@ ARG BUN_VERSION=1.3.14
 # worker fleet gained the ingest_pull and import handlers. Both are invisible to
 # a warm instance -- the first is a manifest change (nothing to re-put, so
 # `wrangler secret list` looks identical), the second is code inside the image.
-ARG FLEET_CONFIG_EPOCH=7
+# 7 -> 8: the OAuth authorization store moved out of one container's memory and
+# into the control plane (`src/control/oauth-store.sql`). Pure code, so nothing
+# to re-put and nothing a warm instance would ever notice -- and a warm instance
+# is exactly what must not survive this one: an instance still running epoch 7
+# keeps serving clients, codes, refresh tokens and revocations out of its own
+# `Map`, which is the defect. Deploy this with the deterministic reload
+# (`containers delete` then `deploy`), not by waiting.
+ARG FLEET_CONFIG_EPOCH=8
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
