@@ -110,6 +110,12 @@ const WORKER_ENV = {
   // store exists to end.
   BRAINZ_SECRET_BACKEND: 'postgres',
   BRAINZ_SECRET_ENCRYPTION_KEY: 'A'.repeat(43),
+  // Set in the fixture on purpose, and set to the value that would do damage.
+  // It must reach NO container — see the test below. A variable that is merely
+  // absent from the fixture would prove nothing, because `selectContainerEnv`
+  // copies only what the deployment actually set: a manifest could gain this
+  // name and every assertion here would stay green.
+  BRAINZ_AUTHORIZATION_BACKEND: 'memory',
   // No longer the store. A bootstrap seed, imported once, deletable afterwards.
   BRAINZ_SECRETS_JSON: '{"secrets":{},"providerKeys":{}}',
   BRAINZ_ROUTING_PROFILE: 'hosted',
@@ -485,6 +491,39 @@ describe('a container receives no binding and nothing it does not read', () => {
       // minter in `src/` refuses. When one lands the variable joins a manifest
       // and this line changes with it.
       expect(vars['R2_SECRET_ACCESS_KEY']).toBeUndefined();
+    }
+  });
+
+  /**
+   * **The one variable whose whole value is being unreachable.**
+   *
+   * `BRAINZ_AUTHORIZATION_BACKEND=memory` puts the OAuth flow's clients, codes,
+   * refresh tokens and revocations back into one container's memory — which is
+   * the incident `src/control/oauth-pg.ts` exists to end: a forgotten client, a
+   * refresh token that dies after fifteen idle minutes, and a revocation that
+   * comes back to life when the container does. It stays reachable for a
+   * single-instance self-hoster running this image, and it must not be settable
+   * on a fleet whose containers are replaced — which is every Cloudflare one.
+   *
+   * `authorization-store.ts` says so in prose ("deliberately absent from
+   * `MCP_FLEET_VARIABLES`, so the hosted fleet cannot be configured back into a
+   * per-container store, by anybody, including us"). This is the line that makes
+   * the sentence true. Without it, adding the name to a manifest is a one-word
+   * diff that nothing in this repository notices: the exact-equality assertions
+   * above compare against what the fixture sets, and a manifest entry for a
+   * variable the deployment has not set copies nothing.
+   */
+  test('the escape hatch back to a per-container OAuth store reaches no container', () => {
+    expect(WORKER_ENV.BRAINZ_AUTHORIZATION_BACKEND).toBe('memory');
+    for (const fleet of FLEETS) {
+      expect(envVarsOf(fleet)['BRAINZ_AUTHORIZATION_BACKEND']).toBeUndefined();
+    }
+    for (const manifest of [
+      router.MCP_FLEET_VARIABLES,
+      router.WORKER_FLEET_VARIABLES,
+      router.WEB_FLEET_VARIABLES,
+    ]) {
+      expect(manifest).not.toContain('BRAINZ_AUTHORIZATION_BACKEND');
     }
   });
 
