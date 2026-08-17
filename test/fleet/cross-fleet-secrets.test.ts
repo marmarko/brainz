@@ -242,21 +242,21 @@ describe('the durable backend is shared by both fleets', () => {
   test(
     'a tenant the web fleet provisions is resolvable by an MCP fleet that holds no secrets file',
     async () => {
+      // **`BRAINZ_SECRET_BACKEND` is deliberately not set here.** The durable
+      // store has to be what a deployment gets by *default*, not what a careful
+      // operator opts into — a default of `file` would put the failure above
+      // back into production for anyone who did not read the release note. So
+      // these two processes are configured exactly as the deployment is, and
+      // the default is under test along with everything else.
       const web = await start(
         'src/web/serve.ts',
-        webEnv({
-          BRAINZ_SECRET_BACKEND: 'postgres',
-          BRAINZ_SECRET_ENCRYPTION_KEY: FAKE_SEALING_KEY,
-        }),
+        webEnv({ BRAINZ_SECRET_ENCRYPTION_KEY: FAKE_SEALING_KEY }),
       );
       // No `BRAINZ_SECRETS_FILE` at all, and no `BRAINZ_SECRETS_JSON` behind
       // it. This process has never been told about any tenant.
       const mcp = await start(
         'src/mcp/serve.ts',
-        mcpEnv({
-          BRAINZ_SECRET_BACKEND: 'postgres',
-          BRAINZ_SECRET_ENCRYPTION_KEY: FAKE_SEALING_KEY,
-        }),
+        mcpEnv({ BRAINZ_SECRET_ENCRYPTION_KEY: FAKE_SEALING_KEY }),
       );
 
       const { tenantId } = await signUp(web, 'durable@example.com');

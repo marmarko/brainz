@@ -44,7 +44,12 @@ import {
   tenantNamespace,
 } from '../../src/control/secrets.ts';
 import { providerKeyNamespace } from '../../src/ai/keys.ts';
-import { createControlPlane, dropControlPlane, type ControlFixture } from '../worker/fixture.ts';
+import {
+  ADMIN_DSN,
+  createControlPlane,
+  dropControlPlane,
+  type ControlFixture,
+} from '../worker/fixture.ts';
 
 const SETUP_TIMEOUT_MS = 120_000;
 
@@ -343,6 +348,21 @@ describe('the schema is created once, by whoever starts first', () => {
       await dropControlPlane(fresh);
     }
   }, SETUP_TIMEOUT_MS);
+
+  test('a database it cannot create the store in is a refusal, not a start', async () => {
+    // The loser of the create race is answered by asking whether the store is
+    // there now, which is a narrow question with a real risk attached: an
+    // implementation that swallowed the error instead would start a fleet whose
+    // every resolve fails, on a control plane nobody noticed was wrong. Here the
+    // DDL cannot apply at all — no `control` schema — and the refusal has to
+    // survive.
+    const sql = new SQL(ADMIN_DSN, { max: 1 });
+    try {
+      expect(ensureSecretStoreSchema(sql)).rejects.toThrow();
+    } finally {
+      await sql.close();
+    }
+  });
 });
 
 describe('BRAINZ_SECRETS_JSON is a seed, and only a seed', () => {
