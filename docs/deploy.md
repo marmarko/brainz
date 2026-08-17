@@ -261,7 +261,7 @@ while seven instances kept serving the environment they booted with.
 
 ## 5. Verify that it serves
 
-"Deployed successfully" is a statement about an upload. These four checks are
+"Deployed successfully" is a statement about an upload. These five checks are
 statements about the fleet.
 
 ```bash
@@ -312,7 +312,7 @@ A `result` with no `isError` is the deploy working end to end. `unauthorized`
 means the bearer is not in `BRAINZ_SECRETS_JSON`; `instance_unavailable` (502)
 means the container refused to start — read its log for the variable it named.
 
-**5 — the web app, which is the check the whole third fleet exists for.** It
+**4 — the web app, which is the check the whole third fleet exists for.** It
 answers no bearer and no discovery document; it answers HTML to a browser. A
 `404` here means the path table did not classify it, a `502` means the container
 refused to start (read its log for the variable it named), and a `401` means the
@@ -323,7 +323,7 @@ curl -si "$ORIGIN/signup" | head -1        # HTTP/2 200
 curl -s  "$ORIGIN/signup" | grep -o '<form' | head -1
 ```
 
-**4 — the worker fleet, which no request will ever prove for you.** The MCP
+**5 — the worker fleet, which no request will ever prove for you.** The MCP
 fleet can be perfectly healthy while no consolidation cycle ever runs; that is
 precisely why the cron exists. Wait for the next half hour, or fire it by hand,
 then read the log:
