@@ -99,6 +99,17 @@ beforeAll(async () => {
       BRAINZ_MCP_URL: 'https://mcp.brainz.test/mcp',
       BRAINZ_STRIPE_WEBHOOK_SECRET: 'whsec_this_test_invented_it',
       BRAINZ_POOL_TARGET: '1',
+      // A connector vendor is configured — obvious fakes, and nothing below
+      // dials it — so that the free-tier case observes the **tier** gate rather
+      // than the vendor-absent refusal that now precedes it. A deployment with
+      // no vendor answers `501 unavailable` first, deliberately: no amount of
+      // paying makes a connector work there. That ordering has its own cases in
+      // `test/fleet/connectors.test.ts`.
+      BRAINZ_PIPEDREAM_PROJECT_ID: 'proj_this_test_invented_it',
+      BRAINZ_PIPEDREAM_CLIENT_ID: 'not-a-real-pipedream-client-id',
+      BRAINZ_PIPEDREAM_CLIENT_SECRET: 'not-a-real-pipedream-client-secret',
+      BRAINZ_PIPEDREAM_ENVIRONMENT: 'development',
+      BRAINZ_PIPEDREAM_API_BASE: 'http://127.0.0.1:1/v1',
     },
   });
 }, SETUP_TIMEOUT_MS);

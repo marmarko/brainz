@@ -145,6 +145,13 @@ const WORKER_ENV = {
   BRAINZ_POOL_TARGET: '0',
   BRAINZ_TENANT_ID_PREFIX: 'canary',
   BRAINZ_ADMIN_CREDENTIAL: 'not-a-real-admin-credential',
+  // The connector vendor's four, plus the base a test points at a double.
+  // Obvious fakes: this repository is public and gitleaks runs on every push.
+  BRAINZ_PIPEDREAM_PROJECT_ID: 'proj_this_test_invented_it',
+  BRAINZ_PIPEDREAM_CLIENT_ID: 'not-a-real-pipedream-client-id',
+  BRAINZ_PIPEDREAM_CLIENT_SECRET: 'not-a-real-pipedream-client-secret',
+  BRAINZ_PIPEDREAM_ENVIRONMENT: 'development',
+  BRAINZ_PIPEDREAM_API_BASE: 'https://pipedream.brainz.test/v1',
 
   // Read by no fleet process at all. Present here because a forward of the whole
   // `env` would carry them, and that has to fail.
@@ -257,7 +264,51 @@ describe('each fleet receives the configuration its own process reads', () => {
       BRAINZ_POOL_TARGET: WORKER_ENV.BRAINZ_POOL_TARGET,
       BRAINZ_TENANT_ID_PREFIX: WORKER_ENV.BRAINZ_TENANT_ID_PREFIX,
       BRAINZ_ADMIN_CREDENTIAL: WORKER_ENV.BRAINZ_ADMIN_CREDENTIAL,
+      BRAINZ_PIPEDREAM_PROJECT_ID: WORKER_ENV.BRAINZ_PIPEDREAM_PROJECT_ID,
+      BRAINZ_PIPEDREAM_CLIENT_ID: WORKER_ENV.BRAINZ_PIPEDREAM_CLIENT_ID,
+      BRAINZ_PIPEDREAM_CLIENT_SECRET: WORKER_ENV.BRAINZ_PIPEDREAM_CLIENT_SECRET,
+      BRAINZ_PIPEDREAM_ENVIRONMENT: WORKER_ENV.BRAINZ_PIPEDREAM_ENVIRONMENT,
+      BRAINZ_PIPEDREAM_API_BASE: WORKER_ENV.BRAINZ_PIPEDREAM_API_BASE,
     });
+  });
+
+  /**
+   * **The connector credential reaches the fleet that mints a connect link, and
+   * neither of the other two — including the one that would poll.**
+   *
+   * The worker absence is the deliberate half and the one a future edit is most
+   * likely to undo, because "the worker polls connectors, so it needs the
+   * connector credential" is a true-sounding sentence. It cannot poll: the
+   * cursor a pull resumes from lives in the tenant's object prefix
+   * (`src/ingest/cursor.ts`), reaching one needs a `ScopedCredentialMinter`, and
+   * `src/` has no production implementation of that port — `web/serve.ts` wires
+   * a *refusing* minter and says so. So the worker's `ingest_pull` handler is
+   * registered and its `openSource` seam is absent, and until that changes this
+   * credential in that container would be authority it cannot exercise sitting
+   * in a process that parses attacker-supplied content.
+   *
+   * When the pull can run, the four variables join `WORKER_FLEET_VARIABLES` and
+   * this test changes with them. That is the point of asserting it rather than
+   * leaving it to the `toEqual` above: the change becomes a decision.
+   */
+  test('the connector credential reaches the web fleet alone, including not the worker', () => {
+    const web = envVarsOf('WebFleet');
+    for (const name of [
+      'BRAINZ_PIPEDREAM_PROJECT_ID',
+      'BRAINZ_PIPEDREAM_CLIENT_ID',
+      'BRAINZ_PIPEDREAM_CLIENT_SECRET',
+      'BRAINZ_PIPEDREAM_ENVIRONMENT',
+      'BRAINZ_PIPEDREAM_API_BASE',
+    ] as const) {
+      expect({ name, value: web[name] }).toEqual({ name, value: WORKER_ENV[name] });
+      for (const fleet of ['McpFleet', 'WorkerFleet'] as const) {
+        expect({ fleet, name, value: envVarsOf(fleet)[name] }).toEqual({
+          fleet,
+          name,
+          value: undefined,
+        });
+      }
+    }
   });
 
   /**

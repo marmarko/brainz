@@ -218,6 +218,15 @@ export interface PipedreamClient extends ProviderApi {
     readonly externalUserId: string;
     readonly now: Date;
     readonly ttlSeconds?: number;
+    /**
+     * Which app the connect page should offer, when the caller knows.
+     *
+     * The token is not app-scoped — it authorises *this external user* to attach
+     * *something* — so this only decides what the vendor's page opens on. A
+     * caller that omits it hands the user a page where they choose, which is a
+     * worse product and not a wrong one.
+     */
+    readonly app?: ProviderApp;
   }): Promise<ClientOutcome<ConnectToken>>;
   deleteExternalUser(request: {
     readonly externalUserId: string;
@@ -383,6 +392,39 @@ export function assertExternalUserId(externalUserId: string): void {
   if (!EXTERNAL_USER_ID_PATTERN.test(externalUserId)) throw new ExternalUserIdError(externalUserId);
 }
 
+/**
+ * The vendor's external user for one tenant's one source — **per source, and
+ * that is a revocation decision rather than a naming convention.**
+ *
+ * The only revocation this vendor offers is
+ * {@link PipedreamClient.deleteExternalUser}: there is no per-account delete, so
+ * whatever an external user id spans is what a disconnect destroys. Bind it to
+ * the tenant alone and `ConnectorVendor.disconnect({source: 'gmail'})` silently
+ * revokes that tenant's calendar and drive at the vendor too — a per-source port
+ * whose implementation is per-tenant, which is the shape where a user unhooks
+ * their mailbox and loses their meetings a fortnight later with nothing in the
+ * product having said so. Per source, `deleteExternalUser` means exactly
+ * "disconnect this source" and the port's contract is the vendor call's.
+ *
+ * The accepted cost, stated: three connected sources are three external users at
+ * the vendor for one person, so a vendor-side per-user fee is paid per source
+ * rather than per tenant. That is the same arithmetic `connectorGate` is built on
+ * (a fee per connected account, whether used or not) rather than a new one.
+ *
+ * **The result is a URL path segment**, so it is checked against the same
+ * anchored alphabet every other one is, and a tenant id long enough to overflow
+ * it is a refusal here rather than a malformed request at the vendor. In
+ * practice `newTenantId` yields 26 characters and the longest source suffix is
+ * six; the bound only bites a deployment that set an extravagant
+ * `BRAINZ_TENANT_ID_PREFIX`, which is a configuration mistake worth naming at
+ * the moment it is made.
+ */
+export function externalUserIdFor(tenantId: string, source: ConnectorSource): string {
+  const id = `${tenantId}-${source}`;
+  assertExternalUserId(id);
+  return id;
+}
+
 /** How early a cached access token is treated as expired. */
 const TOKEN_SAFETY_MARGIN_MS = 60_000;
 
@@ -460,6 +502,30 @@ function queryString(query: ProviderRequest['query']): string {
 function providerUrl(config: PipedreamConfig, request: ProviderRequest): string {
   const base = config.baseUrl ?? DEFAULT_BASE_URL;
   return `${base}/connect/${config.projectId}/proxy/${request.app}${request.path}${queryString(request.query)}`;
+}
+
+/**
+ * Vendor detail #4 — see the header, which names the first three.
+ *
+ * The connect page takes the app it should open on as a query parameter. It is
+ * appended here, to whatever URL the mint answered, rather than being built into
+ * a URL of our own: the vendor supplies `connect_link_url` and may change its
+ * shape, and a caller that re-derived the whole link would be pinning the part
+ * the vendor owns in order to add the part we own.
+ *
+ * A URL the vendor answered that we cannot parse is returned untouched. An
+ * unparseable link with no `app` still works — the user picks — and a link this
+ * function mangled does not.
+ */
+export function connectLinkFor(url: string, app: ProviderApp | undefined): string {
+  if (app === undefined) return url;
+  try {
+    const parsed = new URL(url);
+    parsed.searchParams.set('app', app);
+    return parsed.toString();
+  } catch {
+    return url;
+  }
 }
 
 /** Vendor detail #2 — see the header. The scope of the call, in headers. */
@@ -617,10 +683,12 @@ export function createPipedreamClient(options: {
         value: {
           token,
           expiresAt,
-          connectLinkUrl:
+          connectLinkUrl: connectLinkFor(
             typeof link === 'string' && link.length > 0
               ? link
               : `https://pipedream.com/_static/connect.html?token=${encodeURIComponent(token)}`,
+            request.app,
+          ),
         },
       };
     },

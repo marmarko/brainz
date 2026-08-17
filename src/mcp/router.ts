@@ -301,6 +301,31 @@ export const WEB_FLEET_VARIABLES: readonly string[] = [
   'BRAINZ_POOL_TARGET',
   'BRAINZ_TENANT_ID_PREFIX',
 
+  // The connector vendor's project and OAuth client. All four or none, refused
+  // at start if partial (`web/serve.ts:connectorVendor`); none at all is a
+  // legitimate deployment whose connector routes answer `501 unavailable`.
+  //
+  // **They travel to this fleet and to no other, and the reason is the same one
+  // the Stripe key gets.** The MCP fleet parses attacker-supplied content, and
+  // this credential mints capabilities that attach a stranger's mailbox to a
+  // brain — the widest blast radius of anything on these manifests after the
+  // identity store. The *worker* fleet is the interesting absence: it is the
+  // fleet that would poll a connected account, and it is denied the credential
+  // deliberately, because the cursor a poll needs lives in a tenant's object
+  // prefix and `src/` has no production `ScopedCredentialMinter` to reach one
+  // with. A credential a process cannot use is a credential a compromise can
+  // leak, so it joins that manifest on the day the pull can run, and
+  // `test/fleet/router-env.test.ts` asserts the absence in both directions
+  // until then.
+  'BRAINZ_PIPEDREAM_PROJECT_ID',
+  'BRAINZ_PIPEDREAM_CLIENT_ID',
+  'BRAINZ_PIPEDREAM_CLIENT_SECRET',
+  'BRAINZ_PIPEDREAM_ENVIRONMENT',
+  // Consumed, never published, and carrying a version path — an API base rather
+  // than an origin, exactly like Stripe's and Neon's. Optional: absent takes the
+  // vendor's own, and setting it is how a test points the process at a double.
+  'BRAINZ_PIPEDREAM_API_BASE',
+
   // The operator surface's credential. Unset means `/admin` answers 404 — an
   // admin surface whose credential is unset is one open to everybody, and the
   // fail-closed direction is to not exist.

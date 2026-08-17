@@ -62,6 +62,8 @@ import {
 } from '../control/provisioner.ts';
 import { controlPlaneIdentity, fleetIdentity, isValidTenantId } from '../control/secrets.ts';
 import { createTenantStorage } from '../control/storage.ts';
+import { createPipedreamClient, fetchTransport } from '../ingest/pipedream/client.ts';
+import { createPipedreamConnectorVendor } from './connectors.ts';
 import {
   openControlPlane,
   openIdentityStore,
@@ -111,7 +113,7 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
     mcpUrl: required(env, 'BRAINZ_MCP_URL'),
     stripeWebhookSecret: required(env, 'BRAINZ_STRIPE_WEBHOOK_SECRET'),
     byok: writeOnlyProviderKeys(secrets),
-    connectors: connectorVendor(),
+    ...connectorVendor(env),
     severance: severancePort(withTenant),
     subjectErasure: subjectErasurePort(withTenant),
     provisioner: reportedProvisioner(
@@ -629,18 +631,92 @@ function checkoutPort(env: Environment): { readonly checkout?: CheckoutPort } {
 }
 
 /**
- * The connector vendor, when one is configured — and an honest refusal when not.
+ * The connector vendor, when one is configured.
  *
- * Connectors are paid-only (U15 §5) and the free-tier gate refuses before this
- * is ever reached, so a deployment with no vendor credential is a real and
- * common state. What it must not be is a silent success: a `claimUrl` this
- * process invented is a link that attaches nothing and reports that it did.
+ * **The defect this closes.** This function used to return a `ConnectorVendor`
+ * whose two methods threw a bare `Error`, so `/api/connectors` on a paid tenant
+ * reached the entrypoint's boundary and answered a generic 500 —
+ * indistinguishable from a database outage, on a route the user had paid to
+ * reach. `createPipedreamClient` was complete, tested, and had no constructor
+ * anywhere under `src/`.
+ *
+ * **The ruling on absence, which is the decision this function is.** Two states,
+ * and they are refused in two different places on purpose:
+ *
+ *   * **No configuration at all** is a legitimate deployment. Chat exports and
+ *     folder imports (R8a) need no vendor and a self-hoster may never connect
+ *     one, so this answers `{}` and `app.ts` disables the two connector routes
+ *     with a typed `501 unavailable`. A startup refusal here would make every
+ *     brainz deployment require a Pipedream account to serve a signup page,
+ *     which is a worse product and a worse open-source promise.
+ *   * **Partial configuration is a startup refusal**, naming the missing
+ *     variable — the rule {@link checkoutPort} already applies to Stripe's trio,
+ *     for the reason it gives: a half-configured vendor reaches the network with
+ *     an empty credential and reports the refusal as a vendor outage. An
+ *     operator who has set three of four variables meant to have connectors, and
+ *     a `501 unavailable` would tell them they had not.
+ *
+ * **The API base is configuration rather than a literal**, the same reason
+ * Stripe's and Neon's are: a test has to be able to point the process at a local
+ * double, and a process that can only be observed against the live vendor is one
+ * nobody exercises. It is an {@link apiBase} rather than an {@link origin}
+ * because the vendor's carries a version path.
  */
-function connectorVendor(): ConnectorVendor {
-  const unconfigured = (): never => {
-    throw new Error('no connector vendor is configured on this deployment');
+function connectorVendor(env: Environment): { readonly connectors?: ConnectorVendor } {
+  const projectId = optional(env, 'BRAINZ_PIPEDREAM_PROJECT_ID');
+  const clientId = optional(env, 'BRAINZ_PIPEDREAM_CLIENT_ID');
+  const clientSecret = optional(env, 'BRAINZ_PIPEDREAM_CLIENT_SECRET');
+  const environment = optional(env, 'BRAINZ_PIPEDREAM_ENVIRONMENT');
+  if (
+    projectId === undefined &&
+    clientId === undefined &&
+    clientSecret === undefined &&
+    environment === undefined
+  ) {
+    return {};
+  }
+
+  const base = optional(env, 'BRAINZ_PIPEDREAM_API_BASE');
+  return {
+    connectors: createPipedreamConnectorVendor({
+      client: createPipedreamClient({
+        config: {
+          projectId: required(env, 'BRAINZ_PIPEDREAM_PROJECT_ID'),
+          clientId: required(env, 'BRAINZ_PIPEDREAM_CLIENT_ID'),
+          clientSecret: required(env, 'BRAINZ_PIPEDREAM_CLIENT_SECRET'),
+          environment: pipedreamEnvironment(env),
+          ...(base === undefined ? {} : { baseUrl: apiBase(env, 'BRAINZ_PIPEDREAM_API_BASE') }),
+        },
+        // The production transport, from the module that owns the bytes seam:
+        // a media fetch asks for `HttpResponse.bytes` because a screenshot
+        // decoded as UTF-8 and re-encoded is no longer that screenshot, and
+        // `fetchTransport` is the implementation that answers in bytes. A
+        // transport written here would be a second one that does not.
+        transport: fetchTransport(),
+      }),
+    }),
   };
-  return { mintClaimUrl: unconfigured, disconnect: unconfigured };
+}
+
+/**
+ * Which of the vendor's two environments this deployment talks to.
+ *
+ * A closed set with no default and no coercion, for the reason
+ * {@link suspendTimeoutPolicy} gives about the substrate's: the two are separate
+ * keyspaces at the vendor, so a deployment that believed it was in `production`
+ * and was not attaches every user's mailbox to a development project, and
+ * discovers it from a user asking why their mail never arrived. A typo refuses
+ * at start, where the operator is.
+ */
+function pipedreamEnvironment(env: Environment): 'development' | 'production' {
+  const declared = required(env, 'BRAINZ_PIPEDREAM_ENVIRONMENT');
+  if (declared !== 'development' && declared !== 'production') {
+    throw new FleetConfigError(
+      'BRAINZ_PIPEDREAM_ENVIRONMENT',
+      `takes only "development" or "production" — the vendor's two keyspaces — not ${JSON.stringify(declared)}`,
+    );
+  }
+  return declared;
 }
 
 if (import.meta.main) {
