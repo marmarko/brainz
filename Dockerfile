@@ -154,7 +154,10 @@ ARG BUN_VERSION=1.3.14
 # keeps serving clients, codes, refresh tokens and revocations out of its own
 # `Map`, which is the defect. Deploy this with the deterministic reload
 # (`containers delete` then `deploy`), not by waiting.
-ARG FLEET_CONFIG_EPOCH=8
+# 8 -> 9: the /brain recovery page and the shared language control. Both
+# are code inside the image, so a warm web instance keeps serving the dashboard
+# of dead buttons until it is replaced.
+ARG FLEET_CONFIG_EPOCH=9
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
