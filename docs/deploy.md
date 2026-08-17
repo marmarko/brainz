@@ -301,6 +301,34 @@ Measured on 2026-08-17, epoch 2 → 3:
 | 06:08–06:27 | no request to any path routed to `oauth-flow` |
 | 06:27 | `/authorize` answers `302 → /login?next=…`. The new environment is live |
 
+### The deterministic reload: delete the container application, then deploy
+
+Waiting is the *cheap* way to replace a warm instance; it is not a reliable one,
+and checking prevents it. When a config or code change has to take effect now:
+
+```bash
+bunx wrangler containers list                      # copy the application's ID
+bunx wrangler containers delete <application-id>   # destroys the app and its instances
+bunx wrangler deploy                               # recreates it, fresh, on the current image
+```
+
+The application comes back with a **new ID** — that is how you know it was
+recreated rather than rolled. Verified 2026-08-17: a `form-action` fix deployed
+at 16:45 was still absent from the consent page's CSP at 16:52 with the
+application reporting `active` and its instances reporting `inactive`; deleting
+the application (`a03ee893…`) and redeploying produced `a0382de5…`, and the
+corrected header was live within three minutes.
+
+What this costs: in-flight OAuth codes and any warm connection LRU, both of
+which a client retries through. What it does **not** touch: the tenant
+databases, the control plane, or `control.tenant_secret` — every piece of
+durable state lives outside the container, which is exactly what makes this
+safe to reach for.
+
+Prefer it over a retry loop against the origin. A loop keeps `sleepAfter`
+running from its own last request, so it holds the stale instance alive while
+showing you the answer you are trying to change.
+
 **The trap is that verifying keeps the old instance alive.** `sleepAfter` is
 measured from the last request, and every probe resets it — so a tight
 check-and-retry loop against `/authorize` can hold a stale instance up
