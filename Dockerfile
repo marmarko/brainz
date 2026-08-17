@@ -157,7 +157,14 @@ ARG BUN_VERSION=1.3.14
 # 8 -> 9: the /brain recovery page and the shared language control. Both
 # are code inside the image, so a warm web instance keeps serving the dashboard
 # of dead buttons until it is replaced.
-ARG FLEET_CONFIG_EPOCH=9
+# 9 -> 10: the connector controls. The dashboard's "Connected accounts" section
+# rendered three words and no form, so a warm web instance keeps serving a
+# section that describes connecting an account and offers no way to do it. Pure
+# code inside the image -- nothing to re-put, nothing a warm instance notices,
+# and the whole point of the change is the markup a warm instance keeps not
+# sending. Deploy with the deterministic reload (`containers delete` then
+# `deploy`) against the web fleet, not by waiting.
+ARG FLEET_CONFIG_EPOCH=10
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
