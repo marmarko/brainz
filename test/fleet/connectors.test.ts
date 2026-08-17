@@ -35,6 +35,8 @@ import { join } from 'node:path';
 import { SQL } from 'bun';
 
 import { poolNamespace } from '../../src/control/secrets.ts';
+import { createPostgresSecretStore } from '../../src/control/secret-pg.ts';
+import { importSealingKey } from '../../src/control/sealed.ts';
 import { spawnArgv } from './fixture.ts';
 import {
   createControlPlane,
@@ -47,7 +49,13 @@ import {
   type IdentityFixture,
 } from '../control/identity-fixture.ts';
 import { createEmptyDatabase, dropFixtureDatabase, type SchemaFixture } from '../schema/fixture.ts';
-import { FAKE_CF_ACCOUNT_ID, startService, writeSecretsFile, type RunningService } from './fixture.ts';
+import {
+  FAKE_CF_ACCOUNT_ID,
+  FAKE_SEALING_KEY,
+  startService,
+  writeSecretsFile,
+  type RunningService,
+} from './fixture.ts';
 
 const SETUP_TIMEOUT_MS = 180_000;
 const TEST_TIMEOUT_MS = 60_000;
@@ -71,6 +79,14 @@ let scratch: string;
 let secretsFile: string;
 let web: RunningService;
 let vendor: VendorDouble;
+/**
+ * External user ids the vendor double reports an attached account for.
+ *
+ * A module-level switch rather than a per-call script, because what turns it on
+ * is a user finishing a consent screen at a third party — an event this side
+ * never observes, which is the whole reason reconciliation exists.
+ */
+let attachedAccounts: string[] = [];
 
 // ---------------------------------------------------------------------------
 // The vendor, on loopback.
@@ -128,6 +144,23 @@ function startVendorDouble(): VendorDouble {
           token: 'ctok_from_the_double',
           expires_at: new Date(Date.now() + 600_000).toISOString(),
           connect_link_url: 'https://connect.example.test/start?token=ctok_from_the_double',
+        });
+      }
+      // The accounts listing — the channel through which this fleet learns that
+      // a consent screen was completed. It answers whatever the case in flight
+      // set, defaulting to nothing attached, which is what the vendor really
+      // does answer for an external user still at the consent screen.
+      if (url.pathname.endsWith('/accounts')) {
+        return Response.json({
+          page_info: { total_count: attachedAccounts.length, count: attachedAccounts.length },
+          data: attachedAccounts.map((external) => ({
+            id: 'apn_from_the_double',
+            external_id: external,
+            app: { name_slug: 'gmail' },
+            healthy: true,
+            dead: false,
+            created_at: new Date().toISOString(),
+          })),
         });
       }
       return Response.json({ error: 'no rule' }, { status: 404 });
@@ -218,6 +251,7 @@ beforeEach(async () => {
   await controlSql`DELETE FROM control.job`;
   await controlSql`DELETE FROM control.tenant`;
   vendor.calls.length = 0;
+  attachedAccounts = [];
   await fillPool();
 });
 
@@ -468,6 +502,211 @@ describe('a partially configured connector vendor', () => {
       // A deployment that believed it was in `production` and was not attaches
       // every user's mailbox to a development project.
       expect(stderr).toContain('BRAINZ_PIPEDREAM_ENVIRONMENT');
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The last link: an authorization becoming a connection, through the deployed
+// web process.
+// ---------------------------------------------------------------------------
+
+/**
+ * **The founder authorizes at Google and closes the tab.**
+ *
+ * Every case above stops at the connect link. What happened next was nothing:
+ * `connectSource` had no production caller, no `ConnectorState` was ever
+ * written, `enqueueDuePulls` read nothing, and the mailbox was attached at the
+ * vendor and invisible here. The link was the end of the flow rather than the
+ * middle of it.
+ *
+ * This block drives the **deployed web process** — a second one, on the durable
+ * secret backend, because reconciliation writes a sealed row and the `file`
+ * backend the suite above uses has no sealing key at all. That pairing is a real
+ * deployment state and is asserted rather than assumed: a self-hoster on the
+ * file backend still gets connections, from the worker fleet's own tick.
+ */
+describe('an authorization the user never came back from becomes a connection', () => {
+  let sealed: RunningService;
+
+  beforeAll(async () => {
+    sealed = await startService({
+      entry: 'src/web/serve.ts',
+      env: {
+        ...configured(),
+        // The durable store. The seed file the suite already writes is imported
+        // at boot, so the pool secret provisioning needs is reachable through
+        // the same store — which is how a real deployment migrates.
+        BRAINZ_SECRET_BACKEND: 'postgres',
+        BRAINZ_SECRET_ENCRYPTION_KEY: FAKE_SEALING_KEY,
+      },
+    });
+  }, SETUP_TIMEOUT_MS);
+
+  afterAll(async () => {
+    await sealed?.stop();
+  });
+
+  /**
+   * The pool's connection string, back in the **durable** store.
+   *
+   * The suite's `fillPool` rewrites the seed file, which is the whole store on
+   * the `file` backend the other blocks use. On the durable backend the seed is
+   * imported once at boot and a claimed pool project's secret is consumed, so
+   * every case after the first would answer `provisioning_unavailable`. Writing
+   * it through the same store the process reads is what a pool filler does.
+   */
+  beforeEach(async () => {
+    const durable = createPostgresSecretStore({
+      sql: controlSql,
+      key: await importSealingKey(FAKE_SEALING_KEY),
+    });
+    await durable.secrets.put(poolNamespace(POOL_ID), {
+      connectionString: poolProject.dsn,
+      bearerGrant: '',
+    });
+  });
+
+  function connectOn(cookie: string, source = 'gmail'): Promise<Response> {
+    return fetch(`${sealed.url}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: WEB_ORIGIN, cookie },
+      body: JSON.stringify({ source }),
+    });
+  }
+
+  async function signUpOn(email: string): Promise<string> {
+    const response = await fetch(`${sealed.url}/api/signup`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: WEB_ORIGIN },
+      body: JSON.stringify({ email, password: 'correct horse battery staple', fts_language: 'simple' }),
+    });
+    if (response.status !== 201) {
+      throw new Error(`fixture: signup answered ${response.status} ${await response.text()}`);
+    }
+    return (response.headers.get('set-cookie') ?? '').split(';')[0] ?? '';
+  }
+
+  function grantOn(tenant: string): Promise<Response> {
+    return fetch(`${sealed.url}/admin?op=grant_internal_tier&tenant_id=${tenant}`, {
+      method: 'POST',
+      headers: { origin: WEB_ORIGIN, authorization: `Bearer ${ADMIN_CREDENTIAL}` },
+    });
+  }
+
+  async function linkRow(tenant: string): Promise<{ state: string | null; pending: boolean }> {
+    const rows = await controlSql<{ state: string | null; pending: boolean }[]>`
+      SELECT state, pending_since IS NOT NULL AS pending
+        FROM control.connector_link
+       WHERE tenant_id = ${tenant} AND source = 'gmail'::control.connector_source`;
+    return rows[0] ?? { state: null, pending: false };
+  }
+
+  test(
+    'the deployed process records the intent before the user leaves for the vendor',
+    async () => {
+      const cookie = await signUpOn('intent@example.com');
+      const tenant = await tenantId();
+      await grantOn(tenant);
+
+      expect((await connectOn(cookie)).status).toBe(200);
+
+      // Pending, not connected. Nothing has happened at the vendor yet, and this
+      // row is the only reason anyone will ever go and look.
+      expect(await linkRow(tenant)).toEqual({ state: null, pending: true });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'coming back to the dashboard is enough — no callback, no return URL',
+    async () => {
+      const cookie = await signUpOn('returned@example.com');
+      const tenant = await tenantId();
+      await grantOn(tenant);
+      await connectOn(cookie);
+
+      // The user finishes at Google. This side is told nothing.
+      attachedAccounts = [`${tenant}-gmail`];
+
+      const dashboard = await fetch(`${sealed.url}/dashboard`, { headers: { cookie } });
+      const page = await dashboard.text();
+
+      // The process asked the vendor, on the render, under this tenant's own
+      // per-source external user.
+      const listed = vendor.calls.filter((call) => call.path.endsWith('/accounts'));
+      expect(listed).toHaveLength(1);
+
+      // And the connection exists — sealed, so the control plane holds nothing
+      // a reader of it could use.
+      const row = await linkRow(tenant);
+      expect(row.pending).toBe(false);
+      expect(row.state).toMatch(/^v1[.]/);
+
+      // What the founder actually sees, and the number they need to hear.
+      expect(page).toContain('The first check has not run yet');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a second dashboard load does not ask the vendor again',
+    async () => {
+      const cookie = await signUpOn('twice@example.com');
+      const tenant = await tenantId();
+      await grantOn(tenant);
+      await connectOn(cookie);
+      attachedAccounts = [`${tenant}-gmail`];
+
+      await fetch(`${sealed.url}/dashboard`, { headers: { cookie } });
+      await fetch(`${sealed.url}/dashboard`, { headers: { cookie } });
+
+      // Once. After adoption the link is no longer pending, so an ordinary
+      // dashboard render costs one control-plane query and no vendor traffic —
+      // which is what makes reconciling on a page render affordable at all.
+      expect(vendor.calls.filter((call) => call.path.endsWith('/accounts'))).toHaveLength(1);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a dashboard load with nothing pending never reaches the vendor',
+    async () => {
+      const cookie = await signUpOn('quiet@example.com');
+      await grantOn(await tenantId());
+
+      await fetch(`${sealed.url}/dashboard`, { headers: { cookie } });
+
+      expect(vendor.calls.filter((call) => call.path.endsWith('/accounts'))).toEqual([]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a disconnect the user pressed is not undone by the next render',
+    async () => {
+      const cookie = await signUpOn('stopped@example.com');
+      const tenant = await tenantId();
+      await grantOn(tenant);
+      await connectOn(cookie);
+      // The account is attached at the vendor and stays attached: the double
+      // keeps answering with it, which is the hostile version of this race.
+      attachedAccounts = [`${tenant}-gmail`];
+
+      await fetch(`${sealed.url}/api/connectors`, {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json', origin: WEB_ORIGIN, cookie },
+        body: JSON.stringify({ source: 'gmail' }),
+      });
+
+      const page = await (await fetch(`${sealed.url}/dashboard`, { headers: { cookie } })).text();
+
+      expect(await linkRow(tenant)).toEqual({ state: null, pending: false });
+      expect(page).toContain('Not connected');
+      // And the render did not go looking: a disconnect clears the intent, so
+      // there is nothing for a reconciliation pass to ask about.
+      expect(vendor.calls.filter((call) => call.path.endsWith('/accounts'))).toEqual([]);
     },
     TEST_TIMEOUT_MS,
   );

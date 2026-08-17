@@ -617,6 +617,17 @@ interface SealedDomainEntry {
   readonly domain: string;
   /** Why a domain longer than a paragraph is still content-free. */
   readonly because: string;
+  /**
+   * The ceiling THIS domain may reach, when {@link MAX_SEALED_DOMAIN_LENGTH} is
+   * not enough — and the entry has to say why in {@link SealedDomainEntry.because}.
+   *
+   * Declared per entry rather than by raising the shared constant, which is the
+   * point: a registry where one envelope needs more room must not silently hand
+   * that room to every other one. Still bounded from above by
+   * {@link MAX_SEALED_ENTRY_LENGTH}, which is what stops "it needed a bit more"
+   * from becoming a payload column.
+   */
+  readonly maxLength?: number;
 }
 
 /**
@@ -654,9 +665,16 @@ interface SealedDomainEntry {
  */
 const SEALED_ENVELOPE_DOMAINS: readonly SealedDomainEntry[] = [
   // Ordered by the file the domain is declared in, because that is the order
-  // `textDomains()` walks (`SQL_FILES` is sorted, and `control/oauth-store.sql`
-  // sorts before `control/secret-store.sql`). The registry test compares the two
-  // lists element by element, so a new entry goes where its file goes.
+  // `textDomains()` walks (`SQL_FILES` is sorted, and `control/connector-store.sql`
+  // sorts before `control/oauth-store.sql` sorts before `control/secret-store.sql`).
+  // The registry test compares the two lists element by element, so a new entry
+  // goes where its file goes.
+  {
+    domain: 'control.connector_envelope',
+    maxLength: 4096,
+    because:
+      'it holds an AES-256-GCM envelope over one `ConnectorState`, under the same key and the same module as `control.sealed_envelope`, bound by AAD to `connector/<tenant>/<source>` so a row lifted onto another tenant — or onto the same tenant\'s other source — fails to open rather than handing one mailbox\'s cursor to another. **Both a confidentiality and a storability argument, and they are separate sentences.** The confidentiality one: the record carries the provider\'s own sync token, which is the thing a control-plane dump must not yield. The storability one: `ConnectorState.accountKey` is the mailbox the provider names, which is an address, and this guard makes an address structurally unstorable in the clear. **The bound is 4096 rather than 2048 and the extra is argued rather than assumed:** the sealed record carries a provider continuation token whose length is the provider\'s business (a Drive resume cursor is two opaque tokens joined) and base64url expands it by a third, while the CHECK that would fire fires on a *cursor advance* at the end of a successful poll — a connector that works once and then wedges. That is the outage class the entry below widened itself to avoid, one field further along',
+  },
   {
     domain: 'control.oauth_envelope',
     because:
@@ -674,6 +692,16 @@ const SEALED_ENVELOPE_DOMAINS: readonly SealedDomainEntry[] = [
  * document: it is sized for one envelope, not for a payload column that grew.
  */
 const MAX_SEALED_DOMAIN_LENGTH = 2048;
+
+/**
+ * The ceiling on a per-entry {@link SealedDomainEntry.maxLength}.
+ *
+ * The escape hatch has to have a floor under it or it is not a ceiling at all.
+ * 4096 is one envelope over one small record with an opaque provider token in
+ * it; anything that wants more is asking to be a payload column and should have
+ * to argue that here, in this constant, rather than in a row of the registry.
+ */
+const MAX_SEALED_ENTRY_LENGTH = 4096;
 
 function sealedEntryFor(domain: string): SealedDomainEntry | undefined {
   return SEALED_ENVELOPE_DOMAINS.find(
@@ -781,8 +809,11 @@ function judgeDomain(domain: DomainDecl): DomainVerdict {
   // and it buys that with the probes below — including the bearer-shaped ones
   // no other domain here is asked to reject. An unregistered domain that wants
   // 2048 characters is refused exactly as before.
+  const registered = sealedEntryFor(domain.name);
   const ceiling =
-    sealedEntryFor(domain.name) === undefined ? MAX_TEXT_DOMAIN_LENGTH : MAX_SEALED_DOMAIN_LENGTH;
+    registered === undefined
+      ? MAX_TEXT_DOMAIN_LENGTH
+      : Math.min(registered.maxLength ?? MAX_SEALED_DOMAIN_LENGTH, MAX_SEALED_ENTRY_LENGTH);
   if (length > ceiling) {
     return {
       safe: false,
@@ -1122,6 +1153,22 @@ describe('a sealed envelope is the only secret the control plane may hold', () =
     );
   });
 
+  test('an entry that asks for more room than the registry’s default argues for it, and is still bounded', () => {
+    // The escape hatch inside the escape hatch. A registry where one envelope
+    // needs 4096 characters must not hand 4096 to every other one, and "it
+    // needed a bit more" must not become a payload column: the extra is declared
+    // per entry, and the per-entry declaration is itself capped.
+    for (const entry of SEALED_ENVELOPE_DOMAINS) {
+      if (entry.maxLength === undefined) continue;
+      expect(entry.maxLength).toBeGreaterThan(MAX_SEALED_DOMAIN_LENGTH);
+      expect(entry.maxLength).toBeLessThanOrEqual(MAX_SEALED_ENTRY_LENGTH);
+      // The argument for the extra room has to be in the entry, not in a commit
+      // message: the default bound is already justified, so a domain that wants
+      // past it owes a longer sentence than one that does not.
+      expect(entry.because).toContain('bound is');
+    }
+  });
+
   test('a sealed domain rejects a bare bearer grant, which no reference column can', () => {
     const failures: string[] = [];
     for (const domain of sealedDomains()) {
@@ -1182,6 +1229,23 @@ describe('the content-free guard goes red', () => {
   test('a bounded varchar column fails — a length bound is not a content guarantee', () => {
     // The case a naive guard passes: 200 characters holds a whole paragraph.
     expect(findContentShapedColumns(fixture('note varchar(200),'))).toHaveLength(1);
+  });
+
+  test('a registered domain cannot declare its way past the per-entry cap', () => {
+    // The mutation to fear on the per-entry bound: an entry raises its own
+    // `maxLength` to whatever its column happens to declare, and the cap becomes
+    // a value that follows the schema instead of constraining it.
+    const declared = SEALED_ENVELOPE_DOMAINS.map((entry) => entry.maxLength ?? MAX_SEALED_DOMAIN_LENGTH);
+    expect(Math.max(...declared)).toBeLessThanOrEqual(MAX_SEALED_ENTRY_LENGTH);
+
+    const oversized = parseSchema(`
+CREATE DOMAIN control.connector_envelope AS varchar(${MAX_SEALED_ENTRY_LENGTH + 1})
+  CONSTRAINT connector_envelope_is_a_v1_envelope
+  CHECK (VALUE ~ '^v1[.][A-Za-z0-9_-]{16}[.][A-Za-z0-9_-]{22,}$');
+`);
+    const verdict = judgeDomain(oversized.domains[0]!);
+    expect(verdict.safe).toBe(false);
+    expect(verdict.why).toContain(`ceiling ${MAX_SEALED_ENTRY_LENGTH}`);
   });
 
   test('an unregistered domain cannot buy itself the sealed ceiling', () => {

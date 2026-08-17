@@ -39,9 +39,20 @@ import { createJobRunner } from './runner.ts';
 import { ALPHA_SCHEDULER, runSchedulerTick } from './scheduler.ts';
 import {
   connectorSourceOpener,
+  createConnectorRuntime,
   enqueueDuePulls,
   type ConnectorRuntime,
 } from './connectors.ts';
+import {
+  createControlPlaneTiers,
+  createPostgresConnectorLinks,
+  ensureConnectorLinkSchema,
+} from '../control/connector-pg.ts';
+import {
+  createConnectorReconciler,
+  createPipedreamAccountLister,
+  type ConnectorReconciler,
+} from '../ingest/pipedream/reconcile.ts';
 import { createConsolidateHandler } from './consolidate/cycle.ts';
 import { createExportHandler, enqueueDueExports } from './export.ts';
 import { createSchemaSweepPorts } from '../control/schema-sweep.ts';
@@ -62,6 +73,7 @@ import { createIngestPullHandler } from '../ingest/pipedream/pull.ts';
 import { DEFAULT_STEAL_GRACE_MS } from './locks.ts';
 import {
   fleetRoutingProfile,
+  openConnectorClient,
   openControlPlane,
   openFleetGateway,
   openSecretStore,
@@ -79,26 +91,30 @@ export interface WorkerFleetProcess {
 }
 
 /**
- * The capabilities this process cannot build out of its environment.
+ * The capabilities a caller may substitute for the ones this process builds.
  *
- * **One member, and it is a parameter rather than a variable because there is no
- * variable that would produce it.** A {@link ConnectorRuntime} needs the
- * tenant's object prefix, which needs a prefix-scoped credential, which needs a
- * `ScopedCredentialMinter` — and `src/` has no production implementation of that
- * port, so no value of any environment variable composes one. Reading a
- * credential out of `env` and calling it scoped would be the lie
- * `src/control/storage.ts` rule 4 exists to prevent.
+ * **This used to be the honest record of a lane nothing could compose.** A
+ * {@link ConnectorRuntime} needed the tenant's object prefix, which needs a
+ * prefix-scoped credential, which needs a `ScopedCredentialMinter` — and `src/`
+ * has no production implementation of that port, so no value of any environment
+ * variable composed one and the deployed process ran with the seam absent.
  *
- * `import.meta.main` passes nothing, so the deployed process runs with it
- * absent, which is the honest state. What the parameter buys is that both halves
- * of the connector lane — the handler's `openSource` seam and the cadence pass
- * — are wired to the *same* supplier, and that a tick with a supplier present is
- * observable. Without it, deleting the cadence pass from the tick would change
- * nothing any test could see, which is how this lane got into the state it was
- * in.
+ * Connector state now lives in the control plane, sealed, so the deployed
+ * process **does** build a runtime out of its environment whenever it holds a
+ * vendor credential and a sealing key ({@link connectorSeam}). What survives is
+ * the parameter itself, for the reason it was worth having then: it keeps both
+ * halves of the connector lane — the handler's `openSource` seam and the cadence
+ * pass — wired to the *same* supplier, and it lets a test drive a tick against a
+ * runtime it controls without a vendor on the other end.
+ *
+ * A supplier passed here wins over the one the environment would build, so a
+ * test's runtime is not silently shadowed by a `.env` an operator left lying
+ * around.
  */
 export interface WorkerFleetSeams {
   readonly connectors?: ConnectorRuntime;
+  /** Substituted alongside the runtime, so a test tick can reconcile too. */
+  readonly reconciler?: ConnectorReconciler;
 }
 
 export async function startWorkerFleet(
@@ -118,6 +134,10 @@ export async function startWorkerFleet(
   // ensure is idempotent and advisory-locked, so whichever fleet gets there
   // first does the work and the others ask a question and move on.
   await ensureAuthorizationStoreSchema(controlSql);
+  // Same argument, second table: this fleet reads connector links on every tick,
+  // and a worker that booted before any web instance had ever served a connect
+  // would otherwise fail every tick on `relation does not exist`.
+  await ensureConnectorLinkSchema(controlSql);
 
   const queue = createJobQueue({ sql: controlSql });
   const leases = createLeaseChannel({ sql: leaseSql });
@@ -229,6 +249,16 @@ export async function startWorkerFleet(
   const rawStore = absentRawStore();
   const profile = fleetRoutingProfile(env);
 
+  /**
+   * The connector lane's two halves, from this deployment's own credentials.
+   *
+   * They travel together on purpose. A runtime without a reconciler polls
+   * connections nothing can create; a reconciler without a runtime creates
+   * connections nothing polls. Both come from the same vendor client and the
+   * same link store, so a deployment has the lane or does not have it.
+   */
+  const connectors = connectorSeam(env, { controlSql, secrets, seams });
+
   async function openIngestTenant(tenantId: string): Promise<IngestTenant> {
     const connection = await connectTenant(tenantId);
     return {
@@ -247,8 +277,7 @@ export async function startWorkerFleet(
     profile,
     openTenant: async (tenantId) => (await openIngestTenant(tenantId)).runtime,
     closeTenant: (tenant) => tenant.sql.close(),
-    // Absent on this deployment. See the block above, and `connectors.ts`.
-    openSource: connectorSourceOpener(seams.connectors),
+    openSource: connectorSourceOpener(connectors.runtime),
     onResult(result, lease) {
       process.stdout.write(
         `${JSON.stringify({
@@ -310,18 +339,44 @@ export async function startWorkerFleet(
     // tenant's export is scheduled onto the slot its consolidation already
     // wakes, so this adds a job and not a wake — see `export.ts`.
     await enqueueDueExports({ sql: controlSql, queue }, { now });
+    // **Reconciliation, and it runs BEFORE the cadence pass rather than after.**
+    // A connection adopted this tick is due immediately (`lastPullAt` is null,
+    // so `nextPullAt` is the epoch), so reconciling first means a user who
+    // authorized while this instance was asleep gets their first poll on the
+    // same wake rather than half an hour later. The other order costs a whole
+    // cron period for nothing.
+    //
+    // It asks the vendor only about links a user actually started — a pending
+    // row in the control plane, written when they pressed the button — so a
+    // fleet where nobody is mid-connect reaches the vendor zero times.
+    if (connectors.reconciler !== undefined) {
+      const reconciled = await connectors.reconciler.run({ now });
+      // Reported rather than swallowed, and both halves: `runSchedulerTick`'s
+      // rule is that a tick whose every attempt came back refused looks exactly
+      // like a fleet with nothing to do.
+      if (reconciled.asked > 0) {
+        process.stdout.write(
+          `${JSON.stringify({
+            event: 'connector_reconcile',
+            asked: reconciled.asked,
+            adopted: reconciled.adopted.length,
+            refused: reconciled.refused.map((entry) => entry.reason),
+          })}\n`,
+        );
+      }
+    }
     // The connector cadence, which cannot ride the consolidation slot the export
     // lane rides — gmail's is 300 seconds against a daily ceiling. It costs one
     // control-plane query and, per tenant, a listing that wakes nothing; a
     // tenant's own database is opened only when that listing says a source is
     // already due. See `connectors.ts`. A deployment with no connector runtime
-    // — which is this one — returns before the first query.
+    // returns before the first query.
     await enqueueDuePulls(
       {
         sql: controlSql,
         queue,
         openTenant: connectTenant,
-        ...(seams.connectors === undefined ? {} : { runtime: seams.connectors }),
+        ...(connectors.runtime === undefined ? {} : { runtime: connectors.runtime }),
       },
       { now },
     );
@@ -381,6 +436,54 @@ export async function startWorkerFleet(
       await controlSql.close();
       await leaseSql.close();
     },
+  };
+}
+
+/**
+ * The connector lane, composed from this deployment's environment.
+ *
+ * **Three ways it comes back empty, and each is a real deployment rather than a
+ * misconfiguration.** No vendor credential is a self-hoster who ingests chat
+ * exports and folders (R8a) and never connects an account. No sealing key is the
+ * `file` secret backend, where there is no sealed control-plane store to keep a
+ * connection in. A caller-supplied runtime is a test driving the lane without a
+ * vendor on the other end, and it wins over both — a suite must not be silently
+ * shadowed by an operator's `.env`.
+ *
+ * **The two halves are composed together and never separately.** A runtime with
+ * no reconciler polls connections that nothing can create; a reconciler with no
+ * runtime writes connections that nothing polls. That pairing was the shape of
+ * the defect this whole lane spent a unit in, and building them from one client
+ * and one store is what stops it recurring by omission.
+ */
+function connectorSeam(
+  env: Environment,
+  deps: {
+    readonly controlSql: SQL;
+    readonly secrets: Awaited<ReturnType<typeof openSecretStore>>;
+    readonly seams: WorkerFleetSeams;
+  },
+): { readonly runtime?: ConnectorRuntime; readonly reconciler?: ConnectorReconciler } {
+  const supplied = {
+    ...(deps.seams.connectors === undefined ? {} : { runtime: deps.seams.connectors }),
+    ...(deps.seams.reconciler === undefined ? {} : { reconciler: deps.seams.reconciler }),
+  };
+  if (supplied.runtime !== undefined) return supplied;
+
+  const client = openConnectorClient(env);
+  const key = deps.secrets.sealingKey;
+  if (client === undefined || key === undefined) return supplied;
+
+  const links = createPostgresConnectorLinks({ sql: deps.controlSql, key });
+  return {
+    runtime: createConnectorRuntime({ client, links }),
+    reconciler:
+      supplied.reconciler ??
+      createConnectorReconciler({
+        links,
+        vendor: createPipedreamAccountLister(client),
+        tiers: createControlPlaneTiers(deps.controlSql),
+      }),
   };
 }
 

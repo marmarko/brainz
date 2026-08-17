@@ -65,6 +65,12 @@ import { applyBillingEvent, recordCheckoutCustomer } from '../control/billing.ts
 import type { CheckoutPort } from '../control/checkout.ts';
 import type { BrainProvisioner } from '../control/provisioner.ts';
 import type { ProviderId } from '../ai/keys.ts';
+import {
+  fenceConnectorLink,
+  markConnectPending,
+  readConnectorLinks,
+} from '../control/connector-pg.ts';
+import type { ConnectorReconciler } from '../ingest/pipedream/reconcile.ts';
 import { CONNECT_STEPS, claudeCodeCommand, connectionStatus, installLink } from './connect.ts';
 import { adminDispatch, createBrainOwnerDirectory } from './admin.ts';
 import { connectorStatuses } from './connector-panel.ts';
@@ -225,6 +231,24 @@ export interface WebAppDeps {
    * to the user as an outage, and to the operator as a stack trace.
    */
   readonly connectors?: ConnectorVendor;
+  /**
+   * How this app learns that an authorization actually happened
+   * (`src/ingest/pipedream/reconcile.ts`).
+   *
+   * **A port, and absent-able, for the reason `severance` is both.** It needs
+   * the sealing key that opens the control plane's connector store, and R11's
+   * rule about what a request handler may hold applies to that key exactly as it
+   * applies to a connection string: this module records the *intent* to connect
+   * (a timestamp) and clears a link on disconnect (a counter), and holds nothing
+   * that can read a connector's cursor back.
+   *
+   * Absent disables one thing and only one: the dashboard stops reconciling on
+   * render. It never disables the connect button, because the worker fleet's
+   * tick is the path that does not depend on the user coming back at all — a
+   * deployment with a vendor and no key is a deployment where connections are
+   * still made, half an hour later.
+   */
+  readonly reconciler?: ConnectorReconciler;
   /**
    * How a signup becomes a brain (`src/control/provisioner.ts`).
    *
@@ -1164,6 +1188,23 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         );
       }
 
+      // **The intent is recorded here, and this is the load-bearing line in the
+      // whole flow.** The user is about to leave for the vendor's consent screen
+      // and owes this origin nothing afterwards: they can authorize and close
+      // the tab. This row is what lets the fleet go and *ask* the vendor later
+      // which accounts exist under this tenant's external user — the channel
+      // that survives a browser that never comes home.
+      //
+      // After the mint, so a vendor that refused leaves nothing to look for; and
+      // before the link is handed over, so the record is durable before the user
+      // can act on it. A failure here is a throw into the entrypoint's boundary
+      // rather than a link the founder follows into silence.
+      await markConnectPending(deps.controlSql, {
+        tenantId,
+        source: source as ConnectorSourceName,
+        now: now(),
+      });
+
       // The claim URL is a capability, not display copy: whoever holds it can
       // attach *their* mailbox to *this* brain. It is returned once, to the
       // authenticated owner, and is never logged.
@@ -1254,15 +1295,35 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         );
       }
 
-      const vendor = await configured.disconnect({
+      // ------------------------------------------------------------------
+      // **The order below is the whole of whether this button works, and it is
+      // local-first: stop polling, then tell the vendor.**
+      //
+      // The failure a disconnect must never have is this brain polling with a
+      // credential we have already asked to have revoked. Telling the vendor
+      // first opens exactly that window — and a worse one: a reconciliation pass
+      // that listed this account a moment ago is holding a live answer, and
+      // between the vendor's delete and our own write it can still commit, which
+      // puts the connection back with no vendor account behind it. Clearing the
+      // link first closes both, because the reconciler writes under the fence it
+      // read and this bumps it.
+      //
+      // The cost of this order is stated rather than hidden: if the vendor call
+      // then fails, this brain has stopped polling a mailbox that is still
+      // attached at the vendor. That is the survivable direction — the user sees
+      // an error, retries, and the retry finds the state already clean and asks
+      // the vendor again — and the reverse direction is a mailbox being read by
+      // a brain the user told to stop.
+      // ------------------------------------------------------------------
+      await fenceConnectorLink(deps.controlSql, {
         tenantId,
         source: source as ConnectorSourceName,
+        now: now(),
       });
 
-      // **Disconnect has to stop the polling, not only tell the vendor.** An open
-      // `ingest_pull` job for this source is the cadence; leaving it queued means
-      // the next worker picks it up and pulls with a credential we have just
-      // asked to have revoked.
+      // An open `ingest_pull` job for this source is the cadence already in
+      // flight. Clearing the link stops the *next* one; this stops the one that
+      // is queued now.
       const stopped = await deps.controlSql<{ job_id: string }[]>`
         UPDATE control.job
         SET state = 'discarded', finished_at = ${now()}, updated_at = ${now()},
@@ -1272,6 +1333,11 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
           AND target = ${source}::control.job_target
           AND state IN ('due', 'running')
         RETURNING job_id::text AS job_id`;
+
+      const vendor = await configured.disconnect({
+        tenantId,
+        source: source as ConnectorSourceName,
+      });
 
       if (isFormPost(request)) {
         return html(
@@ -1609,11 +1675,38 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
           ? subscription.tier
           : await effectiveTierOf(deps.controlSql, tenantId, subscription.tier);
       const connectorsAvailable = deps.connectors !== undefined && connectorGate(tier) === null;
+      // **Reconciling here is what makes a user who DID come back see their
+      // connection immediately**, rather than waiting for the worker fleet's
+      // half-hourly wake. It is bounded to this tenant's own unfinished
+      // connects, so the ordinary dashboard render — nothing pending — reaches
+      // the vendor zero times and costs one control-plane query.
+      //
+      // Failure is swallowed on purpose, and only here: a vendor outage must not
+      // turn somebody's dashboard into a 500. The worker's tick reconciles the
+      // same link on its own schedule, so the loss is latency rather than the
+      // connection.
+      if (connectorsAvailable && deps.reconciler !== undefined) {
+        try {
+          await deps.reconciler.run({ now: now(), tenantId });
+        } catch (error) {
+          process.stderr.write(
+            `${JSON.stringify({
+              event: 'connector_reconcile_failed',
+              tenant: tenantId,
+              message: error instanceof Error ? error.message : String(error),
+            })}\n`,
+          );
+        }
+      }
       // Only asked for when there is a panel to put it in: a gated account is
-      // rendered no control and no status, so reading the queue for it would be
-      // a control-plane round trip whose answer nothing displays.
+      // rendered no control and no status, so reading for it would be a
+      // control-plane round trip whose answer nothing displays.
       const connectors = connectorsAvailable
-        ? await connectorStatuses(deps.controlSql, { tenantId, sources: CONNECTOR_SOURCES })
+        ? await connectorStatuses(deps.controlSql, {
+            tenantId,
+            sources: CONNECTOR_SOURCES,
+            links: await readConnectorLinks(deps.controlSql, { tenantId, now: now() }),
+          })
         : [];
       return html(
         renderPage({

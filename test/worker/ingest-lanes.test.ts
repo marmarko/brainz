@@ -52,6 +52,7 @@ import {
   SOURCE_TYPE_FOR,
   connectSource,
   createInMemoryConnectorStore,
+  pullModeFor,
   type ConnectorSource,
   type ConnectorState,
 } from '../../src/ingest/cursor.ts';
@@ -61,6 +62,20 @@ import { HOSTED_PROFILE } from '../../src/ai/routing.ts';
 import { ACTIVE_EMBEDDING_SEAT, seatColumnSql } from '../../src/schema/embedding-seat.ts';
 import { fleetIdentity, tenantNamespace } from '../../src/control/secrets.ts';
 import { startWorkerFleet } from '../../src/worker/serve.ts';
+import { createConnectorRuntime } from '../../src/worker/connectors.ts';
+import {
+  createControlPlaneTiers,
+  createPostgresConnectorLinks,
+  ensureConnectorLinkSchema,
+  markConnectPending,
+  type ConnectorLinks,
+} from '../../src/control/connector-pg.ts';
+import { generateSealingKeyMaterial, importSealingKey } from '../../src/control/sealed.ts';
+import {
+  createConnectorReconciler,
+  type ConnectorAccountLister,
+} from '../../src/ingest/pipedream/reconcile.ts';
+import type { ConnectedAccount, ProviderApi } from '../../src/ingest/pipedream/client.ts';
 import { FAKE_CF_ACCOUNT_ID, writeSecretsFile } from '../fleet/fixture.ts';
 import { testStorage } from '../ingest/fixture.ts';
 import { createGateway } from '../core/write/fixture.ts';
@@ -91,11 +106,16 @@ let leaseSql: SQL;
 let brain: SchemaFixture;
 let brainSql: SQL;
 let tenant: TenantRuntime;
+/** What the connector link store seals under. One per run, and nothing reads it back. */
+let SEALED_KEY: CryptoKey;
 
 beforeAll(async () => {
   control = await createControlPlane('ingestlanes');
   controlSql = connectControl(control, 4);
   leaseSql = connectControl(control, 2);
+  // The connector link table, which both deployed entrypoints ensure at boot.
+  await ensureConnectorLinkSchema(controlSql);
+  SEALED_KEY = await importSealingKey(generateSealingKeyMaterial());
   brain = await provisionFixture('ingestlanes_brain');
   brainSql = connectTenant(brain);
   tenant = {
@@ -773,28 +793,36 @@ describe('the `import` lane', () => {
  * The jobs below fail, because both seams are absent on this deployment. That is
  * the point: failing is a state the fleet can see, and `due` forever is not.
  */
+/**
+ * The real entrypoint, started against this suite's databases.
+ *
+ * Module-scoped rather than local to one describe, because two blocks drive it
+ * now: the one that proves a queued job runs, and the one that proves anything
+ * ever queues it.
+ */
+async function fleetOver(
+  seams: Parameters<typeof startWorkerFleet>[1] = {},
+): Promise<Awaited<ReturnType<typeof startWorkerFleet>>> {
+  const scratch = mkdtempSync(join(tmpdir(), 'brainz-lanes-'));
+  const secretsFile = join(scratch, 'secrets.json');
+  await writeSecretsFile(secretsFile, {
+    secrets: { [tenantNamespace(TENANT)]: { connectionString: brain.dsn, bearerGrant: 'unused' } },
+  });
+  return await startWorkerFleet(
+    {
+      PORT: '0',
+      BRAINZ_CONTROL_DATABASE_URL: control.dsn,
+      BRAINZ_SECRET_BACKEND: 'file',
+      BRAINZ_SECRETS_FILE: secretsFile,
+      BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
+      // Long enough that the only tick is the one a case drives.
+      BRAINZ_WORKER_TICK_MS: '3600000',
+    },
+    seams,
+  );
+}
+
 describe('the running worker fleet claims both ingest kinds', () => {
-  async function fleetOver(
-    seams: Parameters<typeof startWorkerFleet>[1] = {},
-  ): Promise<Awaited<ReturnType<typeof startWorkerFleet>>> {
-    const scratch = mkdtempSync(join(tmpdir(), 'brainz-lanes-'));
-    const secretsFile = join(scratch, 'secrets.json');
-    await writeSecretsFile(secretsFile, {
-      secrets: { [tenantNamespace(TENANT)]: { connectionString: brain.dsn, bearerGrant: 'unused' } },
-    });
-    return await startWorkerFleet(
-      {
-        PORT: '0',
-        BRAINZ_CONTROL_DATABASE_URL: control.dsn,
-        BRAINZ_SECRET_BACKEND: 'file',
-        BRAINZ_SECRETS_FILE: secretsFile,
-        BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
-        // Long enough that the only tick is the one driven below.
-        BRAINZ_WORKER_TICK_MS: '3600000',
-      },
-      seams,
-    );
-  }
 
   /**
    * **The pull lane, end to end through the deployed process.**
@@ -896,6 +924,290 @@ describe('the running worker fleet claims both ingest kinds', () => {
       expect(rows).toEqual([
         { kind: 'ingest_pull', target: 'gmail', trigger: 'connector_cadence' },
       ]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Reconciliation — the last link in the chain.
+// ---------------------------------------------------------------------------
+
+/**
+ * **What every case above assumed, and nothing produced.**
+ *
+ * The block before this one proves a connected source is polled. What it does
+ * *not* prove — and what nothing in `src/` proved, because nothing in `src/`
+ * did it — is that a source ever becomes connected. `connectSource` had no
+ * production caller: the web app minted a real connect link, the user
+ * authorized at Google, and no `ConnectorState` was ever written. Every case
+ * above supplied one by hand.
+ *
+ * These drive the real entrypoint's tick over a real control plane, with the
+ * vendor's account listing as the only channel — no browser, no callback, no
+ * return URL. The user in this story pressed connect and closed the tab.
+ */
+describe('an authorization at the vendor becomes a connection this fleet polls', () => {
+  function links(): ConnectorLinks {
+    return createPostgresConnectorLinks({ sql: controlSql, key: SEALED_KEY });
+  }
+
+  /** The vendor's listing, scripted, and a record of what it was asked. */
+  function lister(accounts: readonly ConnectedAccount[]): ConnectorAccountLister & {
+    readonly asked: readonly string[];
+  } {
+    const asked: string[] = [];
+    return {
+      get asked() {
+        return asked;
+      },
+      accountsFor(request) {
+        asked.push(`${request.tenantId}/${request.source}`);
+        return Promise.resolve({ ok: true as const, value: accounts });
+      },
+    };
+  }
+
+  /** An account the vendor says is attached, in the shape its listing reports. */
+  function attached(overrides: Partial<ConnectedAccount> = {}): ConnectedAccount {
+    return {
+      accountId: 'apn_this_test_invented_it',
+      appSlug: 'gmail',
+      dead: false,
+      createdAt: '2026-08-17T08:55:00.000Z',
+      ...overrides,
+    };
+  }
+
+  /**
+   * Enough of Gmail to answer a first pull with an empty mailbox.
+   *
+   * Empty on purpose: what these cases are about is the connection existing and
+   * being polled, and `sources.test.ts` already owns whether the adapter parses
+   * mail. An empty listing still exercises the whole path — the handler opens
+   * the source, reads the state reconciliation wrote out of the sealed store,
+   * gates the first import and banks a cursor.
+   */
+  function gmailApi(): ProviderApi {
+    return {
+      request(request) {
+        if (request.path.includes('/profile')) {
+          return Promise.resolve({
+            ok: true as const,
+            value: { historyId: '9001', emailAddress: 'owner@example.test' },
+          });
+        }
+        // The delta arm, so a *second* poll of the same connection is a
+        // successful quiet one rather than an incidental provider error — which
+        // is what makes "the cursor the first tick banked is still there" a
+        // statement about the store rather than about a failed call.
+        if (request.path.includes('/history')) {
+          return Promise.resolve({ ok: true as const, value: { historyId: '9002', history: [] } });
+        }
+        if (request.path.includes('/messages')) {
+          return Promise.resolve({ ok: true as const, value: { messages: [] } });
+        }
+        return Promise.resolve({ ok: false as const, reason: 'provider_error' as const, status: 404 });
+      },
+    };
+  }
+
+  async function paid(): Promise<void> {
+    await controlSql`
+      UPDATE control.tenant SET tier = 'paid'::control.tenant_tier WHERE tenant_id = ${TENANT}`;
+  }
+
+  async function linkRow(): Promise<{ state: string | null; fence: string; pending: Date | null }> {
+    const rows = (await controlSql`
+      SELECT state, fence::text AS fence, pending_since AS pending
+        FROM control.connector_link
+       WHERE tenant_id = ${TENANT} AND source = 'gmail'::control.connector_source
+    `) as Array<{ state: string | null; fence: string; pending: Date | null }>;
+    return rows[0] ?? { state: null, fence: '-1', pending: null };
+  }
+
+  async function pullJobs(): Promise<Array<{ target: string; trigger: string }>> {
+    return (await controlSql`
+      SELECT target::text AS target, trigger_reason::text AS trigger
+        FROM control.job WHERE kind = 'ingest_pull'::control.job_kind
+       ORDER BY created_at`) as Array<{ target: string; trigger: string }>;
+  }
+
+  function seamsOver(
+    vendor: ConnectorAccountLister,
+  ): Parameters<typeof startWorkerFleet>[1] {
+    const store = links();
+    return {
+      connectors: createConnectorRuntime({ client: gmailApi(), links: store }),
+      reconciler: createConnectorReconciler({
+        links: store,
+        vendor,
+        tiers: createControlPlaneTiers(controlSql),
+      }),
+    };
+  }
+
+  /**
+   * **The defect, closed, through the deployed process.**
+   *
+   * One tick: the fleet asks the vendor about the connect this user started,
+   * writes the connection, enqueues the cadence pull, and runs it. Nothing in
+   * the sequence involves the browser coming back.
+   */
+  test(
+    'one tick turns a connect the user walked away from into a completed pull',
+    async () => {
+      await paid();
+      await markConnectPending(controlSql, { tenantId: TENANT, source: 'gmail', now: NOW });
+
+      const fleet = await fleetOver(seamsOver(lister([attached()])));
+      try {
+        await fleet.tick(NOW);
+      } finally {
+        await fleet.stop();
+      }
+
+      // The connection exists, sealed, and is no longer waiting to be found.
+      const row = await linkRow();
+      expect(row.state).toMatch(/^v1[.]/);
+      expect(row.pending).toBeNull();
+
+      // And it was polled on the same tick, rather than a cron period later.
+      expect(await pullJobs()).toEqual([{ target: 'gmail', trigger: 'connector_cadence' }]);
+      expect((await jobState('ingest_pull')).state).toBe('done');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  /**
+   * **The trap: reconciling twice.**
+   *
+   * `ConnectorState` carries the cursor. A second pass that wrote a fresh state
+   * over the first would reset it to `null`, `pullModeFor` would answer
+   * `backfill`, and the next poll would re-import the whole mailbox — the spend
+   * and the duplicate-content failure at once. Two ticks, and the second must
+   * change nothing.
+   */
+  test(
+    'a second tick neither re-enqueues nor resets the cursor the first one banked',
+    async () => {
+      await paid();
+      await markConnectPending(controlSql, { tenantId: TENANT, source: 'gmail', now: NOW });
+      const vendor = lister([attached()]);
+
+      const first = await fleetOver(seamsOver(vendor));
+      try {
+        await first.tick(NOW);
+      } finally {
+        await first.stop();
+      }
+
+      const banked = (await links().states(TENANT))[0];
+      expect(banked?.cursor).not.toBeNull();
+
+      const second = await fleetOver(seamsOver(vendor));
+      try {
+        // Far enough ahead that the cadence itself is due again, so what stops a
+        // second *state write* is the store's rule rather than the clock.
+        await second.tick(new Date(NOW.getTime() + 3_600_000));
+      } finally {
+        await second.stop();
+      }
+
+      // The vendor was asked once. After adoption the link is not pending, so
+      // the second pass had nothing to ask about — the bound on vendor traffic.
+      expect(vendor.asked).toEqual([`${TENANT}/gmail`]);
+
+      // The cursor moved *forward* — the second tick polled and banked a newer
+      // one — and that is the difference this case is about. A re-adoption
+      // would have written a fresh state: cursor `null`, `pullModeFor` back to
+      // `backfill`, and the whole mailbox re-listed on the tick after that.
+      const after = (await links().states(TENANT))[0] as ConnectorState;
+      expect(pullModeFor(after)).toBe('delta');
+      expect(after.cursor).not.toBeNull();
+      expect(after.connectedAt).toBe(banked?.connectedAt ?? '');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  /**
+   * **The money ruling.** The tier gate refused this account at the button;
+   * reconciliation must not let a background tick undo that. Asked before the
+   * vendor is, so a downgraded tenant costs no round trip either.
+   */
+  test(
+    'a tenant the tier no longer permits is neither connected nor asked about',
+    async () => {
+      // Left at `seedTenant`'s default, which is `free`.
+      await markConnectPending(controlSql, { tenantId: TENANT, source: 'gmail', now: NOW });
+      const vendor = lister([attached()]);
+
+      const fleet = await fleetOver(seamsOver(vendor));
+      try {
+        await fleet.tick(NOW);
+      } finally {
+        await fleet.stop();
+      }
+
+      expect(vendor.asked).toEqual([]);
+      expect((await linkRow()).state).toBeNull();
+      expect(await pullJobs()).toEqual([]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  /**
+   * **The disconnect ruling, at the fleet.** The user pressed disconnect while
+   * a pending link was still outstanding. `fenceConnectorLink` clears the intent
+   * and advances the fence, and the tick that follows must find nothing to do —
+   * a reconciler that re-added the connection would be a disconnect button that
+   * does not work.
+   */
+  test(
+    'a tick after a disconnect does not put the connection back',
+    async () => {
+      await paid();
+      await markConnectPending(controlSql, { tenantId: TENANT, source: 'gmail', now: NOW });
+      await controlSql`
+        UPDATE control.connector_link
+           SET state = NULL, pending_since = NULL, fence = fence + 1
+         WHERE tenant_id = ${TENANT} AND source = 'gmail'::control.connector_source`;
+      const vendor = lister([attached()]);
+
+      const fleet = await fleetOver(seamsOver(vendor));
+      try {
+        await fleet.tick(NOW);
+      } finally {
+        await fleet.stop();
+      }
+
+      expect(vendor.asked).toEqual([]);
+      expect((await linkRow()).state).toBeNull();
+      expect(await pullJobs()).toEqual([]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  /**
+   * A fleet where nobody is mid-connect must reach the vendor zero times. The
+   * alternative — three sources times every ready tenant, every tick — is a
+   * vendor bill for people who never pressed the button.
+   */
+  test(
+    'a tick with nothing pending asks the vendor nothing at all',
+    async () => {
+      await paid();
+      const vendor = lister([attached()]);
+
+      const fleet = await fleetOver(seamsOver(vendor));
+      try {
+        await fleet.tick(NOW);
+      } finally {
+        await fleet.stop();
+      }
+
+      expect(vendor.asked).toEqual([]);
+      expect(await pullJobs()).toEqual([]);
     },
     TEST_TIMEOUT_MS,
   );

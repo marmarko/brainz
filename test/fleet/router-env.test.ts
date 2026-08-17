@@ -237,6 +237,13 @@ describe('each fleet receives the configuration its own process reads', () => {
       BRAINZ_SECRETS_JSON: WORKER_ENV.BRAINZ_SECRETS_JSON,
       BRAINZ_WORKER_CONCURRENCY: WORKER_ENV.BRAINZ_WORKER_CONCURRENCY,
       BRAINZ_WORKER_TICK_MS: WORKER_ENV.BRAINZ_WORKER_TICK_MS,
+      // The connector lane. See the test below for why these are here now and
+      // were deliberately absent before.
+      BRAINZ_PIPEDREAM_PROJECT_ID: WORKER_ENV.BRAINZ_PIPEDREAM_PROJECT_ID,
+      BRAINZ_PIPEDREAM_CLIENT_ID: WORKER_ENV.BRAINZ_PIPEDREAM_CLIENT_ID,
+      BRAINZ_PIPEDREAM_CLIENT_SECRET: WORKER_ENV.BRAINZ_PIPEDREAM_CLIENT_SECRET,
+      BRAINZ_PIPEDREAM_ENVIRONMENT: WORKER_ENV.BRAINZ_PIPEDREAM_ENVIRONMENT,
+      BRAINZ_PIPEDREAM_API_BASE: WORKER_ENV.BRAINZ_PIPEDREAM_API_BASE,
     });
   });
 
@@ -279,26 +286,35 @@ describe('each fleet receives the configuration its own process reads', () => {
   });
 
   /**
-   * **The connector credential reaches the fleet that mints a connect link, and
-   * neither of the other two — including the one that would poll.**
+   * **The connector credential reaches the two fleets that talk to the vendor,
+   * and not the one that does not.**
    *
-   * The worker absence is the deliberate half and the one a future edit is most
-   * likely to undo, because "the worker polls connectors, so it needs the
-   * connector credential" is a true-sounding sentence. It cannot poll: the
-   * cursor a pull resumes from lives in the tenant's object prefix
-   * (`src/ingest/cursor.ts`), reaching one needs a `ScopedCredentialMinter`, and
-   * `src/` has no production implementation of that port — `web/serve.ts` wires
-   * a *refusing* minter and says so. So the worker's `ingest_pull` handler is
-   * registered and its `openSource` seam is absent, and until that changes this
-   * credential in that container would be authority it cannot exercise sitting
-   * in a process that parses attacker-supplied content.
+   * This test used to assert the web fleet alone, and gave the reason: the
+   * worker *could not poll*, because a pull resumes from a cursor that
+   * `src/ingest/cursor.ts` placed in the tenant's object prefix, reaching one
+   * needs a `ScopedCredentialMinter`, and `src/` has no production
+   * implementation of that port. It then said: *when the pull can run, the four
+   * variables join `WORKER_FLEET_VARIABLES` and this test changes with them.
+   * That is the point of asserting it rather than leaving it to the `toEqual`
+   * above: the change becomes a decision.* This is that change, and this comment
+   * is the decision.
    *
-   * When the pull can run, the four variables join `WORKER_FLEET_VARIABLES` and
-   * this test changes with them. That is the point of asserting it rather than
-   * leaving it to the `toEqual` above: the change becomes a decision.
+   * The pull can run: connector state lives in the control plane, sealed
+   * (`src/control/connector-store.sql`), which every fleet already holds a
+   * handle to. So the worker fleet composes a real `ConnectorRuntime` and a real
+   * reconciler, and both need the vendor client. Withholding the credential now
+   * would mean a batch fleet that cannot do the batch work — which is exactly
+   * the state the connector lane spent a unit in.
+   *
+   * **The MCP fleet stays out, and that absence is now the whole of what this
+   * test defends.** It is the process that parses attacker-supplied content; it
+   * mints no connect link, reconciles nothing and polls nothing, so a vendor
+   * credential there would be authority it cannot exercise sitting in the widest
+   * surface in the deployment.
    */
-  test('the connector credential reaches the web fleet alone, including not the worker', () => {
+  test('the connector credential reaches the vendor-facing fleets, and never the MCP one', () => {
     const web = envVarsOf('WebFleet');
+    const worker = envVarsOf('WorkerFleet');
     for (const name of [
       'BRAINZ_PIPEDREAM_PROJECT_ID',
       'BRAINZ_PIPEDREAM_CLIENT_ID',
@@ -307,13 +323,11 @@ describe('each fleet receives the configuration its own process reads', () => {
       'BRAINZ_PIPEDREAM_API_BASE',
     ] as const) {
       expect({ name, value: web[name] }).toEqual({ name, value: WORKER_ENV[name] });
-      for (const fleet of ['McpFleet', 'WorkerFleet'] as const) {
-        expect({ fleet, name, value: envVarsOf(fleet)[name] }).toEqual({
-          fleet,
-          name,
-          value: undefined,
-        });
-      }
+      // Both fleets, or the lane is broken in one direction with nothing saying
+      // so: a web fleet without it mints no link, a worker without it never
+      // notices the authorization and never polls.
+      expect({ name, value: worker[name] }).toEqual({ name, value: WORKER_ENV[name] });
+      expect({ name, value: envVarsOf('McpFleet')[name] }).toEqual({ name, value: undefined });
     }
   });
 

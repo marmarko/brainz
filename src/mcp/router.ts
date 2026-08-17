@@ -199,6 +199,16 @@ export const MCP_FLEET_VARIABLES: readonly string[] = [
  * the loop ticks. Both are `src/worker/serve.ts`'s and meaningless to a process
  * that runs no scheduler.
  *
+ * **And the connector vendor's four, which are on TWO manifests and are the one
+ * duplication here that is deliberate.** The web fleet mints connect links; this
+ * fleet reconciles authorizations on its tick and polls the connections that
+ * result, and both halves talk to the same vendor project. Withholding them here
+ * is what the connector lane looked like before it worked: `enqueueDuePulls`
+ * composed no runtime, so an attached mailbox was never polled by anyone. The
+ * cost is that a compromise of this fleet reaches the vendor credential as well
+ * as the web fleet's — accepted, because the alternative is a batch fleet that
+ * cannot do the batch work.
+ *
  * Not here, and each for a reason worth reading before adding it back: the
  * Stripe credentials belong to `src/web/serve.ts` and travel on
  * {@link WEB_FLEET_VARIABLES} alone; a Neon API key is read by the provisioner,
@@ -220,6 +230,13 @@ export const WORKER_FLEET_VARIABLES: readonly string[] = [
   ...SHARED_FLEET_VARIABLES,
   'BRAINZ_WORKER_CONCURRENCY',
   'BRAINZ_WORKER_TICK_MS',
+  // `compose.ts:openConnectorClient` — the connector lane's vendor. Read the
+  // paragraph above before deleting these four.
+  'BRAINZ_PIPEDREAM_PROJECT_ID',
+  'BRAINZ_PIPEDREAM_CLIENT_ID',
+  'BRAINZ_PIPEDREAM_CLIENT_SECRET',
+  'BRAINZ_PIPEDREAM_ENVIRONMENT',
+  'BRAINZ_PIPEDREAM_API_BASE',
 ];
 
 /**

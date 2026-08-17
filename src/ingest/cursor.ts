@@ -24,13 +24,30 @@
  * re-estimated and re-gated, which costs nothing extra because U4 is a no-op on
  * everything already held and the delta-aware estimate prices exactly that.
  *
- * **Where this record lives.** Not in the control plane, which is content-free
- * by construction and cannot hold a provider token; not in the tenant schema,
- * whose rungs are U3's and append-only. It goes in the tenant's own object
- * prefix beside the raw payloads, through the same accessor
- * (`src/control/storage.ts`) that derives every other key — and it is
- * **validated on read, never cast**, for the reason U8's manifest is: a worker
- * spends money on what this record says.
+ * **Where this record lives, and the placement moved once.** It is not in the
+ * tenant schema, whose rungs are U3's and append-only — that has not changed.
+ * It was placed in the tenant's own object prefix, beside the raw payloads,
+ * on the reasoning that the control plane *"is content-free by construction and
+ * cannot hold a provider token"*.
+ *
+ * Both halves of that sentence were overtaken. `src/control/secret-store.sql`
+ * generalised the rule to **the control plane holds nothing a reader of the
+ * control plane can use**, and sealed a tenant's connection string there for
+ * exactly the reason connector state needs: a record two fleets must share, with
+ * no volume between them. And the object prefix turned out to be unreachable —
+ * `src/control/storage.ts` has no production `ScopedCredentialMinter`, both
+ * entrypoints compose a refusing one, so a connector state written there is a
+ * connector state written nowhere. That is why `connectSource` had no production
+ * caller for as long as it did.
+ *
+ * So the durable home is `control.connector_link`, sealed under
+ * `connector/<tenant>/<source>` (`src/control/connector-store.sql` carries the
+ * whole argument, `src/control/connector-pg.ts` the four statements). This
+ * module is unchanged by that: {@link ConnectorStateStore} is a port,
+ * {@link createObjectConnectorStore} remains the implementation for a deployment
+ * that gains a credential minter, and the state is still **validated on read,
+ * never cast**, for the reason U8's manifest is — a worker spends money on what
+ * this record says.
  *
  * **Ordering, and why a non-transactional store is sound here.** The cursor is
  * advanced only *after* the items it covers are banked. A crash in between

@@ -41,7 +41,12 @@ import {
 import { importSealingKey } from '../control/sealed.ts';
 import { createTenantSecretStore } from '../control/secrets.ts';
 import type { PoolSecretStore, TenantSecretStore } from '../control/secrets.ts';
-import { FleetConfigError, optional, required, type Environment } from './env.ts';
+import {
+  createPipedreamClient,
+  fetchTransport,
+  type PipedreamClient,
+} from '../ingest/pipedream/client.ts';
+import { apiBase, FleetConfigError, optional, required, type Environment } from './env.ts';
 
 /**
  * The control plane, as a handle.
@@ -64,6 +69,21 @@ export function openIdentityStore(env: Environment): SQL {
 export interface FleetSecrets {
   readonly store: TenantSecretStore & PoolSecretStore;
   readonly providerKeys: ProviderKeyBackend;
+  /**
+   * The key sealed rows open under, when this deployment seals anything.
+   *
+   * Absent on the `file` backend, and that absence is the honest one rather
+   * than a gap: a self-hoster with a volume keeps their secrets in a file and
+   * there is nothing in this database to open. Every caller of a sealed
+   * control-plane store therefore has to decide what it does without one —
+   * `src/worker/serve.ts` composes no connector runtime, which is the same
+   * answer it already gives to a missing vendor credential.
+   *
+   * Handed out rather than re-derived, because `sealingKey` refuses with a
+   * `FleetConfigError` naming the variable and a second importer of that
+   * refusal is a second place for the message to drift.
+   */
+  readonly sealingKey?: CryptoKey;
 }
 
 /** The backends a deployment may choose between. Anything else is a refusal. */
@@ -128,6 +148,7 @@ export async function openSecretStore(env: Environment, controlSql: SQL): Promis
   return {
     store: createTenantSecretStore({ backend: backend.secrets }),
     providerKeys: backend.providerKeys,
+    sealingKey: key,
   };
 }
 
@@ -167,6 +188,89 @@ async function importSeed(env: Environment, controlSql: SQL, key: CryptoKey): Pr
     text: await file.text(),
     source: `the secret seed at ${path}`,
   });
+}
+
+/**
+ * The connector vendor's client, when this deployment has one.
+ *
+ * **Composed here rather than in one entrypoint, because two processes now need
+ * the same client and they must not be able to disagree about it.** The web
+ * fleet mints connect links and reconciles on a dashboard load; the worker fleet
+ * reconciles on its tick and polls. A second construction site is a second
+ * chance to point one fleet at `development` and the other at `production` —
+ * which are separate keyspaces at the vendor, so the symptom would be a user
+ * whose mail simply never arrives.
+ *
+ * **The ruling on absence, unchanged and restated where it now applies twice.**
+ * Two states:
+ *
+ *   * **No configuration at all** is a legitimate deployment. Chat exports and
+ *     folder imports (R8a) need no vendor and a self-hoster may never connect
+ *     one, so this answers `undefined`: `app.ts` disables the connector routes
+ *     with a typed `501` and `worker/serve.ts` composes no connector runtime. A
+ *     startup refusal would make every brainz deployment require a Pipedream
+ *     account to serve a signup page.
+ *   * **Partial configuration is a startup refusal**, naming the missing
+ *     variable — the rule the Stripe trio already follows, for the reason it
+ *     gives: a half-configured vendor reaches the network with an empty
+ *     credential and reports the refusal as a vendor outage.
+ *
+ * The API base is configuration rather than a literal, the same reason Stripe's
+ * and Neon's are: a test has to be able to point the process at a local double,
+ * and a process that can only be observed against the live vendor is one nobody
+ * exercises. An {@link apiBase} rather than an origin because the vendor's
+ * carries a version path.
+ */
+export function openConnectorClient(env: Environment): PipedreamClient | undefined {
+  const projectId = optional(env, 'BRAINZ_PIPEDREAM_PROJECT_ID');
+  const clientId = optional(env, 'BRAINZ_PIPEDREAM_CLIENT_ID');
+  const clientSecret = optional(env, 'BRAINZ_PIPEDREAM_CLIENT_SECRET');
+  const environment = optional(env, 'BRAINZ_PIPEDREAM_ENVIRONMENT');
+  if (
+    projectId === undefined &&
+    clientId === undefined &&
+    clientSecret === undefined &&
+    environment === undefined
+  ) {
+    return undefined;
+  }
+
+  const base = optional(env, 'BRAINZ_PIPEDREAM_API_BASE');
+  return createPipedreamClient({
+    config: {
+      projectId: required(env, 'BRAINZ_PIPEDREAM_PROJECT_ID'),
+      clientId: required(env, 'BRAINZ_PIPEDREAM_CLIENT_ID'),
+      clientSecret: required(env, 'BRAINZ_PIPEDREAM_CLIENT_SECRET'),
+      environment: pipedreamEnvironment(env),
+      ...(base === undefined ? {} : { baseUrl: apiBase(env, 'BRAINZ_PIPEDREAM_API_BASE') }),
+    },
+    // The production transport, from the module that owns the bytes seam: a
+    // media fetch asks for `HttpResponse.bytes` because a screenshot decoded as
+    // UTF-8 and re-encoded is no longer that screenshot, and `fetchTransport` is
+    // the implementation that answers in bytes. A transport written at a
+    // composition root would be a second one that does not.
+    transport: fetchTransport(),
+  });
+}
+
+/**
+ * Which of the vendor's two environments this deployment talks to.
+ *
+ * A closed set with no default and no coercion: the two are separate keyspaces
+ * at the vendor, so a deployment that believed it was in `production` and was
+ * not attaches every user's mailbox to a development project, and discovers it
+ * from a user asking why their mail never arrived. A typo refuses at start,
+ * where the operator is.
+ */
+function pipedreamEnvironment(env: Environment): 'development' | 'production' {
+  const declared = required(env, 'BRAINZ_PIPEDREAM_ENVIRONMENT');
+  if (declared !== 'development' && declared !== 'production') {
+    throw new FleetConfigError(
+      'BRAINZ_PIPEDREAM_ENVIRONMENT',
+      `takes only "development" or "production" — the vendor's two keyspaces — not ${JSON.stringify(declared)}`,
+    );
+  }
+  return declared;
 }
 
 export interface GatewayDeps {

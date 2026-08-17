@@ -213,7 +213,50 @@ export interface ExternalUserDeletion {
   readonly tokensRevoked: 'confirmed' | 'unverified';
 }
 
+/**
+ * One account attached at the vendor, as its accounts listing reports it — and
+ * deliberately four fields rather than the row.
+ *
+ * **What is absent is the interesting part.** No label, no email, no owner.
+ * `ConnectorState.accountKey` is *the provider's own spelling* of the mailbox,
+ * adopted from the first provider listing that reports one and refused if a
+ * later one disagrees — a stop the runner calls `identity_changed`. The vendor's
+ * account record speaks a different vocabulary, so copying its label into that
+ * field would wedge the first real pull against a mailbox that never changed.
+ * Reconciliation therefore learns *that* an account exists and *which
+ * connection id* to call it by, and claims nothing about whose it is.
+ *
+ * `dead` is the vendor's own verdict on the grant. It is read as `false` when
+ * the vendor does not say, because an account listed without a health field is
+ * an account the vendor is offering, and treating silence as death would
+ * disconnect every user the day a field is renamed.
+ */
+export interface ConnectedAccount {
+  /** The vendor's connection id, which is what `x-pd-account-id` takes. */
+  readonly accountId: string;
+  /** Which app it is, when the listing says. Null means the listing did not. */
+  readonly appSlug: string | null;
+  /** The vendor's own verdict on the grant. */
+  readonly dead: boolean;
+  /** When it was attached, if the listing says. Orders two live accounts. */
+  readonly createdAt: string | null;
+}
+
 export interface PipedreamClient extends ProviderApi {
+  /**
+   * Every account attached under one external user — the channel through which
+   * this fleet learns that a consent screen was completed.
+   *
+   * **It is a read, and it asks for no credential.** The vendor offers an
+   * `include_credentials` parameter on this endpoint; it is not sent, and must
+   * not be. Nothing in the reconciliation path needs a provider token — the
+   * proxy call carries the scope in headers — and a request that asked for one
+   * would put a live Google credential in this process's memory and in whatever
+   * logged the response.
+   */
+  listAccounts(request: {
+    readonly externalUserId: string;
+  }): Promise<ClientOutcome<readonly ConnectedAccount[]>>;
   mintConnectToken(request: {
     readonly externalUserId: string;
     readonly now: Date;
@@ -487,6 +530,52 @@ function parseJson(body: string): unknown {
   }
 }
 
+/**
+ * The accounts listing, read defensively.
+ *
+ * **Every field but the id is optional, and an entry with no id is dropped.**
+ * The id is the only thing a later proxy call cannot proceed without — it
+ * becomes `x-pd-account-id` — so an entry missing it is not an account this
+ * fleet can address, and adopting one would write a `ConnectorState` whose every
+ * poll fails. Everything else degrades: an unnamed app is `null` and the caller
+ * decides what silence means, an unparseable timestamp is `null` and orders
+ * nothing.
+ *
+ * Written as a loop over a shape rather than a cast, for the reason
+ * `parseConnectorState` is: a vendor's JSON is the other side of a network, and
+ * this fleet spends money on what it says.
+ */
+export function parseAccounts(body: unknown): readonly ConnectedAccount[] {
+  const data = body === null || typeof body !== 'object' ? undefined : (body as { data?: unknown }).data;
+  if (!Array.isArray(data)) return [];
+
+  const accounts: ConnectedAccount[] = [];
+  for (const entry of data) {
+    if (entry === null || typeof entry !== 'object') continue;
+    const record = entry as Record<string, unknown>;
+    const id = record['id'];
+    if (typeof id !== 'string' || id.length === 0) continue;
+
+    const app = record['app'];
+    const slug =
+      app !== null && typeof app === 'object' ? (app as Record<string, unknown>)['name_slug'] : undefined;
+    const createdAt = record['created_at'];
+
+    accounts.push({
+      accountId: id,
+      appSlug: typeof slug === 'string' && slug.length > 0 ? slug : null,
+      // Either spelling of "this grant is finished". Absent means alive: an
+      // account listed with no health field is one the vendor is offering, and
+      // reading silence as death would disconnect everyone the day it is
+      // renamed.
+      dead: record['dead'] === true || record['healthy'] === false,
+      createdAt:
+        typeof createdAt === 'string' && !Number.isNaN(Date.parse(createdAt)) ? createdAt : null,
+    });
+  }
+  return accounts;
+}
+
 function queryString(query: ProviderRequest['query']): string {
   if (query === undefined) return '';
   const params = new URLSearchParams();
@@ -649,6 +738,31 @@ export function createPipedreamClient(options: {
   }
 
   return {
+    /**
+     * Vendor detail #5, and the one in this file that was checked against the
+     * live vendor rather than reasoned about: `GET /connect/{project}/accounts`
+     * filtered by `external_user_id`, which answers `200` with an empty `data`
+     * array for an external user that has attached nothing. That is the answer
+     * the reconciler sees for every user still sitting on a consent screen, so
+     * it has to be an ordinary success rather than a `404`.
+     *
+     * The filter travels as a query parameter and NOT as the
+     * `x-pd-external-user-id` header `connectionHeaders` builds: that header
+     * scopes a *proxy* call, and this is the vendor's own listing. The id is
+     * still checked against the anchored alphabet, because it reaches the URL.
+     */
+    async listAccounts(request) {
+      assertExternalUserId(request.externalUserId);
+      const outcome = await call({
+        method: 'GET',
+        url: `${base}/connect/${config.projectId}/accounts?external_user_id=${encodeURIComponent(request.externalUserId)}`,
+        headers: { 'x-pd-environment': config.environment },
+        rateKey: 'connect',
+      });
+      if (!outcome.ok) return outcome;
+      return { ok: true, value: parseAccounts(parseJson(outcome.value.body)) };
+    },
+
     async mintConnectToken(request) {
       assertExternalUserId(request.externalUserId);
       const outcome = await call({
@@ -712,9 +826,12 @@ export function createPipedreamClient(options: {
     /**
      * R12's fourth erasure leg.
      *
-     * **This method has no caller in `src/`.** Wiring it into the erasure
-     * pipeline is U17's, and building half of that pipeline here would be worse
-     * than the gap — see the header and `docs/vendor/2026-08-12-pipedream-compliance.md`.
+     * **Its one caller is the disconnect button** (`src/web/connectors.ts`),
+     * which revokes the external user for one source. Wiring it into the
+     * *erasure* pipeline — where an account deletion revokes every source a
+     * subject ever connected — is still U17's, and building half of that
+     * pipeline here would be worse than the gap. See the header and
+     * `docs/vendor/2026-08-12-pipedream-compliance.md`.
      */
     async deleteExternalUser(request) {
       assertExternalUserId(request.externalUserId);

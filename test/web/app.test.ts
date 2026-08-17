@@ -26,6 +26,13 @@ import {
 } from '../../src/web/app.ts';
 import { CONNECT_STEPS, installLink } from '../../src/web/connect.ts';
 import { redactClaimUrls } from '../../src/ingest/pipedream/client.ts';
+import {
+  createPostgresConnectorLinks,
+  ensureConnectorLinkSchema,
+  markConnectPending,
+} from '../../src/control/connector-pg.ts';
+import { generateSealingKeyMaterial, importSealingKey } from '../../src/control/sealed.ts';
+import { connectSource } from '../../src/ingest/cursor.ts';
 import { BRAIN_SETUP_PATH, escapeHtml } from '../../src/web/pages.ts';
 // The other fleet's page, imported rather than described: the sentence it prints
 // is a claim about a page this one serves, and the two are separate processes.
@@ -67,7 +74,18 @@ let recorded: {
   byokPuts: { tenantId: string; provider: string; key: string }[];
   byokRevokes: { tenantId: string; provider: string }[];
   minted: { tenantId: string; source: string }[];
-  disconnected: { tenantId: string; source: string }[];
+  /**
+   * Each disconnect the vendor port was asked to perform — and, taken at the
+   * moment it was asked, what the connector link and the job queue looked like.
+   *
+   * The snapshot is the ordering proof. A disconnect that told the vendor first
+   * and cleared locally afterwards leaves a window in which a reconciliation
+   * pass, holding a listing it read a moment ago, can still commit — and the
+   * connection comes back with no vendor account behind it. Recording the state
+   * *during* the vendor call is the only way to assert which side of that window
+   * this app is on; asserting afterwards passes either way.
+   */
+  disconnected: { tenantId: string; source: string; linkState: string | null; openJobs: number }[];
   severed: { tenantId: string; origin: string; confirm: string }[];
   provisioned: { ftsLanguage: string }[];
 };
@@ -149,9 +167,25 @@ function app(
                 expiresAt: new Date(AT.getTime() + 600_000),
               });
             },
-            disconnect(request: { tenantId: string; source: string }) {
-              recorded.disconnected.push({ ...request });
-              return Promise.resolve({ deleted: true, tokensRevoked: 'unverified' as const });
+            async disconnect(request: { tenantId: string; source: string }) {
+              const link = (await controlSql`
+                SELECT state FROM control.connector_link
+                 WHERE tenant_id = ${request.tenantId}
+                   AND source = ${request.source}::control.connector_source
+              `) as Array<{ state: string | null }>;
+              const open = (await controlSql`
+                SELECT count(*)::int AS n FROM control.job
+                 WHERE tenant_id = ${request.tenantId}
+                   AND kind = 'ingest_pull'::control.job_kind
+                   AND target = ${request.source}::control.job_target
+                   AND state IN ('due', 'running')
+              `) as Array<{ n: number }>;
+              recorded.disconnected.push({
+                ...request,
+                linkState: link[0]?.state ?? null,
+                openJobs: open[0]?.n ?? -1,
+              });
+              return { deleted: true, tokensRevoked: 'unverified' as const };
             },
           },
         }),
@@ -204,10 +238,32 @@ function cookieOf(response: Response): string {
   return `${SESSION_COOKIE}=${token}`;
 }
 
+/**
+ * A source this brain is actually connected to, written the way reconciliation
+ * writes one.
+ *
+ * Through the real store rather than an INSERT, because the panel's whole
+ * question is "does a connection exist", and a hand-built row would let the
+ * table's shape and the reader's expectation drift apart without either test
+ * noticing. The key is local to this suite: nothing here reads a state back.
+ */
+async function attachSource(source: 'gmail' | 'calendar' | 'drive'): Promise<void> {
+  const key = await importSealingKey(generateSealingKeyMaterial());
+  const links = createPostgresConnectorLinks({ sql: controlSql, key });
+  await markConnectPending(controlSql, { tenantId: TENANT, source, now: AT });
+  await links.adopt({
+    tenantId: TENANT,
+    source,
+    fence: 0,
+    state: connectSource({ source, externalUserId: `${TENANT}-${source}`, now: AT }),
+  });
+}
+
 async function reset(): Promise<void> {
   await sql`DELETE FROM account.account`;
   await sql`DELETE FROM account.billing_event`;
   await controlSql`DELETE FROM control.job`;
+  await controlSql`DELETE FROM control.connector_link`;
   await controlSql`DELETE FROM control.tenant`;
   recorded = { byokPuts: [], byokRevokes: [], minted: [], disconnected: [], severed: [], provisioned: [] };
 }
@@ -246,6 +302,11 @@ beforeAll(async () => {
   control = await createControlPlane('webapp');
   sql = connectIdentity(identity);
   controlSql = connectControl(control);
+  // The connector link table, which `src/web/serve.ts` ensures at boot and this
+  // suite composes past. `createControlPlane` applies `schema.sql` alone — the
+  // tables a fleet ensures for itself are each ensured by whoever needs them,
+  // the same way `oauth-sweep.test.ts` ensures the authorization store.
+  await ensureConnectorLinkSchema(controlSql);
   recorded = { byokPuts: [], byokRevokes: [], minted: [], disconnected: [], severed: [], provisioned: [] };
 }, 60_000);
 
@@ -629,7 +690,9 @@ describe('disconnect revokes polling', () => {
       // compliance question is answered in writing.
       tokens_revoked: 'unverified',
     });
-    expect(recorded.disconnected).toEqual([{ tenantId: TENANT, source: 'gmail' }]);
+    expect(recorded.disconnected).toEqual([
+      { tenantId: TENANT, source: 'gmail', linkState: null, openJobs: 0 },
+    ]);
 
     // The calendar cadence is untouched: the unit of disconnection is the source.
     const rows = await controlSql<{ target: string; state: string }[]>`
@@ -638,6 +701,127 @@ describe('disconnect revokes polling', () => {
       { target: 'gmail', state: 'discarded' },
       { target: 'calendar', state: 'due' },
     ].sort((a, b) => a.target.localeCompare(b.target)));
+  });
+
+  /**
+   * **The ordering, asserted from inside the vendor call.**
+   *
+   * By the time the vendor is asked to revoke, this brain has already stopped:
+   * the connector link is cleared and the fence advanced, and the queued pull is
+   * discarded. Reverse the two and there is a window in which a reconciliation
+   * pass — holding an account listing it read a moment ago — commits between the
+   * vendor's delete and our own write, putting the connection back with nothing
+   * behind it; and a window in which a worker claims the queued pull and polls
+   * with a credential we have just asked to have revoked.
+   *
+   * `linkState` and `openJobs` are read *during* `vendor.disconnect`, because an
+   * assertion made afterwards is true whichever order the two ran in.
+   */
+  test('the polling has already stopped by the time the vendor is asked', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await attachSource('gmail');
+    await controlSql`
+      INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason, run_at, created_at, updated_at)
+      VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'gmail', 'due', 'connector_cadence', ${AT}, ${AT}, ${AT})`;
+
+    await app()(
+      new Request(`${ORIGIN}/api/connectors`, {
+        method: 'DELETE',
+        headers: { origin: ORIGIN, cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ source: 'gmail' }),
+      }),
+    );
+
+    expect(recorded.disconnected).toEqual([
+      { tenantId: TENANT, source: 'gmail', linkState: null, openJobs: 0 },
+    ]);
+  });
+
+  /**
+   * The fence, which is what a reconciliation pass already in flight loses to.
+   * Clearing `pending_since` stops the *next* pass from asking; the fence is
+   * what refuses the write of one that asked before any of this happened.
+   */
+  test('disconnect advances the fence a reconciler in flight is writing under', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await markConnectPending(controlSql, { tenantId: TENANT, source: 'gmail', now: AT });
+
+    await app()(
+      new Request(`${ORIGIN}/api/connectors`, {
+        method: 'DELETE',
+        headers: { origin: ORIGIN, cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ source: 'gmail' }),
+      }),
+    );
+
+    const rows = (await controlSql`
+      SELECT fence::text AS fence, pending_since AS pending
+        FROM control.connector_link
+       WHERE tenant_id = ${TENANT} AND source = 'gmail'::control.connector_source
+    `) as Array<{ fence: string; pending: Date | null }>;
+    expect(rows).toEqual([{ fence: '1', pending: null }]);
+  });
+});
+
+describe('pressing connect records the intent before the user leaves', () => {
+  /**
+   * **The load-bearing write in the whole flow.** The user is about to leave for
+   * the vendor's consent screen and owes this origin nothing afterwards — they
+   * can authorize and close the tab. This row is what lets the fleet go and ask
+   * the vendor later which accounts exist under this tenant's external user.
+   * Without it there is no channel at all, which is the state `connectSource`
+   * having no production caller describes.
+   */
+  test('a minted connect link leaves a pending link behind it', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+
+    await app()(post('/api/connectors', { source: 'gmail' }, { cookie }));
+
+    const rows = (await controlSql`
+      SELECT source::text AS source, state, pending_since IS NOT NULL AS pending
+        FROM control.connector_link WHERE tenant_id = ${TENANT}
+    `) as Array<{ source: string; state: string | null; pending: boolean }>;
+    expect(rows).toEqual([{ source: 'gmail', state: null, pending: true }]);
+  });
+
+  /**
+   * Pressing connect on a source that is already polling must not un-connect it.
+   * Adoption is create-only, so a link knocked back to "pending" would be
+   * re-adopted from a *fresh* state — cursor `null` — and the mailbox would be
+   * re-imported from scratch.
+   */
+  test('pressing connect again on a live connection does not disturb it', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await attachSource('gmail');
+
+    await app()(post('/api/connectors', { source: 'gmail' }, { cookie }));
+
+    const rows = (await controlSql`
+      SELECT state IS NOT NULL AS connected, pending_since IS NULL AS quiet
+        FROM control.connector_link WHERE tenant_id = ${TENANT}
+    `) as Array<{ connected: boolean; quiet: boolean }>;
+    expect(rows).toEqual([{ connected: true, quiet: true }]);
+  });
+
+  /**
+   * A refusal writes nothing. The tier gate answers before the mint, so a free
+   * account that reached this route leaves no link for a reconciliation pass to
+   * find — which is what stops the gate being a front door with an open window.
+   */
+  test('a gated account leaves no pending link', async () => {
+    await reset();
+    const cookie = await signedIn('free');
+
+    await app()(post('/api/connectors', { source: 'gmail' }, { cookie }));
+
+    const rows = (await controlSql`
+      SELECT count(*)::int AS n FROM control.connector_link WHERE tenant_id = ${TENANT}
+    `) as Array<{ n: number }>;
+    expect(rows[0]?.n).toBe(0);
   });
 });
 
@@ -1625,7 +1809,7 @@ describe('disconnect, from a page that can only GET and POST', () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get('content-type')).toContain('text/html');
-    expect(recorded.disconnected).toEqual([{ tenantId: TENANT, source: 'gmail' }]);
+    expect(recorded.disconnected).toMatchObject([{ tenantId: TENANT, source: 'gmail' }]);
     const rows = await controlSql<{ state: string }[]>`
       SELECT state::text AS state FROM control.job WHERE target = 'gmail'`;
     expect(rows[0]?.state).toBe('discarded');
@@ -1662,7 +1846,7 @@ describe('disconnect, from a page that can only GET and POST', () => {
     );
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ok: true, tokens_revoked: 'unverified' });
-    expect(recorded.disconnected).toEqual([{ tenantId: TENANT, source: 'gmail' }]);
+    expect(recorded.disconnected).toMatchObject([{ tenantId: TENANT, source: 'gmail' }]);
   });
 
   test('an absent intent is a connect — the JSON callers that never sent one still work', async () => {
@@ -1713,26 +1897,57 @@ describe('the tier gate stays, and it is the control that is absent', () => {
 });
 
 describe('the status beside each source says only what this brain can know', () => {
-  test('with nothing polled it says so rather than claiming a connection', async () => {
+  test('with nothing connected it says so', async () => {
     await reset();
     const cookie = await signedIn('paid');
     const page = await (await app()(get('/dashboard', { cookie }))).text();
     expect(page).toContain('Not connected');
   });
 
-  test('an open pull is the evidence of attachment, and reads as one', async () => {
+  /**
+   * **The state the whole reconciliation flow exists to produce, and the one a
+   * queue-only panel could not show.** A connection adopted a minute ago is
+   * attached and has never been polled — the cadence pass runs on the worker
+   * fleet's next wake. A panel that read only the queue would tell this user
+   * "not connected", and they would press connect again.
+   */
+  test('a connection with no poll yet reads as connected and says the check is coming', async () => {
     await reset();
     const cookie = await signedIn('paid');
+    await attachSource('gmail');
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).toContain('The first check has not run yet');
+    expect([...page.matchAll(/Not connected/g)].length).toBe(2);
+  });
+
+  /**
+   * The other half of the same honesty: a user who pressed connect and has not
+   * finished at the provider is told exactly that, rather than being shown a
+   * page that looks as though nothing happened.
+   */
+  test('a connect the user has not finished reads as started, not as connected', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await markConnectPending(controlSql, { tenantId: TENANT, source: 'gmail', now: new Date() });
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).toContain('You started connecting this');
+  });
+
+  test('an open pull on a live connection reads as a check in flight', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await attachSource('gmail');
     await controlSql`
       INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason, run_at, created_at, updated_at)
       VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'gmail', 'due', 'connector_cadence', ${AT}, ${AT}, ${AT})`;
     const page = await (await app()(get('/dashboard', { cookie }))).text();
-    expect(page).toContain('Connected');
+    expect(page).toContain('A check is queued or running now');
   });
 
   test('a dead-lettered lane reads as failing, and names the code', async () => {
     await reset();
     const cookie = await signedIn('paid');
+    await attachSource('drive');
     await controlSql`
       INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason,
                                run_at, created_at, updated_at, finished_at, dead_lettered_at, failure_code)
@@ -1744,6 +1959,26 @@ describe('the status beside each source says only what this brain can know', () 
   });
 
   /**
+   * A dead letter outlives a disconnect: `handleDisconnect` discards the `due`
+   * and `running` rows and leaves the `dead` one, which is the record of what
+   * was refused and is the whole value of a dead letter. Painting it red on a
+   * source the user has removed would be a warning with no way to clear it
+   * short of connecting the source again.
+   */
+  test('a dead lane on a source the user disconnected is not still shouting', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await controlSql`
+      INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason,
+                               run_at, created_at, updated_at, finished_at, dead_lettered_at, failure_code)
+      VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'drive', 'dead', 'connector_cadence',
+              ${AT}, ${AT}, ${AT}, ${AT}, ${AT}, 'handler_error')`;
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).not.toContain('handler_error');
+    expect([...page.matchAll(/Not connected/g)].length).toBe(3);
+  });
+
+  /**
    * The rule `sourceStaleness` states for its own view, applied here: the most
    * recent *terminal* run wins, so a later success clears the code instead of
    * being reached past. A staleness display nobody can clear is one nobody
@@ -1752,6 +1987,7 @@ describe('the status beside each source says only what this brain can know', () 
   test('a success after a dead lane clears it rather than being reached past', async () => {
     await reset();
     const cookie = await signedIn('paid');
+    await attachSource('drive');
     await controlSql`
       INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason,
                                run_at, created_at, updated_at, finished_at, dead_lettered_at, failure_code)

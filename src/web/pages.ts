@@ -254,8 +254,25 @@ function connectorStatusSentence(status: ConnectorStatus): string {
       );
     case 'connected':
       return `<p>Connected. Last checked ${status.lastCheckedAt === null ? 'at an unrecorded time' : moment(status.lastCheckedAt)}.</p>`;
-    case 'unknown':
-      return `<p>Not connected, as far as this brain can tell — nothing has ever been polled for it.</p>`;
+    // The half hour between authorizing and the first poll, said out loud. A
+    // user who is told only "connected" and then sees nothing arrive concludes
+    // it is broken; a user given the number waits.
+    case 'attached':
+      return (
+        `<p><strong>Connected.</strong> The first check has not run yet — it starts within about ` +
+        `half an hour, and the first one takes longer than the rest because it has a backlog to read.</p>`
+      );
+    // Deliberately not "connecting…": nothing here is in progress. The user
+    // either has not finished at the provider or did not finish at all, and only
+    // they can tell which — so the copy says what is true and what to do.
+    case 'pending':
+      return (
+        `<p>You started connecting this. Nothing has been attached yet — if you closed the provider's ` +
+        `page before finishing, connect again; if you did finish, this appears on its own within about ` +
+        `half an hour.</p>`
+      );
+    case 'absent':
+      return `<p>Not connected.</p>`;
   }
 }
 

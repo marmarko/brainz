@@ -51,25 +51,33 @@
  * an operator cleared it.
  *
  * ============================================================================
- * WHAT IS ABSENT, AND WHY IT IS ABSENT RATHER THAN FAKED
+ * WHERE THE STATE THIS PASS READS ACTUALLY LIVES
  * ============================================================================
  *
- * {@link ConnectorRuntime} has no production implementation, and this is the
- * `destinations: {}` shape one lane over rather than an oversight. Both of its
- * methods need the connector's stored state, which lives under
- * `{tenant}/connectors/<source>` and is reached through a `RawStore` over the
- * tenant's object prefix — and `src/control/storage.ts` has **no production
- * `ScopedCredentialMinter`**, so no process in `src/` can obtain the
- * prefix-scoped credential that read requires. `web/serve.ts` wires a *refusing*
- * minter and says so; `worker/serve.ts` composes an absent runtime and says so
- * here.
+ * This block used to say {@link ConnectorRuntime} had no production
+ * implementation, and gave the reason: both of its methods need the connector's
+ * stored state, `cursor.ts` places that state under `{tenant}/connectors/<source>`
+ * in object storage, and `src/control/storage.ts` has no production
+ * `ScopedCredentialMinter` — so no process in `src/` could obtain the
+ * prefix-scoped credential that read requires. That was true, and the
+ * consequence was worse than "the pass enqueues nothing": `connectSource` had no
+ * production caller anywhere, so a user could authorize at the vendor and
+ * nothing in this fleet would ever be told.
  *
- * The consequence is stated rather than left to be discovered: with the runtime
- * absent this pass enqueues nothing, and a hand-planted `ingest_pull` row fails
- * its handler and walks the backoff ladder to the dead-letter list. That is the
- * designed surface for "this tenant cannot be served" — the same one
- * `TenantNotConsolidableError` uses — and it is the right outcome rather than a
- * job that reports success having polled nothing.
+ * The state now lives in the control plane, sealed
+ * (`src/control/connector-store.sql` carries the whole argument, and it is the
+ * one `secret-store.sql` already made for tenant credentials: the record has to
+ * be shared between fleets with no volume between them). Two things follow for
+ * this file:
+ *
+ *   * {@link ConnectorRuntime.states} still opens no tenant database. It reads
+ *     one control-plane row set — which every fleet process has open already —
+ *     so the economy this module is built around is unchanged.
+ *   * A deployment with no vendor credential still composes no runtime, and the
+ *     absence still behaves the way it did: this pass enqueues nothing, and a
+ *     hand-planted `ingest_pull` row fails its handler and walks the backoff
+ *     ladder to the dead-letter list. That is the designed surface for "this
+ *     tenant cannot be served" — the same one `TenantNotConsolidableError` uses.
  */
 
 import type { SQL } from 'bun';
@@ -81,7 +89,11 @@ import {
   type ConnectorStateStore,
 } from '../ingest/cursor.ts';
 import { readPausedSources } from '../ingest/pause.ts';
+import type { ProviderApi } from '../ingest/pipedream/client.ts';
 import { enqueuePullIfDue } from '../ingest/pipedream/pull.ts';
+import { createCalendarSource } from '../ingest/pipedream/sources/calendar.ts';
+import { createDriveSource } from '../ingest/pipedream/sources/drive.ts';
+import { createGmailSource } from '../ingest/pipedream/sources/gmail.ts';
 import type { ProviderSource } from '../ingest/pipedream/sources/types.ts';
 import type { TenantRuntime } from '../ingest/import/run.ts';
 import type { TenantConnection } from '../control/tier.ts';
@@ -141,6 +153,63 @@ export function connectorSourceOpener(
 ): ConnectorRuntime['open'] {
   if (runtime !== undefined) return (tenant, source) => runtime.open(tenant, source);
   return (_tenant, source) => Promise.reject(new ConnectorRuntimeUnavailableError(source));
+}
+
+/**
+ * The three adapters, by the source they serve.
+ *
+ * A record rather than a `switch`, so the set is the same shape as
+ * `CONNECTOR_SOURCES` and `APP_FOR_SOURCE` and a fourth connector added to one
+ * and not the others fails to typecheck rather than falling through to a
+ * default. Each takes a {@link ProviderApi} and nothing else — the narrow port
+ * the adapters were written against so that KTD6's Phase 5 own-OAuth swap
+ * replaces the client and not them.
+ */
+const ADAPTER_FOR: Readonly<Record<ConnectorSource, (api: ProviderApi) => ProviderSource>> = {
+  gmail: createGmailSource,
+  calendar: createCalendarSource,
+  drive: createDriveSource,
+};
+
+/** Where a tenant's connector states are kept, as this module needs them. */
+export interface ConnectorLinkReader {
+  states(tenantId: string): Promise<readonly ConnectorState[]>;
+  storeFor(tenantId: string): ConnectorStateStore;
+}
+
+/**
+ * The production runtime: the vendor client, and the durable link store.
+ *
+ * **What this closes.** `ConnectorRuntime` was a port with no implementation, so
+ * `enqueueDuePulls` was a no-op in every deployment and the `ingest_pull`
+ * handler's `openSource` seam refused every job. Both halves of the connector
+ * lane were registered and neither could run.
+ *
+ * The client is shared across every tenant and every source, and that is
+ * correct rather than convenient: its rate budget is per **vendor project**, so
+ * one client per tenant would be N tenants each holding the whole quota while
+ * each reported itself inside it.
+ *
+ * The store is per tenant and is built fresh per `open`, because it captures the
+ * disconnect fence it read and conditions its cursor write on that value — a
+ * store shared between two pulls would carry one pull's fence into the other's
+ * write.
+ */
+export function createConnectorRuntime(deps: {
+  readonly client: ProviderApi;
+  readonly links: ConnectorLinkReader;
+}): ConnectorRuntime {
+  return {
+    states(tenantId) {
+      return deps.links.states(tenantId);
+    },
+    open(tenant, source) {
+      return Promise.resolve({
+        source: ADAPTER_FOR[source](deps.client),
+        states: deps.links.storeFor(tenant.tenantId),
+      });
+    },
+  };
 }
 
 export interface PullEnqueueDeps {
