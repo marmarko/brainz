@@ -32,7 +32,7 @@ import {
   type SchemaApplyRequest,
   type TenantSchemaApplier,
 } from '../control/provision.ts';
-import { assertTextSearchConfigExists } from './fts-language.ts';
+import { assertTextSearchConfigExists, observedFtsLanguage } from './fts-language.ts';
 import { HEAD_SCHEMA_VERSION, MIGRATIONS, type TenantMigration } from './migrations.ts';
 import { assertVectorColumns } from './vector-index.ts';
 
@@ -119,12 +119,26 @@ export function createTenantSchemaApplier(
         // Reported by the database rather than echoed back from the request:
         // the failure KTD9 forbids is precisely a database quietly disagreeing
         // with what was asked for.
-        const rows = await sql.unsafe<{ default_text_search_config: string }[]>(
-          'SHOW default_text_search_config',
-        );
-        const configured = rows[0]?.default_text_search_config;
-        if (configured === undefined) return { ok: false };
-        return { ok: true, ftsLanguage: configured.replace(/^pg_catalog\./, '') };
+        //
+        // **Read from the generated column, not from `default_text_search_config`.**
+        // That setting is a *session* default for calls that name no
+        // configuration, it is `pg_catalog.english` on a stock server, and
+        // nothing under `src/` sets it — so asking it answered `english` for
+        // every tenant however the schema was built, and `provisionTenant`,
+        // which compares this against the language the user chose, refused
+        // every non-English tenant at the last step of a successful provision.
+        // English passed. That is KTD9's silent anglicisation with the sign
+        // flipped: instead of a Spanish brain quietly indexed in English, a
+        // Spanish brain that cannot be created.
+        //
+        // `chunk.content_tsv`'s stored expression is what Postgres actually
+        // evaluates on every write, which is the only witness that cannot drift
+        // from the stemming a query will meet — and it is the same witness
+        // `assertFtsLanguageMatches` uses to refuse a drifting migration, so the
+        // two directions of KTD9's check read one fact.
+        const observed = await observedFtsLanguage(sql);
+        if (observed === undefined) return { ok: false };
+        return { ok: true, ftsLanguage: observed };
       } catch {
         return { ok: false };
       } finally {

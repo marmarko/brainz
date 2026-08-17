@@ -60,6 +60,7 @@ import {
   type SchemaFixture,
 } from './fixture.ts';
 import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
+import { createTenantSchemaApplier } from '../../src/schema/apply.ts';
 
 /** The column a seeded vector goes in — the active seat's, so a fixture
  * cannot outlive the column production writes. */
@@ -856,6 +857,45 @@ describe('KTD9 — the tenant’s language reaches every generated column', () =
         );
         expect(covering.length).toBeGreaterThanOrEqual(1);
       }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  /**
+   * The gate that decides whether a provisioned tenant is allowed to be `ready`.
+   *
+   * `provisionTenant` runs `verifyFirstQuery` immediately after the apply and
+   * compares what comes back against the language the user chose; a mismatch is
+   * a recorded `first_query_failed` and no tenant. Nothing in this repository
+   * had ever run the **real** applier's implementation of it — `provision.test.ts`
+   * drives a fake port, `provision.real.test.ts` substitutes a bench applier of
+   * its own that sets `default_text_search_config` on the database, and the pool
+   * path does not verify at all. So the one production combination went
+   * unexercised, and it does not work: a stock Postgres reports
+   * `pg_catalog.english` for that setting whatever the schema was built in, and
+   * nothing under `src/` ever sets it. Every non-English tenant provisioned
+   * through the synchronous path therefore failed at the last step, and only
+   * English passed — which is KTD9's forbidden silent anglicisation arriving as
+   * a refusal instead of a fallback.
+   *
+   * The fixture is `simple`, not `english`, which is what makes this able to
+   * fail at all.
+   */
+  test(
+    'the applier verifies the language the tenant is indexed in, not a session default',
+    async () => {
+      const applier = createTenantSchemaApplier();
+      const verified = await applier.verifyFirstQuery({ connectionString: fixture.dsn });
+
+      expect(verified.ok).toBe(true);
+      expect(verified.ok ? verified.ftsLanguage : undefined).toBe(FIXTURE_FTS_LANGUAGE);
+
+      // And the setting it used to read says something else on this same
+      // database — so the assertion above is discriminating rather than true by
+      // coincidence.
+      const rows = await sql<{ default_text_search_config: string }[]>`
+        SHOW default_text_search_config`;
+      expect(rows[0]?.default_text_search_config).not.toContain(FIXTURE_FTS_LANGUAGE);
     },
     TEST_TIMEOUT_MS,
   );

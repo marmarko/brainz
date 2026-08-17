@@ -1,11 +1,14 @@
 /**
  * The Neon adapter — the production wiring behind `NeonProjectApi`.
  *
- * **Scope, stated plainly.** This exists so U2's create-to-first-query benchmark
- * can run against real Neon (`test/control/provision.real.test.ts`). It is the
- * real API, not a stub, but nothing on the request path constructs one yet: the
- * fleet does not provision tenants, the control plane does. Treat it as wired
- * for the benchmark and reviewed for production, in that order.
+ * **Scope, stated plainly.** This began as the adapter U2's create-to-first-query
+ * benchmark runs against (`test/control/provision.real.test.ts`), and for several
+ * units that was its only constructor anywhere — the web app composed a
+ * provisioner with no `neon` port at all, so the synchronous branch every
+ * default deployment takes refused `no_substrate_configured` at signup. It is
+ * constructed on the request path now: `src/web/serve.ts` builds one from
+ * `BRAINZ_NEON_*` and hands it to `createBrainProvisioner`. The MCP and worker
+ * fleets still hold no vendor credential and still must not.
  *
  * Endpoints and payload shapes are transcribed from the Neon API v2 reference
  * (`https://api-docs.neon.tech/reference/`), read 2026-08-12:
@@ -19,10 +22,21 @@
  *
  * Three behaviours are deliberate rather than incidental:
  *
- * **`suspend_timeout_seconds` is sent on every create.** It is U2 step 5's cost
- * lever and R13's ≈$0.105/month idle anchor depends on it. Neon's own default is
- * 0 (never suspend, i.e. bill forever), so omitting the field is not a neutral
- * choice — it is the expensive one.
+ * **`suspend_timeout_seconds` is sent on every create, unless the account cannot
+ * take it.** It is U2 step 5's cost lever and R13's ≈$0.105/month idle anchor
+ * depends on it. This note used to say that omitting the field means *never
+ * suspend, i.e. bill forever*; that is wrong, and the correction is measured
+ * rather than read: a project created without it comes back carrying
+ * `suspend_timeout_seconds: 0` on its endpoint, and `0` is the API's "use the
+ * default", which is 300 seconds. So omitting is not catastrophic — it is five
+ * minutes of idle compute per wake instead of one, which is the cost difference
+ * R13's anchor is drawn against and still worth sending.
+ *
+ * The exception is real and it is the self-hoster's: a free-plan account refuses
+ * the field outright (`412 modifying the suspend interval is not permitted on
+ * this account`) and creates nothing, so the setting is declared by the operator
+ * — see {@link NeonApiOptions.suspendTimeoutSettable} — and never inferred from
+ * that refusal.
  *
  * **A 2xx with an unexpected body is an error.** An id read as `undefined` and
  * banked on a control-plane row produces a tenant naming a project nobody can
@@ -60,9 +74,53 @@ import type {
 export type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
 
 export const NEON_API_BASE_URL = 'https://console.neon.tech/api/v2';
-export const DEFAULT_NEON_REGION_ID = 'aws-us-east-2';
-export const DEFAULT_NEON_PG_VERSION = 17;
-export const DEFAULT_MAX_ATTEMPTS = 3;
+
+/**
+ * Where a tenant database is created when nothing says otherwise, and on what.
+ *
+ * **Both values are "where the fleet already is", not "what Neon suggests".**
+ * The default used to be `aws-us-east-2` on Postgres 17, which is Neon's own
+ * console default and a fact about nothing in this system. The control plane
+ * this fleet runs against answers from `…us-west-2.aws.neon.tech` and reports
+ * `server_version` 18.4 — checked, not assumed — so `aws-us-west-2` and `18` are
+ * the values that put a tenant beside the fleet rather than a continent away.
+ *
+ * **Why the region is the more expensive of the two to get wrong.** Every read
+ * the request path performs is a round trip from the container to the tenant's
+ * own database, and KTD2's promise is a warm p99. A cross-country round trip is
+ * tens of milliseconds *per statement*, paid on every query for the life of the
+ * tenant, and it is invisible in every test in this repo because they all run
+ * against localhost. It also lands on the benchmark that is supposed to size the
+ * warm pool (`test/control/provision.real.test.ts`): a create-to-first-query
+ * number measured in a region no tenant is created in is a number about nothing.
+ *
+ * **Why the major version is pinned to the control plane's rather than floated.**
+ * They are separate databases and nothing joins them, so drift is survivable —
+ * but the operator debugging a tenant is reading the control plane in the same
+ * session, and an extension or a planner behaviour that differs between majors
+ * turns that into two investigations. A deployment that wants otherwise sets
+ * `BRAINZ_NEON_PG_VERSION`; this is a default, not a constraint.
+ */
+export const DEFAULT_NEON_REGION_ID = 'aws-us-west-2';
+export const DEFAULT_NEON_PG_VERSION = 18;
+/**
+ * How many times a retryable status is tried, and therefore how long the
+ * backoff spans: `500ms · 2^(n-1)` summed over `n-1` waits, which is **15.5
+ * seconds** at six attempts.
+ *
+ * It was three (1.5 seconds), and that is below the floor of the failure it
+ * exists for. Neon serialises operations per project, so the role create that
+ * immediately follows a project create answers `423` until the project's own
+ * operations finish — measured at **6 seconds** on this fleet's first live
+ * signup, read from `GET /projects/{id}/operations`. Every attempt in that
+ * window is a `423` by construction, so the old budget could not succeed: it
+ * created a billable project and then failed `role_create_failed` on it.
+ *
+ * The bound on this is not the attempt count — it is the run's deadline, which
+ * reaches the socket through the signal, so a longer budget cannot outlive the
+ * window after which a run's row is presumed dead.
+ */
+export const DEFAULT_MAX_ATTEMPTS = 6;
 export const DEFAULT_PAGE_SIZE = 100;
 export const DEFAULT_BACKOFF_MS = 500;
 
@@ -94,6 +152,24 @@ export interface NeonApiOptions {
   readonly pgVersion?: number;
   /** Creates the project inside an organisation rather than a personal account. */
   readonly orgId?: string;
+  /**
+   * Whether this account's plan permits setting the suspend interval at all.
+   *
+   * Default `true`, which is the fleet's shape and the expensive one to get
+   * wrong. Neon's free plan refuses the field outright — a create carrying it
+   * answers `412 modifying the suspend interval is not permitted on this
+   * account` and creates nothing, which is how a self-hoster's very first
+   * signup fails with a vendor code naming no field. Declaring `false` sends
+   * the create without it and takes whatever the account's plan enforces.
+   *
+   * **It is declared, never inferred.** Dropping the field automatically on a
+   * 412 would look like a fix and be a regression on every account that can
+   * take the setting: `suspend_timeout_seconds` is R13's ≈$0.105/month idle
+   * anchor, and a fleet that silently stopped sending it would take the vendor
+   * default of 300 seconds — five times the idle compute per wake, on every
+   * tenant, discovered on an invoice rather than in a log.
+   */
+  readonly suspendTimeoutSettable?: boolean;
   readonly fetch?: FetchLike;
   /** Injectable, so retry behaviour is testable without waiting. */
   readonly sleep?: (ms: number) => Promise<void>;
@@ -181,10 +257,16 @@ export function createNeonProjectApi(options: NeonApiOptions): NeonProjectApi {
             region_id: regionId,
             pg_version: pgVersion,
             ...(options.orgId === undefined ? {} : { org_id: options.orgId }),
-            default_endpoint_settings: {
-              // U2 step 5. Neon's own default is 0 — never suspend.
-              suspend_timeout_seconds: request.suspendTimeoutSeconds,
-            },
+            // U2 step 5, and R13's idle anchor. Sent unless the account's plan
+            // forbids the setting entirely — see `suspendTimeoutSettable`, which
+            // an operator declares and this adapter never infers.
+            ...(options.suspendTimeoutSettable === false
+              ? {}
+              : {
+                  default_endpoint_settings: {
+                    suspend_timeout_seconds: request.suspendTimeoutSeconds,
+                  },
+                }),
           },
         },
         undefined,
@@ -263,6 +345,14 @@ export function createNeonProjectApi(options: NeonApiOptions): NeonProjectApi {
 
       for (let page = 0; page < MAX_PAGES; page += 1) {
         const query = new URLSearchParams({ search: name, limit: String(pageSize) });
+        // The same organisation the create used, and for two reasons. An
+        // organisation-scoped API key is refused outright without it — the live
+        // API answers `400 org_id is required` — and this call is the recovery
+        // path for a project whose id was lost, so a refusal here is the moment
+        // an orphan becomes permanent. Even against a key that would tolerate
+        // the omission, a create scoped to an org and a search that is not are
+        // asking about two different places.
+        if (options.orgId !== undefined) query.set('org_id', options.orgId);
         if (cursor !== undefined) query.set('cursor', cursor);
 
         const { body } = await call('searchProjects', 'GET', `/projects?${query.toString()}`);

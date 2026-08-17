@@ -17,6 +17,15 @@
  * web-app identity holds no resolve permission on any tenant namespace, so it is
  * handed ports, not stores.
  *
+ * **The substrate is one of those ports, and it was missing.** A signup becomes
+ * a brain either by claiming a warm pool project or by creating a Neon project
+ * outright, and this file supplied neither vendor nor a reason: the provisioner
+ * was composed without `neon`, `BRAINZ_POOL_TARGET` defaults to `0` — provision
+ * synchronously — and so the shipped default took the one branch that cannot
+ * work. `/signup` rendered, the account was created, and the brain was a `503`.
+ * {@link neonSubstrate} builds the vendor from `BRAINZ_NEON_*` and refuses to
+ * start a process that has neither supplier.
+ *
  * **The error boundary is here because a handler throw has nowhere else to
  * land.** `createWebApp` returns a bare `(Request) => Promise<Response>`; an
  * exception out of it becomes whatever the server runtime decides, which is a
@@ -39,8 +48,19 @@ import { severOrigin } from '../core/lifecycle/severance.ts';
 import { eraseSubject, previewSubjectErasure } from '../core/lifecycle/subject-erasure.ts';
 import { createStripeCheckout, type CheckoutPort } from '../control/checkout.ts';
 import { createPostgresControlPlaneStore } from '../control/control-store.ts';
-import { createBrainProvisioner } from '../control/provisioner.ts';
-import { controlPlaneIdentity, fleetIdentity } from '../control/secrets.ts';
+import {
+  createNeonProjectApi,
+  DEFAULT_NEON_PG_VERSION,
+  DEFAULT_NEON_REGION_ID,
+  NeonApiError,
+} from '../control/neon-api.ts';
+import type { NeonProjectApi } from '../control/provision.ts';
+import {
+  createBrainProvisioner,
+  newTenantId,
+  type BrainProvisioner,
+} from '../control/provisioner.ts';
+import { controlPlaneIdentity, fleetIdentity, isValidTenantId } from '../control/secrets.ts';
 import { createTenantStorage } from '../control/storage.ts';
 import {
   openControlPlane,
@@ -50,6 +70,8 @@ import {
 } from '../fleet/compose.ts';
 import {
   announceListening,
+  apiBase,
+  FleetConfigError,
   integer,
   optional,
   origin,
@@ -76,6 +98,12 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
   // the tenant id came from.
   const withTenant = tenantDatabases(secrets);
 
+  // Read once and passed to both halves of the substrate decision: `0` — the
+  // shipped default, and U2's synchronous behaviour — is what makes the vendor
+  // credential load-bearing rather than optional, and {@link neonSubstrate} has
+  // to know that to refuse legibly.
+  const poolTarget = integer(env, 'BRAINZ_POOL_TARGET', 0);
+
   const handle = createWebApp({
     sql,
     controlSql,
@@ -86,16 +114,20 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
     connectors: connectorVendor(),
     severance: severancePort(withTenant),
     subjectErasure: subjectErasurePort(withTenant),
-    provisioner: createBrainProvisioner({
-      controlSql,
-      store: createPostgresControlPlaneStore(controlSql),
-      secrets: secrets.store,
-      prefixes: prefixSource(),
-      // No default. `pool.ts` refuses a construction that omits the target, and
-      // `0` — provision synchronously, which is U2's behaviour — is what this
-      // runs until the create-to-first-query benchmark produces a receipt.
-      poolTarget: integer(env, 'BRAINZ_POOL_TARGET', 0),
-    }),
+    provisioner: reportedProvisioner(
+      createBrainProvisioner({
+        controlSql,
+        store: createPostgresControlPlaneStore(controlSql),
+        secrets: secrets.store,
+        prefixes: prefixSource(),
+        // No default. `pool.ts` refuses a construction that omits the target, and
+        // `0` — provision synchronously, which is U2's behaviour — is what this
+        // runs until the create-to-first-query benchmark produces a receipt.
+        poolTarget,
+        newId: tenantIds(env),
+        ...neonSubstrate(env, poolTarget),
+      }),
+    ),
     ...checkoutPort(env),
     ...(optional(env, 'BRAINZ_ADMIN_CREDENTIAL') === undefined
       ? {}
@@ -352,6 +384,198 @@ function subjectErasurePort(withTenant: TenantWork): SubjectErasurePort {
           erasedAt: receipt.erasedAt,
         };
       });
+    },
+  };
+}
+
+/**
+ * The substrate a signup provisions onto — or a refusal to start without one.
+ *
+ * **The defect this closes.** `createBrainProvisioner` declares `neon` optional
+ * and `provisionTenant` requires one, and this file supplied neither. The two
+ * facts are only compatible in a deployment that provisions from a warm pool, so
+ * a process with `BRAINZ_POOL_TARGET` unset — the shipped default, `0`, meaning
+ * *provision synchronously* — served a `/signup` page to strangers and answered
+ * `503` to every one of them. `createNeonProjectApi` was complete, tested and
+ * had no constructor anywhere under `src/`.
+ *
+ * **Absence is legal, and absence with no pool is not.** A self-hoster has no
+ * Neon account and an operator running off a pre-filled pool has no vendor
+ * credential in this process; both are real, and for them the typed
+ * `no_substrate_configured` refusal on an empty pool is the honest answer. What
+ * is not a deployment state is *zero* suppliers: the pool provides none and the
+ * vendor provides none, so no signup this process could ever serve can succeed.
+ * That is `env.ts`'s own distinction — a process that will not start is an
+ * outage somebody fixes in a minute, a process that starts misconfigured is an
+ * incident nobody notices — and the refusal names both ways out, because the
+ * operator reading it is looking at a container log with no other context.
+ *
+ * **The org id is configuration and never a literal.** A project created outside
+ * the organisation lands on whoever's personal account minted the key, bills
+ * there, and is invisible in the list every other operator looks at. This
+ * repository is public, so the id could not be written down here even if it
+ * were a good idea.
+ *
+ * **The API base is configuration too** — the same reason `checkout.ts` gives
+ * for Stripe's: a test needs to point the process at a local double, and a
+ * process that can only be observed against the live vendor is one nobody
+ * exercises. It is an {@link apiBase} rather than an {@link origin} because
+ * Neon's carries a version path.
+ */
+function neonSubstrate(env: Environment, poolTarget: number): { readonly neon?: NeonProjectApi } {
+  const apiKey = optional(env, 'BRAINZ_NEON_API_KEY');
+  if (apiKey === undefined) {
+    if (poolTarget === 0) {
+      throw new FleetConfigError(
+        'BRAINZ_NEON_API_KEY',
+        'is required unless this deployment provisions from a warm pool: with BRAINZ_POOL_TARGET at 0 every signup provisions synchronously, and there is no substrate to provision onto. Set the key, or set BRAINZ_POOL_TARGET and fill the pool.',
+      );
+    }
+    return {};
+  }
+
+  const orgId = optional(env, 'BRAINZ_NEON_ORG_ID');
+  const base = optional(env, 'BRAINZ_NEON_API_BASE');
+  return {
+    neon: reportedNeon(
+      createNeonProjectApi({
+        apiKey,
+        // Defaulted rather than omitted so the value this process will use is
+        // decided here, where the reason is written down, rather than inherited
+        // from whatever the adapter last shipped.
+        regionId: optional(env, 'BRAINZ_NEON_REGION_ID') ?? DEFAULT_NEON_REGION_ID,
+        pgVersion: integer(env, 'BRAINZ_NEON_PG_VERSION', DEFAULT_NEON_PG_VERSION),
+        ...(orgId === undefined ? {} : { orgId }),
+        ...(base === undefined ? {} : { baseUrl: apiBase(env, 'BRAINZ_NEON_API_BASE') }),
+        ...suspendTimeoutPolicy(env),
+      }),
+    ),
+  };
+}
+
+/**
+ * Whether this deployment's Neon plan lets it set the suspend interval.
+ *
+ * Two states and no third, because the wrong one is expensive in a way nobody
+ * notices. Unset — the default and the fleet's own shape — sends
+ * `TENANT_SUSPEND_TIMEOUT_SECONDS`, which is R13's ≈$0.105/month idle anchor.
+ * `vendor-default` sends no endpoint settings at all and takes the vendor's own
+ * 300 seconds (measured: the endpoint comes back carrying `0`, which is that
+ * API's "use the default"), which is the only thing a free-plan account can do:
+ * the live API answers `412 modifying the suspend interval is not permitted on
+ * this account` and creates nothing, so the shipped configuration cannot
+ * provision a first tenant there. This was found by running it against the
+ * fleet's own organisation, not by reading the vendor's documentation.
+ *
+ * A misspelling refuses rather than falling back, in either direction: an
+ * operator who believed they had suppressed the setting and had not, or the
+ * reverse, would learn it from a bill.
+ */
+function suspendTimeoutPolicy(env: Environment): { readonly suspendTimeoutSettable?: boolean } {
+  const declared = optional(env, 'BRAINZ_NEON_SUSPEND_TIMEOUT');
+  if (declared === undefined) return {};
+  if (declared !== 'vendor-default') {
+    throw new FleetConfigError(
+      'BRAINZ_NEON_SUSPEND_TIMEOUT',
+      `takes only "vendor-default", which sends no suspend interval because the account's plan forbids setting one. Unset it to send the fleet's own. Not ${JSON.stringify(declared)}.`,
+    );
+  }
+  return { suspendTimeoutSettable: false };
+}
+
+/**
+ * What the vendor said, on the operator's channel — and nothing more than that.
+ *
+ * `provisionTenant` catches every throw out of this port and banks a code on the
+ * tenant row, which is right for a content-free database and insufficient on its
+ * own: `project_create_failed` is the same code for an exhausted quota, a
+ * revoked key and a retired region, and the process was otherwise silent about
+ * which. This was found by running it — the first live signup on this fleet
+ * answered `project_create_failed` and said nothing else — and it is exactly the
+ * opaque refusal a substrate must not fail with.
+ *
+ * **Only what {@link NeonApiError} carries, which is why this is safe.** That
+ * class is deliberately built to hold an operation name and a status and to
+ * touch neither the response body nor the URL nor the key, because a thrown
+ * error is the most casually-logged object in any system. This writes those two
+ * fields and rethrows; anything that is not a `NeonApiError` is passed through
+ * untouched rather than stringified, since an arbitrary throw may carry a DSN.
+ */
+function reportedNeon(neon: NeonProjectApi): NeonProjectApi {
+  async function reporting<T>(run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (error) {
+      if (error instanceof NeonApiError) {
+        process.stderr.write(
+          `${JSON.stringify({
+            event: 'neon_api_failed',
+            operation: error.operation,
+            status: error.status,
+          })}\n`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  return {
+    createProject: (request) => reporting(() => neon.createProject(request)),
+    createRoleAndDatabase: (request) => reporting(() => neon.createRoleAndDatabase(request)),
+    deleteProject: (projectId) => reporting(() => neon.deleteProject(projectId)),
+    searchProjectsByName: (name) => reporting(() => neon.searchProjectsByName(name)),
+  };
+}
+
+/**
+ * How this deployment names the tenants it mints.
+ *
+ * Ordinary signups get `t-`; a deployment that exists to create a *deliberate*
+ * tenant — a canary, an internal fixture — sets `BRAINZ_TENANT_ID_PREFIX`, and
+ * the choice reaches the one place it matters: `neonProjectName` derives the
+ * vendor project's name from the tenant id, so the console list an operator
+ * reads before deleting anything says which rows were created on purpose.
+ *
+ * Validated here rather than at first use. An illegal prefix produces an id that
+ * `control.tenant_id` refuses and the secret store cannot address, which arrives
+ * as a failed signup long after anyone is looking at the configuration.
+ */
+function tenantIds(env: Environment): () => string {
+  const prefix = optional(env, 'BRAINZ_TENANT_ID_PREFIX');
+  if (prefix === undefined) return () => newTenantId();
+  if (!isValidTenantId(newTenantId(prefix))) {
+    throw new FleetConfigError(
+      'BRAINZ_TENANT_ID_PREFIX',
+      `must leave a legal tenant id: lowercase letters, digits and dashes, starting with a letter or digit — not ${JSON.stringify(prefix)}`,
+    );
+  }
+  return () => newTenantId(prefix);
+}
+
+/**
+ * The operator's copy of a refusal the user is deliberately not shown.
+ *
+ * `app.ts` answers `503 provisioning_unavailable` and does not echo the reason,
+ * correctly: it names substrate and pool state, which is deployment shape rather
+ * than something the person signing up can act on, and this is a public origin.
+ * But the reason was then written nowhere at all — a typed `{ok:false}` is never
+ * thrown, so the entrypoint's error boundary never sees it — and a deployment
+ * refusing every signup produced a stderr stream with no mention of why. This is
+ * the same split the error boundary makes: the operator gets the cause, the
+ * stranger gets a generic answer.
+ *
+ * A code, never a message, and never the request. `ProvisionBrainOutcome.reason`
+ * is drawn from a fixed set; a driver error quoting the DSN it was handed is the
+ * ordinary way a connection string reaches a log.
+ */
+function reportedProvisioner(inner: BrainProvisioner): BrainProvisioner {
+  return {
+    async provision(request) {
+      const outcome = await inner.provision(request);
+      if (!outcome.ok) {
+        process.stderr.write(`${JSON.stringify({ event: 'provision_failed', reason: outcome.reason })}\n`);
+      }
+      return outcome;
     },
   };
 }

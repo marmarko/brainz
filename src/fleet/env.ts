@@ -96,6 +96,45 @@ export function origin(env: Environment, name: string): string {
   return url.origin;
 }
 
+/**
+ * A vendor API base, which is an origin *plus a path* and therefore not an
+ * {@link origin}.
+ *
+ * The two are separated deliberately rather than by loosening `origin`. What
+ * `origin` guards is a value that gets *published* — an OAuth issuer a connector
+ * binds to — where a stray path segment is a mismatch surfacing days later at
+ * somebody else's token endpoint. An API base is the opposite: it is consumed,
+ * never published, and the real ones carry a version path (`…/api/v2`), so
+ * refusing a path would make the shipped default unexpressible and force every
+ * operator who wants to point at a proxy or a local double to give up
+ * validation entirely.
+ *
+ * A trailing slash is stripped rather than refused, because every call site
+ * appends a rooted path and `…/v2//projects` is a 404 an operator cannot see in
+ * their own configuration. Query strings and fragments are refused: they cannot
+ * survive concatenation with a path, so accepting one would build a URL nobody
+ * asked for.
+ */
+export function apiBase(env: Environment, name: string): string {
+  const raw = required(env, name);
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new FleetConfigError(name, `must be an absolute URL, not ${JSON.stringify(raw)}`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new FleetConfigError(name, `must be http or https, not ${JSON.stringify(url.protocol)}`);
+  }
+  if (url.search !== '' || url.hash !== '') {
+    throw new FleetConfigError(
+      name,
+      `must carry no query string or fragment, unlike ${JSON.stringify(raw)}`,
+    );
+  }
+  return `${url.origin}${url.pathname}`.replace(/\/$/, '');
+}
+
 /** A comma-separated list. Absent is empty, which is a meaningful allowlist. */
 export function list(env: Environment, name: string): readonly string[] {
   const raw = optional(env, name);

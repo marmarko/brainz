@@ -25,6 +25,7 @@ import { describe, expect, test } from 'bun:test';
 
 import {
   createNeonProjectApi,
+  DEFAULT_MAX_ATTEMPTS,
   NeonApiError,
   NEON_API_BASE_URL,
   type FetchLike,
@@ -115,6 +116,134 @@ describe('creating a project', () => {
     expect(calls[0]?.headers['authorization']).toBe(`Bearer ${API_KEY}`);
   });
 
+  /**
+   * A default is a decision, and this one costs money on every query forever.
+   *
+   * A caller that names no region gets whatever this adapter last shipped, and
+   * for several units that was Neon's own console default — a region no part of
+   * this system is in. A tenant database a continent from the fleet pays a
+   * cross-country round trip on every statement, which is KTD2's warm-p99
+   * promise spent on nothing, and it is invisible to every other test here
+   * because they all pass a region explicitly. The major version is pinned to
+   * the control plane's for the smaller reason: an operator reading both in one
+   * session should not be reading two planners.
+   */
+  test('places a project beside the fleet when the caller names no region', async () => {
+    const { fetch, calls } = fetcher([CREATED_PROJECT]);
+    const neon = createNeonProjectApi({ apiKey: API_KEY, fetch, sleep: () => Promise.resolve() });
+
+    await neon.createProject({ name: 'brainz-alice', suspendTimeoutSeconds: 60 });
+
+    const body = calls[0]?.body as { project: { region_id: string; pg_version: number } };
+    expect(body.project.region_id).toBe('aws-us-west-2');
+    expect(body.project.pg_version).toBe(18);
+  });
+
+  test('creates in a personal account when no organisation is named, and in the organisation when one is', async () => {
+    const personal = fetcher([CREATED_PROJECT]);
+    await createNeonProjectApi({
+      apiKey: API_KEY,
+      fetch: personal.fetch,
+      sleep: () => Promise.resolve(),
+    }).createProject({ name: 'brainz-alice', suspendTimeoutSeconds: 60 });
+    // Absent, not `undefined`: an `org_id: undefined` serialises to a key Neon
+    // has to interpret, and this adapter must send nothing it was not given.
+    expect(Object.keys((personal.calls[0]?.body as { project: object }).project)).not.toContain(
+      'org_id',
+    );
+
+    const orged = fetcher([CREATED_PROJECT]);
+    await createNeonProjectApi({
+      apiKey: API_KEY,
+      fetch: orged.fetch,
+      orgId: 'org-fake-do-not-use',
+      sleep: () => Promise.resolve(),
+    }).createProject({ name: 'brainz-alice', suspendTimeoutSeconds: 60 });
+    expect((orged.calls[0]?.body as { project: { org_id: string } }).project.org_id).toBe(
+      'org-fake-do-not-use',
+    );
+  });
+
+  /**
+   * The org scope belongs on the *search* too, and leaving it off broke the one
+   * path that exists to prevent an orphan.
+   *
+   * A create that succeeds at the vendor and then fails to return leaves a
+   * billable project the control plane cannot name, and
+   * `provision.ts:cleanupArtifacts` recovers it the only way left — by its
+   * deterministic name, through this call. Against an organisation-scoped API
+   * key, `GET /projects` with no `org_id` is a **400** (checked against the live
+   * API: `"org_id is required"`), so the recovery threw `NeonApiError` before it
+   * could look, and the retry that was supposed to delete the orphan created a
+   * second project beside it instead. A create that scopes to an org and a
+   * search that does not are also simply asking about two different places.
+   */
+  test('scopes the recovery search to the same organisation the create used', async () => {
+    const { fetch, calls } = fetcher([{ status: 200, body: { projects: [] } }]);
+    await createNeonProjectApi({
+      apiKey: API_KEY,
+      fetch,
+      orgId: 'org-fake-do-not-use',
+      sleep: () => Promise.resolve(),
+    }).searchProjectsByName('brainz-alice');
+
+    const query = new URL(calls[0]?.url ?? '').searchParams;
+    expect(query.get('org_id')).toBe('org-fake-do-not-use');
+    expect(query.get('search')).toBe('brainz-alice');
+  });
+
+  test('and omits it entirely for a personal-account key', async () => {
+    const { fetch, calls } = fetcher([{ status: 200, body: { projects: [] } }]);
+    await createNeonProjectApi({ apiKey: API_KEY, fetch, sleep: () => Promise.resolve() })
+      .searchProjectsByName('brainz-alice');
+
+    // Not `org_id=undefined`, which is a value the API has to interpret.
+    expect(new URL(calls[0]?.url ?? '').searchParams.has('org_id')).toBe(false);
+  });
+
+  /**
+   * The one account shape where sending the cost lever is a hard refusal.
+   *
+   * Measured against the live API, not guessed: a create carrying
+   * `default_endpoint_settings.suspend_timeout_seconds` against a free-plan
+   * organisation answers **412** — `"modifying the suspend interval is not
+   * permitted on this account"` — and creates nothing. Nothing about the message
+   * says which field is at fault; the whole provision fails as
+   * `project_create_failed`.
+   *
+   * **The omission is configuration and must never be a fallback.** Retrying
+   * without the field after a 412 would be a plausible-looking adapter fix and
+   * the wrong one: the field is R13's idle anchor, so a paid deployment that
+   * quietly stopped sending it would be a fleet of computes suspending on
+   * whatever the vendor decides, discovered on an invoice. So the caller states
+   * that its account cannot take the setting, and the default is to send it.
+   */
+  test('omits the suspend setting only when the account is declared unable to take one', async () => {
+    const sent = fetcher([CREATED_PROJECT]);
+    await createNeonProjectApi({
+      apiKey: API_KEY,
+      fetch: sent.fetch,
+      sleep: () => Promise.resolve(),
+    }).createProject({ name: 'brainz-alice', suspendTimeoutSeconds: 60 });
+    expect(
+      (sent.calls[0]?.body as { project: { default_endpoint_settings?: object } }).project
+        .default_endpoint_settings,
+    ).toEqual({ suspend_timeout_seconds: 60 });
+
+    const omitted = fetcher([CREATED_PROJECT]);
+    await createNeonProjectApi({
+      apiKey: API_KEY,
+      fetch: omitted.fetch,
+      suspendTimeoutSettable: false,
+      sleep: () => Promise.resolve(),
+    }).createProject({ name: 'brainz-alice', suspendTimeoutSeconds: 60 });
+    const project = (omitted.calls[0]?.body as { project: Record<string, unknown> }).project;
+    // Absent, not an empty object: `default_endpoint_settings: {}` is still a
+    // modification of the endpoint settings as far as the 412 is concerned.
+    expect(Object.keys(project)).not.toContain('default_endpoint_settings');
+    expect(project['name']).toBe('brainz-alice');
+  });
+
   test('carries the one-minute suspend delay onto the wire', async () => {
     const { neon, calls } = api([CREATED_PROJECT]);
 
@@ -202,6 +331,64 @@ describe('creating the role and database', () => {
 
     expect(result.roleName).toBe('brainz_owner');
     expect(calls).toHaveLength(4);
+  });
+
+  /**
+   * The retry budget has to outlast a *fresh project*, and it did not.
+   *
+   * Measured, on the first live signup this fleet ever ran: `POST /projects`
+   * returned, the role create that follows it immediately answered `423`, and
+   * the whole budget — three attempts, `500ms` then `1000ms` of backoff — was
+   * spent inside the first second and a half. The project's own operations
+   * (`create_timeline`, `start_compute`, `apply_config`) took **six seconds** to
+   * finish, read back from `GET /projects/{id}/operations`. Neon serialises
+   * operations per project, so every attempt in that window is a `423` by
+   * construction: the sequence could not succeed, and a first signup on a real
+   * account failed `role_create_failed` having created and paid for a project.
+   *
+   * So the assertion is against the measured window rather than against an
+   * attempt count — an attempt count is the thing that was wrong, and a test
+   * asserting the number of tries would have passed on the old budget too. The
+   * clock is virtual, so this costs nothing and cannot flake.
+   */
+  test('outlasts the six seconds a freshly created project spends locked', async () => {
+    let elapsed = 0;
+    const calls: string[] = [];
+    // Every request while the project is settling is a 423; the moment it is
+    // done, the ordinary responses.
+    const queue = [ROLE, DATABASE, URI];
+    let index = 0;
+    const fetch: FetchLike = (_url, init) => {
+      calls.push(String(init?.method ?? 'GET'));
+      if (elapsed < 6_000) {
+        return Promise.resolve(jsonResponse({ status: 423, body: { message: 'in progress' } }));
+      }
+      const canned = queue[index];
+      index += 1;
+      if (canned === undefined) throw new Error('test: ran past the canned responses');
+      return Promise.resolve(jsonResponse(canned));
+    };
+
+    const neon = createNeonProjectApi({
+      apiKey: API_KEY,
+      fetch,
+      sleep: (ms) => {
+        elapsed += ms;
+        return Promise.resolve();
+      },
+    });
+
+    const result = await neon.createRoleAndDatabase({
+      projectId: 'proj-fake-1',
+      branchId: 'br-fake-1',
+      roleName: 'brainz_owner',
+      databaseName: 'brainz',
+    });
+
+    expect(result.roleName).toBe('brainz_owner');
+    // The run deadline is 300s and the signal reaches the socket, so the budget
+    // is bounded by something real rather than by this number.
+    expect(elapsed).toBeLessThan(60_000);
   });
 
   test('a bad request is not retried — retrying a rejection is just a slower rejection', async () => {
@@ -415,15 +602,17 @@ describe('what an error is allowed to say', () => {
   });
 
   test('a server error is retried, then gives up with the last status', async () => {
-    const { neon, calls } = api([
-      { status: 500, body: {} },
-      { status: 500, body: {} },
-      { status: 500, body: {} },
-    ]);
+    // Derived from the budget rather than written down beside it: the attempt
+    // count is a number that has already been wrong once (see the six-second
+    // lock test above), and a literal here would have to be found and edited
+    // every time it moves, which is how a suite ends up pinning the old value.
+    const { neon, calls } = api(
+      Array.from({ length: DEFAULT_MAX_ATTEMPTS }, () => ({ status: 500, body: {} })),
+    );
 
     await expect(
       neon.createProject({ name: 'brainz-alice', suspendTimeoutSeconds: 60 }),
     ).rejects.toThrow(NeonApiError);
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(DEFAULT_MAX_ATTEMPTS);
   });
 });

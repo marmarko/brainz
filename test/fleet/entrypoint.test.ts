@@ -186,6 +186,13 @@ describe('the web entrypoint serves', () => {
       BRAINZ_CF_ACCOUNT_ID: FAKE_CF_ACCOUNT_ID,
         BRAINZ_MCP_URL: `https://${ISSUER_HOST}/mcp`,
         BRAINZ_STRIPE_WEBHOOK_SECRET: 'whsec_this_test_invented_it',
+        // A pool-backed deployment, which is one of the two shapes that can
+        // actually provision. The third shape — no pool AND no vendor
+        // credential — no longer starts, because every signup it could serve
+        // would answer 503; `test/fleet/provisioning.test.ts` owns that refusal.
+        // Named here rather than left at the default so this file says which
+        // deployment it is serving a page for.
+        BRAINZ_POOL_TARGET: '1',
       });
       expect(service.service).toBe('web');
 

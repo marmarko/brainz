@@ -55,9 +55,33 @@ import {
   type TenantSecretStore,
 } from './secrets.ts';
 
-/** `t-` plus 96 bits of hex: inside `control.tenant_id`'s alphabet, and not an account id. */
-export function newTenantId(random: (bytes: number) => Uint8Array = defaultRandom): string {
-  return `t-${Buffer.from(random(12)).toString('hex')}`;
+/** `t-`: an ordinary tenant, minted by a signup nobody was watching. */
+export const DEFAULT_TENANT_ID_PREFIX = 't-';
+
+/**
+ * A prefix plus 96 bits of hex: inside `control.tenant_id`'s alphabet, and not
+ * an account id.
+ *
+ * **The prefix is a parameter because the tenant id is the only thing that
+ * reaches the vendor console.** `neonProjectName` derives the Neon project's
+ * name from it and nothing else, so a deliberately-created tenant — a canary, an
+ * internal fixture, a staging brain — is otherwise indistinguishable from a
+ * stranger's in the one list an operator uses to decide what is safe to delete.
+ * That is the failure this repository has already paid for once: a probe left
+ * eighteen orphaned buckets behind, and what made them expensive was that
+ * nothing named them. `provision.real.test.ts` reserves `bench-` and sweeps it
+ * for the same reason; this makes the mechanism available to the composition
+ * root rather than to one test.
+ *
+ * The caller is responsible for the composed id being legal — `isValidTenantId`
+ * is the check, and `src/web/serve.ts` runs it at startup so an unusable prefix
+ * is a refusal naming the variable rather than a signup that fails later.
+ */
+export function newTenantId(
+  prefix: string = DEFAULT_TENANT_ID_PREFIX,
+  random: (bytes: number) => Uint8Array = defaultRandom,
+): string {
+  return `${prefix}${Buffer.from(random(12)).toString('hex')}`;
 }
 
 function defaultRandom(bytes: number): Uint8Array {
