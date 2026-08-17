@@ -344,6 +344,136 @@ describe('the external user id becomes a URL path segment', () => {
       expect(client.deleteExternalUser({ externalUserId: bad })).rejects.toThrow(/external user id/);
     }
   });
+
+  test('the accounts listing refuses one too — it reaches a URL as well', async () => {
+    // Not the path here but the query string, which is the same problem wearing
+    // a different punctuation: an unchecked id is a caller choosing which
+    // external user's accounts this fleet reads, and the answer decides whose
+    // mailbox gets attached to this brain.
+    const transport = withToken(createScriptedTransport());
+    const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
+    for (const bad of ['../tenant-b', 'tenant/b', 'Tenant-A', '']) {
+      expect(client.listAccounts({ externalUserId: bad })).rejects.toThrow(/external user id/);
+    }
+    // And nothing was dialled: the refusal is before the request, not after it.
+    expect(transport.requests.filter((request) => request.url.includes('/accounts'))).toEqual([]);
+  });
+});
+
+/**
+ * The accounts listing — how this fleet learns that a consent screen was
+ * finished, since nothing tells it.
+ *
+ * **The shape of this call was checked against the live vendor** rather than
+ * reasoned about: it answers `200` with an empty `data` array for an external
+ * user that has attached nothing, which is what every user still sitting on the
+ * consent screen looks like. A client that read that as an error would refuse
+ * the ordinary case.
+ */
+describe('the accounts listing', () => {
+  function listingClient(response: unknown, status = 200) {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/accounts', { status, body: response });
+    return {
+      transport,
+      client: createPipedreamClient({ config: CONFIG, transport, now: () => NOW }),
+    };
+  }
+
+  test('it asks for the accounts of one external user, and never for a credential', async () => {
+    // **`include_credentials` is the parameter this must not send.** The vendor
+    // offers it on this endpoint and nothing in reconciliation needs it — a
+    // proxy call carries its scope in headers — so asking would put a live
+    // Google credential in this process's memory and in whatever logged the
+    // response, for no capability at all.
+    const { transport, client } = listingClient({ data: [] });
+    await client.listAccounts({ externalUserId: 'tenant-a-gmail' });
+
+    const asked = transport.requests.find((request) => request.url.includes('/accounts'));
+    const url = new URL(asked?.url ?? 'https://nowhere.test');
+    expect(asked?.method).toBe('GET');
+    expect(url.searchParams.get('external_user_id')).toBe('tenant-a-gmail');
+    expect(url.searchParams.get('include_credentials')).toBeNull();
+    expect(asked?.url).not.toContain('include_credentials');
+    expect(asked?.url).not.toContain(CONFIG.clientSecret);
+    // The environment travels, because the vendor's two keyspaces are separate
+    // and a listing read against the wrong one is empty rather than wrong.
+    expect(asked?.headers['x-pd-environment']).toBe(CONFIG.environment);
+  });
+
+  test('nothing attached is an ordinary success, not a failure', async () => {
+    const { client } = listingClient({ page_info: { total_count: 0, count: 0 }, data: [] });
+    const outcome = await client.listAccounts({ externalUserId: 'tenant-a-gmail' });
+    expect(outcome).toEqual({ ok: true, value: [] });
+  });
+
+  test('an account is read down to the four fields a connection needs', async () => {
+    const { client } = listingClient({
+      data: [
+        {
+          id: 'apn_this_test_invented_it',
+          app: { name_slug: 'gmail', name: 'Gmail' },
+          healthy: true,
+          dead: false,
+          created_at: '2026-08-13T09:00:00.000Z',
+          // Everything below is deliberately ignored: the vendor's label for an
+          // account is not the provider's own spelling of the mailbox, and
+          // copying it into `accountKey` would stop the first real pull on
+          // `identity_changed` against a mailbox that never changed.
+          name: 'Gmail — owner@example.test',
+          external_id: 'tenant-a-gmail',
+        },
+      ],
+    });
+
+    const outcome = await client.listAccounts({ externalUserId: 'tenant-a-gmail' });
+    expect(outcome).toEqual({
+      ok: true,
+      value: [
+        {
+          accountId: 'apn_this_test_invented_it',
+          appSlug: 'gmail',
+          dead: false,
+          createdAt: '2026-08-13T09:00:00.000Z',
+        },
+      ],
+    });
+  });
+
+  test('either spelling of a finished grant reads as dead, and silence reads as alive', async () => {
+    const { client } = listingClient({
+      data: [
+        { id: 'apn_one', dead: true },
+        { id: 'apn_two', healthy: false },
+        { id: 'apn_three' },
+      ],
+    });
+    const outcome = await client.listAccounts({ externalUserId: 'tenant-a-gmail' });
+    expect(outcome.ok && outcome.value.map((account) => account.dead)).toEqual([true, true, false]);
+  });
+
+  test('an entry with no id is dropped rather than adopted', async () => {
+    // The id becomes `x-pd-account-id` on every later proxy call, so an entry
+    // without one is not an account this fleet can address — adopting it would
+    // write a connection whose every poll fails.
+    const { client } = listingClient({
+      data: [{ app: { name_slug: 'gmail' } }, { id: '' }, { id: 42 }, { id: 'apn_ok' }],
+    });
+    const outcome = await client.listAccounts({ externalUserId: 'tenant-a-gmail' });
+    expect(outcome.ok && outcome.value.map((account) => account.accountId)).toEqual(['apn_ok']);
+  });
+
+  test('a body that is not a listing is an empty listing, not a crash', async () => {
+    const { client } = listingClient('not json at all');
+    const outcome = await client.listAccounts({ externalUserId: 'tenant-a-gmail' });
+    expect(outcome).toEqual({ ok: true, value: [] });
+  });
+
+  test('a refused listing is a typed failure carrying no vendor text', async () => {
+    const { client } = listingClient({ error: 'nope' }, 503);
+    const outcome = await client.listAccounts({ externalUserId: 'tenant-a-gmail' });
+    expect(outcome).toEqual({ ok: false, reason: 'provider_error', status: 503 });
+  });
 });
 
 describe('redaction — the envelope lands in transcripts U8 re-ingests', () => {

@@ -29,9 +29,15 @@ import {
   type ConnectorSource,
   type ConnectorState,
 } from '../../../src/ingest/cursor.ts';
-import { externalUserIdFor, type ConnectedAccount } from '../../../src/ingest/pipedream/client.ts';
+import {
+  externalUserIdFor,
+  type ClientOutcome,
+  type ConnectedAccount,
+  type PipedreamClient,
+} from '../../../src/ingest/pipedream/client.ts';
 import {
   chooseAccount,
+  createPipedreamAccountLister,
   reconcileConnectors,
   type ConnectorAccountLister,
   type ConnectorLinkWriter,
@@ -387,5 +393,31 @@ describe('reconciling a pending connect', () => {
       now: NOW,
     });
     expect(written.cadenceSeconds).toBe(reference.cadenceSeconds);
+  });
+});
+
+describe('the vendor port over the real client', () => {
+  /**
+   * **The external user id is derived, never passed in**, and it is derived per
+   * source. `deleteExternalUser` is the only revocation this vendor offers, so
+   * whatever an external user id spans is what a disconnect destroys — bind it
+   * to the tenant alone and asking about gmail answers for the calendar too,
+   * and disconnecting one silently revokes all three.
+   */
+  test('it asks under this tenant’s per-source external user, and derives it itself', async () => {
+    const asked: string[] = [];
+    const client = {
+      listAccounts(request: { externalUserId: string }): Promise<ClientOutcome<readonly ConnectedAccount[]>> {
+        asked.push(request.externalUserId);
+        return Promise.resolve({ ok: true as const, value: [] });
+      },
+    } as unknown as PipedreamClient;
+
+    const lister = createPipedreamAccountLister(client);
+    await lister.accountsFor({ tenantId: TENANT, source: 'gmail' });
+    await lister.accountsFor({ tenantId: TENANT, source: 'calendar' });
+
+    expect(asked).toEqual([externalUserIdFor(TENANT, 'gmail'), externalUserIdFor(TENANT, 'calendar')]);
+    expect(asked).toEqual([`${TENANT}-gmail`, `${TENANT}-calendar`]);
   });
 });

@@ -33,6 +33,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 import { SQL } from 'bun';
 
 import {
+  createControlPlaneTiers,
   createPostgresConnectorLinks,
   ensureConnectorLinkSchema,
   fenceConnectorLink,
@@ -239,6 +240,71 @@ describe('the cursor, once a pull is advancing it', () => {
 
     expect(await links.storeFor(TENANT).read('gmail')).toBeNull();
   });
+
+  /**
+   * **The other half of the same pair, and the reason it is a pair.**
+   *
+   * `state IS NOT NULL` and `fence = $` answer different questions — *is this
+   * link still connected* and *is it still the same connection* — and only the
+   * second is reachable through today's `fenceConnectorLink`, which does both at
+   * once. That is exactly why the first has to be asserted separately: an edit
+   * that decided the fence bump was unnecessary (clearing `pending_since`
+   * already stops the next pass, after all) would take the removal guard with it
+   * and nothing else would notice, because the fence would still be covering
+   * every case anyone had written down.
+   *
+   * So the row here is cleared **without** a fence bump: the state a disconnect
+   * that forgot to advance the fence would leave. A pull that read the
+   * connection before must not write it back.
+   */
+  test('a write does not resurrect a link that was cleared, fence or no fence', async () => {
+    const store = links.storeFor(TENANT);
+    const held = (await store.read('gmail')) as ConnectorState;
+
+    await sql`
+      UPDATE control.connector_link SET state = NULL
+       WHERE tenant_id = ${TENANT} AND source = 'gmail'::control.connector_source`;
+
+    await store.write({ ...held, cursor: { kind: 'delta', value: 'h-3', issuedAt: NOW.toISOString() } });
+
+    expect((await rowFor(TENANT, 'gmail')).state).toBeNull();
+  });
+
+  /**
+   * **The case the `state IS NOT NULL` clause cannot cover, and the reason the
+   * fence is a second condition rather than a nicety.**
+   *
+   * The user disconnects and then reconnects — possibly a *different* Google
+   * account, which is the whole reason `ConnectorState.accountKey` exists. The
+   * link is live again, so a write conditioned only on "is there a connection
+   * here" lands: the slow pull, still holding the old connection, overwrites the
+   * new one with the old account id and the old cursor. The next poll then reads
+   * a stranger's mailbox under this brain's origin, or re-lists one already
+   * held, and nothing downstream can tell.
+   *
+   * The fence is what makes "the connection I read" and "the connection here"
+   * different questions.
+   */
+  test('a write from a pull that outlived a disconnect-and-reconnect is dropped', async () => {
+    const store = links.storeFor(TENANT);
+    const held = (await store.read('gmail')) as ConnectorState;
+
+    // The user disconnects, then connects again — a live link, at a new fence.
+    await fenceConnectorLink(sql, { tenantId: TENANT, source: 'gmail', now: NOW });
+    await markConnectPending(sql, { tenantId: TENANT, source: 'gmail', now: NOW });
+    const rebuilt: ConnectorState = { ...freshState(), accountId: 'apn_the_second_account' };
+    expect(await links.adopt({ tenantId: TENANT, source: 'gmail', fence: 1, state: rebuilt })).toBe(true);
+
+    // The pull that has been running all along finally writes its cursor back.
+    await store.write({
+      ...held,
+      cursor: { kind: 'delta', value: 'from-the-old-connection', issuedAt: NOW.toISOString() },
+    });
+
+    const [after] = await links.states(TENANT);
+    expect(after?.accountId).toBe('apn_the_second_account');
+    expect(after?.cursor).toBeNull();
+  });
 });
 
 describe('disconnect', () => {
@@ -336,6 +402,36 @@ describe('the seal', () => {
        WHERE tenant_id = ${TENANT} AND source = 'gmail'::control.connector_source`;
 
     expect(links.states(TENANT)).rejects.toThrow();
+  });
+});
+
+/**
+ * The tier reconciliation asks before it asks the vendor.
+ *
+ * `control.tenant.tier` rather than the account's subscription row: the worker
+ * fleet holds no identity database, and a rule whose answer depended on which
+ * fleet was asking would be two rulings wearing one name.
+ */
+describe('the tier a connection is allowed to exist on', () => {
+  test('it is the column billing writes, in all three of its values', async () => {
+    const tiers = createControlPlaneTiers(sql);
+    expect(await tiers.tierFor(TENANT)).toBe('free');
+
+    await sql`UPDATE control.tenant SET tier = 'paid'::control.tenant_tier WHERE tenant_id = ${TENANT}`;
+    expect(await tiers.tierFor(TENANT)).toBe('paid');
+
+    // `internal` is the operator's comp and is a *permitted* tier, not a third
+    // policy: a tenant granted it connects exactly as a paying one does.
+    await sql`UPDATE control.tenant SET tier = 'internal'::control.tenant_tier WHERE tenant_id = ${TENANT}`;
+    expect(await tiers.tierFor(TENANT)).toBe('internal');
+  });
+
+  test('a tenant this control plane has never heard of is free, not paid', async () => {
+    // Fail-closed, and the direction is the whole point: a connected account
+    // carries a monthly vendor fee whether or not the brain is used, so "I could
+    // not find out" has to mean "do not start one". The failure mode of the
+    // other direction is a bill nobody authorised, arriving monthly.
+    expect(await createControlPlaneTiers(sql).tierFor('t-nobody-has-this-id')).toBe('free');
   });
 });
 

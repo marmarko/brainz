@@ -95,6 +95,8 @@ let attachedAccounts: string[] = [];
 interface VendorCall {
   readonly method: string;
   readonly path: string;
+  /** The query string, because the accounts listing carries its scope there. */
+  readonly query: string;
   readonly authorization: string | null;
   readonly body: string;
 }
@@ -130,6 +132,7 @@ function startVendorDouble(): VendorDouble {
       const call: VendorCall = {
         method: request.method,
         path: url.pathname,
+        query: url.search,
         authorization: request.headers.get('authorization'),
         body,
       };
@@ -637,6 +640,13 @@ describe('an authorization the user never came back from becomes a connection', 
       // per-source external user.
       const listed = vendor.calls.filter((call) => call.path.endsWith('/accounts'));
       expect(listed).toHaveLength(1);
+      // Under this tenant's own per-source external user, which is what makes a
+      // later disconnect revoke one source rather than all three.
+      expect(new URLSearchParams(listed[0]?.query ?? '').get('external_user_id')).toBe(
+        `${tenant}-gmail`,
+      );
+      // And never for the account's credentials.
+      expect(listed[0]?.query ?? '').not.toContain('include_credentials');
 
       // And the connection exists — sealed, so the control plane holds nothing
       // a reader of it could use.
