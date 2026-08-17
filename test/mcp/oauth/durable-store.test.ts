@@ -37,9 +37,11 @@ import {
   DEFAULT_REFRESH_TOKEN_TTL_SECONDS,
   MAX_CLIENT_NAME_LENGTH,
   MAX_REDIRECT_URIS,
+  authorize,
   createInMemoryAuthorizationStore,
   hashToken,
   isMintableGrantId,
+  issueTokens,
   mintClientId,
   mintGrantId,
   redeemAuthorizationCode,
@@ -363,6 +365,115 @@ function pkceChallenge(verifier: string): string {
     'base64url',
   );
 }
+
+// ---------------------------------------------------------------------------
+// A credential is banked before it is handed out.
+// ---------------------------------------------------------------------------
+
+describe('nothing is issued before the store has it', () => {
+  /** A store whose one write is held open until the test lets it finish. */
+  function gated(store: AuthorizationStore, method: 'putCode' | 'putRefresh') {
+    let release = (): void => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let banked = false;
+    const gatedStore: AuthorizationStore = {
+      ...store,
+      async putCode(code, record) {
+        if (method === 'putCode') {
+          await gate;
+          banked = true;
+        }
+        await store.putCode(code, record);
+      },
+      async putRefresh(hash, record) {
+        if (method === 'putRefresh') {
+          await gate;
+          banked = true;
+        }
+        await store.putRefresh(hash, record);
+      },
+    };
+    return { store: gatedStore, release: () => release(), banked: () => banked };
+  }
+
+  /** Enough turns of the microtask queue for an unawaited write to have escaped. */
+  async function settle(): Promise<void> {
+    for (let turn = 0; turn < 8; turn += 1) await Promise.resolve();
+  }
+
+  test('issueTokens does not resolve until the refresh record is written', async () => {
+    // `void store.putRefresh(...)` reads as a harmless optimisation and is the
+    // reported failure in miniature: a client holding a refresh token the store
+    // does not is exactly what "the connector broke after fifteen minutes"
+    // looked like. Held open here rather than raced, so the case is a fact
+    // about ordering rather than about scheduling luck.
+    const gate = gated(createInMemoryAuthorizationStore(), 'putRefresh');
+    let settled = false;
+    const issuing = issueTokens(gate.store, {
+      grant: {
+        grantId: mintGrantId(),
+        tenantId: TENANT,
+        scope: 'whole_brain',
+        origins: [],
+        writeOrigin: 'personal:agent',
+        endpoint: 'mcp',
+        clientId: mintClientId(),
+      },
+      signingKey: 'a-signing-key',
+      now: T0,
+    }).then((tokens) => {
+      settled = true;
+      return tokens;
+    });
+
+    await settle();
+    expect(settled).toBe(false);
+    expect(gate.banked()).toBe(false);
+
+    gate.release();
+    const tokens = await issuing;
+    expect(gate.banked()).toBe(true);
+    expect(await gate.store.takeRefresh(hashToken(tokens.refresh_token))).toBeDefined();
+  });
+
+  test('authorize does not return a redirect until the code is written', async () => {
+    // The same property one hop earlier: a browser sent to the client with a
+    // code the store has not banked fails at `/token` as `invalid_grant` — a
+    // routing fault wearing a client error.
+    const base = createInMemoryAuthorizationStore();
+    const client = clientRecord();
+    await base.putClient(client);
+    const gate = gated(base, 'putCode');
+
+    let settled = false;
+    const authorizing = authorize(gate.store, {
+      clientId: client.clientId,
+      redirectUri: REDIRECT,
+      codeChallenge: 'c'.repeat(43),
+      codeChallengeMethod: 'S256',
+      state: 'opaque-state',
+      tenantId: TENANT,
+      scope: 'whole_brain',
+      origins: [],
+      writeOrigin: 'personal:agent',
+      endpoint: 'mcp',
+      now: T0,
+    }).then((outcome) => {
+      settled = true;
+      return outcome;
+    });
+
+    await settle();
+    expect(settled).toBe(false);
+
+    gate.release();
+    const outcome = await authorizing;
+    expect(outcome.ok).toBe(true);
+    expect(gate.banked()).toBe(true);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // What is at rest, and what is not.
