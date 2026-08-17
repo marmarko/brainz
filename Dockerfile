@@ -184,7 +184,14 @@ ARG BUN_VERSION=1.3.14
 # paragraph that tells a founder not to bother coming back, on the page that now
 # adopts their connection when they do. Web fleet only; the worker serves no
 # markup. Deterministic reload (`containers delete` then `deploy`).
-ARG FLEET_CONFIG_EPOCH=12
+# 12 -> 13: the disconnect button, which could not reach the vendor at all --
+# `deleteExternalUser` sent no `x-pd-environment` and the vendor refused every
+# call with `400 Environment missing`, so `/api/connectors DELETE` answered 500
+# for every user on every deployment. Code inside the image, so a warm web
+# instance keeps serving the version whose disconnect cannot detach a mailbox.
+# Web fleet is where the button is; the worker fleet shares the client and is
+# rebuilt anyway. Deterministic reload (`containers delete` then `deploy`).
+ARG FLEET_CONFIG_EPOCH=13
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
