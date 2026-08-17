@@ -135,7 +135,15 @@ ARG BUN_VERSION=1.3.14
 # the deploy publishes a new Worker version and the running fleets keep resolving
 # tenants out of the snapshot they booted with — which is the bug this change
 # exists to end, still happening after the fix shipped.
-ARG FLEET_CONFIG_EPOCH=5
+#
+# 5 -> 6: no configuration changed. This bump exists to REPLACE every running
+# instance, which is the only way to ask the question the durable store was
+# built to answer: a tenant provisioned by a container that no longer exists
+# must still resolve. The store is only durable if it outlives its writer, and
+# the writer is only gone once the platform has replaced it — so the epoch is
+# the instrument here rather than a side effect. A bump whose whole purpose is
+# instance replacement is a legitimate use of this knob; nothing else moves.
+ARG FLEET_CONFIG_EPOCH=6
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
