@@ -104,8 +104,14 @@ bunx wrangler secret put BRAINZ_CONTROL_DATABASE_URL
 bunx wrangler secret put BRAINZ_SECRETS_JSON
 bunx wrangler secret put BRAINZ_CF_ACCOUNT_ID
 bunx wrangler secret put BRAINZ_HOSTED_KEY_CLOUDFLARE
-bunx wrangler secret put BRAINZ_HOSTED_KEY_OPENAI
 ```
+
+Five secrets, not six. The embedding seat moved to `@cf/qwen/qwen3-embedding-0.6b`
+after this list was first written, so the hosted profile reaches no OpenAI route
+and `BRAINZ_HOSTED_KEY_OPENAI` is not set on a hosted deployment. Confirm against
+the code rather than this file: `providersReachable()` is pinned by
+`test/register/completeness.test.ts`, and it returns `cloudflare`, `google` and
+`self-host`.
 
 | Secret | MCP | Worker | Required? | What reads it |
 |---|:--:|:--:|---|---|
@@ -113,7 +119,7 @@ bunx wrangler secret put BRAINZ_HOSTED_KEY_OPENAI
 | `BRAINZ_SECRETS_JSON` | ✓ | ✓ | yes | The image's bootstrap writes it to a file and points `BRAINZ_SECRETS_FILE` at it. See [Known limits](#known-limits). |
 | `BRAINZ_CF_ACCOUNT_ID` | ✓ | ✓ | on the `hosted` profile | `compose.ts:selectFleetTransport` — the Cloudflare seats bill through `…/accounts/{id}/ai`. Not needed by `self-host`. |
 | `BRAINZ_HOSTED_KEY_CLOUDFLARE` | ✓ | ✓ | on the `hosted` profile | The pooled credential for eight of the nine model seats. |
-| `BRAINZ_HOSTED_KEY_OPENAI` | ✓ | ✓ | for embeddings | The embedding seat, which did not move to Unified Billing. |
+| `BRAINZ_HOSTED_KEY_OPENAI` | ✓ | ✓ | **no** — self-host only | No hosted route reaches OpenAI since the embedding seat moved to Cloudflare. Setting it on a hosted deployment does nothing. |
 | `BRAINZ_HOSTED_KEY_GOOGLE` | ✓ | ✓ | self-host only | A direct Google relationship. No hosted route reads it. |
 | `BRAINZ_HOSTED_KEY_SELF_HOST` | ✓ | ✓ | self-host only | A local/self-hosted inference endpoint's credential. |
 | `BRAINZ_ROUTING_PROFILE` | ✓ | ✓ | no (`hosted`) | Which routing table (`src/ai/routing.ts`). |
@@ -158,13 +164,22 @@ statements about the fleet.
 ORIGIN=https://brainz-fleet.<your-subdomain>.workers.dev
 ```
 
-**1 — the container starts and answers.** Not the Worker: `/health` is served
-inside the MCP container, so a 200 here proves an instance booted, bound :8080
-and was reached through the Durable Object.
+**1 — the origin is up and refuses correctly.** `/health` is served *inside* the
+MCP container, but the edge authenticates before it routes, so an unauthenticated
+request never reaches the container and answers `401 {"error":"unauthorized"}`.
+That 401 is the pass: it proves the Worker is live and fail-closed. It does
+**not** prove a container booted — check 3 is what proves that, and this check
+was written believing otherwise.
 
 ```bash
-curl -si "$ORIGIN/health" | head -1        # HTTP/2 200
+curl -si "$ORIGIN/health" | head -1        # HTTP/2 401 — the edge, refusing
 ```
+
+Do not "fix" this by exempting `/health` from auth. An unauthenticated liveness
+route on a public origin in front of scale-to-zero containers billed per 10ms is
+a free way for anyone to wake every instance you have. The platform's own
+readiness probe reaches `pingEndpoint` inside the Durable Object and never
+crosses this edge.
 
 **2 — the configuration actually arrived.** This is the check that would have
 caught the failure this runbook exists to prevent: the discovery document echoes
