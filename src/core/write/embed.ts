@@ -72,6 +72,25 @@ export const CONTEXTUAL_WRAP_TIER = 'title';
 /** How many chunks are encoded per provider call on the backfill. */
 export const CHUNK_EMBED_BATCH = 32;
 
+/**
+ * The other half of a batch, and the one whose absence stopped a brain.
+ *
+ * The provider's limit is on the SIZE of a request, not on how many strings it
+ * holds: over it the call is `HTTP 400 / AiError code 3030, "input too big"`.
+ * `CHUNK_EMBED_BATCH` bounds only the count, so a batch of 32 ordinary chunks
+ * fit and a batch of 32 large ones — the same 32 the backlog re-selects every
+ * pass, because failing to embed them is what keeps them in the backlog — did
+ * not. The result was a wedge that could not clear itself: every run rebuilt the
+ * identical oversized request and every run was refused.
+ *
+ * Measured against the live model rather than guessed: 69,676 encoded characters
+ * were accepted and 73,808 were refused, so the cliff sits near 70k. The budget
+ * below is well under it because the true limit is in tokens, and the character
+ * count of a token varies with the text — a margin that looks generous on
+ * English prose is not generous on anything else.
+ */
+export const CHUNK_EMBED_MAX_CHARS = 48_000;
+
 export class EmbeddingWidthError extends Error {
   constructor(message: string) {
     super(message);
@@ -319,15 +338,34 @@ export async function runChunkEmbedBacklog(options: {
   for (;;) {
     if (embedded >= ceiling) break;
     const take = Math.min(batchSize, ceiling - embedded);
-    const pending = await pendingChunkEmbeddings(options.sql, take, seat.column);
-    if (pending.length === 0) break;
+    const candidates = await pendingChunkEmbeddings(options.sql, take, seat.column);
+    if (candidates.length === 0) break;
+
+    // Encoded first, then bounded by what the encoding actually weighs. The
+    // title is part of the request and was not part of any count, which is how
+    // 32 chunks that each fit could add up to one request that did not.
+    const encoded = candidates.map((chunk) =>
+      documentEncoding({ title: chunk.title, content: chunk.content }),
+    );
+    let cut = 0;
+    let chars = 0;
+    while (cut < encoded.length) {
+      const next = chars + (encoded[cut] as string).length;
+      // The first item always goes, whatever it weighs: a single chunk over the
+      // budget must still be attempted, or it is a permanent hole in the backlog
+      // that no later pass can route around. It fails loudly instead.
+      if (cut > 0 && next > CHUNK_EMBED_MAX_CHARS) break;
+      chars = next;
+      cut += 1;
+    }
+    const pending = candidates.slice(0, cut);
 
     const outcome = await embedTexts({
       gateway: options.gateway,
       tenantId: options.tenantId,
       caller: options.caller,
       budget: options.budget,
-      texts: pending.map((chunk) => documentEncoding({ title: chunk.title, content: chunk.content })),
+      texts: encoded.slice(0, cut),
     });
 
     if (!outcome.ok) {

@@ -20,6 +20,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import {
   EmbeddingWidthError,
+  CHUNK_EMBED_MAX_CHARS,
   backlogSize,
   pendingChunkEmbeddings,
   runChunkEmbedBacklog,
@@ -161,5 +162,76 @@ describe('the backfill will not write a vector into another seat’s column', ()
       [id],
     )) as Array<{ shipped: boolean; other: boolean }>;
     expect(rows[0]).toEqual({ shipped: true, other: false });
+  });
+});
+
+/**
+ * **The batch the provider refused, and the wedge it made.**
+ *
+ * `CHUNK_EMBED_BATCH` bounds how MANY strings go in a request. The provider's
+ * limit is on how BIG the request is: over it the answer is `HTTP 400 /
+ * AiError 3030, "input too big"`. Thirty-two ordinary chunks fit; thirty-two
+ * large ones did not — and the backlog re-selects exactly the rows it failed to
+ * embed, so every pass rebuilt the identical oversized request and every pass
+ * was refused. Three connectors on one brain stopped for hours behind it,
+ * because the backlog spans every source.
+ *
+ * The measurement behind `CHUNK_EMBED_MAX_CHARS`: against the live model,
+ * 69,676 encoded characters were accepted and 73,808 were refused. The budget
+ * sits well under that because the real limit is in tokens and characters-per-
+ * token varies with the text.
+ *
+ * The assertion is per-REQUEST, not per-run. A run that splits into two calls
+ * of legal size is the fix working; a run that makes one call of illegal size
+ * is the bug, and both embed the same number of chunks.
+ */
+describe('a batch is bounded by what it weighs, not only by how many it holds', () => {
+  test('no single gateway call exceeds the size budget, however large the chunks are', async () => {
+    // Each chunk is a fifth of the budget, so a count-bounded batch of 32 would
+    // build one request roughly six times over it.
+    const big = 'x'.repeat(Math.floor(CHUNK_EMBED_MAX_CHARS / 5));
+    for (let i = 0; i < 12; i += 1) {
+      await seedChunk(`${big} ${i}`);
+    }
+
+    const { gateway, transport } = createGateway();
+    const result = await runChunkEmbedBacklog({
+      sql: fixture.sql,
+      gateway,
+      tenantId: TENANT,
+      caller: CALLER,
+      budget: uncappedBudget(),
+    });
+
+    expect(result.failure).toBeUndefined();
+    expect(transport.calls.length).toBeGreaterThan(1);
+    for (const call of transport.calls) {
+      const input = call.input;
+      if (input.kind !== 'embedding') continue;
+      const chars = input.texts.reduce((total, text) => total + text.length, 0);
+      expect(chars).toBeLessThanOrEqual(CHUNK_EMBED_MAX_CHARS);
+    }
+  });
+
+  test('one chunk larger than the whole budget is still attempted, not stranded', async () => {
+    // The alternative to attempting it is a row no pass can ever route around —
+    // a permanent hole that stops the backlog behind it forever. It fails
+    // loudly instead of silently blocking everything else.
+    const huge = 'y'.repeat(CHUNK_EMBED_MAX_CHARS + 5_000);
+    await seedChunk(huge);
+
+    const { gateway, transport } = createGateway();
+    await runChunkEmbedBacklog({
+      sql: fixture.sql,
+      gateway,
+      tenantId: TENANT,
+      caller: CALLER,
+      budget: uncappedBudget(),
+    });
+
+    const sent = transport.calls.flatMap((call) =>
+      call.input.kind === 'embedding' ? call.input.texts : [],
+    );
+    expect(sent.some((text) => text.length > CHUNK_EMBED_MAX_CHARS)).toBe(true);
   });
 });
