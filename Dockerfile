@@ -212,7 +212,19 @@ ARG BUN_VERSION=1.3.14
 # the panel; code inside the image, so a warm instance keeps alarming its owner
 # about a working connector. Deterministic reload (`containers delete` then
 # `deploy`).
-ARG FLEET_CONFIG_EPOCH=16
+# 16 -> 17: the retry ladder becomes a property of the job kind. `ingest_pull`
+# waits on somebody else's API, so its five attempts at 30s doubling to 15
+# minutes burned in under four minutes -- four of the five rungs inside a single
+# 30-minute wake window -- and the vendor-route fix of epoch 14 landed on lanes
+# that would never ask again. The connector ladder is now twelve attempts from
+# one cron period to a six-hour cap, a failure may declare itself terminal so a
+# withdrawn grant stops instead of asking for two days, and a dead lane has a
+# user-reachable way back. Worker fleet runs the ladder and the classifier; web
+# fleet renders the three states and carries the retry submit. Both are code
+# inside the image, so warm instances of either keep running the four-minute
+# policy. Deterministic reload (`containers delete` then `deploy`) against the
+# worker AND web fleets.
+ARG FLEET_CONFIG_EPOCH=17
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
