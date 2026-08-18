@@ -446,6 +446,29 @@ export async function eraseSubject(
       // to set — they go when the purge takes the entity, through the same
       // `ON DELETE CASCADE` that has always held them, and the test purges for
       // real rather than asserting it here.
+      //
+      // **Recoverable, and deliberately NOT reachable from the account
+      // holder's restore surface**, for two reasons that are worth stating
+      // where the tombstone is written rather than only where the surface is:
+      //
+      //   * the account holder is not the party who requested this. An undo
+      //     button on somebody else's erasure request is the wrong party
+      //     reversing it, one click away, with no record of having been asked;
+      //   * and `restoreForgotten` structurally *cannot* undo an erasure. It
+      //     walks `TOMBSTONED_TABLES` and `ARCHIVED_TABLES` only, while this
+      //     function hard-deleted `page_version`, `review_queue` and
+      //     `entity_edge` above and is about to write a live suppression row.
+      //     A restore would therefore return nonzero counts for a strict subset
+      //     — a button that reports success for a recovery that did not happen.
+      //
+      // So the instant this stamps is absent from `listRestorable` by
+      // construction (it writes no `retraction` row) and refused by the restore
+      // port's membership gate. The surviving path is operator-mediated and
+      // out of band: read the instant from `erased_subject.erased_at`, call
+      // `restoreForgotten`, and delete the suppression row alongside it or the
+      // next poll undoes the undo. That is the vocabulary the schema already
+      // has — `erased_by IN ('app','panel','operator')`, with `agent_mcp`
+      // deliberately absent.
       await tx`UPDATE entity SET deleted_at = ${at}::timestamptz
                 WHERE deleted_at IS NULL AND entity_id = ANY(${ids}::text[]::bigint[])`;
     }

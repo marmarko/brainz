@@ -144,6 +144,40 @@ export type Page =
       readonly kind: 'connector_notice';
       readonly heading: string;
       readonly message: string;
+    }
+  | {
+      /**
+       * The 72-hour window, as somewhere a person can actually go.
+       *
+       * **Why this page exists when severance has none.** `/api/severance` is
+       * API-only and no page posts to it; it is reachable today only by a
+       * hand-rolled request. That is survivable for a destructive control the
+       * user is talked through out of band. It is not survivable here, because
+       * the `forget` notice has to NAME a destination — a JSON endpoint alone
+       * would move the gap rather than close it, which is the whole defect this
+       * change is about.
+       *
+       * **Every field is shape, and that is structural rather than careful.**
+       * The port that fills this reads two ledgers and no content table, so
+       * there is no title, statement, excerpt, filename, alias or external
+       * reference available to render even by mistake. Origins are safe and
+       * deliberately shown: they are the credential labels the user chose,
+       * already on the connectors panel, and already the string
+       * `/api/severance` demands as its own echo.
+       */
+      readonly kind: 'retractions';
+      /** False renders the explanation instead of a control that cannot work. */
+      readonly available: boolean;
+      readonly retractions: readonly {
+        readonly deletedAt: string;
+        readonly restorableUntil: string;
+        readonly kind: 'record' | 'origin';
+        readonly origins: readonly string[];
+        readonly targetKind: string | null;
+        readonly counts: Readonly<Record<string, number>>;
+      }[];
+      readonly overflowed: boolean;
+      readonly ttlHours: number;
     };
 
 /** HTML-escape. Five characters, applied to every interpolation without exception. */
@@ -796,5 +830,80 @@ claiming more than it told us.</p>
 <p class="problem">${escapeHtml(page.message)}</p>
 <p><a href="/dashboard">Back to your dashboard</a></p>`,
       );
+
+    case 'retractions':
+      return shell(
+        'What you can undo — brainz',
+        `<h1>What you can undo</h1>
+${
+  page.available
+    ? `<p class="note">Anything you retracted in the last ${escapeHtml(String(page.ttlHours))} hours can be
+put back. After that it is swept for good.</p>
+${
+  page.retractions.length === 0
+    ? '<p class="note">Nothing here. You have retracted nothing inside the window.</p>'
+    : `<ul class="sources">
+${page.retractions.map(retractionEntry).join('\n')}
+</ul>`
+}
+${
+  page.overflowed
+    ? '<p class="note">There are more than shown. Restore some of these and reload to see the rest.</p>'
+    : ''
+}`
+    : '<p class="problem">This deployment cannot restore retractions. Nothing here can put anything back, ' +
+      'and a button that said otherwise would be the lie this page exists to avoid.</p>'
+}
+<p><a href="/dashboard">Back to your dashboard</a></p>`,
+      );
   }
 }
+
+/**
+ * One offer, and the hidden field is the whole reason the echo is bearable.
+ *
+ * The confirmation is the instant, and an instant is the one value where a typo
+ * produces another valid key — so the page carries it rather than asking anyone
+ * to retype it. Severance asks for a retype because its echo is a *consent*
+ * control; this one is an *identity* control, and demanding deliberation for it
+ * would be ceremony that teaches people to paste carelessly.
+ */
+function retractionEntry(entry: {
+  readonly deletedAt: string;
+  readonly restorableUntil: string;
+  readonly kind: 'record' | 'origin';
+  readonly origins: readonly string[];
+  readonly targetKind: string | null;
+  readonly counts: Readonly<Record<string, number>>;
+}): string {
+  const what =
+    entry.kind === 'origin'
+      ? 'Disconnected an account'
+      : `Retracted ${escapeHtml(RETRACTION_NOUNS[entry.targetKind ?? ''] ?? 'a record')}`;
+  const counted = Object.entries(entry.counts)
+    .filter(([, value]) => Number(value) > 0)
+    .map(([field, value]) => `${escapeHtml(String(value))} ${escapeHtml(field)}`)
+    .join(', ');
+  return `  <li>
+    <div class="source-name">${what}</div>
+    <p class="note">${escapeHtml(entry.deletedAt)} &middot; from ${escapeHtml(entry.origins.join(', '))}
+${counted.length === 0 ? '' : ` &middot; ${counted}`}</p>
+    <p class="note">Restorable until ${escapeHtml(entry.restorableUntil)}.</p>
+    <form method="post" action="/api/restore">
+      <input type="hidden" name="deleted_at" value="${escapeHtml(entry.deletedAt)}">
+      <input type="hidden" name="confirm" value="${escapeHtml(entry.deletedAt)}">
+      <button type="submit">Restore</button>
+    </form>
+  </li>`;
+}
+
+/**
+ * What each id kind is called to a person. Deliberately generic: naming the
+ * record would mean reading it, and this page reads no content table.
+ */
+const RETRACTION_NOUNS: Readonly<Record<string, string>> = {
+  doc: 'a document',
+  chunk: 'a passage',
+  fact: 'a fact',
+  ent: 'a person or company',
+};

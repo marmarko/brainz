@@ -143,20 +143,23 @@ export interface PurgeEnqueueResult {
 const DEFAULT_LIMIT = 500;
 
 /**
- * **Off unless an operator turned it on, and that is not timidity.**
+ * **Off unless an operator turned it on, and that stays true for a different
+ * reason than it used to.**
  *
- * This lane hard-deletes, and `restoreForgotten` — the undo the 72-hour window
- * exists to protect — has **no production caller**: not a tool in `TOOL_NAMES`,
- * not an op in `ADMIN_OPERATIONS`, nothing in the web app. So switching the
- * enqueuer on does not start enforcing a promise the product already keeps; it
- * converts `forget` from reversible-in-principle into irreversible-in-fact,
- * for every tenant, on the next tick after a deploy.
+ * This comment used to say the lane must stay off because `restoreForgotten`
+ * had no production caller — so switching it on would not begin keeping the
+ * 72-hour promise, it would convert `forget` from reversible-in-principle into
+ * irreversible-in-fact. That condition is gone: `GET /api/retractions` lists
+ * what is still restorable, `POST /api/restore` puts one back, `/retractions`
+ * is the page `forget`'s own notice names, and `src/web/serve.ts` supplies the
+ * port that reaches all three.
  *
- * The machinery is finished and countable — `previewTombstonePurge` reports the
- * closure without deleting a row — so the remaining decision is a product one
- * about a restore surface, and it belongs to whoever owns the data rather than
- * to whoever deployed last. When a restore path exists this default flips and
- * this comment goes with it.
+ * **The default does not flip with it, and that is a separate property rather
+ * than leftover caution.** "Absent reads as off" means a deployment that has
+ * never heard of this flag does not start hard-deleting because somebody
+ * rebuilt a container — which is a statement about upgrades, not about whether
+ * the undo exists. Turning the lane on is still an operator's decision made
+ * once, deliberately, per fleet.
  */
 export function purgeEnqueueEnabled(env: Record<string, string | undefined>): boolean {
   return env['BRAINZ_PURGE_ENABLED'] === 'true';

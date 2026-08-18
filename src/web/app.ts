@@ -200,6 +200,83 @@ export interface SubjectErasurePort {
   >;
 }
 
+/**
+ * The undo, as a port — and the reason it is on this surface rather than on
+ * `tools/call`.
+ *
+ * **The gap it closes.** `src/mcp/tombstone.ts:restoreForgotten` has been
+ * complete and tested since R12 and had no production caller at all, while
+ * `forget` told every user `recoverableUntil = now + 72h`. That was survivable
+ * only while nothing hard-deleted; the retention lane is switched on, so the
+ * promise on the receipt is now false rather than merely unimplemented.
+ *
+ * **A session, never a grant, and that is load-bearing rather than
+ * incidental.** The listing is whole-brain and unfenced by construction — it
+ * reads two ledgers rather than the rows themselves — so a caller holding a
+ * credential instead of a session would see the *shape* of a retraction from an
+ * origin that credential may not read. `tenantOf(session.accountId)` is the
+ * only admission.
+ *
+ * **Why not an MCP tool, when the executor's sibling `forget` is one.** R12a's
+ * argument for subject erasure is that the assistant issuing it is the assistant
+ * reading the correspondent's mail; restore is the safe direction, so that
+ * argument does not carry over unchanged. The one that does is asymmetry:
+ * `severOrigin` requires an out-of-band session and a typed string echo, and an
+ * agent-framed "yes" on a chat connection would reverse it — a control requiring
+ * out-of-band consent to apply, undone by in-band consent. This repo already
+ * refuses that shape for `set_context_policy`. Compounding it, `restoreForgotten`
+ * takes no `Grant` at all, unlike every other write executor. The ledger's
+ * `origin_contexts` is what would make a *forget-only* MCP restore fenceable
+ * later — a subset check against one ledger row, with no fence added to the
+ * executor and severance instants absent by construction — and that is a
+ * deliberate deferral rather than an oversight.
+ *
+ * **Two methods, and the split is not severance's.** `SeverancePort` previews
+ * because arrivals between consent and execution change the number. Nothing
+ * arrives to change what carries an instant, so this reads a plural index rather
+ * than a per-item preview — naming it one would promise a re-run that does not
+ * happen.
+ */
+export interface RetractionPort {
+  list(request: { readonly tenantId: string }): Promise<{
+    readonly retractions: readonly {
+      readonly deletedAt: string;
+      readonly restorableUntil: string;
+      readonly kind: 'record' | 'origin';
+      readonly origins: readonly string[];
+      readonly targetKind: string | null;
+      readonly counts: Readonly<Record<string, number>>;
+    }[];
+    readonly overflowed: boolean;
+    readonly ttlHours: number;
+  }>;
+  restore(request: {
+    readonly tenantId: string;
+    readonly deletedAt: string;
+    readonly confirm: string;
+  }): Promise<
+    | {
+        readonly ok: true;
+        readonly restored: Readonly<Record<string, number>>;
+        readonly unarchived: Readonly<Record<string, number>>;
+        readonly supersededCards: number;
+        readonly supersededAliases: number;
+        /** True when the instant was a context severance. Changes the copy. */
+        readonly wasOrigin: boolean;
+        /** Every count zero: this instant has already been put back. */
+        readonly alreadyRestored: boolean;
+        /** When the window closes — present so an expiry can be named exactly. */
+        readonly restorableUntil: string;
+      }
+    | {
+        readonly ok: false;
+        readonly reason: 'ttl_expired' | 'not_confirmed' | 'not_found';
+        /** Set on `ttl_expired`: when the window closed. */
+        readonly closedAt?: string;
+      }
+  >;
+}
+
 export interface ConnectorVendor {
   mintClaimUrl(request: {
     readonly tenantId: string;
@@ -286,6 +363,18 @@ export interface WebAppDeps {
    * it is handed to a third party as the answer to their request.
    */
   readonly subjectErasure?: SubjectErasurePort;
+  /**
+   * The 72-hour window's own surface. Absent disables the routes rather than
+   * faking them — the rule `severance` follows, applied to the one operation
+   * here that is *not* destructive, where the failure it prevents is the mirror
+   * image: an endpoint that answered `ok` for a restore nothing performed would
+   * tell a user their data is back when it is still tombstoned and counting
+   * down to a purge.
+   *
+   * Supplied unconditionally by `src/web/serve.ts`, and
+   * `test/web/port-supply.test.ts` fails if any port declared here is not.
+   */
+  readonly retractions?: RetractionPort;
   /** The Stripe endpoint signing secret, resolved from the secret store. */
   readonly stripeWebhookSecret: string;
   /** Set for an operator deployment; absent disables `/admin` entirely. */
@@ -332,6 +421,32 @@ export function sessionCookie(token: string, maxAgeSeconds: number): string {
 
 export function clearedSessionCookie(): string {
   return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
+}
+
+/**
+ * What a completed restore says, and the sentence a severance undo must carry.
+ *
+ * **`was_origin` is not decoration.** Restoring a severance instant returns the
+ * rows; it does **not** reconnect the connector, does not undo the discard of
+ * the queued `ingest_pull` jobs that severance performed, and does not touch the
+ * vendor's tokens. Without the second sentence the button lies about its own
+ * scope — the user reads "restored" and expects mail to resume.
+ *
+ * The replay case is named rather than dressed up as success: a second click on
+ * an instant already put back changed nothing, and saying so is what makes the
+ * gap between {@link restoreForgotten} and its bookkeeping honest instead of a
+ * bug (see `markRetractionRestored`).
+ */
+export function restoreMessage(outcome: {
+  readonly alreadyRestored: boolean;
+  readonly wasOrigin: boolean;
+}): string {
+  if (outcome.alreadyRestored) {
+    return 'That retraction has already been restored. Nothing changed.';
+  }
+  return outcome.wasOrigin
+    ? 'Data restored. The account remains disconnected — reconnect it from Connectors if you want it polling again.'
+    : 'Restored. It is searchable again.';
 }
 
 const STATE_CHANGING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
@@ -639,6 +754,10 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     if (path === '/api/subject-erasure' && request.method === 'POST') {
       return handleSubjectErasure(request, session);
     }
+    if (path === '/api/retractions') return handleRetractions(session);
+    if (path === '/api/restore' && request.method === 'POST') {
+      return handleRestore(request, session);
+    }
 
     // ---- The pages. -------------------------------------------------------
     //
@@ -658,6 +777,7 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     if (path === '/' || path === '/dashboard') return renderDashboard(session);
     if (path === '/brain') return renderBrainSetup(session);
     if (path === '/connect') return renderConnect(session);
+    if (path === '/retractions') return renderRetractions(session);
 
     return json({ ok: false, code: 'not_found', message: 'No such page.' }, 404);
 
@@ -1664,6 +1784,160 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         unrecoverable_after_days: outcome.unrecoverableAfterDays,
         erased_at: outcome.erasedAt,
       });
+    }
+
+    /**
+     * What is still undoable, as JSON.
+     *
+     * A plural index rather than a preview: nothing arrives between reading this
+     * and clicking, because what carries an instant is fixed at the instant.
+     */
+    async function handleRetractions(session: Session): Promise<Response> {
+      if (deps.retractions === undefined) {
+        return json({ ok: false, code: 'unavailable' }, 501);
+      }
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return json({ ok: false, code: 'no_brain_yet' }, 409);
+
+      const listing = await deps.retractions.list({ tenantId });
+      return json({
+        ok: true,
+        ttl_hours: listing.ttlHours,
+        // "Took exactly the ceiling" and "took the ceiling and there is more"
+        // are different facts, and only the second means the user has not been
+        // shown everything they may still undo.
+        overflowed: listing.overflowed,
+        retractions: listing.retractions.map((entry) => ({
+          deleted_at: entry.deletedAt,
+          restorable_until: entry.restorableUntil,
+          kind: entry.kind,
+          origins: entry.origins,
+          target_kind: entry.targetKind,
+          counts: entry.counts,
+        })),
+      });
+    }
+
+    /**
+     * Put one retraction back.
+     *
+     * **The confirmation echoes the instant, and this route checks it as well as
+     * the port does**, for the reason `handleSeverance` gives: the echo is the
+     * control, and a control checked in exactly one place is one edit away from
+     * being checked nowhere.
+     *
+     * The echo here buys *identity* rather than deliberation, and that is the
+     * difference from severance's. A restore is not destructive, so there is no
+     * consent to obtain — but the key is a millisecond-precision timestamp
+     * arriving as a string, which makes it the one parameter in this system
+     * where a typo produces **another valid key**. The listing populates it as a
+     * hidden field, so the two agree in the happy path; the check catches a
+     * hand-rolled POST, a client that *constructs* an instant instead of copying
+     * one, and a future edit that starts accepting the key from somewhere other
+     * than the listing.
+     *
+     * **The refusals are three different statuses on purpose.** 404 for an
+     * instant that is not a retraction of theirs; 410 for one whose window has
+     * closed, because 410 is "it was here, it is not, and it will not be back";
+     * 400 for an echo that does not match. And the success case names
+     * `already_restored` rather than reporting a second restore that moved
+     * nothing.
+     */
+    async function handleRestore(request: Request, session: Session): Promise<Response> {
+      if (deps.retractions === undefined) {
+        return json({ ok: false, code: 'unavailable' }, 501);
+      }
+      const fields = await body(request);
+      const deletedAt = stringOf(fields, 'deleted_at').trim();
+      const confirm = stringOf(fields, 'confirm').trim();
+      if (deletedAt.length === 0) return json({ ok: false, code: 'instant_required' }, 400);
+      if (confirm !== deletedAt) return json({ ok: false, code: 'not_confirmed' }, 400);
+
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return json({ ok: false, code: 'no_brain_yet' }, 409);
+
+      const outcome = await deps.retractions.restore({ tenantId, deletedAt, confirm });
+      if (!outcome.ok) {
+        if (outcome.reason === 'not_found') {
+          return json(
+            { ok: false, code: 'not_found', message: 'No retraction of yours at that instant.' },
+            404,
+          );
+        }
+        if (outcome.reason === 'ttl_expired') {
+          // Two sentences, both true at every point on the timeline, and neither
+          // making any claim about where the bytes are. "May have been
+          // permanently deleted" describes an uncertainty the user cannot
+          // resolve; "contact support" implies a back door that does not exist;
+          // "this data is gone" is false for up to a day, because the purge's
+          // grace band keeps the rows past the TTL — and the band is not
+          // mentioned either, since a number a user cannot act on but can appeal
+          // to converts a closed window into a support ticket.
+          const closed = outcome.closedAt ?? deletedAt;
+          return json(
+            {
+              ok: false,
+              code: 'ttl_expired',
+              message: `The 72-hour window for this retraction closed at ${closed}. It can no longer be restored.`,
+            },
+            410,
+          );
+        }
+        return json({ ok: false, code: outcome.reason }, 400);
+      }
+
+      return json({
+        ok: true,
+        deleted_at: deletedAt,
+        restored: outcome.restored,
+        // Reported beside `restored` rather than folded in: one clears a flag,
+        // the other re-inserts a row into a table that may have moved on.
+        unarchived: outcome.unarchived,
+        // The two "came back short" numbers. A response reporting three pages
+        // restored while two cards stayed deleted would re-open, one layer up,
+        // exactly the partial-success lie those fields exist to prevent.
+        superseded_cards: outcome.supersededCards,
+        superseded_aliases: outcome.supersededAliases,
+        already_restored: outcome.alreadyRestored,
+        was_origin: outcome.wasOrigin,
+        message: restoreMessage(outcome),
+      });
+    }
+
+    /** The listing, as a page — the destination `forget`'s notice names. */
+    async function renderRetractions(session: Session): Promise<Response> {
+      if (deps.retractions === undefined) {
+        return html(
+          renderPage({
+            kind: 'retractions',
+            available: false,
+            retractions: [],
+            overflowed: false,
+            ttlHours: 0,
+          }),
+          501,
+        );
+      }
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return seeOther(BRAIN_SETUP_PATH);
+
+      const listing = await deps.retractions.list({ tenantId });
+      return html(
+        renderPage({
+          kind: 'retractions',
+          available: true,
+          retractions: listing.retractions.map((entry) => ({
+            deletedAt: entry.deletedAt,
+            restorableUntil: entry.restorableUntil,
+            kind: entry.kind,
+            origins: [...entry.origins],
+            targetKind: entry.targetKind,
+            counts: { ...entry.counts },
+          })),
+          overflowed: listing.overflowed,
+          ttlHours: listing.ttlHours,
+        }),
+      );
     }
 
     /**

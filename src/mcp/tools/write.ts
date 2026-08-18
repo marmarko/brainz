@@ -155,7 +155,14 @@ export const forget: Handler = async (ctx, args) => {
       cascade: outcome.cascade,
     },
     notice: [
-      `Retracted, not erased: it stops being returned now and can be restored until ${outcome.recoverableUntil}.`,
+      // **The destination is the notice.** This sentence promised a recovery
+      // window for as long as `restoreForgotten` had no production caller — the
+      // window was real in the code and unreachable in the product, which is a
+      // worse artifact than no promise at all now that the retention lane
+      // hard-deletes. Naming the page is what converts it into something a user
+      // can act on, and `webAppBaseUrl` is already on the context because the
+      // manage twin and the panel deep-link through it.
+      `Retracted, not erased: it stops being returned now and can be restored until ${outcome.recoverableUntil} at ${ctx.webAppBaseUrl.replace(/\/+$/, '')}/retractions.`,
     ],
   };
 };

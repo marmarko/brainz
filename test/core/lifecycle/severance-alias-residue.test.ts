@@ -85,7 +85,12 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import { severOrigin } from '../../../src/core/lifecycle/severance.ts';
 import { brainOrigins, entityCard } from '../../../src/mcp/reads.ts';
-import { purgeExpiredTombstones, restoreForgotten } from '../../../src/mcp/tombstone.ts';
+import {
+  listRestorable,
+  markRetractionRestored,
+  purgeExpiredTombstones,
+  restoreForgotten,
+} from '../../../src/mcp/tombstone.ts';
 import { EMBEDDING_DIMENSIONS } from '../../../src/schema/vector-index.ts';
 import { connect, dropFixtureDatabase, provisionFixture, type SchemaFixture } from '../../schema/fixture.ts';
 
@@ -365,6 +370,78 @@ describe('the census still resolves the severed origin, and that is load-bearing
       // The cost, stated: this is what "fixing" the census would do to the half
       // of the corpus the preview's second column is about.
       expect(withoutWork.card.aliases).not.toContain(SHARED_ALIAS);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Severing what a restore just put back.
+// ---------------------------------------------------------------------------
+
+describe('a severance after a restore takes the restored rows again', () => {
+  /**
+   * The sequence the restore surface makes reachable for the first time:
+   * disconnect, change your mind, disconnect again. It is worth pinning because
+   * nothing in `severOrigin` consults either ledger — it short-circuits only on
+   * `not_confirmed` and `unknown_origin` — so the second severance has to be an
+   * ordinary severance of rows that are live again, at a new instant, rather
+   * than a no-op that reports `alreadySevered` over a brain it did not touch.
+   *
+   * And the listing must follow: the first severance is marked restored and
+   * stops being offered, the second is offered in its place. Two buttons for one
+   * origin, one of them dead, is the state this asserts against.
+   */
+  const FIRST = new Date('2026-07-01T00:00:00.000Z');
+  const SECOND = new Date('2026-07-01T06:00:00.000Z');
+  const AFTER_FIRST = new Date(FIRST.getTime() + 3600_000);
+  const AFTER_SECOND = new Date(SECOND.getTime() + 3600_000);
+  const SECOND_ALIAS = 'the second work nickname';
+
+  test(
+    'the rows come back, go again at a new instant, and only the live retraction is offered',
+    async () => {
+      const rows = (await sql.unsafe(`
+        INSERT INTO entity (canonical_name, entity_type, origin_contexts)
+        VALUES ('Second Person', 'person', ARRAY['${WORK}', '${PERSONAL}'])
+        RETURNING entity_id::text AS entity_id
+      `)) as Array<{ entity_id: string }>;
+      const entityId = rows[0]?.entity_id ?? '';
+      await sql.unsafe(`
+        INSERT INTO entity_alias (entity_id, alias, alias_source, origin_contexts)
+        VALUES (${entityId}::bigint, '${SECOND_ALIAS}', 'user', ARRAY['${WORK}'])
+      `);
+
+      const first = await severOrigin(sql, { origin: WORK, confirm: WORK, now: FIRST });
+      expect(first.ok).toBe(true);
+      if (!first.ok) return;
+      expect(first.receipt.archived.aliases).toBe(1);
+
+      const restored = await restoreForgotten(sql, {
+        deletedAt: FIRST.toISOString(),
+        now: AFTER_FIRST,
+      });
+      expect(restored.ok).toBe(true);
+      if (!restored.ok) return;
+      expect(restored.unarchived.aliases).toBe(1);
+      await markRetractionRestored(sql, { deletedAt: FIRST.toISOString(), now: AFTER_FIRST });
+
+      // Second time. The alias is live again, so it is in the exact-origin
+      // class again, and it goes again — under a different key.
+      const second = await severOrigin(sql, { origin: WORK, confirm: WORK, now: SECOND });
+      expect(second.ok).toBe(true);
+      if (!second.ok) return;
+      expect(second.receipt.archived.aliases).toBe(1);
+      const archived = (await sql`
+        SELECT severed_at FROM severed_alias WHERE alias = ${SECOND_ALIAS}
+      `) as Array<{ severed_at: Date }>;
+      expect(archived).toHaveLength(1);
+      expect(new Date(archived[0]?.severed_at ?? 0).toISOString()).toBe(SECOND.toISOString());
+
+      const offered = await listRestorable(sql, { now: AFTER_SECOND });
+      const instants = offered.retractions.map((entry) => entry.at);
+      expect(instants).toContain(SECOND.toISOString());
+      expect(instants).not.toContain(FIRST.toISOString());
     },
     TEST_TIMEOUT_MS,
   );

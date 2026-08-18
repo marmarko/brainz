@@ -39,6 +39,7 @@ import {
   createWebApp,
   type ConnectorVendor,
   type ProviderKeyWriter,
+  type RetractionPort,
   type SeverancePort,
   type SubjectErasurePort,
 } from './app.ts';
@@ -57,6 +58,13 @@ import { createTenantProviderKeyStore, type ProviderId } from '../ai/keys.ts';
 import { previewSeverance } from '../core/lifecycle/blast-radius.ts';
 import { severOrigin } from '../core/lifecycle/severance.ts';
 import { eraseSubject, previewSubjectErasure } from '../core/lifecycle/subject-erasure.ts';
+import {
+  FORGET_TTL_HOURS,
+  findRestorable,
+  listRestorable,
+  markRetractionRestored,
+  restoreForgotten,
+} from '../mcp/tombstone.ts';
 import { createStripeCheckout, type CheckoutPort } from '../control/checkout.ts';
 import { createPostgresControlPlaneStore } from '../control/control-store.ts';
 import {
@@ -141,6 +149,11 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
     ...connectorPorts(env, { controlSql, secrets }),
     severance: severancePort(withTenant),
     subjectErasure: subjectErasurePort(withTenant),
+    // Supplied unconditionally and in the same change that declares it. A port
+    // no composition root supplies is the defect this file has now recorded
+    // three times, and `test/web/port-supply.test.ts` is what makes the third
+    // the last.
+    retractions: retractionPort(withTenant),
     provisioner: reportedProvisioner(
       createBrainProvisioner({
         controlSql,
@@ -409,6 +422,118 @@ function subjectErasurePort(withTenant: TenantWork): SubjectErasurePort {
           attachmentObjectsUnreachable: receipt.attachmentObjectsUnreachable,
           unrecoverableAfterDays: receipt.unrecoverableAfterDays,
           erasedAt: receipt.erasedAt,
+        };
+      });
+    },
+  };
+}
+
+/**
+ * The 72-hour window's caller — the third time this defect would have shipped.
+ *
+ * **What was missing.** `src/mcp/tombstone.ts:restoreForgotten` is complete,
+ * correct and tested, and had no production caller: not a tool in `TOOL_NAMES`,
+ * not an op in `ADMIN_OPERATIONS`, nothing here. `forget` told every user
+ * `recoverableUntil = now + 72h` and no surface could honour it. That is the
+ * shape recorded twice above — `severOrigin` and `eraseSubject` — and
+ * `test/web/port-supply.test.ts` is why it is the last time, because it fails
+ * on any port `app.ts` declares and this file does not supply.
+ *
+ * **Ledger membership gates the executor, and this is the correctness
+ * requirement of the whole change.** Keeping subject-erasure instants out of the
+ * *listing* is not enough: `POST /api/restore` takes a raw instant, and an
+ * erasure instant is an ordinary readable timestamp. Handed to
+ * `restoreForgotten` it un-deletes the erasure's rows across all seven
+ * tombstoned tables and returns **nonzero** counts — so the route would render
+ * a receipt saying the data is back while `erased_subject`'s suppression row is
+ * still live and `page_version`, `review_queue` and `entity_edge` are still
+ * hard-deleted. That is precisely the class the severance header condemns — a
+ * destructive operation that lies — arriving through a *restore*. So
+ * {@link findRestorable} runs first and a miss is `not_found`.
+ *
+ * **The echo is checked before the connection.** A restore whose confirmation
+ * does not echo the instant must not resolve a namespace or open a socket, the
+ * same ordering `subjectErasurePort.execute` uses, and it is checked again in
+ * `app.ts` for the reason `severancePort` states: a control checked in exactly
+ * one place is one edit away from being checked nowhere.
+ *
+ * **Exported, unlike its two siblings.** The gate above is composition — find,
+ * then restore, then bookkeep — and a test that rebuilt those three steps around
+ * a fake would be asserting its own arrangement rather than this one.
+ * `test/web/restore-route.test.ts` drives this object against a real schema with
+ * a `TenantWork` that hands back its fixture connection.
+ */
+export function retractionPort(withTenant: TenantWork): RetractionPort {
+  return {
+    list: (request) =>
+      withTenant(request.tenantId, async (sql) => {
+        const listing = await listRestorable(sql, { now: new Date() });
+        return {
+          retractions: listing.retractions.map((entry) => ({
+            deletedAt: entry.at,
+            restorableUntil: entry.restorableUntil,
+            kind: entry.kind,
+            origins: entry.origins,
+            targetKind: entry.targetKind,
+            counts: entry.counts,
+          })),
+          overflowed: listing.overflowed,
+          ttlHours: FORGET_TTL_HOURS,
+        };
+      }),
+    restore: (request) => {
+      if (request.confirm !== request.deletedAt) {
+        return Promise.resolve({ ok: false as const, reason: 'not_confirmed' as const });
+      }
+      return withTenant(request.tenantId, async (sql) => {
+        const now = new Date();
+        // Provenance first. `null` here is "no retraction of yours at that
+        // instant" — an instant this brain never wrote, an unparseable string,
+        // a severance already put back, or an erasure, which is the one that
+        // matters.
+        const entry = await findRestorable(sql, { deletedAt: request.deletedAt });
+        if (entry === null) return { ok: false as const, reason: 'not_found' as const };
+
+        // The window is decided here and nowhere else. `findRestorable` is
+        // membership only, deliberately, so a retraction whose 72 hours ran out
+        // between the page load and the click can be told *when* it ran out
+        // rather than being told it never existed.
+        const outcome = await restoreForgotten(sql, { deletedAt: request.deletedAt, now });
+        if (!outcome.ok) {
+          return {
+            ok: false as const,
+            reason: outcome.reason,
+            closedAt: entry.restorableUntil,
+          };
+        }
+
+        // After the restore committed, never before: this is bookkeeping about
+        // something that happened. A crash in the gap leaves a ledger row whose
+        // next click finds every count zero, which the surface renders as
+        // "already restored" — the non-atomicity was made truthful first.
+        await markRetractionRestored(sql, { deletedAt: request.deletedAt, now });
+
+        const restored = { ...outcome.restored } as Record<string, number>;
+        const unarchived = { ...outcome.unarchived } as Record<string, number>;
+        // **All four, not just `restored`.** A restore that moved no rows but
+        // reports superseded cards is a real receipt about a real collision, and
+        // calling that "already restored" would hide the one thing the user
+        // needs to know: something did not come back.
+        const nothingMoved =
+          Object.values(restored).every((value) => value === 0) &&
+          Object.values(unarchived).every((value) => value === 0) &&
+          outcome.supersededCards === 0 &&
+          outcome.supersededAliases === 0;
+
+        return {
+          ok: true as const,
+          restored,
+          unarchived,
+          supersededCards: outcome.supersededCards,
+          supersededAliases: outcome.supersededAliases,
+          wasOrigin: entry.kind === 'origin',
+          alreadyRestored: nothingMoved,
+          restorableUntil: entry.restorableUntil,
         };
       });
     },

@@ -159,6 +159,13 @@ const WEB_PATHS: ReadonlySet<string> = new Set([
   '/api/severance/preview',
   '/api/subject-erasure',
   '/api/subject-erasure/preview',
+  // The 72-hour window's own surface. The page is listed beside the others a
+  // browser lands on because `forget`'s notice prints its URL — a link this
+  // deployment hands to a user, which an origin that did not route it would
+  // 404 on the way to the one thing that can undo a retraction.
+  '/retractions',
+  '/api/retractions',
+  '/api/restore',
 ]);
 
 /**

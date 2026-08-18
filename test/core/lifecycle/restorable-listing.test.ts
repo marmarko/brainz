@@ -52,7 +52,6 @@ import {
   markRetractionRestored,
   restoreForgotten,
 } from '../../../src/mcp/tombstone.ts';
-import { ACTIVE_EMBEDDING_SEAT } from '../../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../../src/schema/vector-index.ts';
 import { connect, dropFixtureDatabase, provisionFixture, type SchemaFixture } from '../../schema/fixture.ts';
 
@@ -60,9 +59,6 @@ import type { SQL } from 'bun';
 
 const SETUP_TIMEOUT_MS = 180_000;
 const TEST_TIMEOUT_MS = 60_000;
-
-const SEAT_COLUMN = ACTIVE_EMBEDDING_SEAT.column;
-const EMBEDDING = `('[1' || repeat(',0', ${EMBEDDING_DIMENSIONS - 1}) || ']')::vector(${EMBEDDING_DIMENSIONS})`;
 
 const WORK = 'work:mail';
 const PERSONAL = 'personal:mail';
@@ -122,15 +118,6 @@ async function insertChunk(pageId: string, content: string, origin = WORK): Prom
      VALUES ($1, $2, $3::bigint, 0)`,
     [origin, content, pageId],
   );
-}
-
-async function insertEntity(name: string, origins: readonly string[]): Promise<string> {
-  const rows = (await sql.unsafe(
-    `INSERT INTO entity (canonical_name, entity_type, origin_contexts)
-     VALUES ($1, 'person', $2::text[]) RETURNING entity_id::text AS id`,
-    [name, `{${origins.join(',')}}`],
-  )) as Array<{ id: string }>;
-  return rows[0]?.id ?? '';
 }
 
 // ---------------------------------------------------------------------------

@@ -1,16 +1,18 @@
 /**
  * **The switch on the only lane in the fleet that destroys data.**
  *
- * `purgeExpiredTombstones` is correct, bounded and countable — and turning its
- * enqueuer on is still a product decision rather than an engineering one,
- * because `restoreForgotten` has no production caller. Nothing in `TOOL_NAMES`,
- * nothing in `ADMIN_OPERATIONS`, nothing in the web app restores a forgotten
- * page. So an enqueuer that defaults on would not begin keeping the 72-hour
- * promise; it would begin enforcing the deletion half of a promise whose
- * recovery half does not exist.
+ * This header used to argue that the enqueuer must default off because
+ * `restoreForgotten` had no production caller — nothing in `TOOL_NAMES`,
+ * nothing in `ADMIN_OPERATIONS`, nothing in the web app could restore a
+ * forgotten page. That premise is gone: the web app lists what is restorable
+ * and puts it back (`src/web/serve.ts:retractionPort`), so the deletion half of
+ * the 72-hour promise no longer runs ahead of the recovery half.
  *
- * These assertions are cheap and the failure they prevent is not: a hard-delete
- * lane that arrives switched on because someone rebuilt a container.
+ * The assertions below are unchanged, because what they pin never depended on
+ * that argument. "Absent reads as off" is a property of **upgrades**: a fleet
+ * that has never heard of this flag must not begin hard-deleting because
+ * somebody rebuilt a container. That is cheap to assert and the failure it
+ * prevents is not.
  */
 
 import { describe, expect, test } from 'bun:test';

@@ -626,28 +626,49 @@ export async function listRestorable(
 ): Promise<RestorableListing> {
   const since = restorableSince(request.now, request.ttlHours).toISOString();
   const ttlMs = retentionHoursOf(request.ttlHours) * 3600_000;
-  const limit = request.limit ?? RESTORABLE_LIMIT;
+  const limit = Math.trunc(request.limit ?? RESTORABLE_LIMIT);
 
   // limit + 1, because `overflowed` is the question "is there more" and a query
   // that stopped at the ceiling cannot answer it.
-  const rows = (await sql.unsafe(
+  const rows = await readLedgers(sql, {
+    predicate: 'at >= $1::timestamptz',
+    parameter: since,
+    limit: limit + 1,
+  });
+
+  return {
+    retractions: collapseByInstant(rows.slice(0, limit), ttlMs),
+    overflowed: rows.length > limit,
+  };
+}
+
+/**
+ * The two ledgers, read as one relation.
+ *
+ * Both callers below name their own predicate over the unioned `at` column and
+ * nothing else, so "which tables a retraction is discoverable from" is decided
+ * exactly once. Every identifier here is a literal; the only value that crosses
+ * is bound.
+ */
+async function readLedgers(
+  sql: SQL,
+  request: { readonly predicate: string; readonly parameter: string; readonly limit: number },
+): Promise<RestorableRow[]> {
+  return (await sql.unsafe(
     `SELECT ${INSTANT_AS_ISO('at')} AS at, kind, origins, target_kind, counts FROM (
        SELECT retracted_at AS at, 'record'::text AS kind, origin_contexts AS origins,
               target_kind, removed AS counts
          FROM retraction
-        WHERE retracted_at >= $1::timestamptz
        UNION ALL
        SELECT severed_at, 'origin'::text, ARRAY[origin_context], NULL::text, removed
          FROM severance
-        WHERE severed_at >= $1::timestamptz AND restored_at IS NULL
+        WHERE restored_at IS NULL
      ) ledgers
+      WHERE ${request.predicate}
       ORDER BY at DESC
-      LIMIT ${Math.trunc(limit) + 1}`,
-    [since],
+      LIMIT ${Math.trunc(request.limit)}`,
+    [request.parameter],
   )) as unknown as RestorableRow[];
-
-  const collapsed = collapseByInstant(rows.slice(0, Math.trunc(limit)), ttlMs);
-  return { retractions: collapsed, overflowed: rows.length > Math.trunc(limit) };
 }
 
 function collapseByInstant(rows: readonly RestorableRow[], ttlMs: number): RestorableRetraction[] {
@@ -700,19 +721,30 @@ function targetKindOf(
  * `null` means "no retraction of yours at that instant" — including an instant
  * that is not a timestamp at all, which is refused here rather than being cast
  * in SQL and coming back as a 500 on a hand-rolled request.
+ *
+ * **Membership only. It does not apply the window, deliberately.**
+ * {@link restoreForgotten} is the sole authority on whether 72 hours have
+ * passed, and a second window test here would be a second place for the
+ * product's only "no" to be decided. It would also make the honest expiry
+ * message unreachable: an instant whose window closed a minute ago is a
+ * retraction that *existed*, and answering `not_found` for it would tell the
+ * user they are looking at something that never happened rather than at
+ * something they are too late for. So this admits it, the executor refuses it,
+ * and the surface can say when the window closed. Past the purge's own cutoff
+ * the ledger row is gone and `null` becomes the truth again.
  */
 export async function findRestorable(
   sql: SQL,
-  request: { readonly deletedAt: string; readonly now: Date; readonly ttlHours?: number },
+  request: { readonly deletedAt: string; readonly ttlHours?: number },
 ): Promise<RestorableRetraction | null> {
   if (Number.isNaN(Date.parse(request.deletedAt))) return null;
-  const listing = await listRestorable(sql, {
-    now: request.now,
-    ...(request.ttlHours === undefined ? {} : { ttlHours: request.ttlHours }),
+  const ttlMs = retentionHoursOf(request.ttlHours) * 3600_000;
+  const rows = await readLedgers(sql, {
+    predicate: 'at = $1::timestamptz',
+    parameter: request.deletedAt,
     limit: RESTORABLE_LIMIT,
   });
-  const wanted = Date.parse(request.deletedAt);
-  return listing.retractions.find((entry) => Date.parse(entry.at) === wanted) ?? null;
+  return collapseByInstant(rows, ttlMs)[0] ?? null;
 }
 
 /**
@@ -1349,10 +1381,16 @@ export async function purgeExpiredTombstones(
   // budget exists at all: this is one narrow DELETE against a table with one row
   // per retraction and no cascade hanging off it, not a page delete dragging
   // hundreds of live children out with it.
-  const swept = (await sql.unsafe(
-    `DELETE FROM retraction WHERE retracted_at <= $1::timestamptz RETURNING 1 AS gone`,
-    [cutoff],
-  )) as Array<{ gone: number }>;
+  //
+  // In its own transaction, like every batch, so the sweep is a durable step
+  // rather than work that a later failure could take back.
+  const swept = await sql.begin(
+    async (tx) =>
+      (await (tx as SQL).unsafe(
+        `DELETE FROM retraction WHERE retracted_at <= $1::timestamptz RETURNING 1 AS gone`,
+        [cutoff],
+      )) as Array<{ gone: number }>,
+  );
 
   return {
     cutoff,
