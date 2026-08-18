@@ -224,7 +224,24 @@ ARG BUN_VERSION=1.3.14
 # inside the image, so warm instances of either keep running the four-minute
 # policy. Deterministic reload (`containers delete` then `deploy`) against the
 # worker AND web fleets.
-ARG FLEET_CONFIG_EPOCH=17
+# 17 -> 18: three connector fixes at once, and they are the first epoch whose
+# whole content is what a failing lane *records*. (a) A first import was sized
+# against three times the life it had: `DEFAULT_MAX_ATTEMPT_MS` promised fifteen
+# minutes and `WorkerFleet.sleepAfter` gives roughly five, so a long pull was
+# killed by the platform mid-attempt and the next wake filed `attempt_timed_out`
+# and charged the attempt. The pull now yields on a wall clock and resumes from
+# its cursor. (b) Every folder in a Drive was filed as a document that would not
+# parse, so `items_failed` -- the number the connector panel shows an operator --
+# counted a folder tree that never changes. (c) `auth_expired` was answered by
+# two unrelated classifiers, and since it became terminal in epoch 17 a rotated
+# fleet credential would have marked every tenant's every lane dead and asked
+# each owner to reconnect an account that was working; the fleet's half is now
+# `fleet_auth_failed`, retryable. Worker fleet runs all three (the pull, the
+# adapter, the classifier); web fleet renders the new cause and its copy. Both
+# are code inside the image, so warm instances of either keep the old behaviour.
+# Deterministic reload (`containers delete` then `deploy`) against the worker AND
+# web fleets.
+ARG FLEET_CONFIG_EPOCH=18
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
