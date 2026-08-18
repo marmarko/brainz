@@ -196,7 +196,16 @@ ARG BUN_VERSION=1.3.14
 # eight consecutive failed runs across all three sources, because they share one
 # URL builder. Code inside the image, so warm worker instances keep asking the
 # wrong route until replaced.
-ARG FLEET_CONFIG_EPOCH=14
+# 14 -> 15: the way back from a dead lane. Epoch 14 fixed the request shape and
+# could not take effect: all three of the live brain's connectors had already
+# dead-lettered, and a dead lane stands in the cadence's anti-join forever, so
+# nothing would ever ask again. Disconnect now clears a dead lane too, and
+# `/admin?op=requeue_connector` clears one without costing the user a
+# re-authorization. Web fleet carries the operator surface and the disconnect;
+# both live in code inside the image, so a warm instance keeps serving the
+# version with no way back. Deterministic reload (`containers delete` then
+# `deploy`).
+ARG FLEET_CONFIG_EPOCH=15
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
