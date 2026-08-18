@@ -50,11 +50,108 @@ export const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
 export const DEFAULT_STEAL_GRACE_MS = 15_000;
 
 /**
- * The wall-clock ceiling on a single attempt — the stall backstop. Generous,
- * because a first import is genuinely long; finite, because "genuinely long" and
- * "wedged" are indistinguishable from the outside without a bound.
+ * The wall-clock ceiling on a single attempt — the **stall backstop, and only
+ * that**. It answers one question: has this handler stopped making progress on a
+ * worker that is otherwise alive? A wedged handler heartbeats forever, because
+ * the renewal is the runner's and not the handler's, so the liveness signal is
+ * exactly what masks the stall — see the header. Nothing else may be sized off
+ * this number.
+ *
+ * **It is not a work budget, and reading it as one is what broke the connector
+ * lane.** A handler that meant to run inside this ceiling would be sizing itself
+ * against fifteen minutes it does not have: the process is stopped by the
+ * platform first (see {@link FLEET_WAKE_WINDOW_MS}), and the ceiling then
+ * *misreports* that kill as the job's own timeout, because `reclaim` reads a
+ * lapsed deadline and cannot see that the worker had already gone. The budget a
+ * cooperative handler yields inside is {@link attemptYieldAtMs}.
  */
 export const DEFAULT_MAX_ATTEMPT_MS = 15 * 60_000;
+
+/**
+ * How long the platform keeps this process alive after a wake.
+ *
+ * **This is not a policy this module chose.** It is `WorkerFleet.sleepAfter` in
+ * `src/mcp/router.ts`, restated where the batch lane can read it, and
+ * `test/worker/long-import.test.ts` reads the class back and refuses a
+ * disagreement — because the whole defect was that the two disagreed by 3x with
+ * nothing in the repo able to notice.
+ *
+ * **Why internal work does not extend it.** `@cloudflare/containers` renews the
+ * window from the request path only (`renewActivityTimeout`), and stops the
+ * container when it lapses with nothing in flight (`isActivityExpired`). The
+ * worker fleet's only caller is `wakeWorkerFleet`, which dials `/health` once
+ * per cron period. So the clock starts at the wake, runs while the fleet works,
+ * and is never touched by the working.
+ *
+ * A slice that outlives this is not slow — it is dead. Its pages are banked
+ * (every write commits as it goes) but its cursor is not, its lease lapses with
+ * nobody awake to reclaim it, and the next wake charges it an attempt.
+ */
+export const FLEET_WAKE_WINDOW_MS = 5 * 60_000;
+
+/**
+ * What a slice keeps back from the window it is given.
+ *
+ * Two things come out of it and both are real. The container's clock starts at
+ * the wake request; this process's own clock starts after the image boots and
+ * the fleet opens its connections, so `processStartedAt + window` **overstates**
+ * when the container dies by however long that took. And the checkpoint itself
+ * is not free: the cursor write, the run row, the health record and the job
+ * completion are round trips that must land on the near side of the kill, or the
+ * slice did the work and banked none of it.
+ */
+export const ATTEMPT_BANK_RESERVE_MS = 60_000;
+
+/**
+ * When a cooperative handler must have banked and returned.
+ *
+ * **The earlier of two different facts**, which is why it is a `min` and not a
+ * constant. The process's own life is the binding one in the deployment: a claim
+ * taken four minutes into a five-minute window inherits what is left of it, not
+ * a fresh budget, because the container's clock started at the wake and not at
+ * the claim. The wrapper's ceiling is the other, and it binds when a caller
+ * shortens it — a test, or a fleet configured tighter — so a handler can never
+ * plan to yield after the reaper has already taken the job.
+ *
+ * **The ceiling arrives as a duration and not as an instant, and that is not a
+ * stylistic choice.** `attempt_deadline_at` is stamped from the instant the
+ * *queue* was handed (`ClaimRequest.now`), and this function is answering in the
+ * clock the *handler* reads. Production runs both on wall clock and they agree;
+ * anything driving the queue from an injected clock — every job test in this
+ * repo — does not, and an absolute deadline compared across the two is a
+ * subtraction of unrelated numbers. It reads as a slice that ran out of time
+ * before it started, on every attempt, which is the quietest possible way for a
+ * connector to stop importing. So the caller does the conversion where it holds
+ * both halves in one domain: `attemptDeadlineAt − context.now` is a duration in
+ * the queue's clock, and `nowMs + that` is the same instant in the handler's.
+ *
+ * The result may be in the past. That is the honest answer for a claim taken
+ * with nothing left, and the caller's rule is what keeps it safe: the pull
+ * always attempts at least one item before it consults this, so a spent window
+ * costs a slice its size and never its forward progress.
+ */
+export function attemptYieldAtMs(request: {
+  /** The handler's own clock, read once at the start of the attempt. */
+  readonly nowMs: number;
+  readonly processStartedAtMs: number;
+  /** `attempt_deadline_at − now`, both taken from the queue's clock. */
+  readonly attemptRemainingMs: number;
+  /** Overridable so a test can name a window without restating the platform's. */
+  readonly wakeWindowMs?: number;
+  readonly reserveMs?: number;
+}): number {
+  const wakeWindowMs = request.wakeWindowMs ?? FLEET_WAKE_WINDOW_MS;
+  const reserveMs = request.reserveMs ?? ATTEMPT_BANK_RESERVE_MS;
+  if (reserveMs >= wakeWindowMs) {
+    throw new Error(
+      'invariant: the banking reserve must be shorter than the wake window, or no slice ever has time to write its checkpoint',
+    );
+  }
+  return Math.min(
+    request.processStartedAtMs + wakeWindowMs - reserveMs,
+    request.nowMs + request.attemptRemainingMs - reserveMs,
+  );
+}
 
 /**
  * A TTL shorter than this many heartbeat intervals declares a live worker dead

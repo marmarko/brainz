@@ -33,6 +33,7 @@ import {
 } from '../../../src/ingest/pipedream/pull.ts';
 import { externalRefFor } from '../../../src/ingest/pipedream/sources/types.ts';
 import type { JobLease } from '../../../src/worker/jobs.ts';
+import { DEFAULT_MAX_ATTEMPT_MS } from '../../../src/worker/locks.ts';
 import { createGateway } from '../../core/write/fixture.ts';
 import { TENANT, countRows, createIngestFixture, type IngestFixture } from '../fixture.ts';
 import { createFakeSource, mailBody, page } from './fixture.ts';
@@ -318,6 +319,11 @@ describe('the loss is visible', () => {
       target: 'gmail',
       attempt: 1,
       leaseUntil: NOW,
+      // The wall-clock ceiling the runner stamps at claim. Present because the
+      // handler sizes its own slice budget against it — a lease without one is a
+      // row `queue.claim` refuses to return, so leaving it off made this fixture
+      // a shape production cannot produce.
+      attemptDeadlineAt: new Date(NOW.getTime() + DEFAULT_MAX_ATTEMPT_MS),
     } as unknown as JobLease;
 
     await handler({ lease, now: NOW, signal: new AbortController().signal });
@@ -347,6 +353,11 @@ describe('the loss is visible', () => {
       target: 'calendar',
       attempt: 1,
       leaseUntil: NOW,
+      // The wall-clock ceiling the runner stamps at claim. Present because the
+      // handler sizes its own slice budget against it — a lease without one is a
+      // row `queue.claim` refuses to return, so leaving it off made this fixture
+      // a shape production cannot produce.
+      attemptDeadlineAt: new Date(NOW.getTime() + DEFAULT_MAX_ATTEMPT_MS),
     } as unknown as JobLease;
 
     expect(

@@ -125,6 +125,18 @@ export async function startWorkerFleet(
   env: Environment,
   seams: WorkerFleetSeams = {},
 ): Promise<WorkerFleetProcess> {
+  /**
+   * When this process was woken, taken **before** anything it does.
+   *
+   * The platform's activity window opened at the cron's request to `/health`,
+   * which is earlier still — the image had to boot to answer it — so this
+   * overstates how long the container has left, and
+   * `ATTEMPT_BANK_RESERVE_MS` is what covers the difference. Taken here rather
+   * than where the handler is built because everything between the two is
+   * connections and schema ensures, and a slice must not be given the time they
+   * spent.
+   */
+  const processStartedAtMs = Date.now();
   const controlSql = openControlPlane(env);
   // The dedicated lease channel (H4). Its own handle, never the work one.
   const leaseSql = new SQL(env['BRAINZ_CONTROL_DATABASE_URL'] as string, { max: 2 });
@@ -285,6 +297,11 @@ export async function startWorkerFleet(
   const ingestPullHandler = createIngestPullHandler({
     control: controlSql,
     profile,
+    // The slice budget's origin. A first import is longer than any window this
+    // fleet is given, so a pull is asked to bank and return inside the one it
+    // has rather than be killed part-way through a fifteen-minute attempt the
+    // container was never going to live to see.
+    processStartedAtMs,
     openTenant: async (tenantId) => (await openIngestTenant(tenantId)).runtime,
     closeTenant: (tenant) => tenant.sql.close(),
     openSource: connectorSourceOpener(connectors.runtime),

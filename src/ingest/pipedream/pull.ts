@@ -98,6 +98,7 @@ import type {
   JobTrigger,
 } from '../../worker/jobs.ts';
 import type { JobContext } from '../../worker/runner.ts';
+import { attemptYieldAtMs } from '../../worker/locks.ts';
 import {
   SOURCE_TYPE_FOR,
   discardCursor,
@@ -211,6 +212,20 @@ export interface PullRequest {
   readonly inlineItemCeiling?: number;
   readonly inlineSpendCeiling?: number;
   readonly maxItems?: number;
+  /**
+   * **The wall-clock budget, beside the spend one.** When {@link PullRequest.clock}
+   * passes this instant the pull stops the way a spent budget stops it: the
+   * cursor holds, what was written stays written, and the run closes `stopped`
+   * rather than `failed`.
+   *
+   * Absent means unbounded, which is right for an interactive caller — a user
+   * waiting on "connect Gmail" is the clock. The `ingest_pull` handler always
+   * supplies one, because the process it runs in has a life it cannot extend
+   * (`src/worker/locks.ts:attemptYieldAtMs`).
+   */
+  readonly yieldAtMs?: number;
+  /** Injectable so the budget is arithmetic against a real database, not a sleep. */
+  readonly clock?: () => number;
 }
 
 export type PullStopReason =
@@ -220,7 +235,20 @@ export type PullStopReason =
   /** The listing reported a different account than the one on record. */
   | 'identity_changed'
   /** Items the page offered that this pull never got to. The cursor holds. */
-  | 'not_attempted';
+  | 'not_attempted'
+  /**
+   * The slice ran out of wall clock and banked.
+   *
+   * **Its own reason and not `not_attempted`**, even though both hold the cursor
+   * and both mean "come back". The two have opposite causes and opposite
+   * remedies: `not_attempted` is a ceiling the caller chose refusing work it was
+   * offered, and it is the same on every retry. This is the *process* running
+   * out of life, and the next wake — a new container, a fresh window — carries
+   * the same work further. An operator reading a connector that says this every
+   * slice is reading a healthy long import; one that said `not_attempted` would
+   * be reading a ceiling nobody set.
+   */
+  | 'time_exhausted';
 
 /** Which ingest-log code a stop is, so a stopped run says *why* it stopped. */
 function stopCodeFor(reason: PullStopReason): IngestFailureCode {
@@ -229,6 +257,12 @@ function stopCodeFor(reason: PullStopReason): IngestFailureCode {
       return 'budget_exhausted';
     case 'identity_changed':
     case 'not_attempted':
+    // `cancelled`'s panel copy is *it picks up where it left off*, which is
+    // exactly what a banked slice does — and the only line in the vocabulary
+    // that is true of it. `provider_error` would blame a provider that did
+    // nothing wrong, and `budget_exhausted` would tell a user their spend cap
+    // stopped an import their spend cap had nothing to do with.
+    case 'time_exhausted':
       return 'cancelled';
     case 'model_not_priced':
       return 'provider_error';
@@ -510,6 +544,19 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
   const sourceType = SOURCE_TYPE_FOR[source.source];
   const interactive = request.interactive ?? true;
   const maxItems = request.maxItems ?? DEFAULT_MAX_ITEMS_PER_PULL;
+
+  /**
+   * Has this slice run out of wall clock?
+   *
+   * Asked, never scheduled. A timer that aborted the pull would leave the run
+   * row open and the cursor half-written, which is the shape the whole file is
+   * built to avoid; a question asked between units of work stops at a point
+   * where everything before it is already banked.
+   */
+  const outOfTime = (): boolean => {
+    if (request.yieldAtMs === undefined) return false;
+    return (request.clock ?? Date.now)() >= request.yieldAtMs;
+  };
 
   const counts: MutableCounts = { ...EMPTY_COUNTS };
   let attemptedItems = 0;
@@ -1060,6 +1107,25 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     let halted: PullStopReason | undefined;
 
     for (const { item, verdict, quarantine } of items) {
+      // **The wall clock, checked here and guarded on forward progress.**
+      //
+      // Between items rather than inside one, because that is the only boundary
+      // where the page just written is banked and the next one has not been
+      // started — the same boundary `budget_exhausted` stops at, and it stops
+      // the same way: the cursor holds, the run closes `stopped`, the job
+      // completes without failing, and the next wake re-lists this page and
+      // walks the prefix it already holds for free.
+      //
+      // `attemptedItems > 0` is not defensive spelling. A slice claimed with its
+      // window already spent — the tick that lands seconds before the container
+      // sheds — would otherwise attempt nothing at all, hold the cursor, and
+      // hand the identical page to the next slice. That is a poller that has
+      // stopped importing while every row in the control plane says it is
+      // healthy. One item per attempt is slow; zero is a loop.
+      if (attemptedItems > 0 && outOfTime()) {
+        halted = 'time_exhausted';
+        break;
+      }
       attemptedItems += 1;
 
       const receipt = await ingestDocument(
@@ -1140,6 +1206,16 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
     //    never happens. Quarantined chunks are not in this backlog — which is
     //    the structural half of "the junk gate runs before the meter".
     // ------------------------------------------------------------------
+    // **The second budget boundary, and the one that is easy to leave out.**
+    // Embedding is the slow half of a slice and this pass is unbounded in wall
+    // clock — it drains every chunk with a null vector, which after a page of
+    // mail is most of them. A slice that spent its window on the items and then
+    // entered this would be killed inside it, and the kill is what costs an
+    // attempt. Stopping here banks the same way: the chunks stay `embedding IS
+    // NULL`, which is a query and not a promise this process holds, so the next
+    // slice's own backlog drains them.
+    if (halted === undefined && outOfTime()) halted = 'time_exhausted';
+
     if (halted === undefined) {
       const backlog = await runChunkEmbedBacklog({
         sql: tenant.sql,
@@ -1364,10 +1440,13 @@ export class IngestPullFailure extends Error {
  * the remedy is a deploy — precisely the shipped-bug class this ladder was
  * lengthened to survive.
  *
- * `budget_exhausted`, `identity_changed` and `not_attempted` never reach a
- * thrown failure — the first two complete the job as `stopped` or `refused` with
- * the cursor held — but they are named rather than left to a `default`, because
- * a silent default is how a new stop reason inherits a ruling nobody made.
+ * `budget_exhausted`, `identity_changed`, `not_attempted` and `time_exhausted`
+ * never reach a thrown failure — they complete the job as `stopped` or `refused`
+ * with the cursor held — but they are named rather than left to a `default`,
+ * because a silent default is how a new stop reason inherits a ruling nobody
+ * made. `time_exhausted` is the one it would be most expensive to get wrong:
+ * terminal, it would dead-letter a lane on the ordinary shape of a large first
+ * import, which is precisely the incident this ladder was lengthened for.
  */
 export function pullStopIsTerminal(reason: PullStopReason | 'unknown'): boolean {
   switch (reason) {
@@ -1382,6 +1461,7 @@ export function pullStopIsTerminal(reason: PullStopReason | 'unknown'): boolean 
     case 'budget_exhausted':
     case 'identity_changed':
     case 'not_attempted':
+    case 'time_exhausted':
     case 'unknown':
       return false;
   }
@@ -1461,6 +1541,23 @@ export interface PullHandlerDeps {
   readonly priceBook?: PriceBook;
   readonly maxItems?: number;
   /**
+   * The clock the slice budget is measured on. Injectable for the same reason
+   * `runner.ts` takes its instant as an argument: it makes "this pull ran out of
+   * time" arithmetic a test can state, rather than a sleep it has to survive.
+   */
+  readonly clock?: () => number;
+  /**
+   * When the process this handler runs in was woken.
+   *
+   * Defaults to the moment the handler was built, which in `src/worker/serve.ts`
+   * is boot — the composition root builds it once. It is a property of the
+   * *process*, not of the attempt: the container's activity window started at
+   * the wake request, so a job claimed four minutes in has one minute of life,
+   * not five, and a budget measured from the claim would promise time the
+   * platform has already spent.
+   */
+  readonly processStartedAtMs?: number;
+  /**
    * Where the pull's own result goes.
    *
    * Without it the handler computes `counts.failed`, `stopReason` and the widen
@@ -1488,6 +1585,13 @@ export interface PullHandlerDeps {
 export function createIngestPullHandler(
   deps: PullHandlerDeps,
 ): (context: JobContext) => Promise<void> {
+  const clock = deps.clock ?? Date.now;
+  // Captured once, where the handler is built. `src/worker/serve.ts` builds it
+  // at boot, so this is the process's wake — the instant the platform's activity
+  // window started running. Reading it per attempt would restart a clock only
+  // the container is allowed to restart.
+  const processStartedAtMs = deps.processStartedAtMs ?? clock();
+
   return async (context: JobContext): Promise<void> => {
     const { lease } = context;
     if (!isConnectorSource(lease.target)) {
@@ -1557,6 +1661,17 @@ export function createIngestPullHandler(
             }),
         ...(deps.priceBook === undefined ? {} : { priceBook: deps.priceBook }),
         ...(deps.maxItems === undefined ? {} : { maxItems: deps.maxItems }),
+        // The budget, from the two facts that bound it: how long this process
+        // has left, and how long the wrapper will wait. See
+        // `src/worker/locks.ts:attemptYieldAtMs`.
+        clock,
+        yieldAtMs: attemptYieldAtMs({
+          nowMs: clock(),
+          processStartedAtMs,
+          // A duration, taken entirely inside the queue's own clock. Both of
+          // these come from the runner; neither is comparable to `clock()`.
+          attemptRemainingMs: lease.attemptDeadlineAt.getTime() - context.now.getTime(),
+        }),
       });
 
       await deps.onResult?.(result, lease);
