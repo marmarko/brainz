@@ -59,6 +59,7 @@ export const MIGRATIONS: readonly TenantMigration[] = [
   { version: 14, name: 'fact-seat-nullable', file: 'migrations/v14-fact-seat-nullable.sql' },
   { version: 15, name: 'fleet-auth-failure', file: 'migrations/v15-fleet-auth-failure.sql' },
   { version: 16, name: 'embed-unavailable', file: 'migrations/v16-embed-unavailable.sql' },
+  { version: 17, name: 'embed-cause-split', file: 'migrations/v17-embed-cause-split.sql' },
 ];
 
 /** The version this code applies to a fresh tenant, derived rather than typed twice. */

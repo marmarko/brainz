@@ -63,6 +63,16 @@ export type RunOutcome = (typeof RUN_OUTCOMES)[number];
  * and the pin in `test/control/connector-health.test.ts` compares the sequence.
  * New codes go on the end.
  *
+ * `embed_key_unavailable` and `embed_transport_failed` are the ninth and tenth,
+ * and they split the eighth for the reason the seventh split the third: the two
+ * have different owners and different remedies. A key that will not resolve is
+ * an operator's configuration and no amount of waiting fixes it; a transport
+ * that refused is the vendor's or the network's and usually fixes itself. Under
+ * one code an outage of the first kind was indistinguishable from a bad hour of
+ * the second, which is six hours of looking in the wrong place.
+ * `embed_unavailable` survives as the catch-all for an embed failure that is
+ * neither — it is not a synonym for either.
+ *
  * `embed_unavailable` is the eighth and it is deliberately not `provider_error`:
  * that one is a single item the provider refused, this one is the whole brain
  * unable to index anything. The embed backlog spans every source, so one
@@ -83,6 +93,8 @@ export const INGEST_FAILURE_CODES = [
   'cancelled',
   'fleet_auth_failed',
   'embed_unavailable',
+  'embed_key_unavailable',
+  'embed_transport_failed',
 ] as const;
 export type IngestFailureCode = (typeof INGEST_FAILURE_CODES)[number];
 

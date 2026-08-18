@@ -126,7 +126,10 @@ CREATE TYPE control.connector_ingest_failure AS ENUM (
   -- The embedder, not the source. Appended rather than inserted: a label added
   -- in the middle would leave a fresh control plane and an upgraded one holding
   -- the same labels in different orders, and the pin compares the sequence.
-  'embed_unavailable'
+  'embed_unavailable',
+  -- The two that split it. Appended, never inserted.
+  'embed_key_unavailable',
+  'embed_transport_failed'
 );
 
 -- `control.job.failure_code`'s vocabulary (`JOB_FAILURE_CODES`). This is the

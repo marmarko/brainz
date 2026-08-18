@@ -285,6 +285,23 @@ export function causeSentence(cause: string | null): string | null {
       );
     case 'provider_error':
       return 'The provider refused the request. Nothing to do — it tries again on its own.';
+    case 'embed_key_unavailable':
+      // Same sentence as the general case on purpose. The split exists for the
+      // operator, who gets the code; the difference between a credential we
+      // cannot resolve and a provider that refused is not a difference the
+      // person waiting for their mail can act on, and naming it here would
+      // spend their attention on our configuration.
+      return (
+        'The service that makes your text searchable could not be reached, so this check ' +
+        'stopped rather than file anything it could not index. Nothing was lost — it resumes ' +
+        'from where it stopped once indexing is back.'
+      );
+    case 'embed_transport_failed':
+      return (
+        'The service that makes your text searchable refused the request, so this check ' +
+        'stopped rather than file anything it could not index. Nothing was lost — it resumes ' +
+        'from where it stopped once indexing is back.'
+      );
     case 'embed_unavailable':
       // Deliberately says "indexing", not "importing". What failed is the step
       // that makes text searchable, and the mail itself is not lost — the cursor

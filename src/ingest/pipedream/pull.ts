@@ -213,7 +213,11 @@ export type PullStopReason =
    * the provider would not give us. The backlog it drains has no source filter,
    * so this stops every connector at once and the remedy is an operator's.
    */
-  | 'embed_unavailable';
+  | 'embed_unavailable'
+  /** The embedder's credential would not resolve. An operator's, not a wait's. */
+  | 'embed_key_unavailable'
+  /** The embedder answered, and what it answered with was a refusal. */
+  | 'embed_transport_failed';
 
 /** Which ingest-log code a stop is, so a stopped run says *why* it stopped. */
 function stopCodeFor(reason: PullStopReason): IngestFailureCode {
@@ -227,6 +231,10 @@ function stopCodeFor(reason: PullStopReason): IngestFailureCode {
       return 'provider_error';
     case 'embed_unavailable':
       return 'embed_unavailable';
+    case 'embed_key_unavailable':
+      return 'embed_key_unavailable';
+    case 'embed_transport_failed':
+      return 'embed_transport_failed';
     default:
       return ingestCodeFor(reason);
   }
@@ -366,6 +374,28 @@ function ingestCodeFor(reason: PullFailureReason): IngestFailureCode {
     // the provider, which is what a staleness display needs.
     default:
       return 'provider_error';
+  }
+}
+
+/**
+ * The gateway's reason for an embed failure, as the stop this run reports.
+ *
+ * Only the two causes with different remedies are named. Everything else stays
+ * `embed_unavailable`, which is the honest answer rather than a bucket: a
+ * `budget_exhausted` from the embedder is already handled above and never
+ * reaches here, and inventing a code for a reason nobody has seen would be a
+ * vocabulary entry no operator could act on.
+ */
+function embedStopFor(reason: string): PullStopReason {
+  switch (reason) {
+    case 'key_unavailable':
+    case 'scope_denied':
+    case 'no_key_available':
+      return 'embed_key_unavailable';
+    case 'transport_failed':
+      return 'embed_transport_failed';
+    default:
+      return 'embed_unavailable';
   }
 }
 
@@ -1063,7 +1093,12 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
       // answer stops gmail, calendar and drive in the same tick — and the three
       // rows an operator then reads are indistinguishable from three unrelated
       // bad items unless the code says which happened.
-      else if (backlog.failure !== undefined) incomplete ??= 'embed_unavailable';
+      //
+      // The gateway's own reason is carried rather than flattened: it is already
+      // in `backlog.failure` and was being thrown away one line from the surface
+      // that needed it. Which of the two arrived decides where an operator
+      // looks, and looking in the wrong one cost six hours.
+      else if (backlog.failure !== undefined) incomplete ??= embedStopFor(backlog.failure);
     }
 
     // ------------------------------------------------------------------
@@ -1296,6 +1331,12 @@ export function pullStopIsTerminal(reason: PullStopReason | 'unknown'): boolean 
     // here that routinely answers later, and dead-lettering the lane would turn
     // a provider's bad hour into a connector the owner has to reconnect by hand.
     case 'embed_unavailable':
+    // Both retryable, including the key one. Retrying will not resolve a
+    // credential an operator has to fix — but dead-lettering the lane makes the
+    // owner reconnect an account that was never the problem, and the remedy
+    // lands in the fleet's configuration rather than in this tenant's grant.
+    case 'embed_key_unavailable':
+    case 'embed_transport_failed':
     case 'unknown':
       return false;
   }

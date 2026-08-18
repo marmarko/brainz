@@ -396,23 +396,34 @@ describe('a control plane built before a code existed learns it', () => {
   let oldSql: SQL;
 
   /**
-   * `connector-health.sql`, rewound to the vocabulary *before* the newest label.
+   * The labels this suite pretends the old deployment had never heard of.
    *
-   * Keyed on the newest label rather than on `fleet_auth_failed`, which is what
-   * it used to name: that made the rewind silently stop rewinding the moment an
-   * eighth label was appended after it, and a rewind that matches nothing is
-   * caught below only because the throw was written. Any comment lines the DDL
-   * carries between the labels are consumed too, or the strip leaves a dangling
-   * `--` inside the enum body.
+   * ONE constant drives both the DDL rewind and the expectation below. They used
+   * to be two hand-written mentions of `fleet_auth_failed`, and when a label was
+   * appended after it the rewind quietly matched nothing while the filter went on
+   * removing a label that was still in the middle — the pair asserted that the
+   * current file equals itself, which is the one thing this describe must never
+   * do. Appending a label now updates this list and nothing else.
    */
+  const CODES_ADDED_SINCE = ['embed_key_unavailable', 'embed_transport_failed'] as const;
+
+  /** `connector-health.sql`, rewound to the vocabulary before those labels. */
   function ddlBeforeNewestCode(): string {
-    const rewound = SCHEMA_SQL.replace(
-      /,\s*\n(?:\s*--[^\n]*\n)*\s*'embed_unavailable'\n\)/,
-      '\n)',
-    );
+    let rewound = SCHEMA_SQL;
+    for (const code of CODES_ADDED_SINCE) {
+      // Any comment lines the DDL carries between labels go with it, or the
+      // strip leaves a dangling `--` inside the enum body.
+      rewound = rewound.replace(
+        new RegExp(`,\\s*\\n(?:\\s*--[^\\n]*\\n)*\\s*'${code}'(?=\\s*[,)])`),
+        '',
+      );
+    }
     // The rewind must have done something, or this whole describe is asserting
     // that the current file equals itself.
     if (rewound === SCHEMA_SQL) throw new Error('the newest-label rewind matched nothing');
+    for (const code of CODES_ADDED_SINCE) {
+      if (rewound.includes(`'${code}'`)) throw new Error(`the rewind left ${code} behind`);
+    }
     return rewound;
   }
 
@@ -437,7 +448,7 @@ describe('a control plane built before a code existed learns it', () => {
     // pair used to name `fleet_auth_failed` in both places and would have gone
     // on asserting a rewind that no longer happened.
     expect(before.map((row) => row.label)).toEqual(
-      INGEST_FAILURE_CODES.filter((code) => code !== 'embed_unavailable'),
+      INGEST_FAILURE_CODES.filter((code) => !CODES_ADDED_SINCE.includes(code as never)),
     );
 
     await ensureConnectorHealthSchema(oldSql);

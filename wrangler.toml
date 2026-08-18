@@ -64,6 +64,23 @@ compatibility_flags = ["nodejs_compat"]
 # it is recorded at the bottom of this file.
 workers_dev = true
 
+# ---------------------------------------------------------------------------
+# The retention lane's switch, and the one flag in this file that destroys data.
+#
+# `purgeExpiredTombstones` hard-deletes tombstoned rows past the 72-hour window
+# plus a 24-hour grace band. It is declared here rather than left to a secret
+# because it is not a credential and an operator should be able to read, in the
+# checked-in config, whether this deployment deletes. `purgeEnqueueEnabled`
+# requires exactly "true" — no truthiness — so a "1" here cannot switch
+# deletion on by accident, and an absent key reads as off.
+#
+# Enabled deliberately and with the consequence stated: `restoreForgotten` has
+# no production caller, so while this is "true" a forget is irreversible in
+# fact rather than merely after 96 hours. Set it to "false" to stop the lane.
+# ---------------------------------------------------------------------------
+[vars]
+BRAINZ_PURGE_ENABLED = "true"
+
 [observability]
 enabled = true
 
