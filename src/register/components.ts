@@ -97,6 +97,16 @@ export const NOT_A_DESTINATION: readonly NotADestination[] = [
       'the OpenAI base URL in `PROVIDER_DIRECT_BASES` (`src/ai/gateway.ts`), which is a table of direct endpoints per provider id rather than a route. **No shipped routing profile names the `openai` provider any more** — the embedding seat, the last one that did, moved onto Cloudflare — so nothing resolves this base and nothing is sent to it. It is deliberately not deleted with the register entry it lost: the provider id is still in `PROVIDER_IDS`, so an operator profile could name it, and a base table with a hole in it would send that operator to a `no direct endpoint configured` error rather than to OpenAI. The moment a shipped profile routes `openai` again, `providersReachable()` reports it, `findRegisterGaps` goes red for a provider no entry claims, and this excuse has to be replaced by an entry — which is the direction R10 needs this to fail in.',
   },
   {
+    host: 'gmail.googleapis.com',
+    reason:
+      "Google's Gmail API, named in `PROVIDER_API_BASE` (`src/ingest/pipedream/client.ts`) and cited in `src/ingest/pipedream/sources/gmail.ts`. **This fleet opens no connection to it.** The connector proxy takes the whole upstream URL as a base64url path segment, so the string is a *forwarding instruction handed to Pipedream*, which makes the call under the OAuth grant it holds; every byte brainz sends still goes to `api.pipedream.com`. The party that reads a tenant's mailbox on our behalf is therefore the `pipedream` entry, which says so and holds the token. It appeared here as a host the moment the proxy shape was corrected to name its upstream — before that the same call was made with an app-relative path and no hostname in the source at all, which is precisely the invisibility this scan exists to remove: the destination did not change, only whether the code said it out loud.",
+  },
+  {
+    host: 'www.googleapis.com',
+    reason:
+      "Google's Calendar and Drive APIs, named once in `PROVIDER_API_BASE` (`src/ingest/pipedream/client.ts`) and cited in `src/ingest/pipedream/sources/calendar.ts` and `sources/drive.ts`. Nothing is sent to it directly, for the same reason as `gmail.googleapis.com` directly above — it is the forwarding target inside a Pipedream proxy call, not a destination this fleet addresses. The host is spelled out rather than assumed because it is not interchangeable: the same Calendar path under `calendar.googleapis.com` answers Google's own 404, which would reach the runner as an empty calendar rather than as a mistake.",
+  },
+  {
     host: 'developers.openai.com',
     reason:
       "a documentation URL in comments in `src/mcp/openai.ts` and `src/ingest/oauth/seam.ts`, citing the `search`/`fetch` contract the `/openai` surface was built against and the date it was read (2026-08-15). Nothing is sent to it, and it is deliberately not deleted from the comment: the citation is the receipt for a shape this repository is conformant to. Its live sibling `api.openai.com` is a base URL no shipped profile routes to any more, and is excused directly above.",

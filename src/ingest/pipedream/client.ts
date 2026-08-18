@@ -28,9 +28,23 @@
  *     file — because "account deletion leaves no live credential anywhere" is a
  *     sentence that ends up in a privacy policy.
  *
- * The exact URL and header shape of the proxy call is the third unverified
- * detail. It is confined to {@link providerUrl} and {@link connectionHeaders};
- * everything above them speaks in `ProviderRequest`.
+ * **The proxy call's URL and header shape was the third unverified detail, and
+ * it was wrong.** It is now measured, against the live project on 2026-08-17
+ * with real connected accounts, and it is confined to {@link providerUrl},
+ * {@link PROVIDER_API_BASE} and {@link proxyHeaders}; everything above them
+ * still speaks in `ProviderRequest`.
+ *
+ * What "wrong" cost, so the next person weighs an unverified vendor detail
+ * properly: the shipped shape put the app and an app-relative path in the URL
+ * (`/proxy/gmail/gmail/v1/users/me/profile`) and the scope in `x-pd-*` headers.
+ * The vendor answers that with `404 {"error":"Route not found"}`. Every
+ * connector poll in production failed on it — eight consecutive runs, all three
+ * sources, `provider_error`, `items_seen: 0`, each dying in ~450ms at the
+ * provider call. Zero pages, zero chunks, for as long as it was deployed. The
+ * tests were green throughout, because the transport fake matched the URL the
+ * builder produced and the builder produced what the fake matched. The fake now
+ * decodes the target the way the vendor does and reproduces the vendor's own
+ * refusals, which is what makes this suite evidence rather than agreement.
  *
  * **The claim URL is a capability, not display copy.** Whoever holds it can
  * attach *their* Google account to *this* tenant's brain. So: short TTL,
@@ -232,7 +246,7 @@ export interface ExternalUserDeletion {
  * disconnect every user the day a field is renamed.
  */
 export interface ConnectedAccount {
-  /** The vendor's connection id, which is what `x-pd-account-id` takes. */
+  /** The vendor's connection id, which is what the proxy's `account_id` takes. */
   readonly accountId: string;
   /** Which app it is, when the listing says. Null means the listing did not. */
   readonly appSlug: string | null;
@@ -535,7 +549,8 @@ function parseJson(body: string): unknown {
  *
  * **Every field but the id is optional, and an entry with no id is dropped.**
  * The id is the only thing a later proxy call cannot proceed without — it
- * becomes `x-pd-account-id` — so an entry missing it is not an account this
+ * becomes the proxy's `account_id`, which the vendor requires — so an entry
+ * missing it is not an account this
  * fleet can address, and adopting one would write a `ConnectorState` whose every
  * poll fails. Everything else degrades: an unnamed app is `null` and the caller
  * decides what silence means, an unparseable timestamp is `null` and orders
@@ -587,10 +602,74 @@ function queryString(query: ProviderRequest['query']): string {
   return encoded.length === 0 ? '' : `?${encoded}`;
 }
 
-/** Vendor detail #1 — see the header. */
-function providerUrl(config: PipedreamConfig, request: ProviderRequest): string {
+/**
+ * **Which upstream each app is addressed to**, and the only place any of them
+ * is named.
+ *
+ * The proxy forwards to an absolute URL, so the host is now part of every
+ * request this fleet makes and is no longer the vendor's business to guess.
+ * Keyed by {@link ProviderApp} rather than repeated in the three adapters
+ * because the two would then be able to disagree — `app: 'gmail'` pointed at
+ * Drive's host is a mistake this table makes unrepresentable, and the adapters
+ * already name their app on every call.
+ *
+ * **The host is load-bearing, and was measured rather than assumed.** Calendar
+ * answers `200` under `www.googleapis.com` and Google's own HTML `404` under
+ * `calendar.googleapis.com` — same path, same account, same request. Gmail is
+ * the other way round and lives on its own host. Every entry below was checked
+ * against the live project on 2026-08-17 with the founder's connected accounts;
+ * changing one without re-checking it is how this file got here.
+ */
+export const PROVIDER_API_BASE: Readonly<Record<ProviderApp, string>> = {
+  gmail: 'https://gmail.googleapis.com',
+  google_calendar: 'https://www.googleapis.com',
+  google_drive: 'https://www.googleapis.com',
+};
+
+/** The absolute upstream URL a provider request names, query and all. */
+function upstreamUrl(request: ProviderRequest): string {
+  return `${PROVIDER_API_BASE[request.app]}${request.path}${queryString(request.query)}`;
+}
+
+/**
+ * Vendor detail #1, **measured against the live project on 2026-08-17** rather
+ * than reasoned about — which is what the header used to admit it had not been.
+ *
+ * The proxy takes the whole upstream URL as a single **base64url** path segment
+ * and the connection's scope as **query parameters**:
+ *
+ *     /connect/{project}/proxy/{base64url(the absolute upstream URL, query and all)}
+ *       ?external_user_id={id}&account_id={apn_…}
+ *
+ * Three things about that are each a way to get a wrong answer rather than an
+ * error, so each is deliberate:
+ *
+ *   * **base64url, padding stripped.** `+`, `/` and `=` are not path
+ *     characters. A raw `/` splits the segment and the vendor answers
+ *     `404 {"error":"Route not found"}` — the same 404 the app-relative shape
+ *     answered, reached a completely different way. This is not hypothetical
+ *     for one file in a thousand: a 44-character Drive id (the everyday length)
+ *     puts the `?` at an offset where standard base64 emits one, so every
+ *     `alt=media` download of an ordinary document would break.
+ *   * **the upstream's own query goes INSIDE the encoded target.** Left on the
+ *     proxy URL it is silently dropped: the vendor answers `200` and Google
+ *     never sees `maxResults` or `q`. An unfiltered mailbox read that reports
+ *     itself as a healthy pull is worse than any outage, because nothing
+ *     upstream of it can tell.
+ *   * **the scope goes on the proxy URL, not in headers.** See
+ *     {@link proxyHeaders}.
+ */
+function providerUrl(config: PipedreamConfig, request: ProviderRequest, accountId: string): string {
+  // The id reaches a URL now rather than a header, so it is checked against the
+  // anchored alphabet here — the same reason `listAccounts` checks it.
+  assertExternalUserId(request.externalUserId);
   const base = config.baseUrl ?? DEFAULT_BASE_URL;
-  return `${base}/connect/${config.projectId}/proxy/${request.app}${request.path}${queryString(request.query)}`;
+  const scope = new URLSearchParams({
+    external_user_id: request.externalUserId,
+    account_id: accountId,
+  });
+  const target = Buffer.from(upstreamUrl(request), 'utf8').toString('base64url');
+  return `${base}/connect/${config.projectId}/proxy/${target}?${scope.toString()}`;
 }
 
 /**
@@ -617,17 +696,23 @@ export function connectLinkFor(url: string, app: ProviderApp | undefined): strin
   }
 }
 
-/** Vendor detail #2 — see the header. The scope of the call, in headers. */
-function connectionHeaders(
-  config: PipedreamConfig,
-  request: Pick<ProviderRequest, 'externalUserId' | 'accountId'>,
-): Record<string, string> {
-  assertExternalUserId(request.externalUserId);
-  return {
-    'x-pd-environment': config.environment,
-    'x-pd-external-user-id': request.externalUserId,
-    ...(request.accountId == null ? {} : { 'x-pd-account-id': request.accountId }),
-  };
+/**
+ * Vendor detail #2 — see the header. **The environment, and nothing else.**
+ *
+ * The scope used to travel here as `x-pd-external-user-id` and
+ * `x-pd-account-id`. It does not: the proxy reads both from the query string
+ * (see {@link providerUrl}), and it answers `400 {"error":"External user ID
+ * missing"}` / `400 {"error":"Account ID missing"}` when they are absent from
+ * there — whatever the headers say. So the two headers are removed rather than
+ * left in place: a header that reads as the thing scoping the request, and
+ * isn't, is harmless today and misleading for as long as the file lives.
+ *
+ * `x-pd-environment` stays on every call to this vendor, here and on the
+ * accounts listing and the external-user delete, because development and
+ * production are separate keyspaces and the vendor refuses rather than guesses.
+ */
+function proxyHeaders(config: PipedreamConfig): Record<string, string> {
+  return { 'x-pd-environment': config.environment };
 }
 
 export function createPipedreamClient(options: {
@@ -739,17 +824,20 @@ export function createPipedreamClient(options: {
 
   return {
     /**
-     * Vendor detail #5, and the one in this file that was checked against the
-     * live vendor rather than reasoned about: `GET /connect/{project}/accounts`
-     * filtered by `external_user_id`, which answers `200` with an empty `data`
-     * array for an external user that has attached nothing. That is the answer
-     * the reconciler sees for every user still sitting on a consent screen, so
-     * it has to be an ordinary success rather than a `404`.
+     * Vendor detail #5: `GET /connect/{project}/accounts` filtered by
+     * `external_user_id`, which answers `200` with an empty `data` array for an
+     * external user that has attached nothing. That is the answer the
+     * reconciler sees for every user still sitting on a consent screen, so it
+     * has to be an ordinary success rather than a `404`.
      *
-     * The filter travels as a query parameter and NOT as the
-     * `x-pd-external-user-id` header `connectionHeaders` builds: that header
-     * scopes a *proxy* call, and this is the vendor's own listing. The id is
-     * still checked against the anchored alphabet, because it reaches the URL.
+     * **This is the vendor's own listing, not a proxy call**, and the
+     * distinction is the whole reason the two are spelled out separately here.
+     * A proxy call is scoped by `external_user_id` *and* `account_id` on the
+     * URL and forwards to Google; this one is scoped by `external_user_id`
+     * alone, is answered by the vendor itself, and is where the `account_id`
+     * every proxy call needs comes from in the first place. The id is checked
+     * against the anchored alphabet because it reaches a URL, the same as
+     * there.
      */
     async listAccounts(request) {
       assertExternalUserId(request.externalUserId);
@@ -808,10 +896,33 @@ export function createPipedreamClient(options: {
     },
 
     async request(request) {
+      /**
+       * **A proxy call without a connection id cannot succeed**, so it is not
+       * made. The vendor answers `400 {"error":"Account ID missing"}`, which
+       * classifies as `provider_error` — the code that reads as "the provider
+       * had a problem, we will retry" — for a source that has nothing connected
+       * to retry against. Refused here, it says the true thing (`not_connected`,
+       * which the ingest log holds as `cancelled`) and spends no vendor quota
+       * saying it.
+       *
+       * Reported rather than thrown, and reported as a *typed* failure, because
+       * every caller of this method already branches on `reason` and none of
+       * them expects an exception.
+       */
+      const accountId = request.accountId ?? null;
+      if (accountId === null || accountId.length === 0) {
+        return {
+          ok: false,
+          reason: 'not_connected',
+          status: null,
+          detail: 'the proxy call needs the connection id this source has not been given yet',
+        };
+      }
+
       const outcome = await call({
         method: request.method,
-        url: providerUrl(config, request),
-        headers: connectionHeaders(config, request),
+        url: providerUrl(config, request, accountId),
+        headers: proxyHeaders(config),
         rateKey: request.app,
         ...(request.binary === true ? { binary: true } : {}),
       });

@@ -30,6 +30,14 @@
  * backfill are never seen. `~` is the delimiter because Google's page tokens
  * are base64url (`[A-Za-z0-9_-]`) and cannot contain one.
  *
+ * **Upstream: `PROVIDER_API_BASE['gmail']` — `https://gmail.googleapis.com`.**
+ * The paths below are joined onto it and the whole absolute URL is what the
+ * proxy forwards, so the host is part of every call this adapter makes. It is
+ * named once, in that table, rather than here: `app` already says which upstream
+ * this is, and a second copy beside it is a second thing that can be wrong.
+ * Gmail does NOT share Calendar's and Drive's host — `sources.test.ts` pins
+ * each adapter's decoded target against the base it was verified on.
+ *
  * **Assumption 1 lives closest to this file.** If Pipedream's OAuth apps do not
  * cover production restricted Gmail scopes, this adapter is what gets replaced
  * — by CASA-free scopes plus an MBOX export through U8's folder import — and

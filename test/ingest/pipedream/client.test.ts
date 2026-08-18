@@ -12,11 +12,14 @@
  * is a permanent grant, and a redeem that skips the tenant binding hands one
  * user's mailbox to another user's brain.
  *
- * **The vendor answers are unverified** (Assumption 1, deliberately deferred to
- * this unit). What is tested here is the shape of the call and the honesty of
- * what it reports back — `tokensRevoked: 'unverified'` is the whole point of
- * that field, and a test pins it so nobody can quietly promote it to
- * `'confirmed'` without a vendor answer in `docs/vendor/`.
+ * **The proxy call's shape is no longer unverified** — it was measured against
+ * the live project on 2026-08-17, after the shape this repo guessed turned out
+ * to be one the vendor answers `404` to, and it is pinned by its own describe
+ * block below. The rest of Assumption 1 still is unverified, and the honesty of
+ * what this client reports back is the other half of what is tested here:
+ * `tokensRevoked: 'unverified'` is the whole point of that field, and a test
+ * pins it so nobody can quietly promote it to `'confirmed'` without a vendor
+ * answer in `docs/vendor/`.
  */
 
 import { describe, expect, test } from 'bun:test';
@@ -106,9 +109,14 @@ describe('provider requests', () => {
 
     expect(outcome.ok).toBe(true);
     const call = transport.requests.at(-1);
-    expect(call?.url).toContain('maxResults=10');
-    expect(JSON.stringify(call?.headers)).toContain('tenant-a');
-    expect(JSON.stringify(call?.headers)).toContain('apn_1');
+    // The scope is on the proxy URL and the upstream's own query is inside the
+    // encoded target. This test used to read both out of the headers, which is
+    // where they were sent and not where the vendor reads them; the shape is
+    // pinned properly by the describe block below.
+    const url = new URL(call?.url ?? '');
+    expect(url.searchParams.get('external_user_id')).toBe('tenant-a');
+    expect(url.searchParams.get('account_id')).toBe('apn_1');
+    expect(call?.target).toContain('maxResults=10');
   });
 
   test('the access token is fetched once and reused', async () => {
@@ -117,11 +125,243 @@ describe('provider requests', () => {
     transport.on('/messages', { status: 200, body: { messages: [] } });
     const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
 
-    await client.request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a' });
-    await client.request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a' });
+    await client.request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a', accountId: 'apn_1' });
+    await client.request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a', accountId: 'apn_1' });
 
     const tokenCalls = transport.requests.filter((request) => request.url.includes('/oauth/token'));
     expect(tokenCalls.length).toBe(1);
+  });
+});
+
+/**
+ * **The proxy call's shape, measured against the live project on 2026-08-17.**
+ *
+ * This is the detail the file header called unverified for four days while
+ * every connector poll in production died on it: eight consecutive runs,
+ * `provider_error`, `items_seen: 0`, across all three sources, each dying in
+ * ~450ms at the provider call. The shape that was shipped —
+ * `/proxy/{app}{path}` with the scope in `x-pd-*` headers — answers
+ * `404 {"error":"Route not found"}`. The shape below answers `200`.
+ *
+ * Every assertion here was checked against the live vendor first, and the
+ * transport fake reproduces the refusals it was seen to give, so the two halves
+ * cannot drift back into agreeing with each other while both are wrong. The
+ * measurements, in the order they were taken:
+ *
+ *   * `/proxy/{base64url(absolute upstream URL)}?external_user_id&account_id`
+ *     → `200`, the real mailbox profile.
+ *   * `/proxy/gmail/gmail/v1/users/me/profile` + `x-pd-external-user-id` +
+ *     `x-pd-account-id` → `404 {"error":"Route not found"}`.
+ *   * the upstream's own query INSIDE the encoded target → `200`, and the
+ *     result is filtered (`maxResults=2` returned 2).
+ *   * the same query on the PROXY URL → `200`, and the result IGNORED it. That
+ *     is the failure this file guards hardest: not an outage, a connector that
+ *     looks healthy and reads the wrong thing.
+ *   * no `external_user_id` → `400 {"error":"External user ID missing"}`;
+ *     no `account_id` → `400 {"error":"Account ID missing"}`.
+ */
+describe('the proxy call is shaped the way the vendor answers', () => {
+  const GMAIL_PROFILE = 'https://gmail.googleapis.com/gmail/v1/users/me/profile';
+
+  /** The proxy URL's own path segment, decoded the way the vendor decodes it. */
+  function encodedTarget(url: string): string {
+    const path = new URL(url).pathname;
+    return path.slice(path.indexOf('/proxy/') + '/proxy/'.length);
+  }
+
+  function decode(segment: string): string {
+    return Buffer.from(segment, 'base64url').toString('utf8');
+  }
+
+  test('the target is one absolute upstream URL, base64url-encoded into one path segment', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on(GMAIL_PROFILE, { status: 200, body: { emailAddress: 'someone@example.test' } });
+    const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
+
+    const outcome = await client.request({
+      app: 'gmail',
+      method: 'GET',
+      path: '/gmail/v1/users/me/profile',
+      externalUserId: 'tenant-a',
+      accountId: 'apn_1',
+    });
+    expect(outcome.ok).toBe(true);
+
+    const call = transport.requests.at(-1);
+    const url = new URL(call?.url ?? '');
+    const segment = encodedTarget(call?.url ?? '');
+
+    // One segment, not several: a second `/` is what the vendor's router answers
+    // `404 Route not found` to, and it is exactly what the app-relative shape
+    // and a standard-base64 alphabet both produce.
+    expect(segment).not.toContain('/');
+    // base64**url**, padding stripped. `+`, `/` and `=` are each fatal in a URL
+    // path segment, and a 44-character Drive file id — the everyday length —
+    // puts the `?` at an offset where standard base64 emits a raw `/`.
+    expect(segment).toMatch(/^[A-Za-z0-9_-]+$/);
+    // Asserted by DECODING what was built, never by re-deriving it.
+    expect(decode(segment)).toBe(GMAIL_PROFILE);
+    expect(url.pathname).toBe(`/v1/connect/${CONFIG.projectId}/proxy/${segment}`);
+  });
+
+  test('the scope is on the proxy URL and the upstream query is inside the target', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/gmail/v1/users/me/messages', { status: 200, body: { messages: [] } });
+    const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
+
+    await client.request({
+      app: 'gmail',
+      method: 'GET',
+      path: '/gmail/v1/users/me/messages',
+      query: { maxResults: 2, q: 'after:2026/08/01' },
+      externalUserId: 'tenant-a',
+      accountId: 'apn_1',
+    });
+
+    const call = transport.requests.at(-1);
+    const url = new URL(call?.url ?? '');
+
+    // **Exact set equality, not presence.** A `maxResults` that leaked onto the
+    // proxy URL alongside the scope would still pass a presence check, and the
+    // vendor answers 200 to it having silently dropped the parameter — an
+    // unfiltered mailbox read that reports itself as a healthy pull.
+    expect([...url.searchParams.keys()].sort()).toEqual(['account_id', 'external_user_id']);
+    expect(url.searchParams.get('external_user_id')).toBe('tenant-a');
+    expect(url.searchParams.get('account_id')).toBe('apn_1');
+
+    const target = new URL(decode(encodedTarget(call?.url ?? '')));
+    expect(target.origin).toBe('https://gmail.googleapis.com');
+    expect(target.pathname).toBe('/gmail/v1/users/me/messages');
+    expect(target.searchParams.get('maxResults')).toBe('2');
+    expect(target.searchParams.get('q')).toBe('after:2026/08/01');
+  });
+
+  test('a query value carrying + and / survives the round trip intact', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/gmail/v1/users/me/messages', { status: 200, body: { messages: [] } });
+    const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
+
+    // Drive's own listing query is the real case: `URLSearchParams` renders its
+    // spaces as `+` and its slashes as `%2F`, so both characters are already in
+    // every target this fleet builds.
+    const awkward = "trashed = false and name contains 'a+b/c'";
+    await client.request({
+      app: 'gmail',
+      method: 'GET',
+      path: '/gmail/v1/users/me/messages',
+      query: { q: awkward },
+      externalUserId: 'tenant-a',
+      accountId: 'apn_1',
+    });
+
+    const segment = encodedTarget(transport.requests.at(-1)?.url ?? '');
+    expect(segment).toMatch(/^[A-Za-z0-9_-]+$/);
+    // Parsed, not string-compared: what has to survive is the VALUE Google
+    // reads, and a `+` that arrives as a space is a different query.
+    expect(new URL(decode(segment)).searchParams.get('q')).toBe(awkward);
+  });
+
+  test('the scope headers the proxy no longer takes are gone, not merely unused', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on(GMAIL_PROFILE, { status: 200, body: {} });
+    const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
+
+    await client.request({
+      app: 'gmail',
+      method: 'GET',
+      path: '/gmail/v1/users/me/profile',
+      externalUserId: 'tenant-a',
+      accountId: 'apn_1',
+    });
+
+    const headers = transport.requests.at(-1)?.headers ?? {};
+    // A stale header on this call is harmless today and misleading forever: it
+    // reads as the thing that scopes the request, and it is not.
+    expect(headers['x-pd-external-user-id']).toBeUndefined();
+    expect(headers['x-pd-account-id']).toBeUndefined();
+    // The environment header stays — the two environments are separate
+    // keyspaces and the vendor does not guess between them.
+    expect(headers['x-pd-environment']).toBe(CONFIG.environment);
+    expect(headers.authorization).toBe('Bearer test-access-token');
+  });
+
+  test('a proxy call with no connection id is refused here, not spent at the vendor', async () => {
+    const transport = withToken(createScriptedTransport());
+    const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
+
+    const outcome = await client.request({
+      app: 'gmail',
+      method: 'GET',
+      path: '/gmail/v1/users/me/profile',
+      externalUserId: 'tenant-a',
+      accountId: null,
+    });
+
+    // The vendor answers `400 {"error":"Account ID missing"}`, which classifies
+    // as `provider_error` — "we will retry" — for a source that has nothing
+    // connected to retry against. Refusing before the send says the true thing
+    // and spends no quota doing it.
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.reason).toBe('not_connected');
+    expect(transport.requests.some((request) => request.url.includes('/proxy/'))).toBe(false);
+  });
+
+  test('the transport fake refuses exactly what the live vendor refused', async () => {
+    // The fake is the only thing standing between this file and a second
+    // unverified guess, so its fidelity is asserted rather than assumed.
+    const transport = createScriptedTransport();
+    const project = `/v1/connect/${CONFIG.projectId}/proxy`;
+    const scope = 'external_user_id=tenant-a&account_id=apn_1';
+    const encoded = Buffer.from(GMAIL_PROFILE, 'utf8').toString('base64url');
+
+    // The shape this repo shipped.
+    const shipped = await transport.send({
+      method: 'GET',
+      url: `https://api.example-connect.test${project}/gmail/gmail/v1/users/me/profile`,
+      headers: { 'x-pd-external-user-id': 'tenant-a', 'x-pd-account-id': 'apn_1' },
+    });
+    expect(shipped.status).toBe(404);
+    expect(shipped.body).toContain('Route not found');
+
+    // A standard-base64 segment, whose alphabet puts a raw `/` in the path.
+    // The id is a fake of the everyday 44-character Drive length, which is what
+    // lands the `?` at an offset where standard base64 emits one.
+    const standard = Buffer.from(
+      'https://www.googleapis.com/drive/v3/files/fake-drive-file-id-at-the-everyday-44-length?alt=media',
+      'utf8',
+    ).toString('base64');
+    expect(standard).toContain('/');
+    const mangled = await transport.send({
+      method: 'GET',
+      url: `https://api.example-connect.test${project}/${standard}?${scope}`,
+      headers: {},
+    });
+    expect(mangled.status).toBe(404);
+
+    for (const [partial, missing] of [
+      ['external_user_id=tenant-a', 'Account ID missing'],
+      ['account_id=apn_1', 'External user ID missing'],
+    ] as const) {
+      const answer = await transport.send({
+        method: 'GET',
+        url: `https://api.example-connect.test${project}/${encoded}?${partial}`,
+        headers: {},
+      });
+      expect(answer.status).toBe(400);
+      expect(answer.body).toContain(missing);
+    }
+
+    // And the one deliberate deviation: the vendor drops an upstream parameter
+    // left on the proxy URL and answers 200 with unfiltered data. A fake that
+    // reproduced that silence could not fail the test that matters.
+    expect(() =>
+      transport.send({
+        method: 'GET',
+        url: `https://api.example-connect.test${project}/${encoded}?${scope}&maxResults=2`,
+        headers: {},
+      }),
+    ).toThrow('maxResults');
   });
 });
 
@@ -147,6 +387,11 @@ describe('failure classification', () => {
       method: 'GET',
       path: '/messages',
       externalUserId: 'a',
+      // A connection id, because this test is about the token and the client
+      // refuses a proxy call with no connection before it ever mints one — the
+      // vendor requires `account_id` on the proxy URL, so a source with nothing
+      // attached is `not_connected` rather than a failed refresh.
+      accountId: 'apn_1',
     });
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
@@ -453,7 +698,7 @@ describe('the accounts listing', () => {
   });
 
   test('an entry with no id is dropped rather than adopted', async () => {
-    // The id becomes `x-pd-account-id` on every later proxy call, so an entry
+    // The id becomes the proxy's `account_id` on every later call, so an entry
     // without one is not an account this fleet can address — adopting it would
     // write a connection whose every poll fails.
     const { client } = listingClient({
@@ -568,7 +813,7 @@ describe('the token mint is part of the traffic it authorizes', () => {
   test('the mint is paced by the budget, not exempt from it', async () => {
     const taken: string[] = [];
     const transport = withToken(createScriptedTransport());
-    transport.on('/proxy/gmail', { status: 200, body: { ok: true } });
+    transport.on('https://gmail.googleapis.com/messages', { status: 200, body: { ok: true } });
     const client = createPipedreamClient({
       config: CONFIG,
       transport,
@@ -581,7 +826,7 @@ describe('the token mint is part of the traffic it authorizes', () => {
       },
     });
 
-    await client.request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a' });
+    await client.request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a', accountId: 'apn_1' });
 
     // The mint is a request to the same vendor under the same project quota; a
     // call that spends it without asking is a hole in the ceiling.
@@ -619,7 +864,7 @@ describe('the token mint is part of the traffic it authorizes', () => {
 
     for (let index = 0; index < 4; index += 1) {
       clock += 1_000;
-      await client.request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a' });
+      await client.request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a', accountId: 'apn_1' });
     }
 
     expect(mints).toBe(1);
@@ -635,7 +880,7 @@ describe('the token mint is part of the traffic it authorizes', () => {
       config: CONFIG,
       transport: throttled,
       now: () => NOW,
-    }).request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a' });
+    }).request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a', accountId: 'apn_1' });
     expect(rateLimited.ok).toBe(false);
     if (rateLimited.ok) return;
     expect(rateLimited.reason).toBe('rate_limited');
@@ -646,7 +891,7 @@ describe('the token mint is part of the traffic it authorizes', () => {
       config: CONFIG,
       transport: broken,
       now: () => NOW,
-    }).request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a' });
+    }).request({ app: 'gmail', method: 'GET', path: '/messages', externalUserId: 'a', accountId: 'apn_1' });
     expect(serverError.ok).toBe(false);
     if (serverError.ok) return;
     expect(serverError.reason).toBe('provider_error');
@@ -720,6 +965,7 @@ describe('the rate budget bounds more than one pull', () => {
         method: 'GET',
         path: '/events',
         externalUserId: 'a',
+        accountId: 'apn_1',
       });
 
     // The first client spends the whole burst…

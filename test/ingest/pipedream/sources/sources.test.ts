@@ -17,7 +17,10 @@
 import { describe, expect, test } from 'bun:test';
 
 import { MAX_MEDIA_BYTES } from '../../../../src/core/media/accept.ts';
-import { createPipedreamClient } from '../../../../src/ingest/pipedream/client.ts';
+import {
+  PROVIDER_API_BASE,
+  createPipedreamClient,
+} from '../../../../src/ingest/pipedream/client.ts';
 import { createCalendarSource } from '../../../../src/ingest/pipedream/sources/calendar.ts';
 import { createDriveSource } from '../../../../src/ingest/pipedream/sources/drive.ts';
 import { createGmailSource } from '../../../../src/ingest/pipedream/sources/gmail.ts';
@@ -47,6 +50,19 @@ function base64url(text: string): string {
 }
 
 const CONNECTION = { externalUserId: 'tenant-a', accountId: 'apn_1' } as const;
+
+/**
+ * Every upstream URL an adapter asked the proxy for, decoded.
+ *
+ * The OAuth mint is filtered out — it is a call to the vendor's own endpoint
+ * and names no upstream — so what is left is exactly the set of things Google
+ * was asked for.
+ */
+function proxyTargets(transport: ReturnType<typeof createScriptedTransport>): readonly string[] {
+  return transport.requests
+    .filter((request) => request.url.includes('/proxy/'))
+    .map((request) => request.target);
+}
 
 describe('gmail', () => {
   test('a backfill maps messages, headers and the history cursor', async () => {
@@ -98,16 +114,16 @@ describe('gmail', () => {
     expect(outcome.page.nextCursor).toEqual({ kind: 'delta', value: '5500' });
     expect(outcome.page.outsideWindow).toBe(40_000);
     // The window is pushed to the provider rather than filtered locally.
-    expect(transport.requests.some((request) => request.url.includes('after%3A2026%2F05%2F15'))).toBe(
+    expect(transport.requests.some((request) => request.target.includes('after%3A2026%2F05%2F15'))).toBe(
       true,
     );
     // And the id was taken BEFORE the listing: a message that arrives mid-list
     // must land in the delta that follows rather than in the gap between them.
     const profileAt = transport.requests.findIndex((request) =>
-      request.url.includes('/users/me/profile'),
+      request.target.includes('/users/me/profile'),
     );
     const listAt = transport.requests.findIndex((request) =>
-      request.url.includes('/users/me/messages?'),
+      request.target.includes('/users/me/messages?'),
     );
     expect(profileAt).toBeGreaterThanOrEqual(0);
     expect(profileAt).toBeLessThan(listAt);
@@ -177,7 +193,7 @@ describe('gmail', () => {
       externalRefFor('gmail', 'm5'),
     ]);
     // And no message fetch was attempted for it.
-    expect(transport.requests.some((request) => request.url.includes('/messages/m5'))).toBe(false);
+    expect(transport.requests.some((request) => request.target.includes('/messages/m5'))).toBe(false);
   });
 
   test('a message untrashed upstream comes back, rather than staying tombstoned for good', async () => {
@@ -303,7 +319,7 @@ describe('gmail', () => {
     if (!outcome.ok) return;
     expect(outcome.page.items.length).toBe(0);
     expect(outcome.page.tombstones.length).toBe(0);
-    expect(transport.requests.some((request) => request.url.includes('/messages/m10'))).toBe(false);
+    expect(transport.requests.some((request) => request.target.includes('/messages/m10'))).toBe(false);
   });
 
   test('an expired history window is a cursor invalidation, not a provider error', async () => {
@@ -538,6 +554,19 @@ describe('drive', () => {
 
   const delta = { ...CONNECTION, mode: 'delta', cursor: 'p-8', since: null, maxItems: 100, now: NOW } as const;
 
+  /**
+   * **A file id of the everyday Drive length, and the length is the point.**
+   *
+   * `https://www.googleapis.com/drive/v3/files/{id}?alt=media` puts the `?` at
+   * index `42 + len(id)`, and when that index is ≡ 2 (mod 3) — which 44
+   * characters is, and 44 is what an ordinary Drive id has — standard base64
+   * encodes it as a raw `/`. A raw `/` splits the proxy's single path segment
+   * and the vendor answers `404` before Google is ever reached. So this id is
+   * what makes an encoding regression fail *here*, in the adapter that
+   * downloads, rather than only in the builder's alphabet assertion.
+   */
+  const EVERYDAY_FILE_ID = 'fake-drive-file-id-at-the-everyday-44-length';
+
   test('a screenshot arrives as media, byte for byte', async () => {
     // It is never decoded leniently into a page of noise — that much was always
     // right. What was wrong is that the honest failure row was the *end* of it:
@@ -546,10 +575,16 @@ describe('drive', () => {
     const transport = withToken(createScriptedTransport());
     transport.on(
       '/changes?',
-      changeFor({ id: 'f4', name: 'photo.png', mimeType: 'image/png', trashed: false, size: '278' }),
+      changeFor({
+        id: EVERYDAY_FILE_ID,
+        name: 'photo.png',
+        mimeType: 'image/png',
+        trashed: false,
+        size: '278',
+      }),
     );
     const bytes = screenshotBytes();
-    transport.on('/files/f4', { status: 200, body: '', bytes });
+    transport.on(`/files/${EVERYDAY_FILE_ID}`, { status: 200, body: '', bytes });
 
     const outcome = await createDriveSource(client(transport)).list(delta);
 
@@ -558,14 +593,20 @@ describe('drive', () => {
     expect(outcome.page.items.length).toBe(0);
     expect(outcome.page.failures.length).toBe(0);
     const media = outcome.page.media?.[0];
-    expect(media?.externalRef).toBe(externalRefFor('drive', 'f4'));
+    expect(media?.externalRef).toBe(externalRefFor('drive', EVERYDAY_FILE_ID));
     expect(media?.mediaType).toBe('image/png');
     // Byte-for-byte, and the fixture carries a NUL, a lone 0xFF and an illegal
     // UTF-8 pair precisely so a string round trip cannot survive this.
     expect([...(media?.bytes ?? [])]).toEqual([...bytes]);
     // Fetched as bytes, not as text: the request that produced them said so.
-    const fetched = transport.requests.find((request) => request.url.includes('/files/f4'));
+    const fetched = transport.requests.find((request) =>
+      request.target.includes(`/files/${EVERYDAY_FILE_ID}`),
+    );
     expect(fetched?.binary).toBe(true);
+    // And the segment that carried it stayed inside the URL-safe alphabet. This
+    // exact download is the one a standard-base64 encoder breaks.
+    const segment = new URL(fetched?.url ?? '').pathname.split('/proxy/')[1] ?? '';
+    expect(segment).toMatch(/^[A-Za-z0-9_-]+$/);
   });
 
   test('a voice memo is still refused, and visibly', async () => {
@@ -587,7 +628,7 @@ describe('drive', () => {
     expect(outcome.page.failures[0]?.reason).toBe('parse_failed');
     // And it was never downloaded. A refusal that fetches first is a refusal
     // that already paid for the thing it refused.
-    expect(transport.requests.some((request) => request.url.includes('/files/f5'))).toBe(false);
+    expect(transport.requests.some((request) => request.target.includes('/files/f5'))).toBe(false);
   });
 
   test('an oversize file is refused from the listing, before it is fetched', async () => {
@@ -613,7 +654,7 @@ describe('drive', () => {
     expect(outcome.page.media ?? []).toEqual([]);
     expect(outcome.page.failures[0]?.reason).toBe('parse_failed');
     expect(outcome.page.failures[0]?.retryable).toBe(false);
-    expect(transport.requests.some((request) => request.url.includes('/files/f6'))).toBe(false);
+    expect(transport.requests.some((request) => request.target.includes('/files/f6'))).toBe(false);
   });
 
   test('a client that cannot answer in bytes holds the cursor rather than skipping the file', async () => {
@@ -777,7 +818,7 @@ describe('a page that could not be finished', () => {
       now: NOW,
     });
     expect(resumed.ok).toBe(true);
-    const url = next.requests.find((request) => request.url.includes('/history?'))?.url ?? '';
+    const url = next.requests.find((request) => request.target.includes('/history?'))?.target ?? '';
     expect(url).toContain('startHistoryId=5500');
     expect(url).toContain('pageToken=hp-2');
   });
@@ -930,7 +971,7 @@ describe('a page that could not be finished', () => {
       maxItems: 100,
       now: NOW,
     });
-    const url = next.requests.find((request) => request.url.includes('/drive/v3/'))?.url ?? '';
+    const url = next.requests.find((request) => request.target.includes('/drive/v3/'))?.target ?? '';
     expect(url).toContain('/drive/v3/changes');
     expect(url).toContain('pageToken=cp-2');
   });
@@ -966,8 +1007,121 @@ describe('a page that could not be finished', () => {
       maxItems: 100,
       now: NOW,
     });
-    const url = next.requests.find((request) => request.url.includes('/events?'))?.url ?? '';
+    const url = next.requests.find((request) => request.target.includes('/events?'))?.target ?? '';
     expect(url).toContain('syncToken=sync-1');
     expect(url).toContain('pageToken=ep-2');
+  });
+});
+
+/**
+ * **Which upstream each adapter actually talks to.**
+ *
+ * The proxy forwards to an absolute URL, so the host is part of every request
+ * these adapters make — and it is not interchangeable. Calendar under
+ * `calendar.googleapis.com` answers Google's own `404`, which would reach the
+ * runner as an empty calendar rather than as a mistake; Gmail is on a host of
+ * its own. `PROVIDER_API_BASE` is the single place any of them is named, and
+ * this is the test that stops it from being renamed without a vendor check:
+ * each entry below was verified against the live project on 2026-08-17.
+ *
+ * Asserted over EVERY request an adapter makes, not a sampled one. The Drive
+ * download and the Gmail per-message fetch are separate calls from the listing
+ * that found them, and a base that was right for the listing and wrong for the
+ * fetch is a connector that lists everything and imports nothing.
+ */
+describe('each adapter names its verified upstream', () => {
+  const upstreams = [
+    { name: 'gmail', base: 'https://gmail.googleapis.com', prefix: '/gmail/v1/' },
+    { name: 'google_calendar', base: 'https://www.googleapis.com', prefix: '/calendar/v3/' },
+    { name: 'google_drive', base: 'https://www.googleapis.com', prefix: '/drive/v3/' },
+  ] as const;
+
+  test('the table is the only place a host is named, and it says what was measured', () => {
+    for (const upstream of upstreams) {
+      expect(PROVIDER_API_BASE[upstream.name]).toBe(upstream.base);
+    }
+    // Gmail does not share the other two's host. Collapsing them is a one-line
+    // edit that answers 404 for one source and 200 for the others.
+    expect(PROVIDER_API_BASE.gmail).not.toBe(PROVIDER_API_BASE.google_drive);
+  });
+
+  test('gmail addresses every call to its own host', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/users/me/profile', { status: 200, body: { historyId: '5500', emailAddress: 'a@b.test' } });
+    transport.on('/users/me/messages?', { status: 200, body: { messages: [{ id: 'm1' }] } });
+    transport.on('/messages/m1', {
+      status: 200,
+      body: {
+        id: 'm1',
+        internalDate: `${Date.UTC(2026, 6, 1)}`,
+        payload: { mimeType: 'text/plain', body: { data: base64url('a message body worth keeping') } },
+      },
+    });
+
+    await createGmailSource(client(transport)).list({
+      ...CONNECTION,
+      mode: 'backfill',
+      cursor: null,
+      since: SINCE,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    const targets = proxyTargets(transport);
+    // The profile, the listing and the per-message fetch: three calls, one host.
+    expect(targets.length).toBe(3);
+    for (const target of targets) {
+      expect(target.startsWith('https://gmail.googleapis.com/gmail/v1/')).toBe(true);
+    }
+  });
+
+  test('calendar addresses its call to the host that answers it', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/events?', { status: 200, body: { nextSyncToken: 'sync-1', items: [] } });
+
+    await createCalendarSource(client(transport)).list({
+      ...CONNECTION,
+      mode: 'backfill',
+      cursor: null,
+      since: SINCE,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    const targets = proxyTargets(transport);
+    expect(targets.length).toBe(1);
+    expect(targets[0]?.startsWith('https://www.googleapis.com/calendar/v3/')).toBe(true);
+    // The host that does NOT answer, named so the mistake is a failing test
+    // rather than an empty calendar.
+    expect(targets[0]).not.toContain('calendar.googleapis.com');
+  });
+
+  test('drive addresses the listing and the download alike', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/changes/startPageToken', { status: 200, body: { startPageToken: 'p-1' } });
+    transport.on('/drive/v3/files?', {
+      status: 200,
+      body: {
+        files: [
+          { id: 'doc-1', name: 'strategy', mimeType: 'application/vnd.google-apps.document', trashed: false },
+        ],
+      },
+    });
+    transport.on('/files/doc-1/export', { status: 200, body: 'the strategy document, at some length' });
+
+    await createDriveSource(client(transport)).list({
+      ...CONNECTION,
+      mode: 'backfill',
+      cursor: null,
+      since: SINCE,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    const targets = proxyTargets(transport);
+    expect(targets.length).toBe(3);
+    for (const target of targets) {
+      expect(target.startsWith('https://www.googleapis.com/drive/v3/')).toBe(true);
+    }
   });
 });

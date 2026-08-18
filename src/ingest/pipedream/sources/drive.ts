@@ -7,6 +7,14 @@
  * both are tombstones here, because a document in the bin must stop answering
  * queries whatever the mechanism was.
  *
+ * **Upstream: `PROVIDER_API_BASE['google_drive']` — `https://www.googleapis.com`.**
+ * Named once in that table rather than here, because `app` already says which
+ * upstream this is. This adapter is the one that makes the proxy's encoding
+ * load-bearing: a 44-character file id — the everyday length — puts the `?` of
+ * `?alt=media` at an offset where standard base64 emits a raw `/`, which splits
+ * the proxy's path segment and is answered `404` before Google is ever reached.
+ * Every download below depends on that segment being base64**url**.
+ *
  * **A binary file is never decoded leniently.** A PDF or a PNG run through a
  * text decoder becomes a page of replacement characters with a vector attached
  * to it: it costs an embedding call and pollutes retrieval with a document that

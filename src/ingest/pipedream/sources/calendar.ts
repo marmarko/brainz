@@ -8,6 +8,13 @@
  * tomorrow's briefing, and U11 would eventually read it against its
  * rescheduled replacement and report a contradiction that never happened.
  *
+ * **Upstream: `PROVIDER_API_BASE['google_calendar']` — `https://www.googleapis.com`.**
+ * Named once in that table rather than here, because `app` already says which
+ * upstream this is. The host is not interchangeable and was not guessed: the
+ * same path under `calendar.googleapis.com` answers Google's own `404`, which
+ * is a failure that would look exactly like an empty calendar. `sources.test.ts`
+ * pins this adapter's decoded target against the base it was verified on.
+ *
  * It is also the source that forces the cursor-expiry path: Calendar answers
  * `410 GONE` on an expired sync token and *mandates* a full re-sync. The
  * runner's answer is to discard the cursor and re-enter through U8's gate with
