@@ -639,6 +639,46 @@ also why this answers for a tenant whose compute is suspended or unreachable.
 types cannot hold anything else. The per-item record stays in the tenant's own
 `ingest_log`, where a provider's id for somebody's mail belongs.
 
+### A lane that says `dead` needs one more command, and nothing else will do it
+
+`state: "dead"` is not "it will try again later". `enqueueDuePulls` counts a
+dead-lettered lane as a lane already standing and enqueues nothing over it, so
+**the source is never polled again by anything** — not by the cadence, not by a
+redeploy, not by a fleet that has since fixed whatever killed it. It stays that
+way until it is cleared, and there are exactly two things that clear it: the
+user's own disconnect, and this.
+
+```bash
+curl -sS -X POST -H "authorization: Bearer $BRAINZ_ADMIN_CREDENTIAL" \
+  "$ORIGIN/admin?op=requeue_connector&tenant_id=$TENANT&source=gmail" | jq '.content'
+```
+
+```json
+{ "tenant_id": "t-…", "source": "gmail", "lanes_cleared": 1 }
+```
+
+`POST` only, for the reason the tier grants are: an operator action reachable by
+GET is an action a bookmark, a shell-history recall or a link pasted into a
+ticket can fire, with the tenant id in the URL of every one of them.
+
+It clears the lane and enqueues nothing itself — the cadence already decides
+whether a source is due, whether the user paused it, and whether a lane is open,
+and a second enqueuer beside it would be a second copy of all three. The next
+tick picks the source up; `op=connector_status` shows a new lane with
+`attempts: 0` within a minute or two.
+
+**When to reach for it, and when not to.** Reach for it after a fleet-side fix —
+a bad request shape, a wrong host, a broken credential path — where the lanes
+died of our defect and the grants at the provider are perfectly good. Asking
+those users to disconnect and reconnect would cost each of them a
+re-authorization to recover from a bug they did not cause. Do **not** reach for
+it when `cause` is `auth_expired`: the grant is genuinely gone, the fresh lane
+will fail the same way, and the panel is already telling that user the one thing
+that does fix it.
+
+`lanes_cleared: 0` means nothing was standing — the lane already drained, or the
+source was never connected. It is an ordinary answer, not a failure.
+
 The same facts reach the user in their own words on `/dashboard`, so a support
 reply can usually be "look at the panel" rather than a screenshot of this JSON.
 

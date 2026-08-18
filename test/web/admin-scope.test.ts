@@ -126,11 +126,14 @@ describe('the surface is not simply refusing everything', () => {
         { controlSql, owners: noOwners },
         {
           name: operation,
-          args: { tenant_id: TENANT },
-          // The two tier operations change a column, so they are only accepted
-          // over POST — see `ADMIN_WRITE_OPERATIONS`. Passing it for every
-          // operation here keeps this test about "the surface answers" rather
-          // than about the method gate, which has its own cases below.
+          // `source` is `requeue_connector`'s second required argument and is
+          // ignored by every other operation. Named here rather than given a
+          // case of its own so this loop stays "every operation answers".
+          args: { tenant_id: TENANT, source: 'gmail' },
+          // The write operations change a column, so they are only accepted over
+          // POST — see `ADMIN_WRITE_OPERATIONS`. Passing it for every operation
+          // here keeps this test about "the surface answers" rather than about
+          // the method gate, which has its own cases below.
           write: true,
         },
       );

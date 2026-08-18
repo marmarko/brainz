@@ -59,6 +59,8 @@ import type { SQL } from 'bun';
 
 import { grantOperatorTier, revokeOperatorTier } from '../control/billing.ts';
 import { causeOf, readConnectorHealth } from '../control/connector-health.ts';
+import { discardConnectorLanes } from '../control/connector-lanes.ts';
+import { CONNECTOR_SOURCES, isConnectorSource } from '../ingest/cursor.ts';
 
 /**
  * The nine names on the wire, plus `synthesize`, exactly as
@@ -107,8 +109,11 @@ export const ADMIN_TOOL_SCOPE: Readonly<Record<string, 'denied'>> = Object.freez
  * {@link BrainOwnerDirectory} for what it may say about a person, and
  * {@link tenantDirectory} for why it exists at all.
  *
- * The last two move one column, and they are the only writes on this surface.
- * See {@link ADMIN_WRITE_OPERATIONS}.
+ * The last three write, and they are the only writes on this surface. See
+ * {@link ADMIN_WRITE_OPERATIONS}. Two of them move one column on
+ * `control.tenant`; `requeue_connector` moves one column on `control.job`, and
+ * `src/control/connector-lanes.ts` carries what that column means — this surface
+ * decides who may ask, not what a state transition is.
  */
 export const ADMIN_OPERATIONS = [
   'fleet_status',
@@ -117,6 +122,7 @@ export const ADMIN_OPERATIONS = [
   'pool_status',
   'queue_status',
   'connector_status',
+  'requeue_connector',
   'grant_internal_tier',
   'revoke_internal_tier',
 ] as const;
@@ -158,6 +164,7 @@ export type AdminOperation = (typeof ADMIN_OPERATIONS)[number];
  * nor the response is a thing worth exfiltrating. See {@link BrainOwnerDirectory}.
  */
 export const ADMIN_WRITE_OPERATIONS: ReadonlySet<string> = new Set<string>([
+  'requeue_connector',
   'grant_internal_tier',
   'revoke_internal_tier',
 ]);
@@ -391,7 +398,7 @@ export async function adminDispatch(deps: AdminDeps, request: AdminRequest): Pro
     return {
       ok: false,
       code: 'invalid_params',
-      message: `${JSON.stringify(request.name)} changes a tenant's tier and is only accepted over POST.`,
+      message: `${JSON.stringify(request.name)} changes something and is only accepted over POST.`,
     };
   }
 
@@ -412,6 +419,56 @@ export async function adminDispatch(deps: AdminDeps, request: AdminRequest): Pro
         return { ok: false, code: 'invalid_params', message: 'tenant_id is required.' };
       }
       return { ok: true, content: await connectorStatus(deps.controlSql, tenantId) };
+    }
+    /**
+     * **The way back from a dead lane, and the only one that does not cost the
+     * user a re-authorization.**
+     *
+     * A dead-lettered `ingest_pull` row stands in the cadence's anti-join
+     * forever, so the source is never polled again by anything —
+     * `src/control/connector-lanes.ts` carries the whole argument. The user's
+     * remedy is disconnect-and-reconnect, which now clears it too; but when the
+     * lane died of a fleet-wide defect of ours, asking every affected person to
+     * re-consent at their provider to recover from a bug we shipped and fixed is
+     * not a remedy. This clears the lane without touching the grant, and the
+     * cadence enqueues a fresh job on its next tick.
+     *
+     * It does not enqueue one itself. The cadence already decides whether a
+     * source is due, whether it is paused, and whether a lane is open; a second
+     * enqueuer beside it would be a second copy of all three.
+     */
+    case 'requeue_connector': {
+      const tenantId = namedTenant(request);
+      if (tenantId === null) {
+        return { ok: false, code: 'invalid_params', message: 'tenant_id is required.' };
+      }
+      const source = request.args?.['source'];
+      if (typeof source !== 'string' || !isConnectorSource(source)) {
+        // The vocabulary, never the argument. A message that echoed the caller's
+        // string would carry a word somebody wrote onto this surface, which is
+        // the one thing it does not do.
+        return {
+          ok: false,
+          code: 'invalid_params',
+          message: `source is required and must be one of: ${CONNECTOR_SOURCES.join(', ')}.`,
+        };
+      }
+      const cleared = await discardConnectorLanes(deps.controlSql, {
+        tenantId,
+        source,
+        now,
+      });
+      return {
+        ok: true,
+        content: {
+          tenant_id: tenantId,
+          source,
+          // A count, not the ids: a job id is fleet-minted and content-free, but
+          // an operator reading this wants to know whether anything was stuck,
+          // and a list invites somebody to build a second surface keyed on it.
+          lanes_cleared: cleared.length,
+        },
+      };
     }
     case 'tenant_status': {
       const tenantId = namedTenant(request);

@@ -584,11 +584,26 @@ granted until you say so.</p>
       // `rel="noreferrer"` on top of the response's own `referrer-policy`:
       // two independent statements of the same rule, because the one that
       // travels with the markup survives a later edit to the header helper.
+      //
+      // **`target="_blank"`, because the vendor's page never comes back.** Its
+      // consent flow ends on "you can now close this window" and issues no
+      // redirect — there is no return leg. Navigating this tab therefore
+      // replaces the only page that can tell the user whether the connection
+      // took with a dead end whose sole exit is the back button, at the moment
+      // they most need to be told. `noopener` is written out beside `noreferrer`
+      // rather than left to be implied: the opener handle is the thing a new tab
+      // introduces, and it should not go away if the referrer rule is ever
+      // relaxed. No script is involved — the response's CSP forbids inline
+      // JavaScript, so a scripted opener would be a control that does nothing.
       return shell(
         `Connect ${page.source} — brainz`,
         `<h1>Connect ${source}</h1>
 <p>Follow this link to ${source}'s consent screen at the connector vendor:</p>
-<p><a href="${escapeHtml(page.claimUrl)}" rel="noreferrer">Connect ${source} at the connector vendor &rarr;</a></p>
+<p><a href="${escapeHtml(page.claimUrl)}" target="_blank" rel="noreferrer noopener">Connect ${source} at the connector vendor &rarr;</a></p>
+<p class="note">It opens in a <strong>new tab</strong>, and that tab does not come back: the vendor
+finishes by telling you to close the window. Close it when it does — <strong>this page</strong>, and
+the dashboard behind it, is where you come back to. Your brain notices the new connection on its own
+within a few minutes; nothing here needs you to press anything again.</p>
 <p class="note">That link is a capability, not an address. Anyone who has it can attach <em>their</em>
 ${source} account to <em>this</em> brain, so it expires at ${moment(page.expiresAt)} and works once.
 Do not paste it anywhere — not into a chat, not into a note, not to yourself.</p>
@@ -633,7 +648,7 @@ here deletes what was ingested; the export and erasure controls are the ones tha
         `<h1>${source} disconnected</h1>
 <p>The connector vendor was asked to delete the account behind ${source} and answered
 <code>${page.vendorDeleted ? 'deleted' : 'nothing to delete'}</code>.</p>
-<p>${page.pollingStopped === 0 ? 'No poll was queued for it.' : `${page.pollingStopped} queued or running ${page.pollingStopped === 1 ? 'check was' : 'checks were'} stopped.`}</p>
+<p>${page.pollingStopped === 0 ? 'No check was standing for it.' : `${page.pollingStopped} standing ${page.pollingStopped === 1 ? 'check was' : 'checks were'} stopped.`}</p>
 <p class="note">Token revocation at the vendor is reported as
 <code>${escapeHtml(page.tokensRevoked)}</code>. We report what the vendor reports rather than
 claiming more than it told us.</p>

@@ -708,6 +708,41 @@ describe('disconnect revokes polling', () => {
   });
 
   /**
+   * **A dead-lettered lane is the one a disconnect must clear, and it was the
+   * one a disconnect left standing.**
+   *
+   * `enqueueDuePulls` counts `dead` as a lane already standing and enqueues
+   * nothing over it — so a row this route left behind is not a stale record, it
+   * is a permanent stop: the source is never polled again, by the cadence or by
+   * anything else, including the reconnect the dashboard tells the user to
+   * perform. `src/control/connector-lanes.ts` carries the argument; this is the
+   * user-facing half of it.
+   */
+  test('a dead-lettered lane is cleared too, so a reconnect can actually poll again', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await controlSql`
+      INSERT INTO control.job (
+        job_id, tenant_id, kind, target, state, trigger_reason, attempts, max_attempts,
+        run_at, created_at, updated_at, dead_lettered_at, failure_code)
+      VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'gmail', 'dead', 'connector_cadence',
+        5, 5, ${AT}, ${AT}, ${AT}, ${AT}, 'handler_error')`;
+
+    const response = await app()(
+      new Request(`${ORIGIN}/api/connectors`, {
+        method: 'DELETE',
+        headers: { origin: ORIGIN, cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ source: 'gmail' }),
+      }),
+    );
+
+    expect(await response.json()).toMatchObject({ ok: true, polling_stopped: 1 });
+    const rows = await controlSql<{ state: string }[]>`
+      SELECT state::text AS state FROM control.job WHERE target = 'gmail'`;
+    expect(rows).toEqual([{ state: 'discarded' }]);
+  });
+
+  /**
    * **The ordering, asserted from inside the vendor call.**
    *
    * By the time the vendor is asked to revoke, this brain has already stopped:
@@ -1746,7 +1781,54 @@ describe('the dashboard offers a control per connector, not a list of words', ()
     // global policy cannot quietly start telling the vendor where the user
     // came from.
     expect(response.headers.get('referrer-policy')).toBe('no-referrer');
-    expect(await response.text()).toContain('rel="noreferrer"');
+    // The attribute rather than the exact string: `noopener` joined it when the
+    // link learned to open a tab, and this guarantee is about what the browser
+    // is told, not about the order of two tokens.
+    expect(await response.text()).toMatch(/rel="[^"]*noreferrer[^"]*"/);
+  });
+
+  /**
+   * **The vendor's page never comes back, so it must not take the dashboard with
+   * it.**
+   *
+   * Pipedream's consent flow ends on a page that says *"You can now close this
+   * window"* and issues no redirect — there is no return leg to wait for. A
+   * same-tab navigation therefore leaves the user parked on a dead vendor page
+   * with the back button as their only way home, at the exact moment they need
+   * the dashboard to tell them whether the connection took.
+   *
+   * `target="_blank"` with **both** tokens spelled out: `noreferrer` is the
+   * pre-existing guarantee and already implies `noopener` in current browsers,
+   * and `noopener` is written beside it anyway because the opener handle is the
+   * thing a new tab introduces and a later edit that relaxes the referrer rule
+   * must not silently hand the vendor's page a handle on ours.
+   *
+   * No script anywhere near it: the response's CSP forbids inline JavaScript, so
+   * a window-opening handler would be a control that does nothing.
+   */
+  test('the vendor link opens its own tab, and says so, because that page never returns', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    const response = await app()(form('/api/connectors', { source: 'gmail' }, { cookie }));
+    const page = await response.text();
+
+    const anchor = /<a href="[^"]*claim[^"]*"[^>]*>/.exec(page)?.[0] ?? '';
+    expect(anchor).toContain('target="_blank"');
+    expect(anchor).toMatch(/rel="[^"]*noreferrer[^"]*"/);
+    expect(anchor).toMatch(/rel="[^"]*noopener[^"]*"/);
+
+    // The copy has to carry the same promise the attribute makes, or a new tab
+    // is a surprise rather than an instruction.
+    expect(page).toContain('new tab');
+    expect(page).toContain('close');
+    // And it has to say where to come back to, because the vendor will not send
+    // them.
+    expect(page).toContain('this page');
+
+    // No script did it. A CSP that forbids inline JavaScript makes a scripted
+    // opener a control that silently does nothing.
+    expect(page).not.toContain('<script');
+    expect(page).not.toContain('onclick');
   });
 
   test('the capability never reaches a URL — not the address bar, not history', async () => {

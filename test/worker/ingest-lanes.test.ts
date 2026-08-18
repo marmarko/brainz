@@ -86,6 +86,7 @@ import {
   ensureConnectorHealthSchema,
   readConnectorHealth,
 } from '../../src/control/connector-health.ts';
+import { discardConnectorLanes } from '../../src/control/connector-lanes.ts';
 import { generateSealingKeyMaterial, importSealingKey } from '../../src/control/sealed.ts';
 import {
   createConnectorReconciler,
@@ -786,6 +787,72 @@ describe('the cadence pass', () => {
     const result = await enqueueDuePulls(passDeps(broken, opened), { now: NOW });
     expect(result.unreadable).toBe(1);
     expect(result.enqueued).toEqual([]);
+  });
+
+  /**
+   * **A dead lane is the one member of the anti-join that never drains, and
+   * until this pair nothing in `src/` could clear it.**
+   *
+   * `due` runs and `running` settles. `dead` stands until somebody moves it, and
+   * the only writer that moved a lane at all — the user's disconnect — matched
+   * `('due', 'running')`. So a source that dead-lettered was never polled again
+   * by anything: not by the cadence, not by a reconnect, not by a fleet that had
+   * since fixed whatever killed it. A single bad vendor request shape therefore
+   * became a permanent outage for every brain it touched, and the fix for it
+   * changed nothing, because nothing would ever ask again.
+   *
+   * The two halves are asserted together deliberately. "The lane is discarded"
+   * on its own is a statement about a column; what matters is that the cadence
+   * — the thing that was stuck — enqueues once it is.
+   */
+  test('a dead lane stops the cadence forever, and clearing it starts the cadence again', async () => {
+    const jobId = await enqueueClaimable('ingest_pull', 'gmail');
+    await controlSql`
+      UPDATE control.job
+         SET state = 'dead', attempts = 5, failure_code = 'handler_error',
+             dead_lettered_at = ${NOW}
+       WHERE job_id = ${jobId}::uuid`;
+
+    const opened: string[] = [];
+    const blocked = await enqueueDuePulls(passDeps(runtimeWith(connected(), null), opened), {
+      now: NOW,
+    });
+    expect(blocked.enqueued).toEqual([]);
+    // Not even a refusal to read: the dead row is excluded in the anti-join, so
+    // the pass never asks. That is why an operator surface, not a retry, is the
+    // shape of the way back.
+    expect(blocked.refused).toEqual([]);
+
+    const cleared = await discardConnectorLanes(controlSql, {
+      tenantId: TENANT,
+      source: 'gmail',
+      now: NOW,
+    });
+    expect(cleared).toHaveLength(1);
+
+    const recovered = await enqueueDuePulls(passDeps(runtimeWith(connected(), null), opened), {
+      now: NOW,
+    });
+    expect(recovered.enqueued).toEqual([{ tenantId: TENANT, source: 'gmail' }]);
+
+    // A NEW row, with its own id and a fresh attempt budget — the reason this
+    // discards rather than flipping the dead row back to `due`. `lease_token` is
+    // the fence every worker write names, and a row put back into circulation
+    // carrying a token some straggler still believes it holds is a fence that
+    // has stopped fencing.
+    const rows = (await controlSql`
+      SELECT job_id::text AS job_id, state::text AS state, attempts, lease_token
+        FROM control.job WHERE kind = 'ingest_pull' ORDER BY state`) as Array<{
+      job_id: string;
+      state: string;
+      attempts: number;
+      lease_token: number;
+    }>;
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.state)).toEqual(['discarded', 'due']);
+    const fresh = rows.find((row) => row.state === 'due');
+    expect(fresh?.job_id).not.toBe(jobId);
+    expect(fresh).toMatchObject({ attempts: 0, lease_token: 0 });
   });
 });
 

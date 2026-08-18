@@ -70,6 +70,7 @@ import {
   markConnectPending,
   readConnectorLinks,
 } from '../control/connector-pg.ts';
+import { discardConnectorLanes } from '../control/connector-lanes.ts';
 import type { ConnectorReconciler } from '../ingest/pipedream/reconcile.ts';
 import { CONNECT_STEPS, claudeCodeCommand, connectionStatus, installLink } from './connect.ts';
 import { adminDispatch, createBrainOwnerDirectory } from './admin.ts';
@@ -1321,18 +1322,18 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         now: now(),
       });
 
-      // An open `ingest_pull` job for this source is the cadence already in
-      // flight. Clearing the link stops the *next* one; this stops the one that
-      // is queued now.
-      const stopped = await deps.controlSql<{ job_id: string }[]>`
-        UPDATE control.job
-        SET state = 'discarded', finished_at = ${now()}, updated_at = ${now()},
-            lease_owner = NULL, lease_expires_at = NULL, attempt_deadline_at = NULL
-        WHERE tenant_id = ${tenantId}
-          AND kind = 'ingest_pull'
-          AND target = ${source}::control.job_target
-          AND state IN ('due', 'running')
-        RETURNING job_id::text AS job_id`;
+      // A standing `ingest_pull` job for this source is the cadence already in
+      // flight. Clearing the link stops the *next* one; this stops the one
+      // standing now — including a dead-lettered one, which used to be left
+      // behind and is the member that never drains on its own. A dead row stands
+      // in `enqueueDuePulls`'s anti-join forever, so a disconnect that left it
+      // there made the reconnect after it permanently silent.
+      // `src/control/connector-lanes.ts` owns the statement and the argument.
+      const stopped = await discardConnectorLanes(deps.controlSql, {
+        tenantId,
+        source,
+        now: now(),
+      });
 
       const vendor = await configured.disconnect({
         tenantId,
