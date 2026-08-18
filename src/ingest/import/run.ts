@@ -167,10 +167,11 @@ export interface ImportMaterial {
   /**
    * The objects this scan carried. Absent for a source that has none.
    *
-   * U8's folder importer and U9's Drive source used to answer every binary with
-   * a failure row — safe, and it meant images and PDFs never arrived at all, so
-   * the transcribe phase had a permanently empty queue. This is the seam U21
-   * named.
+   * U8's folder importer used to answer every binary with a failure row — safe,
+   * and it meant images and PDFs never arrived at all, so the transcribe phase
+   * had a permanently empty queue. This is the seam U21 named, and this importer
+   * is now its only producer: the connector lane offers no objects, because
+   * Drive — the one adapter that ever did — is metadata-only.
    */
   readonly media?: readonly ImportMediaItem[];
   /** The bytes to preserve under `{tenant}/raw/`, and the untrusted id to key them by. */

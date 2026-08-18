@@ -668,9 +668,12 @@ function upstreamUrl(request: ProviderRequest): string {
  *     characters. A raw `/` splits the segment and the vendor answers
  *     `404 {"error":"Route not found"}` — the same 404 the app-relative shape
  *     answered, reached a completely different way. This is not hypothetical
- *     for one file in a thousand: a 44-character Drive id (the everyday length)
- *     puts the `?` at an offset where standard base64 emits one, so every
- *     `alt=media` download of an ordinary document would break.
+ *     and it is not confined to one rare URL: **the Drive listing this fleet
+ *     makes on every backfill** — `/drive/v3/files` with its `fields`
+ *     projection — is a length that puts a raw `/` in a standard-base64 segment,
+ *     so a regression in the alphabet takes the whole source out. The example
+ *     used to be a per-file `alt=media` download; Drive is metadata-only now and
+ *     downloads nothing, and the rule outlived the call it was written for.
  *   * **the upstream's own query goes INSIDE the encoded target.** Left on the
  *     proxy URL it is silently dropped: the vendor answers `200` and Google
  *     never sees `maxResults` or `q`. An unfiltered mailbox read that reports

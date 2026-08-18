@@ -325,10 +325,16 @@ describe('the proxy call is shaped the way the vendor answers', () => {
     expect(shipped.body).toContain('Route not found');
 
     // A standard-base64 segment, whose alphabet puts a raw `/` in the path.
-    // The id is a fake of the everyday 44-character Drive length, which is what
-    // lands the `?` at an offset where standard base64 emits one.
+    // **The URL is the Drive listing this fleet makes on every backfill**, with
+    // the `fields` projection the adapter asks for, because that is a call that
+    // still happens: Drive is metadata-only and downloads nothing, so a
+    // per-file `alt=media` example would guard a request nobody sends.
     const standard = Buffer.from(
-      'https://www.googleapis.com/drive/v3/files/fake-drive-file-id-at-the-everyday-44-length?alt=media',
+      'https://www.googleapis.com/drive/v3/files?pageSize=100&fields=' +
+        encodeURIComponent(
+          'nextPageToken,files(id,name,mimeType,trashed,createdTime,modifiedTime,size,' +
+            'webViewLink,owners(displayName,emailAddress))',
+        ),
       'utf8',
     ).toString('base64');
     expect(standard).toContain('/');

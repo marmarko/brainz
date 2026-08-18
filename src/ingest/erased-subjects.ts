@@ -46,10 +46,11 @@
  *     a plaintext list to compare against would undo the erasure it is meant to
  *     enforce. `test/ingest/pipedream/erased-subject.test.ts` pins this bound as
  *     an observed fact rather than leaving it to be rediscovered.
- *   * **Not covered.** Objects. A `PulledMedia` is bytes and a content type; the
- *     only text it will ever have arrives from U11's transcribe phase, long
- *     after this decision. An attachment that arrives on a *suppressed* item is
- *     unaffected by that, because the item never becomes a page at all.
+ *   * **Not reachable from a pull at all.** Objects. No connector offers one:
+ *     Drive was the only adapter that ever did and it is metadata-only, so a
+ *     pull carries items and tombstones and nothing else. Objects still arrive
+ *     through the folder importer (`import/run.ts`), whose only text comes from
+ *     U11's transcribe phase, long after this decision.
  *
  * **The suppression is deliberately allowed to be broader than the sweep.** The
  * erasure's own page arm matches title and chunk text; a mail *from* her whose
