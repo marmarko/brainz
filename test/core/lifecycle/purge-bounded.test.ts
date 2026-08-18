@@ -75,6 +75,8 @@ const PERSONAL = 'personal:mail';
 /** When the retraction happened, and when a sweep that takes it must run. */
 const RETRACTED_AT = new Date('2026-06-10T00:00:00.000Z');
 const HOUR = 3600_000;
+/** Older than {@link RETRACTED_AT}, so a bounded claim sorts it first. */
+const EARLIER = new Date(RETRACTED_AT.getTime() - HOUR);
 /** Past the TTL *and* its grace band — the instant the sweep is eligible. */
 const AFTER_THE_SWEEP = new Date(
   RETRACTED_AT.getTime() + (FORGET_TTL_HOURS + PURGE_GRACE_HOURS + 1) * HOUR,
@@ -153,6 +155,31 @@ async function insertVersion(pageId: string, docKey: string, version: number): P
              'the full verbatim body of the document that was retracted', repeat('b', 64), 'superseded')`,
     [docKey, version, pageId],
   );
+}
+
+/**
+ * `commitment_origin_union` (R15) refuses a commitment whose origins do not
+ * cover the fact it was extracted from, so the origins are a parameter rather
+ * than a constant — a helper that hardcoded one origin could not seed a
+ * commitment on a cross-origin fact, which is the exact shape this file is
+ * about.
+ */
+async function insertCommitment(
+  statement: string,
+  pageId: string | null,
+  factId: string | null,
+  retractedAt: Date | null,
+  origins: readonly string[] = [WORK],
+): Promise<string> {
+  const rows = (await sql.unsafe(
+    `INSERT INTO commitment (statement, owner_name, trust_level, derivation, origin_contexts,
+                             page_id, fact_id, deleted_at)
+     VALUES ($1, 'the platform team', 'model_extracted', 'model_derived', $2::text[],
+             $3::bigint, $4::bigint, $5::timestamptz)
+     RETURNING commitment_id::text AS id`,
+    [statement, pgArray(origins), pageId, factId, retractedAt?.toISOString() ?? null],
+  )) as Array<{ id: string }>;
+  return rows[0]?.id ?? '';
 }
 
 async function retract(table: string, key: string, id: string, at: Date): Promise<void> {
@@ -450,6 +477,50 @@ describe('the preview describes the run and does not perform it', () => {
       // snapshot is NOT deleted. `page_version_page_fkey` is ON DELETE SET NULL,
       // so the full verbatim body of the retracted document stays standing.
       expect(preview.cascaded.pageVersionsOrphaned).toBe(1);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a commitment reached only through a doomed fact is counted, not just deleted',
+    async () => {
+      // `commitment` is the one table with two parents, and both of its cascade
+      // routes bypass its own `deleted_at`. Two shapes, and a run whose batches
+      // are small enough to separate them from their own claim reaches both:
+      //
+      //   * an expired commitment on a **live** fact on a retracted page — the
+      //     page cascades the fact, the fact cascades the commitment;
+      //   * an expired commitment on an expired **orphan** fact that this batch
+      //     claimed, when the commitment's own claim was already full.
+      //
+      // Either way the row was retracted, so the preview counts it under
+      // `tombstoned.commitments`. A delete whose fact-arm is narrower than the
+      // batch's doomed-fact set removes it and reports it nowhere.
+      const going = await insertPage('gmail:two-parents');
+      const live = await insertFact(going, 'a live fact on a retracted page', [WORK, PERSONAL]);
+      const orphanFact = await insertFact(null, 'an expired fact on no page', [WORK]);
+      await retract('fact', 'fact_id', orphanFact, RETRACTED_AT);
+      await retract('page', 'page_id', going, RETRACTED_AT);
+
+      // Older than the two below, so a one-row claim takes this one and leaves
+      // the others to be reached through their parents.
+      await insertCommitment('the decoy that fills the claim', null, null, EARLIER);
+      await insertCommitment('reached through a live fact', null, live, RETRACTED_AT, [WORK, PERSONAL]);
+      await insertCommitment('reached through an expired orphan fact', null, orphanFact, RETRACTED_AT);
+
+      const preview = await previewTombstonePurge(sql, { now: AFTER_THE_SWEEP });
+      expect(preview.tombstoned.commitments).toBe(3);
+
+      const purged = await purgeExpiredTombstones(sql, {
+        now: AFTER_THE_SWEEP,
+        budget: { rowsPerBatch: 1, maxBatches: 20 },
+      });
+
+      expect(purged.exhausted).toBe(true);
+      expect(await count('commitment')).toBe(0);
+      expect(purged.counts.commitments).toBe(3);
+      expect(purged.counts).toEqual(preview.tombstoned);
+      expect(purged.cascaded).toEqual(preview.cascaded);
     },
     TEST_TIMEOUT_MS,
   );

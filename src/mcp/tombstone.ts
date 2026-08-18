@@ -1158,7 +1158,12 @@ async function runPurgeBatch(tx: SQL, cutoff: string, rowsPerBatch: number): Pro
     entity: entities,
   };
   for (const entry of TOMBSTONED_TABLES) {
-    counts[entry.field] = await deleteClaimed(tx, entry, claims[entry.table] ?? [], pages, entities, cutoff);
+    counts[entry.field] = await deleteClaimed(tx, entry, claims[entry.table] ?? [], {
+      pages,
+      entities,
+      facts,
+      cutoff,
+    });
   }
 
   // ---- Step 7. The archives, after the tables they hang off.
@@ -1191,10 +1196,14 @@ async function deleteClaimed(
   tx: SQL,
   entry: TombstonedTable,
   ids: readonly string[],
-  pages: readonly string[],
-  entities: readonly string[],
-  cutoff: string,
+  batch: {
+    readonly pages: readonly string[];
+    readonly entities: readonly string[];
+    readonly facts: readonly string[];
+    readonly cutoff: string;
+  },
 ): Promise<number> {
+  const { pages, entities, cutoff } = batch;
   if (entry.table === 'page' || entry.table === 'entity') {
     const rows = (await tx.unsafe(
       `DELETE FROM ${entry.table} WHERE ${entry.key} = ANY($1::bigint[]) RETURNING ${entry.key}`,
@@ -1221,14 +1230,24 @@ async function deleteClaimed(
     const claimedPages = `$${params.length}::bigint[]`;
     reachable.push(`page_id = ANY(${claimedPages})`);
     if (entry.table === 'commitment') {
-      // A commitment also cascades from its fact, and step 3 takes this batch's
-      // expired facts before step 5 takes the pages. Counted here rather than
-      // left to that cascade for the reason the header gives: which statement
-      // removes a row must not depend on how the batches fell.
+      // **`commitment` is the only table with two parents, and the second one is
+      // where the count leaks.** It cascades from its fact as well as from its
+      // page, so the arm has to be the batch's whole doomed-fact set — the same
+      // one step 0 nulls pointers into and the same one the cascade count reads.
+      // A narrower arm (facts that are themselves expired, or facts on claimed
+      // pages only) leaves two shapes deleted-but-uncounted: an expired
+      // commitment on a **live** fact riding a claimed page out, and an expired
+      // commitment on an expired orphan fact this batch claimed when the
+      // commitment's own claim was already full. Both were retracted, so the
+      // preview counts them; a receipt that did not is the "countable before it
+      // is trusted" property failing in exactly the multi-batch case it exists
+      // for. The expiry filter stays on the *commitment* (`EXPIRED(t)` below),
+      // never on the fact.
+      params.push(idArray(batch.facts));
       reachable.push(
         `fact_id IN (SELECT f.fact_id FROM fact f
-                      WHERE f.page_id = ANY(${claimedPages})
-                        AND f.deleted_at IS NOT NULL AND f.deleted_at <= $1::timestamptz)`,
+                      WHERE f.fact_id = ANY($${params.length}::bigint[])
+                         OR f.page_id = ANY(${claimedPages}))`,
       );
     }
   }
