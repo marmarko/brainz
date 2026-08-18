@@ -80,13 +80,18 @@ import {
   type ConnectorStateStore,
 } from '../../src/ingest/cursor.ts';
 import type { TenantRuntime } from '../../src/ingest/import/run.ts';
-import { createIngestPullHandler, enqueuePullIfDue } from '../../src/ingest/pipedream/pull.ts';
+import {
+  IngestPullFailure,
+  createIngestPullHandler,
+  enqueuePullIfDue,
+} from '../../src/ingest/pipedream/pull.ts';
 import type {
   ProviderListOutcome,
   ProviderListRequest,
   ProviderSource,
   PulledItem,
 } from '../../src/ingest/pipedream/sources/types.ts';
+import { jobRetryableOf } from '../../src/worker/jobs.ts';
 import {
   ATTEMPT_BANK_RESERVE_MS,
   DEFAULT_STEAL_GRACE_MS,
@@ -126,11 +131,25 @@ const MAILBOX_ITEMS = 12;
 /**
  * What one embedding call costs the virtual clock.
  *
- * Chosen so a slice's budget covers four calls and not six: the item loop must
- * run out of time inside a page, which is the case that had no coverage. Written
- * as a division of the budget rather than a bare number so the two move together.
+ * Sized against the *window* and never against the budget, and the difference is
+ * the only thing pinning {@link ATTEMPT_BANK_RESERVE_MS} to a number. Divided by
+ * the budget, the reserve immunises itself: shrink it and the item cost shrinks
+ * with it, every slice takes the same four-and-a-bit items, and a reserve of
+ * zero — a slice planning to write its cursor, its run row, its health record
+ * and its job completion at the exact instant the container is stopped — leaves
+ * the whole file green. Measured: it did.
+ *
+ * Against the window, the reserve has to be worth at least one unit of work,
+ * which is what it is *for*. The loop asks the clock between items and never
+ * inside one, so a slice always overshoots its yield point by up to one item;
+ * the reserve is the room that overshoot and the banking behind it run in. A
+ * reserve shorter than an item leaves the loop entering a sixth call it cannot
+ * afford, the page drains, and `pages < PAGE_ITEMS` below goes red.
+ *
+ * Six per window, which at today's constants is the same 50s an eighth of the
+ * budget was — the numbers are unchanged, only what they are anchored to.
  */
-const EMBED_COST_MS = Math.floor((FLEET_WAKE_WINDOW_MS - ATTEMPT_BANK_RESERVE_MS) / 4.8);
+const EMBED_COST_MS = Math.floor(FLEET_WAKE_WINDOW_MS / 6);
 
 /**
  * A page the item loop finishes with nothing left of the window.
@@ -719,6 +738,31 @@ describe('the yield point', () => {
         reserveMs: FLEET_WAKE_WINDOW_MS,
       }),
     ).toThrow(/reserve/);
+  });
+});
+
+/**
+ * The ruling on the new stop reason, driven through the reader that acts on it.
+ *
+ * `pullStopIsTerminal` is consulted in exactly one place — `IngestPullFailure`'s
+ * constructor — and `time_exhausted` does not reach it today, because a slice
+ * that banked returns `stopped` and the handler throws only on `failed`. So the
+ * arm is a ruling made for a caller that does not exist yet, which is the shape
+ * that rots quietly: the day anything decides a spent window should fail its
+ * job, a terminal ruling dead-letters a lane on the ordinary shape of a large
+ * first import — the exact incident this change exists for — and nothing else in
+ * the suite would notice. It was checked: flipping the arm alone left 370 tests
+ * green.
+ *
+ * Asked through `jobRetryableOf`, the runner's own reader, rather than of the
+ * predicate — what matters is that the ladder keeps the lane, not which boolean
+ * a function returned. And asked beside a reason that *is* terminal, so a
+ * predicate that answered the same to everything could not pass.
+ */
+describe('a pull that ran out of wall clock', () => {
+  test('is never terminal, whichever caller comes to ask', () => {
+    expect(jobRetryableOf(new IngestPullFailure('gmail', 'time_exhausted'), false)).toBe(true);
+    expect(jobRetryableOf(new IngestPullFailure('gmail', 'auth_expired'), false)).toBe(false);
   });
 });
 
