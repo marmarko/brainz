@@ -178,6 +178,26 @@ export type Page =
       }[];
       readonly overflowed: boolean;
       readonly ttlHours: number;
+    }
+  | {
+      /**
+       * What a browser gets back from the Restore button.
+       *
+       * **A page rather than the JSON body, for the reason `connector_notice`
+       * states one union member up:** a form post answered with `{"ok":true,…}`
+       * renders that object as text in a browser window with no way back, and
+       * the whole argument for `/retractions` existing was that a JSON endpoint
+       * alone moves the gap rather than closing it. A button that ends in JSON
+       * is that gap with one extra click.
+       *
+       * **And not a bare redirect either.** The sentence a severance restore
+       * carries — the account is still disconnected — is load-bearing, and this
+       * app has no flash mechanism to carry a message through a 303. So the
+       * outcome is rendered where it happened, with the way back on it.
+       */
+      readonly kind: 'retraction_notice';
+      readonly heading: string;
+      readonly message: string;
     };
 
 /** HTML-escape. Five characters, applied to every interpolation without exception. */
@@ -829,6 +849,14 @@ claiming more than it told us.</p>
         `<h1>${escapeHtml(page.heading)}</h1>
 <p class="problem">${escapeHtml(page.message)}</p>
 <p><a href="/dashboard">Back to your dashboard</a></p>`,
+      );
+
+    case 'retraction_notice':
+      return shell(
+        `${page.heading} — brainz`,
+        `<h1>${escapeHtml(page.heading)}</h1>
+<p>${escapeHtml(page.message)}</p>
+<p><a href="/retractions">Back to what you can undo</a></p>`,
       );
 
     case 'retractions':

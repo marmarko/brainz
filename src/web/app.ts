@@ -1859,9 +1859,12 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       const outcome = await deps.retractions.restore({ tenantId, deletedAt, confirm });
       if (!outcome.ok) {
         if (outcome.reason === 'not_found') {
-          return json(
-            { ok: false, code: 'not_found', message: 'No retraction of yours at that instant.' },
+          return answer(
+            request,
             404,
+            { ok: false, code: 'not_found' },
+            'Nothing to restore',
+            'No retraction of yours at that instant.',
           );
         }
         if (outcome.reason === 'ttl_expired') {
@@ -1874,34 +1877,64 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
           // mentioned either, since a number a user cannot act on but can appeal
           // to converts a closed window into a support ticket.
           const closed = outcome.closedAt ?? deletedAt;
-          return json(
-            {
-              ok: false,
-              code: 'ttl_expired',
-              message: `The 72-hour window for this retraction closed at ${closed}. It can no longer be restored.`,
-            },
+          return answer(
+            request,
             410,
+            { ok: false, code: 'ttl_expired' },
+            'That window has closed',
+            `The 72-hour window for this retraction closed at ${closed}. It can no longer be restored.`,
           );
         }
-        return json({ ok: false, code: outcome.reason }, 400);
+        return answer(request, 400, { ok: false, code: outcome.reason }, 'Not restored', outcome.reason);
       }
 
-      return json({
-        ok: true,
-        deleted_at: deletedAt,
-        restored: outcome.restored,
-        // Reported beside `restored` rather than folded in: one clears a flag,
-        // the other re-inserts a row into a table that may have moved on.
-        unarchived: outcome.unarchived,
-        // The two "came back short" numbers. A response reporting three pages
-        // restored while two cards stayed deleted would re-open, one layer up,
-        // exactly the partial-success lie those fields exist to prevent.
-        superseded_cards: outcome.supersededCards,
-        superseded_aliases: outcome.supersededAliases,
-        already_restored: outcome.alreadyRestored,
-        was_origin: outcome.wasOrigin,
-        message: restoreMessage(outcome),
-      });
+      return answer(
+        request,
+        200,
+        {
+          ok: true,
+          deleted_at: deletedAt,
+          restored: outcome.restored,
+          // Reported beside `restored` rather than folded in: one clears a flag,
+          // the other re-inserts a row into a table that may have moved on.
+          unarchived: outcome.unarchived,
+          // The two "came back short" numbers. A response reporting three pages
+          // restored while two cards stayed deleted would re-open, one layer up,
+          // exactly the partial-success lie those fields exist to prevent.
+          superseded_cards: outcome.supersededCards,
+          superseded_aliases: outcome.supersededAliases,
+          already_restored: outcome.alreadyRestored,
+          was_origin: outcome.wasOrigin,
+        },
+        outcome.alreadyRestored ? 'Nothing changed' : 'Restored',
+        restoreMessage(outcome),
+      );
+    }
+
+    /**
+     * One outcome, in whichever language the caller speaks.
+     *
+     * **A browser posting this form must not be handed a JSON body.** The page
+     * carries a plain `<form>` and no script — there is no bundler here — so a
+     * click arrives as `application/x-www-form-urlencoded` and an answer of
+     * `{"ok":true,…}` renders as text in a window with no way back. That is the
+     * failure `pages.ts:connector_notice` names in its own docstring, and it
+     * would land on the one surface whose entire justification was that a JSON
+     * endpoint alone moves the gap rather than closing it.
+     *
+     * The message is identical in both, and so is the status: a `fetch` client
+     * and a browser must not be able to learn different things about the same
+     * restore.
+     */
+    function answer(
+      request: Request,
+      status: number,
+      payload: Record<string, unknown>,
+      heading: string,
+      message: string,
+    ): Response {
+      if (!isFormPost(request)) return json({ ...payload, message }, status);
+      return html(renderPage({ kind: 'retraction_notice', heading, message }), status);
     }
 
     /** The listing, as a page — the destination `forget`'s notice names. */

@@ -166,6 +166,26 @@ function post(
   return new Request(`${ORIGIN}${path}`, { method: 'POST', headers, body: JSON.stringify(fields) });
 }
 
+/**
+ * The Restore button as a browser actually presses it: no script on the page,
+ * so the click is a form-encoded POST rather than a `fetch`.
+ */
+function formPost(
+  path: string,
+  fields: Record<string, string>,
+  cookie: string,
+): Request {
+  return new Request(`${ORIGIN}${path}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      origin: ORIGIN,
+      cookie,
+    },
+    body: new URLSearchParams(fields).toString(),
+  });
+}
+
 async function signedIn(options: { readonly withBrain?: boolean } = {}): Promise<string> {
   const handle = app();
   const created = await handle(
@@ -411,6 +431,44 @@ describe('the refusals say the true thing', () => {
     const body = (await response.json()) as Record<string, unknown>;
     expect(body.already_restored).toBe(true);
     expect(body.message).toBe('That retraction has already been restored. Nothing changed.');
+  });
+
+  test('a browser gets a page back, never the JSON body', async () => {
+    // The page carries a plain `<form>` and no script, so this is the ONLY way
+    // a real user reaches this route. Answering it with `{"ok":true,…}` renders
+    // that object as text in a window with no way back — the failure
+    // `pages.ts:connector_notice` names — on the one surface whose whole
+    // justification was that a JSON endpoint alone moves the gap rather than
+    // closing it.
+    const cookie = await signedIn();
+    const response = await app()(
+      formPost('/api/restore', { deleted_at: LISTED.deletedAt, confirm: LISTED.deletedAt }, cookie),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type') ?? '').toContain('text/html');
+    const page = await response.text();
+    expect(page).toContain('Restored. It is searchable again.');
+    // And a way back, because a terminal page with no link is the dead end one
+    // step further along.
+    expect(page).toContain('href="/retractions"');
+    expect(page).not.toContain('"ok":true');
+  });
+
+  test('and a browser meeting the closed window is told when it closed', async () => {
+    const cookie = await signedIn();
+    const closed = LISTED.restorableUntil;
+    const response = await app({ answer: { ok: false, reason: 'ttl_expired', closedAt: closed } })(
+      formPost('/api/restore', { deleted_at: LISTED.deletedAt, confirm: LISTED.deletedAt }, cookie),
+    );
+
+    // Same status and the same sentence a `fetch` client gets: the two callers
+    // must not be able to learn different things about one restore.
+    expect(response.status).toBe(410);
+    const page = await response.text();
+    expect(page).toContain(
+      `The 72-hour window for this retraction closed at ${closed}. It can no longer be restored.`,
+    );
   });
 
   test('restoring a severance says the account is still disconnected', () => {
