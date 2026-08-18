@@ -20,6 +20,19 @@
  * not own. The receipt the caller gets back carries the instant, so a retraction
  * is undoable by a party that never saw the row ids.
  *
+ * **The `retraction` table is not a recovery key, it is a discovery index — and
+ * that is why the paragraph above survives it.** {@link restoreForgotten} still
+ * takes an instant and still keys on `deleted_at`; nothing in rung 18 is read on
+ * the way to a row. What the instant alone could never answer is the question a
+ * user actually asks first — *what may I undo?* — because the set of instants
+ * derivable from the content tables mixes `forget` together with subject
+ * erasure, which stamps the same seven tables and which {@link restoreForgotten}
+ * structurally cannot undo. The ledger carries the one thing an instant cannot:
+ * provenance, positively sourced. It is written inside `forgetRecord`'s own
+ * transaction and swept by {@link purgeExpiredTombstones} on the same cutoff as
+ * the rows it describes, so it cannot outlive its subject — which is the
+ * condition on which it is permitted to exist at all.
+ *
  * **The cascade is chosen, not inherited.** Retracting a document takes its
  * passages and the facts extracted from it, because leaving a fact whose source
  * the user just retracted is the failure a user would describe as "it did not
@@ -313,9 +326,45 @@ export async function forgetRecord(
   const at = request.now.toISOString();
   const grantLiteral = textArrayLiteral(request.grant);
   const permitted = await mayTouch(sql, request.grant, request.id);
-  if (permitted !== 'ok') return { ok: false, reason: permitted };
+  if (permitted.verdict !== 'ok') return { ok: false, reason: permitted.verdict };
 
   const cascade = await sql.begin(async (tx) => {
+    const counts = await cascadeOf(tx);
+    // **Inside this transaction, after the cascade, before it returns**, and
+    // every one of those three is load-bearing. A ledger row written outside
+    // would survive a rolled-back cascade and offer an undo for a retraction
+    // that never happened; one written before the cascade would carry counts
+    // nothing had produced yet. `severance.ts` makes the same argument for its
+    // own audit row, one module over.
+    //
+    // **Written even when every count is zero.** A second `forget` of an
+    // already-tombstoned record retracts nothing, and suppressing its row would
+    // make that retraction unfindable while the first one's instant sits in a
+    // receipt the user no longer has. The restore surface renders an all-zero
+    // outcome as "already restored", which is what makes keeping the row honest
+    // rather than merely tidy.
+    await tx`
+      INSERT INTO retraction (retracted_at, target_kind, origin_contexts, removed)
+      VALUES (${at}::timestamptz, ${request.id.kind},
+              ${textArrayLiteral(permitted.origins)}::text[], ${{ ...counts }})
+    `;
+    return counts;
+  });
+
+  return {
+    ok: true,
+    id: formatId(request.id.kind, request.id.key),
+    deletedAt: at,
+    recoverableUntil: new Date(request.now.getTime() + FORGET_TTL_HOURS * 3600_000).toISOString(),
+    cascade,
+  };
+
+  /**
+   * The cascade itself, unchanged and extracted so the ledger write above has
+   * somewhere to stand. Each arm still returns its own counts directly, which
+   * is why this is a function rather than a variable the switch assigns into.
+   */
+  async function cascadeOf(tx: SQL): Promise<CascadeCounts> {
     switch (request.id.kind) {
       case 'chunk': {
         const chunks = await tombstone(
@@ -381,51 +430,69 @@ export async function forgetRecord(
         return { pages: 0, chunks: 0, facts: 0, entities };
       }
     }
-  });
-
-  return {
-    ok: true,
-    id: formatId(request.id.kind, request.id.key),
-    deletedAt: at,
-    recoverableUntil: new Date(request.now.getTime() + FORGET_TTL_HOURS * 3600_000).toISOString(),
-    cascade,
-  };
+  }
 }
 
+/**
+ * What the fence read, and its verdict — **both**, because the read already
+ * happened.
+ *
+ * This used to answer `'ok'` and throw the origins away. They are exactly what
+ * the ledger row above has to record, and re-reading them afterwards would be a
+ * second answer to a question already asked: origin is immutable under R15's
+ * fence, so there is no read-then-write race to close and no reason for the
+ * ledger's copy to differ from the one the admission decision was made on.
+ *
+ * The alternative — deriving the ledger's origins from the *grant* — would
+ * record the credential rather than the material, and a credential is wider
+ * than what it retracted by construction.
+ */
+type TouchVerdict =
+  | { readonly verdict: 'ok'; readonly origins: readonly string[] }
+  | { readonly verdict: ForgetRefusal };
+
 /** The same three fence rules the read of this row would apply. */
-async function mayTouch(sql: SQL, grant: Grant, id: OpaqueId): Promise<'ok' | ForgetRefusal> {
+async function mayTouch(sql: SQL, grant: Grant, id: OpaqueId): Promise<TouchVerdict> {
   switch (id.kind) {
     case 'chunk': {
       const rows = (await sql.unsafe('SELECT origin_context FROM chunk WHERE chunk_id = $1::bigint', [
         id.key,
       ])) as Array<{ origin_context: string }>;
       const row = rows[0];
-      if (row === undefined) return 'not_found';
-      return fenceScalar(row.origin_context, grant) ? 'ok' : 'scope_denied';
+      if (row === undefined) return { verdict: 'not_found' };
+      return fenceScalar(row.origin_context, grant)
+        ? { verdict: 'ok', origins: [row.origin_context] }
+        : { verdict: 'scope_denied' };
     }
     case 'doc': {
       const rows = (await sql.unsafe('SELECT origin_context FROM page WHERE page_id = $1::bigint', [
         id.key,
       ])) as Array<{ origin_context: string }>;
       const row = rows[0];
-      if (row === undefined) return 'not_found';
-      return fenceScalar(row.origin_context, grant) ? 'ok' : 'scope_denied';
+      if (row === undefined) return { verdict: 'not_found' };
+      return fenceScalar(row.origin_context, grant)
+        ? { verdict: 'ok', origins: [row.origin_context] }
+        : { verdict: 'scope_denied' };
     }
     case 'fact': {
       const rows = (await sql.unsafe('SELECT origin_contexts FROM fact WHERE fact_id = $1::bigint', [
         id.key,
       ])) as Array<{ origin_contexts: string[] }>;
       const row = rows[0];
-      if (row === undefined) return 'not_found';
-      return fenceRow(row.origin_contexts, grant) ? 'ok' : 'scope_denied';
+      if (row === undefined) return { verdict: 'not_found' };
+      return fenceRow(row.origin_contexts, grant)
+        ? { verdict: 'ok', origins: row.origin_contexts }
+        : { verdict: 'scope_denied' };
     }
     case 'ent': {
       const rows = (await sql.unsafe('SELECT origin_contexts FROM entity WHERE entity_id = $1::bigint', [
         id.key,
       ])) as Array<{ origin_contexts: string[] }>;
       const row = rows[0];
-      if (row === undefined) return 'not_found';
-      return fenceEntity(row.origin_contexts, grant) ? 'ok' : 'scope_denied';
+      if (row === undefined) return { verdict: 'not_found' };
+      return fenceEntity(row.origin_contexts, grant)
+        ? { verdict: 'ok', origins: row.origin_contexts }
+        : { verdict: 'scope_denied' };
     }
   }
 }
@@ -433,6 +500,246 @@ async function mayTouch(sql: SQL, grant: Grant, id: OpaqueId): Promise<'ok' | Fo
 async function tombstone(tx: SQL, statement: string, params: readonly unknown[]): Promise<number> {
   const rows = (await tx.unsafe(`${statement} RETURNING 1 AS touched`, [...params])) as Array<{ touched: number }>;
   return rows.length;
+}
+
+/**
+ * The admission boundary, spelled once for the surface that offers an undo.
+ *
+ * {@link restoreForgotten} refuses while `now − deletedAt > ttl`, which is
+ * exactly `deletedAt >= now − ttl` at the same inclusive edge. A listing that
+ * computed its own cutoff would be a second spelling of the product's only
+ * "no", and the two failures it produces are both silent: offering a button
+ * that refuses, or hiding a retraction that would have worked.
+ *
+ * **Derived from that inequality rather than substituted into it.**
+ * `restoreForgotten` is unchanged by this rung — its refusal is the last thing
+ * standing between a user and a half-restored brain, and rewriting its
+ * comparison to route through this function would change one behaviour nobody
+ * asked to change: an unparseable `deletedAt` currently compares false and is
+ * admitted (matching no rows), where `>= since` would refuse it as expired.
+ * {@link findRestorable} closes that hole at the surface instead, and
+ * `test/core/lifecycle/restorable-agreement.test.ts` pins the two against each
+ * other at the boundary in both directions.
+ */
+export function restorableSince(now: Date, ttlHours?: number): Date {
+  return new Date(now.getTime() - retentionHoursOf(ttlHours) * 3600_000);
+}
+
+/**
+ * How an instant is spelled on the way out, and why it is not simply
+ * `to_char(…, '…MS…')`.
+ *
+ * Both writers stamp `Date.toISOString()`, so every instant in both ledgers is
+ * millisecond-precision today and the common branch renders a string
+ * byte-identical to the `deleted_at` the user's own receipt carried — which is
+ * what makes the confirmation echo an identity check a human can perform.
+ * The second branch is not decoration: a future writer stamping `now()` would
+ * store microseconds, and a listing that rendered those truncated would emit a
+ * key matching no row — a button that 404s on the retraction it is standing
+ * next to. Rendering the full precision when it exists keeps the key exact, and
+ * `Date.parse` accepts both spellings.
+ */
+const INSTANT_AS_ISO = (column: string): string =>
+  `CASE WHEN date_trunc('milliseconds', ${column}) = ${column}
+        THEN to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+        ELSE to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+   END`;
+
+/**
+ * One retraction a user may still undo, described by **shape and never by
+ * substance**.
+ *
+ * There is no title here, no statement, no excerpt and no record id, and that
+ * is structural rather than disciplinary: {@link listRestorable} reads two
+ * ledgers and no content table, so there is no field to leak and no future edit
+ * that could add one without also adding a join.
+ *
+ * Shape is enough to choose between two retractions in one window, and the
+ * argument is not "close enough": **restore is the only operation in this
+ * lifecycle that is itself undoable.** A restore of the wrong instant is
+ * corrected by a fresh `forget`, which opens a fresh 72-hour window.
+ */
+export interface RestorableRetraction {
+  /** The restore key — the instant, spelled as the receipt spelled it. */
+  readonly at: string;
+  readonly restorableUntil: string;
+  /** `record` for a `forget`, `origin` for a context severance. */
+  readonly kind: 'record' | 'origin';
+  readonly origins: readonly string[];
+  /** Which of the four id kinds, or `null` for a severance and for a tie. */
+  readonly targetKind: 'doc' | 'chunk' | 'fact' | 'ent' | null;
+  readonly counts: Readonly<Record<string, number>>;
+}
+
+/** What {@link listRestorable} answers. */
+export interface RestorableListing {
+  readonly retractions: readonly RestorableRetraction[];
+  /**
+   * There were more than `limit`.
+   *
+   * Carried rather than inferred for the reason {@link PurgeRunResult.exhausted}
+   * is: "took exactly the ceiling" and "took the ceiling and there is more" are
+   * different facts, and only the second one means the user has not been shown
+   * everything they may still undo.
+   */
+  readonly overflowed: boolean;
+}
+
+/** The listing's default ceiling. A window this full is already pathological. */
+export const RESTORABLE_LIMIT = 100;
+
+interface RestorableRow {
+  readonly at: string;
+  readonly kind: 'record' | 'origin';
+  readonly origins: string[];
+  readonly target_kind: string | null;
+  readonly counts: Record<string, number>;
+}
+
+/**
+ * Every retraction still inside the window, newest first.
+ *
+ * **Two ledgers and no content table**, which is what makes this cheap and what
+ * makes it safe. Two index-only scans (`retraction_by_time`,
+ * `severance_by_time`) over O(retractions) rows rather than O(rows in the
+ * brain) — and the derived alternative would have needed a new index on every
+ * content table anyway, since every `deleted_at` index in this schema is partial
+ * `WHERE deleted_at IS NULL`.
+ *
+ * **Subject-erasure instants are absent by construction.** They appear in
+ * neither ledger. That is deliberately not a filter: filtering would have meant
+ * excluding instants present in `erased_subject`, whose upsert overwrites
+ * `erased_at` on a second erasure of one correspondent — orphaning the first
+ * erasure's instant while its tombstones are still inside the window, and
+ * putting an undo button next to an erasure a third party requested, which
+ * {@link restoreForgotten} cannot perform and would report `ok` for anyway.
+ *
+ * **Rows sharing one instant collapse to one entry.** A severance and a `forget`
+ * cannot realistically land on the same microsecond, but the restore *unit* is
+ * the instant — one call un-deletes everything stamped with it — so a listing
+ * that offered two buttons for one instant would offer the same action twice
+ * and report the second as a no-op.
+ */
+export async function listRestorable(
+  sql: SQL,
+  request: { readonly now: Date; readonly ttlHours?: number; readonly limit?: number },
+): Promise<RestorableListing> {
+  const since = restorableSince(request.now, request.ttlHours).toISOString();
+  const ttlMs = retentionHoursOf(request.ttlHours) * 3600_000;
+  const limit = request.limit ?? RESTORABLE_LIMIT;
+
+  // limit + 1, because `overflowed` is the question "is there more" and a query
+  // that stopped at the ceiling cannot answer it.
+  const rows = (await sql.unsafe(
+    `SELECT ${INSTANT_AS_ISO('at')} AS at, kind, origins, target_kind, counts FROM (
+       SELECT retracted_at AS at, 'record'::text AS kind, origin_contexts AS origins,
+              target_kind, removed AS counts
+         FROM retraction
+        WHERE retracted_at >= $1::timestamptz
+       UNION ALL
+       SELECT severed_at, 'origin'::text, ARRAY[origin_context], NULL::text, removed
+         FROM severance
+        WHERE severed_at >= $1::timestamptz AND restored_at IS NULL
+     ) ledgers
+      ORDER BY at DESC
+      LIMIT ${Math.trunc(limit) + 1}`,
+    [since],
+  )) as unknown as RestorableRow[];
+
+  const collapsed = collapseByInstant(rows.slice(0, Math.trunc(limit)), ttlMs);
+  return { retractions: collapsed, overflowed: rows.length > Math.trunc(limit) };
+}
+
+function collapseByInstant(rows: readonly RestorableRow[], ttlMs: number): RestorableRetraction[] {
+  const byInstant = new Map<string, RestorableRetraction>();
+  for (const row of rows) {
+    const previous = byInstant.get(row.at);
+    const counts: Record<string, number> = { ...(previous?.counts ?? {}) };
+    for (const [field, value] of Object.entries(row.counts ?? {})) {
+      counts[field] = (counts[field] ?? 0) + Number(value);
+    }
+    const origins = [...new Set([...(previous?.origins ?? []), ...(row.origins ?? [])])];
+    byInstant.set(row.at, {
+      at: row.at,
+      restorableUntil: new Date(Date.parse(row.at) + ttlMs).toISOString(),
+      // A severance in the group wins the label: it is the wider event, and the
+      // rendering it selects is the one that has to warn about the connector
+      // staying disconnected.
+      kind: previous?.kind === 'origin' || row.kind === 'origin' ? 'origin' : 'record',
+      origins,
+      targetKind: targetKindOf(previous, row),
+      counts,
+    });
+  }
+  return [...byInstant.values()];
+}
+
+/** One kind, or `null` — never the first of two, which would name half an event. */
+function targetKindOf(
+  previous: RestorableRetraction | undefined,
+  row: RestorableRow,
+): RestorableRetraction['targetKind'] {
+  const here = (row.target_kind ?? null) as RestorableRetraction['targetKind'];
+  if (previous === undefined) return here;
+  return previous.targetKind === here ? here : null;
+}
+
+/**
+ * Is this one instant something the account holder may undo?
+ *
+ * **The executor's admission gate, not a convenience.** `restoreForgotten` takes
+ * a bare instant and will happily un-delete whatever carries it — including a
+ * subject erasure's seven tables, returning nonzero counts while
+ * `erased_subject`'s suppression row stays live and `page_version`,
+ * `review_queue` and `entity_edge` stay hard-deleted. A restore route that
+ * called the executor directly would therefore render a receipt for a recovery
+ * that did not happen, on behalf of a request a third party made. Ledger
+ * membership is what makes the instant *this user's retraction* rather than
+ * merely *an instant*.
+ *
+ * `null` means "no retraction of yours at that instant" — including an instant
+ * that is not a timestamp at all, which is refused here rather than being cast
+ * in SQL and coming back as a 500 on a hand-rolled request.
+ */
+export async function findRestorable(
+  sql: SQL,
+  request: { readonly deletedAt: string; readonly now: Date; readonly ttlHours?: number },
+): Promise<RestorableRetraction | null> {
+  if (Number.isNaN(Date.parse(request.deletedAt))) return null;
+  const listing = await listRestorable(sql, {
+    now: request.now,
+    ...(request.ttlHours === undefined ? {} : { ttlHours: request.ttlHours }),
+    limit: RESTORABLE_LIMIT,
+  });
+  const wanted = Date.parse(request.deletedAt);
+  return listing.retractions.find((entry) => Date.parse(entry.at) === wanted) ?? null;
+}
+
+/**
+ * Take a restored instant out of the listing. Two arms, because the two ledgers
+ * are different kinds of record.
+ *
+ * **The record arm deletes.** `retraction` is a discovery index, and a row whose
+ * tombstones are back has nothing left to discover. **The origin arm stamps.**
+ * `severance` is append-only audit with the recompute worklist derived from it
+ * (`v10-severance.sql`), so deleting one would remove the evidence a
+ * consolidation cycle reads; the listing filters `restored_at IS NULL` instead.
+ *
+ * **Runs after {@link restoreForgotten} returns, and the gap is chosen.** That
+ * function opens and commits its own transaction and cannot be wrapped from
+ * outside without editing tested code on the recovery path. A crash in the gap
+ * leaves a ledger row whose next click finds every count zero — which the
+ * surface renders as "already restored, nothing changed". The non-atomicity was
+ * made truthful before it was accepted.
+ */
+export async function markRetractionRestored(
+  sql: SQL,
+  request: { readonly deletedAt: string; readonly now: Date },
+): Promise<void> {
+  await sql`DELETE FROM retraction WHERE retracted_at = ${request.deletedAt}::timestamptz`;
+  await sql`
+    UPDATE severance SET restored_at = ${request.now.toISOString()}::timestamptz
+     WHERE severed_at = ${request.deletedAt}::timestamptz AND restored_at IS NULL`;
 }
 
 export type RestoreOutcome =
@@ -779,6 +1086,16 @@ export interface PurgeRunResult {
    */
   readonly exhausted: boolean;
   readonly budget: ResolvedPurgeBudget;
+  /**
+   * Ledger rows swept — `retraction` rows whose tombstones this cutoff has
+   * passed (rung 18).
+   *
+   * Reported rather than left silent because it is the number that proves the
+   * discovery index cannot outlive its subject. A ledger that kept describing
+   * retractions whose rows the purge already destroyed would be a durable record
+   * of what a user asked to be rid of, retained past the thing itself.
+   */
+  readonly retractionsSwept: number;
 }
 
 /**
@@ -1021,6 +1338,22 @@ export async function purgeExpiredTombstones(
     }
   }
 
+  // ---- The ledger, swept on the same clock as what it describes.
+  //
+  // **After the loop and in its own statement, deliberately.** Inside
+  // `runPurgeBatch` these rows would count into `claimed`, and `claimed === 0`
+  // is the signal that proves the backlog is gone — a batch that claimed
+  // nothing but ledger rows would keep the loop from ever proving it.
+  //
+  // Unbounded, unlike everything above it, and that is safe for the reason the
+  // budget exists at all: this is one narrow DELETE against a table with one row
+  // per retraction and no cascade hanging off it, not a page delete dragging
+  // hundreds of live children out with it.
+  const swept = (await sql.unsafe(
+    `DELETE FROM retraction WHERE retracted_at <= $1::timestamptz RETURNING 1 AS gone`,
+    [cutoff],
+  )) as Array<{ gone: number }>;
+
   return {
     cutoff,
     counts: counts as unknown as PurgeCounts,
@@ -1028,6 +1361,7 @@ export async function purgeExpiredTombstones(
     batches,
     exhausted,
     budget,
+    retractionsSwept: swept.length,
   };
 }
 

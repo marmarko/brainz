@@ -157,6 +157,14 @@ const EXPECTED_TABLES: ReadonlyMap<string, TableClass> = new Map([
   // are user vocabulary rather than a derivation, and the table is a lifecycle
   // mechanism, so it classifies with the other retraction bookkeeping.
   ['severed_alias', 'operational'],
+
+  // Rung 18's discovery index. One row per `forget`, written in the same
+  // transaction as the tombstones it describes, so the 72-hour window can be
+  // listed and not merely keyed. It is classified with the other retraction
+  // bookkeeping rather than as content because that is exactly what it holds:
+  // an instant, a kind, the fence's origins and the cascade counts — no title,
+  // no statement, no excerpt, and deliberately no id pointing at what went.
+  ['retraction', 'operational'],
 ]);
 
 const SHARED_ORIGIN_TRIGGER_FUNCTION = 'refuse_origin_change';
@@ -460,6 +468,14 @@ const ORIGIN_FIXTURES: ReadonlyMap<string, { readonly where: string; readonly ta
       'severed_alias',
       { where: `alias = 'fence archived alias'`, tamper: `origin_contexts = ARRAY['personal','work']` },
     ],
+    // Rung 18. The ledger row is what makes an instant *listable*, so an origin
+    // that could be edited afterwards would let a retraction from one credential
+    // be re-labelled as another's — on the one table a restore surface reads to
+    // decide what it may offer.
+    [
+      'retraction',
+      { where: `target_kind = 'doc'`, tamper: `origin_contexts = ARRAY['personal','work']` },
+    ],
   ]);
 
 describe('R15 — the database refuses to let an origin move, on every table that has one', () => {
@@ -509,6 +525,8 @@ describe('R15 — the database refuses to let an origin move, on every table tha
       INSERT INTO severed_alias (entity_id, alias, alias_source, origin_contexts, created_at, severed_at)
       SELECT (SELECT entity_id FROM entity WHERE canonical_name = 'fence-subject'),
              'fence archived alias', 'user', ARRAY['personal'], now(), now();
+      INSERT INTO retraction (retracted_at, target_kind, origin_contexts, removed)
+      VALUES (now(), 'doc', ARRAY['personal'], '{}'::jsonb);
     `);
   });
 

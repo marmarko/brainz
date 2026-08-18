@@ -99,6 +99,7 @@ beforeEach(async () => {
   // Order matters even here: `page_version` holds a reference the page delete
   // would only SET NULL, and the archive hangs off `entity`.
   await sql.unsafe(`
+    DELETE FROM retraction;
     DELETE FROM page_version;
     DELETE FROM severed_alias;
     DELETE FROM commitment;
@@ -388,6 +389,71 @@ describe('the retention window is respected at both edges', () => {
 
       const late = await purgeExpiredTombstones(sql, { now: AFTER_THE_SWEEP });
       expect(late.counts.pages).toBe(1);
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 3b. The discovery index goes when what it describes goes.
+// ---------------------------------------------------------------------------
+
+describe('the retraction ledger is swept on the same clock as its tombstones', () => {
+  test(
+    'a ledger row past the cutoff is taken and counted; one inside the window is not',
+    async () => {
+      // The ledger (rung 18) is what makes a retraction findable, and a ledger
+      // that outlived its tombstones would be the failure this whole surface
+      // exists to prevent wearing the fix's clothes: a durable record of what a
+      // user asked to be rid of, kept after the thing itself was destroyed. The
+      // sweep is the condition on which the table is permitted to exist.
+      const expired = await insertPage('gmail:expired');
+      await retract('page', 'page_id', expired, RETRACTED_AT);
+      await sql.unsafe(
+        `INSERT INTO retraction (retracted_at, target_kind, origin_contexts, removed)
+         VALUES ($1::timestamptz, 'doc', ARRAY['${WORK}'], '{"pages":1}'::jsonb)`,
+        [RETRACTED_AT.toISOString()],
+      );
+      // Retracted a day before the sweep is eligible to reach it — the row is
+      // still inside somebody's window when the older one is not.
+      const recent = new Date(AFTER_THE_SWEEP.getTime() - 2 * HOUR);
+      await sql.unsafe(
+        `INSERT INTO retraction (retracted_at, target_kind, origin_contexts, removed)
+         VALUES ($1::timestamptz, 'fact', ARRAY['${PERSONAL}'], '{"facts":1}'::jsonb)`,
+        [recent.toISOString()],
+      );
+
+      const purged = await purgeExpiredTombstones(sql, { now: AFTER_THE_SWEEP });
+
+      expect(purged.counts.pages).toBe(1);
+      // Reported rather than silent: the number is the evidence the index is
+      // bounded by the same clock as the rows.
+      expect(purged.retractionsSwept).toBe(1);
+      const left = (await sql.unsafe(
+        `SELECT target_kind FROM retraction ORDER BY retraction_id`,
+      )) as Array<{ target_kind: string }>;
+      expect(left.map((row) => row.target_kind)).toEqual(['fact']);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'the sweep does not consume the exhaustion signal',
+    async () => {
+      // Deliberately NOT inside `runPurgeBatch`: `claimed === 0` is what proves
+      // the backlog is gone, and ledger rows counted into it would keep a run
+      // from ever proving it — a purge that always reports "there is more".
+      await sql.unsafe(
+        `INSERT INTO retraction (retracted_at, target_kind, origin_contexts, removed)
+         VALUES ($1::timestamptz, 'doc', ARRAY['${WORK}'], '{}'::jsonb)`,
+        [RETRACTED_AT.toISOString()],
+      );
+
+      const purged = await purgeExpiredTombstones(sql, { now: AFTER_THE_SWEEP });
+
+      expect(purged.retractionsSwept).toBe(1);
+      expect(purged.exhausted).toBe(true);
+      expect(purged.batches).toBe(1);
     },
     TEST_TIMEOUT_MS,
   );
