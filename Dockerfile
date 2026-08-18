@@ -205,7 +205,14 @@ ARG BUN_VERSION=1.3.14
 # both live in code inside the image, so a warm instance keeps serving the
 # version with no way back. Deterministic reload (`containers delete` then
 # `deploy`).
-ARG FLEET_CONFIG_EPOCH=15
+# 15 -> 16: the panel calling every running check a failure. `claim` increments
+# `attempts` as it sets `running`, so a healthy first pull reads `attempts = 1`
+# and rendered as "the last check did not work" for the whole four to five
+# minutes a mailbox poll takes, against a five-minute cadence. Web fleet renders
+# the panel; code inside the image, so a warm instance keeps alarming its owner
+# about a working connector. Deterministic reload (`containers delete` then
+# `deploy`).
+ARG FLEET_CONFIG_EPOCH=16
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
