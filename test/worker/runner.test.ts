@@ -566,10 +566,14 @@ describe('the queue and the schema agree about what a job may be', () => {
     // statements of one rule. A pairing the table allows and the CHECK refuses is
     // a constraint violation raised on a live enqueue.
     await seedTenant(sideSql, 'pairings');
-    const legal: readonly (readonly ['consolidate' | 'ingest_pull' | 'import' | 'export' | 're_embed', JobLease['target']])[] = [
+    const legal: readonly (readonly [
+      'consolidate' | 'ingest_pull' | 'import' | 'export' | 're_embed' | 'purge',
+      JobLease['target'],
+    ])[] = [
       ['consolidate', 'whole_brain'],
       ['export', 'whole_brain'],
       ['re_embed', 'whole_brain'],
+      ['purge', 'whole_brain'],
       ['ingest_pull', 'gmail'],
       ['ingest_pull', 'calendar'],
       ['ingest_pull', 'drive'],

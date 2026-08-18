@@ -291,7 +291,7 @@ describe('the residue is taken, and taking it does not out-live the undo', () =>
     'and past the window the purge empties the archive for good',
     async () => {
       const purged = await purgeExpiredTombstones(sql, { now: LONG_AFTER });
-      expect(purged.aliases).toBe(1);
+      expect(purged.counts.aliases).toBe(1);
 
       expect(await aliases()).toEqual([SHARED_ALIAS]);
       expect((await sql`SELECT count(*)::int AS n FROM severed_alias`) as Array<{ n: number }>).toEqual([

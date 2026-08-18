@@ -439,7 +439,7 @@ describe('the purge reaches every table the restore does', () => {
       }
 
       const purged = await purgeExpiredTombstones(sql, { now: new Date('2026-06-30T00:00:00.000Z') });
-      expect(purged.entityCards).toBeGreaterThan(0);
+      expect(purged.counts.entityCards).toBeGreaterThan(0);
 
       expect(await tombstoneCensus()).toEqual(
         Object.fromEntries(TOMBSTONED_TABLES.map((entry) => [entry.table, 0])),

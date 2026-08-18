@@ -291,7 +291,7 @@ describe('the new takes are on forget’s clock like every other one', () => {
       expect(again.receipt.tombstoned.attachments).toBe(3);
 
       const purged = await purgeExpiredTombstones(sql, { now: LONG_AFTER });
-      expect(purged.attachments).toBe(3);
+      expect(purged.counts.attachments).toBe(3);
 
       // Nothing work-shaped left anywhere: the attachments by their own sweep,
       // the exact-origin edge by its endpoints' cascade.

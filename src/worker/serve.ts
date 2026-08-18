@@ -59,6 +59,8 @@ import {
 } from '../ingest/pipedream/reconcile.ts';
 import { createConsolidateHandler } from './consolidate/cycle.ts';
 import { createExportHandler, enqueueDueExports } from './export.ts';
+import { createPurgeHandler, enqueueDuePurges } from './purge.ts';
+import { ensurePurgeJobKind } from '../control/job-kinds.ts';
 import { createSchemaSweepPorts } from '../control/schema-sweep.ts';
 import {
   ensureAuthorizationStoreSchema,
@@ -148,6 +150,13 @@ export async function startWorkerFleet(
   // a missing table would turn every attempt's record into a logged error and
   // leave the product back where it started, with the cause on stdout.
   await ensureConnectorHealthSchema(controlSql);
+  // Not a table but a *change*, and the same argument: `src/control/schema.sql`
+  // builds a control plane from nothing and is run once, so a value added to
+  // `control.job_kind` reaches new installs and no live deployment. This fleet
+  // enqueues `purge` on every tick; without the rung the insert answers
+  // `22P02 invalid input value for enum control.job_kind` forever. See
+  // `src/control/job-kinds.ts`.
+  await ensurePurgeJobKind(controlSql);
 
   const queue = createJobQueue({ sql: controlSql });
   const leases = createLeaseChannel({ sql: leaseSql });
@@ -223,6 +232,37 @@ export async function startWorkerFleet(
     destinations: {},
     onExport(tenantId, outcome) {
       process.stdout.write(`${JSON.stringify({ event: 'export', tenant: tenantId, ...outcome })}\n`);
+    },
+  });
+
+  /**
+   * R12's retention sweep, given the handler and the enqueuer it never had
+   * (`src/worker/purge.ts`).
+   *
+   * **This is the first time `forget`'s 72-hour TTL is enforced by anything.**
+   * `purgeExpiredTombstones` had no production caller at all — every reference
+   * to it in `src/` was a comment reasoning from a sweep that did not run. The
+   * handler takes the module's conservative default budget, so a first pass over
+   * a brain carrying years of tombstones is small and countable and the next
+   * slot resumes it; see the file header for why a run that does not finish
+   * completes the job rather than failing it.
+   */
+  const purgeHandler = createPurgeHandler({
+    open: connectTenant,
+    onPurge(tenantId, result) {
+      process.stdout.write(
+        `${JSON.stringify({
+          event: 'purge',
+          tenant: tenantId,
+          cutoff: result.cutoff,
+          batches: result.batches,
+          exhausted: result.exhausted,
+          // Both halves, because the second is the one the receipt never had:
+          // rows removed by a foreign key that nobody ever retracted.
+          removed: result.counts,
+          cascaded: result.cascaded,
+        })}\n`,
+      );
     },
   });
 
@@ -338,6 +378,7 @@ export async function startWorkerFleet(
     handlers: {
       consolidate: createConsolidateHandler(ports),
       export: exportHandler,
+      purge: purgeHandler,
       ingest_pull: ingestPullHandler,
       import: importHandler,
     },
@@ -361,6 +402,11 @@ export async function startWorkerFleet(
     // tenant's export is scheduled onto the slot its consolidation already
     // wakes, so this adds a job and not a wake — see `export.ts`.
     await enqueueDueExports({ sql: controlSql, queue }, { now });
+    // The retention lane, on the same slot as the export for the same reason:
+    // both ride a wake the consolidation ceiling already pays for. Its own
+    // enqueuer rather than a branch inside the export's, so a result type still
+    // answers one question.
+    await enqueueDuePurges({ sql: controlSql, queue }, { now });
     // **Reconciliation, and it runs BEFORE the cadence pass rather than after.**
     // A connection adopted this tick is due immediately (`lastPullAt` is null,
     // so `nextPullAt` is the epoch), so reconciling first means a user who

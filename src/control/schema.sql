@@ -331,15 +331,27 @@ CREATE INDEX tenant_stale_provisioning
 -- digits, never the filename.
 -- ===========================================================================
 
--- What a job *is*. Five kinds, fixed at U10 because U8 and U9 consume `import`
--- and `ingest_pull` in Phase 2 and a queue whose type set is still moving is a
--- queue every consumer re-implements.
+-- What a job *is*. Fixed at U10 because U8 and U9 consume `import` and
+-- `ingest_pull` in Phase 2 and a queue whose type set is still moving is a queue
+-- every consumer re-implements.
+--
+-- **This file builds a control plane from nothing; a live one is migrated by
+-- `src/control/job-kinds.ts`.** There is no migration ladder for the control
+-- plane the way `src/schema/migrations.ts` is one for a tenant, so a value added
+-- here reaches a fresh install and no existing deployment. `ensurePurgeJobKind`
+-- is the idempotent boot-time rung that reaches the other one, and the two must
+-- carry the same value set and the same CHECK expression — a `purge` job the
+-- code enqueues against an enum that has never heard of it is a `22P02` on a
+-- live insert.
 CREATE TYPE control.job_kind AS ENUM (
   'consolidate',
   'ingest_pull',
   'import',
   'export',
-  're_embed'
+  're_embed',
+  -- The 72-hour retention sweep against the tenant's own database, and the first
+  -- caller `src/mcp/tombstone.ts:purgeExpiredTombstones` has ever had.
+  'purge'
 );
 
 -- What the job acts on, and the reason it is one NOT NULL enum rather than a
@@ -466,6 +478,7 @@ CREATE TABLE control.job (
     (kind = 'consolidate' AND target = 'whole_brain')
     OR (kind = 'export' AND target = 'whole_brain')
     OR (kind = 're_embed' AND target = 'whole_brain')
+    OR (kind = 'purge' AND target = 'whole_brain')
     OR (kind = 'ingest_pull' AND target IN ('gmail', 'calendar', 'drive'))
     OR (kind = 'import' AND target IN ('chat_export', 'folder'))
   ),

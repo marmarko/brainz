@@ -100,9 +100,13 @@ function rungs(kind: JobKind, random: () => number): number[] {
 describe('the ladder each kind walks', () => {
   test('every kind has a policy, and the connector lane is the one that differs', () => {
     // Not "the record has the right keys" — that is a type. What is asserted is
-    // that the other four were left alone, because the fix for one lane silently
+    // that every other lane was left alone, because the fix for one lane silently
     // re-timing consolidation is exactly the regression this shape invites.
-    for (const kind of ['consolidate', 'export', 're_embed', 'import'] as const) {
+    // `purge` is in this arm rather than beside the connector: a retention sweep
+    // fails because something of ours broke, and there is nothing to catch up on
+    // — the next run's cutoff already covers whatever the failed one would have
+    // taken — so stopping loudly and soon is right for it.
+    for (const kind of ['consolidate', 'export', 're_embed', 'import', 'purge'] as const) {
       expect({ kind, ...retryPolicyFor(kind) }).toEqual({
         kind,
         maxAttempts: 5,

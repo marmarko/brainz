@@ -22,11 +22,20 @@
  */
 
 /**
- * The five kinds, fixed at U10 rather than grown per consumer. U8 (`import`) and
- * U9 (`ingest_pull`) land in Phase 2 and consume these; a queue whose type set is
+ * The kinds, fixed at U10 rather than grown per consumer. U8 (`import`) and U9
+ * (`ingest_pull`) land in Phase 2 and consume these; a queue whose type set is
  * still moving is a queue every consumer re-implements.
+ *
+ * **`purge` is the one addition since, and adding it cost five registrations
+ * plus a live-schema migration**, which is the price this list's stability is
+ * bought with. It is `src/mcp/tombstone.ts:purgeExpiredTombstones`'s first
+ * caller: the 72-hour TTL `forget` promises had never once been enforced,
+ * because that function's only callers were its own tests. `re_embed` is the
+ * standing warning about doing this by halves — it is in this list and in the
+ * `control.job_kind` enum and has **no handler**, so a `re_embed` row would sit
+ * `due` forever, invisible to the dead-letter list an operator reads.
  */
-export const JOB_KINDS = ['consolidate', 'ingest_pull', 'import', 'export', 're_embed'] as const;
+export const JOB_KINDS = ['consolidate', 'ingest_pull', 'import', 'export', 're_embed', 'purge'] as const;
 export type JobKind = (typeof JOB_KINDS)[number];
 
 /**
@@ -55,6 +64,7 @@ export const LEGAL_TARGETS: Readonly<Record<JobKind, readonly JobTarget[]>> = {
   consolidate: ['whole_brain'],
   export: ['whole_brain'],
   re_embed: ['whole_brain'],
+  purge: ['whole_brain'],
   ingest_pull: ['gmail', 'calendar', 'drive'],
   import: ['chat_export', 'folder'],
 };
@@ -508,6 +518,12 @@ export const RETRY_POLICY: Readonly<Record<JobKind, RetryPolicy>> = {
   consolidate: { maxAttempts: DEFAULT_MAX_ATTEMPTS, backoff: DEFAULT_BACKOFF },
   export: { maxAttempts: DEFAULT_MAX_ATTEMPTS, backoff: DEFAULT_BACKOFF },
   re_embed: { maxAttempts: DEFAULT_MAX_ATTEMPTS, backoff: DEFAULT_BACKOFF },
+  // The retention sweep against the tenant's own database. Ours to fix, and a
+  // lane that stops loudly is what is wanted: a purge that has been failing
+  // quietly for two days is a TTL nobody is enforcing, which is the state this
+  // kind exists to end. There is also nothing to catch up on — the next run's
+  // cutoff already covers everything the failed one would have taken.
+  purge: { maxAttempts: DEFAULT_MAX_ATTEMPTS, backoff: DEFAULT_BACKOFF },
   // A user-supplied archive against our own object store. Same class.
   import: { maxAttempts: DEFAULT_MAX_ATTEMPTS, backoff: DEFAULT_BACKOFF },
   // Somebody else's API. See the block above for every number here.

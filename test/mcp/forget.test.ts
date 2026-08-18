@@ -24,6 +24,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import {
   FORGET_TTL_HOURS,
+  PURGE_GRACE_HOURS,
   purgeExpiredTombstones,
   restoreForgotten,
 } from '../../src/mcp/tombstone.ts';
@@ -208,6 +209,18 @@ describe('recovery inside the TTL', () => {
   );
 });
 
+/**
+ * The purge sweeps at `FORGET_TTL_HOURS + PURGE_GRACE_HOURS`, not at the TTL.
+ *
+ * The 72 hours is the window the *user* is promised and `restoreForgotten` still
+ * admits an undo for exactly that long. The grace band is the far edge: a
+ * batched purge commits between batches, so a restore admitted at the boundary
+ * could otherwise land mid-cascade. See `PURGE_GRACE_HOURS`. The cases below
+ * therefore run the sweep past both, and the one asserting that a fresh
+ * tombstone survives is unchanged — it was always about the near edge.
+ */
+const PAST_THE_SWEEP = FORGET_TTL_HOURS + PURGE_GRACE_HOURS + 1;
+
 describe('the 72-hour purge', () => {
   test(
     'leaves a tombstone younger than the TTL alone',
@@ -218,7 +231,7 @@ describe('the 72-hour purge', () => {
       const purged = await purgeExpiredTombstones(fixture.sql, {
         now: new Date(fixture.now() + (FORGET_TTL_HOURS - 1) * HOUR),
       });
-      expect(purged.chunks).toBe(0);
+      expect(purged.counts.chunks).toBe(0);
 
       const rows = (await fixture.sql.unsafe('SELECT count(*)::int AS n FROM chunk WHERE chunk_id = $1::bigint', [
         chunkIds[0] ?? '',
@@ -229,15 +242,15 @@ describe('the 72-hour purge', () => {
   );
 
   test(
-    'removes a tombstone past the TTL, and the row is gone for good',
+    'removes a tombstone past the TTL and its grace band, and the row is gone for good',
     async () => {
       const { chunkIds } = await seedDocument('purge-old');
       await fixture.call('forget', { id: `chunk:${chunkIds[0]}` });
 
       const purged = await purgeExpiredTombstones(fixture.sql, {
-        now: new Date(fixture.now() + (FORGET_TTL_HOURS + 1) * HOUR),
+        now: new Date(fixture.now() + PAST_THE_SWEEP * HOUR),
       });
-      expect(purged.chunks).toBeGreaterThan(0);
+      expect(purged.counts.chunks).toBeGreaterThan(0);
 
       const rows = (await fixture.sql.unsafe('SELECT count(*)::int AS n FROM chunk WHERE chunk_id = $1::bigint', [
         chunkIds[0] ?? '',
@@ -282,9 +295,9 @@ describe('the 72-hour purge', () => {
       await fixture.call('forget', { id: `fact:${newer}` });
 
       const purged = await purgeExpiredTombstones(fixture.sql, {
-        now: new Date(fixture.now() + (FORGET_TTL_HOURS + 1) * HOUR),
+        now: new Date(fixture.now() + PAST_THE_SWEEP * HOUR),
       });
-      expect(purged.facts).toBeGreaterThanOrEqual(1);
+      expect(purged.counts.facts).toBeGreaterThanOrEqual(1);
 
       const gone = (await fixture.sql.unsafe(
         'SELECT count(*)::int AS n FROM fact WHERE fact_id = $1::bigint',
