@@ -228,7 +228,11 @@ describe('a retryable loss holds the cursor', () => {
 
     expect(result.counts.written).toBe(1);
     expect(result.outcome).toBe('stopped');
-    expect(result.stopReason).toBe('provider_error');
+    // `embed_unavailable`, not `provider_error`: the backlog is a query over
+    // every chunk in the tenant regardless of source, so this is the whole brain
+    // unable to index — three connectors stop on it at once, and under one
+    // shared code that was indistinguishable from three unrelated bad items.
+    expect(result.stopReason).toBe('embed_unavailable');
     expect(
       await countRows(
         fixture.tenantSql,

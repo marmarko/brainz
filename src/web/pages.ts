@@ -285,6 +285,17 @@ export function causeSentence(cause: string | null): string | null {
       );
     case 'provider_error':
       return 'The provider refused the request. Nothing to do — it tries again on its own.';
+    case 'embed_unavailable':
+      // Deliberately says "indexing", not "importing". What failed is the step
+      // that makes text searchable, and the mail itself is not lost — the cursor
+      // holds, so the same items are re-offered the moment the indexer answers.
+      // Asks for nothing, for `fleet_auth_failed`'s reason: the service that
+      // could not be reached is ours.
+      return (
+        'The service that makes your text searchable could not be reached, so this check ' +
+        'stopped rather than file anything it could not index. Nothing was lost — it resumes ' +
+        'from where it stopped once indexing is back.'
+      );
     case 'parse_failed':
       return 'Something came back in a shape we could not read. That one is ours to fix.';
     case 'cancelled':

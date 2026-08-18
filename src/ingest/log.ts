@@ -63,6 +63,12 @@ export type RunOutcome = (typeof RUN_OUTCOMES)[number];
  * and the pin in `test/control/connector-health.test.ts` compares the sequence.
  * New codes go on the end.
  *
+ * `embed_unavailable` is the eighth and it is deliberately not `provider_error`:
+ * that one is a single item the provider refused, this one is the whole brain
+ * unable to index anything. The embed backlog spans every source, so one
+ * unanswerable gateway stops gmail, calendar and drive together — a shape three
+ * separate bad items would otherwise be indistinguishable from.
+ *
  * `fleet_auth_failed` is the seventh and it is deliberately not `auth_expired`:
  * that one is the *user's* grant and is terminal, this one is brainz's own
  * fleet-wide credential failing to mint and is retryable. See
@@ -76,6 +82,7 @@ export const INGEST_FAILURE_CODES = [
   'budget_exhausted',
   'cancelled',
   'fleet_auth_failed',
+  'embed_unavailable',
 ] as const;
 export type IngestFailureCode = (typeof INGEST_FAILURE_CODES)[number];
 

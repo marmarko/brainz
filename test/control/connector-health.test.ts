@@ -395,19 +395,31 @@ describe('a control plane built before a code existed learns it', () => {
   let old: ControlFixture;
   let oldSql: SQL;
 
-  /** `connector-health.sql`, rewound to the six-label vocabulary. */
-  function ddlBeforeFleetAuth(): string {
-    const rewound = SCHEMA_SQL.replace(/,\s*\n\s*'fleet_auth_failed'\n\)/, '\n)');
+  /**
+   * `connector-health.sql`, rewound to the vocabulary *before* the newest label.
+   *
+   * Keyed on the newest label rather than on `fleet_auth_failed`, which is what
+   * it used to name: that made the rewind silently stop rewinding the moment an
+   * eighth label was appended after it, and a rewind that matches nothing is
+   * caught below only because the throw was written. Any comment lines the DDL
+   * carries between the labels are consumed too, or the strip leaves a dangling
+   * `--` inside the enum body.
+   */
+  function ddlBeforeNewestCode(): string {
+    const rewound = SCHEMA_SQL.replace(
+      /,\s*\n(?:\s*--[^\n]*\n)*\s*'embed_unavailable'\n\)/,
+      '\n)',
+    );
     // The rewind must have done something, or this whole describe is asserting
     // that the current file equals itself.
-    if (rewound === SCHEMA_SQL) throw new Error('the six-label rewind matched nothing');
+    if (rewound === SCHEMA_SQL) throw new Error('the newest-label rewind matched nothing');
     return rewound;
   }
 
   beforeAll(async () => {
     old = await createControlPlane('connectorhealthold');
     oldSql = connect(old);
-    await oldSql.unsafe(ddlBeforeFleetAuth());
+    await oldSql.unsafe(ddlBeforeNewestCode());
     await seedTenant(oldSql, TENANT);
   }, 60_000);
 
@@ -421,8 +433,11 @@ describe('a control plane built before a code existed learns it', () => {
       SELECT enumlabel::text AS label FROM pg_enum
        WHERE enumtypid = 'control.connector_ingest_failure'::regtype
        ORDER BY enumsortorder`) as unknown as { label: string }[];
+    // Filtered on the same label the rewind strips, so the two cannot drift: the
+    // pair used to name `fleet_auth_failed` in both places and would have gone
+    // on asserting a rewind that no longer happened.
     expect(before.map((row) => row.label)).toEqual(
-      INGEST_FAILURE_CODES.filter((code) => code !== 'fleet_auth_failed'),
+      INGEST_FAILURE_CODES.filter((code) => code !== 'embed_unavailable'),
     );
 
     await ensureConnectorHealthSchema(oldSql);

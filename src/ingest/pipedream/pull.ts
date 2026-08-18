@@ -206,7 +206,14 @@ export type PullStopReason =
   /** The listing reported a different account than the one on record. */
   | 'identity_changed'
   /** Items the page offered that this pull never got to. The cursor holds. */
-  | 'not_attempted';
+  | 'not_attempted'
+  /**
+   * The embedding gateway could not be reached or refused, so nothing in this
+   * brain can be indexed — as distinct from `provider_error`, which is one item
+   * the provider would not give us. The backlog it drains has no source filter,
+   * so this stops every connector at once and the remedy is an operator's.
+   */
+  | 'embed_unavailable';
 
 /** Which ingest-log code a stop is, so a stopped run says *why* it stopped. */
 function stopCodeFor(reason: PullStopReason): IngestFailureCode {
@@ -218,6 +225,8 @@ function stopCodeFor(reason: PullStopReason): IngestFailureCode {
       return 'cancelled';
     case 'model_not_priced':
       return 'provider_error';
+    case 'embed_unavailable':
+      return 'embed_unavailable';
     default:
       return ingestCodeFor(reason);
   }
@@ -362,7 +371,12 @@ function ingestCodeFor(reason: PullFailureReason): IngestFailureCode {
 
 function writeCodeFor(reason: WriteFailureReason): IngestFailureCode {
   switch (reason) {
+    // Separated from `tenant_not_configured` deliberately: an item that could
+    // not be embedded and an item written against an unconfigured tenant are
+    // both `provider_error`-shaped to a reader, and only the first one means
+    // "the indexer is down for this whole brain".
     case 'embed_failed':
+      return 'embed_unavailable';
     case 'tenant_not_configured':
       return 'provider_error';
     default:
@@ -1044,7 +1058,12 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
       // (the backlog is a query over `embedding IS NULL`, not a promise this
       // process holds), so nothing is lost — but a run that closed `ok` over it
       // is a brain reporting itself indexed when it is not.
-      else if (backlog.failure !== undefined) incomplete ??= 'provider_error';
+      // Its own code, not `provider_error`. The backlog is a query over every
+      // chunk in the tenant regardless of source, so a gateway that cannot
+      // answer stops gmail, calendar and drive in the same tick — and the three
+      // rows an operator then reads are indistinguishable from three unrelated
+      // bad items unless the code says which happened.
+      else if (backlog.failure !== undefined) incomplete ??= 'embed_unavailable';
     }
 
     // ------------------------------------------------------------------
@@ -1273,6 +1292,10 @@ export function pullStopIsTerminal(reason: PullStopReason | 'unknown'): boolean 
     case 'budget_exhausted':
     case 'identity_changed':
     case 'not_attempted':
+    // Retryable on purpose: a gateway that cannot answer now is the one class
+    // here that routinely answers later, and dead-lettering the lane would turn
+    // a provider's bad hour into a connector the owner has to reconnect by hand.
+    case 'embed_unavailable':
     case 'unknown':
       return false;
   }
