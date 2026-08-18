@@ -241,7 +241,15 @@ ARG BUN_VERSION=1.3.14
 # are code inside the image, so warm instances of either keep the old behaviour.
 # Deterministic reload (`containers delete` then `deploy`) against the worker AND
 # web fleets.
-ARG FLEET_CONFIG_EPOCH=18
+# 18 -> 19: reverting the long-import yield budget. It sized every slice
+# against `processStartedAtMs + 5m - 1m`, captured once at boot and never
+# refreshed -- so a worker process older than four minutes had a yield point
+# permanently in the past, and the `attemptedItems > 0` floor capped every slice
+# at ONE item. Live consequence: zero net new pages after the deploy, against
+# pre-deploy runs of 397s writing 54. Its premise was also false: the container
+# is not stopped when the 5m window lapses -- a lane was claimed 28 minutes
+# after the cron.
+ARG FLEET_CONFIG_EPOCH=19
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
