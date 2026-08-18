@@ -229,6 +229,10 @@ export const MCP_FLEET_VARIABLES: readonly string[] = [
 export const WORKER_FLEET_VARIABLES: readonly string[] = [
   ...SHARED_FLEET_VARIABLES,
   'BRAINZ_WORKER_CONCURRENCY',
+  // The retention lane's switch. Absent reads as off in `purgeEnqueueEnabled`,
+  // which is the whole point: a hard-delete lane must not arrive switched on
+  // because a container was rebuilt.
+  'BRAINZ_PURGE_ENABLED',
   'BRAINZ_WORKER_TICK_MS',
   // `compose.ts:openConnectorClient` — the connector lane's vendor. Read the
   // paragraph above before deleting these four.

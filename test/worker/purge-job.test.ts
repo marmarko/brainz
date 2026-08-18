@@ -215,6 +215,10 @@ describe('a control plane created before this release can store the kind afterwa
 // Half two: something enqueues it.
 // ---------------------------------------------------------------------------
 
+// `enabled: true` on every call below, and deliberately not a default: the
+// production tick reads `BRAINZ_PURGE_ENABLED` and this lane hard-deletes, so
+// the off-by-default behaviour is pinned in `purge-gate.test.ts` rather than
+// left as the absence of an assertion here.
 describe('the tick enqueues a whole-brain purge for every ready tenant', () => {
   test('one job per ready tenant, and none for a tenant that is not', async () => {
     await seedTenant(controlSql, TENANT);
@@ -222,7 +226,7 @@ describe('the tick enqueues a whole-brain purge for every ready tenant', () => {
     await seedTenant(controlSql, 'purge-unprovisioned', { state: 'provisioning' });
 
     const queue = createJobQueue({ sql: controlSql });
-    const result = await enqueueDuePurges({ sql: controlSql, queue }, { now: NOW });
+    const result = await enqueueDuePurges({ sql: controlSql, queue }, { now: NOW, enabled: true });
 
     expect(result.enqueued.map((row) => row.tenantId).sort()).toEqual([TENANT, OTHER].sort());
     const rows = (await controlSql`
@@ -239,7 +243,7 @@ describe('the tick enqueues a whole-brain purge for every ready tenant', () => {
     await seedTenant(controlSql, TENANT);
     const queue = createJobQueue({ sql: controlSql });
 
-    const result = await enqueueDuePurges({ sql: controlSql, queue }, { now: NOW });
+    const result = await enqueueDuePurges({ sql: controlSql, queue }, { now: NOW, enabled: true });
 
     // A salt of its own would spread the fleet's load more evenly and double the
     // number of times a suspended tenant compute is woken, which is the wrong
@@ -253,8 +257,8 @@ describe('the tick enqueues a whole-brain purge for every ready tenant', () => {
     await seedTenant(controlSql, TENANT);
     const queue = createJobQueue({ sql: controlSql });
 
-    await enqueueDuePurges({ sql: controlSql, queue }, { now: NOW });
-    const again = await enqueueDuePurges({ sql: controlSql, queue }, { now: NOW });
+    await enqueueDuePurges({ sql: controlSql, queue }, { now: NOW, enabled: true });
+    const again = await enqueueDuePurges({ sql: controlSql, queue }, { now: NOW, enabled: true });
 
     // Not "refused once" — asked zero times. The queue's partial unique index is
     // the authority, but a tick that leaned on it would issue one INSERT per

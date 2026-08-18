@@ -142,11 +142,34 @@ export interface PurgeEnqueueResult {
 /** How many tenants one tick will give a purge slot to. */
 const DEFAULT_LIMIT = 500;
 
+/**
+ * **Off unless an operator turned it on, and that is not timidity.**
+ *
+ * This lane hard-deletes, and `restoreForgotten` — the undo the 72-hour window
+ * exists to protect — has **no production caller**: not a tool in `TOOL_NAMES`,
+ * not an op in `ADMIN_OPERATIONS`, nothing in the web app. So switching the
+ * enqueuer on does not start enforcing a promise the product already keeps; it
+ * converts `forget` from reversible-in-principle into irreversible-in-fact,
+ * for every tenant, on the next tick after a deploy.
+ *
+ * The machinery is finished and countable — `previewTombstonePurge` reports the
+ * closure without deleting a row — so the remaining decision is a product one
+ * about a restore surface, and it belongs to whoever owns the data rather than
+ * to whoever deployed last. When a restore path exists this default flips and
+ * this comment goes with it.
+ */
+export function purgeEnqueueEnabled(env: Record<string, string | undefined>): boolean {
+  return env['BRAINZ_PURGE_ENABLED'] === 'true';
+}
+
 export async function enqueueDuePurges(
   deps: PurgeEnqueueDeps,
-  options: { readonly now: Date; readonly limit?: number },
+  options: { readonly now: Date; readonly limit?: number; readonly enabled?: boolean },
 ): Promise<PurgeEnqueueResult> {
   const { now } = options;
+  // Absent reads as off, so a deployment that never heard of the flag does not
+  // start deleting because it was upgraded.
+  if (options.enabled !== true) return { due: 0, enqueued: [], refused: [] };
   const periodMs = deps.periodMs ?? ALPHA_CEILING_MS;
   const limit = options.limit ?? DEFAULT_LIMIT;
 

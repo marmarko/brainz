@@ -183,8 +183,17 @@ describe('history is captured, and it is more than one deep', () => {
     async () => {
       // The whole reason this table exists. The predecessors are tombstoned;
       // age them past the TTL and purge, and the history must still be there.
+      //
+      // **120, not 96, and the difference is a coin flip.** The purge's cutoff
+      // is `FORGET_TTL_HOURS + PURGE_GRACE_HOURS` = 96h, and `deleted_at <=
+      // cutoff` compares a `now()` Postgres computed against a `new Date()` the
+      // caller computed microseconds apart. Aged to exactly 96h this row lands
+      // on the boundary and the comparison goes whichever way the two clocks
+      // happened to fall — the test failed about two runs in three and passed
+      // the rest. What it means to assert is "unambiguously past the window",
+      // so it now says a number that stays past it if the grace band moves.
       await fixture.tenantSql`
-        UPDATE page SET deleted_at = now() - interval '96 hours'
+        UPDATE page SET deleted_at = now() - interval '120 hours'
          WHERE external_ref = ${REF} AND deleted_at IS NOT NULL
       `;
       const { purgeExpiredTombstones } = await import('../../../src/mcp/tombstone.ts');

@@ -59,7 +59,7 @@ import {
 } from '../ingest/pipedream/reconcile.ts';
 import { createConsolidateHandler } from './consolidate/cycle.ts';
 import { createExportHandler, enqueueDueExports } from './export.ts';
-import { createPurgeHandler, enqueueDuePurges } from './purge.ts';
+import { createPurgeHandler, enqueueDuePurges, purgeEnqueueEnabled } from './purge.ts';
 import { ensurePurgeJobKind } from '../control/job-kinds.ts';
 import { createSchemaSweepPorts } from '../control/schema-sweep.ts';
 import {
@@ -406,7 +406,7 @@ export async function startWorkerFleet(
     // both ride a wake the consolidation ceiling already pays for. Its own
     // enqueuer rather than a branch inside the export's, so a result type still
     // answers one question.
-    await enqueueDuePurges({ sql: controlSql, queue }, { now });
+    await enqueueDuePurges({ sql: controlSql, queue }, { now, enabled: purgeEnqueueEnabled(env) });
     // **Reconciliation, and it runs BEFORE the cadence pass rather than after.**
     // A connection adopted this tick is due immediately (`lastPullAt` is null,
     // so `nextPullAt` is the epoch), so reconciling first means a user who
