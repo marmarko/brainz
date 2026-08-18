@@ -678,6 +678,80 @@ describe('drive', () => {
     expect(outcome.page.failures[0]?.reason).toBe('provider_error');
     expect(outcome.page.failures[0]?.retryable).toBe(true);
   });
+
+  /**
+   * **A folder is not a document that failed to parse — it is not a document.**
+   *
+   * Measured against the founder's live Drive on 2026-08-17: page one of
+   * `/drive/v3/files` carried 4 folders among 26 entries. Every one of them
+   * reached `classifyMedia`, was refused for a content type that is not a
+   * content type, and became a `parse_failed` row in `ingest_log` — four bogus
+   * refusals per run, forever, against a Drive whose folder tree never changes.
+   *
+   * Two separate costs, so two separate guards below. The rows are the first:
+   * `items_failed` is the number the connector panel shows an operator, and a
+   * source that reports 18 failures when 14 files were genuinely refused is a
+   * diagnosis surface lying about its own subject. The second is the page
+   * budget — see the test after this one.
+   */
+  test('a folder is skipped, not recorded as a document that would not parse', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on(
+      '/changes?',
+      changeFor({
+        id: 'folder-1',
+        name: 'Board decks',
+        mimeType: 'application/vnd.google-apps.folder',
+        trashed: false,
+      }),
+    );
+
+    const outcome = await createDriveSource(client(transport)).list(delta);
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    // Not a failure, not an item, not an object: a folder has no content, and
+    // the adapter's job is to turn provider objects into pages.
+    expect(outcome.page.failures).toEqual([]);
+    expect(outcome.page.items).toEqual([]);
+    expect(outcome.page.media ?? []).toEqual([]);
+    // And it cost no request. A folder has no bytes to download and no export
+    // to ask for, so reaching the network for one is a call that can only fail.
+    expect(proxyTargets(transport).some((target) => target.includes('folder-1'))).toBe(false);
+  });
+
+  /**
+   * **The listing refuses folders at the provider, so they never cost a slice.**
+   *
+   * The changes feed takes no `q`, which is why the guard above exists at all;
+   * the backfill listing does, and a folder that arrives is a slot of
+   * `maxItems` spent on something that can never become a page. Live on
+   * 2026-08-17 the same account answered 4 folders + 22 files unfiltered and 26
+   * files with the clause below — 15% of a first import's page budget, on every
+   * page, for the life of the backfill.
+   */
+  test('the backfill listing asks the provider not to send folders at all', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/changes/startPageToken', { status: 200, body: { startPageToken: 'p-1' } });
+    transport.on('/drive/v3/files?', { status: 200, body: { files: [] } });
+
+    await createDriveSource(client(transport)).list({
+      ...CONNECTION,
+      mode: 'backfill',
+      cursor: null,
+      since: SINCE,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    const listing = proxyTargets(transport).find((target) => target.includes('/drive/v3/files?')) ?? '';
+    const q = new URL(listing).searchParams.get('q') ?? '';
+    expect(q).toContain('trashed = false');
+    // The window clause is still there: refusing folders must not cost the
+    // bound that keeps a first import inside the tenant's window.
+    expect(q).toContain(`modifiedTime > '${SINCE.toISOString()}'`);
+    expect(q).toContain("mimeType != 'application/vnd.google-apps.folder'");
+  });
 });
 
 /**

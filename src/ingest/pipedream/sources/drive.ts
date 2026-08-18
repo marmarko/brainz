@@ -56,6 +56,20 @@ import {
 const APP = 'google_drive' as const;
 const PAGE_SIZE = 100;
 
+/**
+ * **A folder is not a document that failed to parse — it is not a document.**
+ *
+ * Drive's listing and its change feed both carry folders, and every one of them
+ * used to reach `classifyMedia`, be refused for a content type that is not a
+ * content type, and land in `ingest_log` as `parse_failed`. Measured against a
+ * live account on 2026-08-17: 4 folders in the first 26 entries, so four bogus
+ * refusals per run against a folder tree that never changes — and
+ * `items_failed` is the number the connector panel shows an operator, so the
+ * surface a stalled connector is diagnosed from was reporting 18 refusals where
+ * 14 files had genuinely been refused.
+ */
+const GOOGLE_FOLDER = 'application/vnd.google-apps.folder';
+
 const GOOGLE_DOC = 'application/vnd.google-apps.document';
 const GOOGLE_SHEET = 'application/vnd.google-apps.spreadsheet';
 const GOOGLE_SLIDES = 'application/vnd.google-apps.presentation';
@@ -191,10 +205,16 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
     const items: PulledItem[] = [];
     const media: PulledMedia[] = [];
     const failures: PulledFailure[] = [];
+    // **Above the ceiling on purpose.** A slot spent on a folder is a slot no
+    // file gets, so the skip has to happen before the budget is counted rather
+    // than inside `fetchContent`. The listing refuses folders at the provider
+    // (see `backfill`); the changes feed takes no `q`, so this is the only
+    // guard that covers a folder created or renamed since the last pull.
+    const candidates = files.filter((file) => asString(file.mimeType) !== GOOGLE_FOLDER);
     const ceiling = Math.max(0, request.maxItems);
     // Beyond the ceiling is accounted for, not sliced away: a retryable row
     // holds the cursor, so the change is offered again rather than skipped.
-    for (const file of files.slice(ceiling)) {
+    for (const file of candidates.slice(ceiling)) {
       const id = asString(file.id);
       failures.push(
         id === null
@@ -202,7 +222,7 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
           : ceilingFailureFor(externalRefFor('drive', id)),
       );
     }
-    for (const file of files.slice(0, ceiling)) {
+    for (const file of candidates.slice(0, ceiling)) {
       const fetched = await fetchContent(request, file);
       if ('reason' in fetched) failures.push(fetched);
       else if ('bytes' in fetched) media.push(fetched);
@@ -308,7 +328,13 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
       query: {
         pageSize: Math.min(PAGE_SIZE, Math.max(1, request.maxItems)),
         fields: `nextPageToken,files(${FILE_FIELDS})`,
-        q: `trashed = false${request.since === null ? '' : ` and modifiedTime > '${request.since.toISOString()}'`}`,
+        // The folder clause is the provider's half of the guard in `collect`:
+        // asked for here, a folder never costs a slice of `maxItems` in the
+        // first place. Live, that is 4 of every 26 entries — 15% of a first
+        // import's page budget, on every page, for the life of the backfill.
+        q:
+          `trashed = false and mimeType != '${GOOGLE_FOLDER}'` +
+          `${request.since === null ? '' : ` and modifiedTime > '${request.since.toISOString()}'`}`,
         ...(resume.pageToken === null ? {} : { pageToken: resume.pageToken }),
       },
       externalUserId: request.externalUserId,
