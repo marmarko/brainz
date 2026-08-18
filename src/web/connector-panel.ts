@@ -80,7 +80,22 @@ import type { ConnectorLinkView } from '../control/connector-pg.ts';
  *    as the ladder ran. A user whose grant was revoked was told their connector
  *    was working, right up until it dead-lettered.
  *  * `connected` — a pull has completed.
- *  * `failing` — the lane was dead-lettered and has not succeeded since.
+ *  * `blocked` — the lane was dead-lettered **below** its attempt budget, which
+ *    only happens when a failure was classified terminal: the provider will not
+ *    accept our access, and no amount of retrying changes that. The user has to
+ *    do something.
+ *  * `failing` — the lane walked its whole ladder and gave up. Nothing is
+ *    required of the user except, if they want it back, one press.
+ *
+ * **`blocked` and `failing` used to be one state, and that was the panel's last
+ * remaining lie.** A revoked grant and a two-day provider outage both ended as
+ * `failing`, and the copy told both of them to disconnect and connect again —
+ * an instruction that is right for the first and a wasted re-authorization for
+ * the second. The two are told apart from `control.job` alone: a lane that
+ * stopped short of `max_attempts` was stopped on purpose (`src/worker/jobs.ts:
+ * jobRetryableOf`), and one that reached it ran out. No health record is needed
+ * for the distinction, which matters because the health record is the thing that
+ * may be missing.
  */
 export type ConnectorPanelState =
   | 'absent'
@@ -89,6 +104,7 @@ export type ConnectorPanelState =
   | 'checking'
   | 'retrying'
   | 'connected'
+  | 'blocked'
   | 'failing';
 
 export interface ConnectorStatus {
@@ -117,6 +133,25 @@ export interface ConnectorStatus {
   readonly cause: string | null;
   /** Items the last attempt could not import. Zero when nothing was lost. */
   readonly itemsFailed: number;
+  /**
+   * When the queue will try again, on a `retrying` lane. Null everywhere else.
+   *
+   * It is `run_at` on the open row and nothing computed: the panel does not know
+   * the backoff policy and must not restate it. The copy says *around*, because
+   * the worker fleet is woken by a cron every thirty minutes, so every delay the
+   * queue writes is rounded up to the next wake.
+   */
+  readonly nextAttemptAt: Date | null;
+  /**
+   * Attempts already spent and failed, and the budget they were spent from.
+   *
+   * Both zero when there is nothing to count. They exist so the copy can say
+   * *how long this has been going on* without the page inventing a duration:
+   * "the check failed four times" is a fact the queue holds, and "it has been
+   * failing for two days" is one it does not.
+   */
+  readonly attempts: number;
+  readonly maxAttempts: number;
 }
 
 /**
@@ -147,9 +182,25 @@ export interface PullHistory {
    * in-flight attempt from the spent ones, so the query discounts it there.
    */
   readonly openAttempts: number;
+  /** The open row's own budget, so the copy can say "of twelve" without guessing. */
+  readonly openMaxAttempts: number;
+  /** When the open row becomes claimable. The queue's `run_at`, unmodified. */
+  readonly openRunAt: Date | null;
   readonly lastDoneAt: Date | null;
   readonly deadAt: Date | null;
   readonly deadCode: string | null;
+  /**
+   * What the dead row had spent, and what it was allowed to spend.
+   *
+   * These two are how `blocked` is told from `failing` without a health record.
+   * A lane that died **below** its budget was stopped deliberately by
+   * `queue.fail`'s terminal branch; one that died **at** it ran out of ladder.
+   * Both zero when nothing here is dead, which reads as `failing` — the
+   * conservative direction, and the one an upgraded brain's older dead letters
+   * fall into.
+   */
+  readonly deadAttempts: number;
+  readonly deadMaxAttempts: number;
 }
 
 /**
@@ -181,13 +232,34 @@ export function statusFor(
   // would paint a red line on a source the user has removed, and the only way
   // to clear it would be to connect the source again.
   if (stillDead && link === 'connected') {
+    // **Which of the two deaths this was**, from the row's own counters. A lane
+    // stopped short of its budget was stopped on purpose — `queue.fail`'s
+    // terminal branch is the only thing that can do that — and the remedy is the
+    // user's. A lane that reached its budget spent every rung of its ladder, and
+    // the remedy is a button.
+    //
+    // **Both counters must be real before either is believed.** A dead row with
+    // `attempts = 0` is not a state the queue can produce — dying requires a
+    // failure, and a failure requires a claim, which increments — so a zero
+    // there means the row was written by something other than `fail` or
+    // `reclaim`, or read from a lane older than these columns. Either way it
+    // carries no evidence about which of the two deaths this was, and the
+    // no-evidence answer is `failing`: it is the reading that offers the user a
+    // control rather than an instruction, and the control works on any dead lane.
+    const stoppedEarly =
+      history.deadAttempts > 0 &&
+      history.deadMaxAttempts > 0 &&
+      history.deadAttempts < history.deadMaxAttempts;
     return {
       source,
-      state: 'failing',
+      state: stoppedEarly ? 'blocked' : 'failing',
       lastCheckedAt: history.deadAt,
       failureCode: history.deadCode,
       cause,
       itemsFailed,
+      nextAttemptAt: null,
+      attempts: history.deadAttempts,
+      maxAttempts: history.deadMaxAttempts,
     };
   }
 
@@ -204,6 +276,9 @@ export function statusFor(
       failureCode: null,
       cause: null,
       itemsFailed: 0,
+      nextAttemptAt: null,
+      attempts: 0,
+      maxAttempts: 0,
     };
   }
 
@@ -221,6 +296,13 @@ export function statusFor(
       // been fine would be exactly the red line the header forbids.
       cause: retrying ? cause : null,
       itemsFailed: retrying ? itemsFailed : 0,
+      // Only on the retrying reading, for the same reason the cause is: a first
+      // check that has not run yet is not waiting out a backoff, and telling a
+      // user it will "try again around 09:30" about a check that has never
+      // failed is the `retrying`-for-`checking` confusion in a second place.
+      nextAttemptAt: retrying ? history.openRunAt : null,
+      attempts: history.openAttempts,
+      maxAttempts: history.openMaxAttempts,
     };
   }
   if (history !== undefined && history.lastDoneAt !== null) {
@@ -235,6 +317,9 @@ export function statusFor(
       // short rather than empty.
       cause,
       itemsFailed,
+      nextAttemptAt: null,
+      attempts: 0,
+      maxAttempts: 0,
     };
   }
   // Attached, and the first check has not run. Not a gap to be papered over: the
@@ -247,6 +332,9 @@ export function statusFor(
     failureCode: null,
     cause: null,
     itemsFailed: 0,
+    nextAttemptAt: null,
+    attempts: 0,
+    maxAttempts: 0,
   };
 }
 
@@ -272,9 +360,13 @@ export async function connectorStatuses(
       target: string;
       open: number;
       open_attempts: number;
+      open_max_attempts: number;
+      open_run_at: Date | null;
       last_done_at: Date | null;
       dead_at: Date | null;
       dead_code: string | null;
+      dead_attempts: number;
+      dead_max_attempts: number;
     }[]
   >`
     SELECT target::text                                                    AS target,
@@ -286,10 +378,24 @@ export async function connectorStatuses(
            coalesce(max(
              CASE WHEN state = 'running' THEN greatest(attempts - 1, 0) ELSE attempts END
            ) FILTER (WHERE state IN ('due', 'running')), 0)::int           AS open_attempts,
+           coalesce(max(max_attempts)
+             FILTER (WHERE state IN ('due', 'running')), 0)::int           AS open_max_attempts,
+           -- When the queue will claim it next. Only from a due row: a running
+           -- one is being worked on now and its run_at is when THIS attempt
+           -- started, which rendered as a next attempt would be a time in the
+           -- past.
+           min(run_at) FILTER (WHERE state = 'due')                        AS open_run_at,
            max(finished_at) FILTER (WHERE state = 'done')                  AS last_done_at,
            max(dead_lettered_at) FILTER (WHERE state = 'dead')             AS dead_at,
            (array_agg(failure_code::text ORDER BY dead_lettered_at DESC)
-              FILTER (WHERE state = 'dead'))[1]                            AS dead_code
+              FILTER (WHERE state = 'dead'))[1]                            AS dead_code,
+           -- The dead row's own counters, ordered the same way dead_code is, so
+           -- all three describe the SAME row. They are what tells a lane that
+           -- was stopped on purpose from one that ran out of ladder.
+           coalesce((array_agg(attempts ORDER BY dead_lettered_at DESC)
+              FILTER (WHERE state = 'dead'))[1], 0)::int                   AS dead_attempts,
+           coalesce((array_agg(max_attempts ORDER BY dead_lettered_at DESC)
+              FILTER (WHERE state = 'dead'))[1], 0)::int                   AS dead_max_attempts
       FROM control.job
      WHERE tenant_id = ${request.tenantId}
        AND kind = 'ingest_pull'
@@ -307,9 +413,13 @@ export async function connectorStatuses(
       target: row.target,
       open: row.open,
       openAttempts: row.open_attempts,
+      openMaxAttempts: row.open_max_attempts,
+      openRunAt: row.open_run_at,
       lastDoneAt: row.last_done_at,
       deadAt: row.dead_at,
       deadCode: row.dead_code,
+      deadAttempts: row.dead_attempts,
+      deadMaxAttempts: row.dead_max_attempts,
     });
   }
   return request.sources.map((source) =>

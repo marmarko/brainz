@@ -26,9 +26,10 @@ import type { SQL } from 'bun';
 
 import {
   backoffMs,
-  DEFAULT_BACKOFF,
+  DEFAULT_MAX_ATTEMPTS,
   isLegalTarget,
   JOB_KINDS,
+  retryPolicyFor,
   type BackoffConfig,
   type ClaimRequest,
   type ClearDeadLetterOutcome,
@@ -47,11 +48,18 @@ import {
   type JobTarget,
   type JobTrigger,
   type ReclaimRequest,
+  type ReviveLaneOutcome,
+  type ReviveLaneRequest,
 } from './jobs.ts';
 import { attemptDeadlineAt, leaseExpiryAt, type ConnectionBound } from './locks.ts';
 
-/** Default retry ladder length. Five attempts, then the dead letter. */
-export const DEFAULT_MAX_ATTEMPTS = 5;
+/**
+ * Re-exported from where the policy now lives (`jobs.ts`), so the ladder length
+ * and the ladder's shape are one record rather than a number here and a config
+ * there. Kept exported under this name because it is the queue's own default and
+ * callers know it as that.
+ */
+export { DEFAULT_MAX_ATTEMPTS };
 
 /** How many wedged leases one reclaim sweep takes. */
 export const DEFAULT_RECLAIM_LIMIT = 100;
@@ -112,7 +120,18 @@ export interface JobQueueOptions {
   readonly sql: SQL;
   /** Injectable so a test can name the rows it asserts on. */
   readonly newJobId?: () => string;
+  /**
+   * Replaces the ladder for **every** kind. A test knob: production reads
+   * `RETRY_POLICY` per kind, and a deployment-wide override would be exactly the
+   * one-number policy that `RETRY_POLICY` exists to end.
+   */
   readonly backoff?: BackoffConfig;
+  /**
+   * Pins the jitter without replacing the ladder, so a test can assert the
+   * connector policy's own rungs as exact numbers. Wins over
+   * `backoff.random` when both are given.
+   */
+  readonly random?: () => number;
 }
 
 export type PostgresJobQueue = JobQueue & ConnectionBound;
@@ -120,7 +139,17 @@ export type PostgresJobQueue = JobQueue & ConnectionBound;
 export function createJobQueue(options: JobQueueOptions): PostgresJobQueue {
   const { sql } = options;
   const newJobId = options.newJobId ?? (() => crypto.randomUUID());
-  const backoff: BackoffConfig = options.backoff ?? DEFAULT_BACKOFF;
+
+  /**
+   * The ladder this kind walks. Resolved per call rather than captured once,
+   * because `fail` and `reclaim` see one kind at a time and a queue that closed
+   * over a single config is the global policy wearing a record's clothes.
+   */
+  function backoffFor(kind: JobKind): BackoffConfig {
+    const ladder: BackoffConfig = options.backoff ?? retryPolicyFor(kind).backoff;
+    const random = options.random ?? ladder.random;
+    return random === undefined ? ladder : { ...ladder, random };
+  }
 
   /**
    * Why an insert that returned nothing returned nothing. Read *after* the
@@ -169,7 +198,10 @@ export function createJobQueue(options: JobQueueOptions): PostgresJobQueue {
 
       const jobId = request.jobId ?? newJobId();
       const runAt = request.runAt ?? request.now;
-      const maxAttempts = request.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+      // The kind's own budget, not one number for the fleet. A caller may still
+      // name its own — the cadence never does; a test that is about something
+      // else does — but the default is the policy `RETRY_POLICY` states.
+      const maxAttempts = request.maxAttempts ?? retryPolicyFor(request.kind).maxAttempts;
 
       // One statement carries three refusals:
       //
@@ -329,7 +361,15 @@ export function createJobQueue(options: JobQueueOptions): PostgresJobQueue {
     },
 
     async fail(lease: JobLease, request: FailRequest): Promise<FencedOutcome> {
-      const retryAt = new Date(request.now.getTime() + backoffMs(lease.attempts, backoff));
+      const retryAt = new Date(
+        request.now.getTime() + backoffMs(lease.attempts, backoffFor(lease.kind)),
+      );
+      // Terminal is the caller's reading of *this* failure — "the permission was
+      // withdrawn" is not a fact the row carries — so it arrives as a parameter.
+      // What it is not allowed to be is a second write path: it ORs into the
+      // same CASE the exhaustion test uses, so there is exactly one statement
+      // that can move a job to `dead` and one place that sets `dead_lettered_at`.
+      const terminal = request.terminal === true;
 
       // The dead-letter decision is made by the statement, from the row's own
       // `attempts`, rather than from the lease the caller is holding. A worker
@@ -337,10 +377,10 @@ export function createJobQueue(options: JobQueueOptions): PostgresJobQueue {
       // ladder computed from a stale count is a ladder with no top.
       const failed = rowsOf(await sql`
         UPDATE control.job
-        SET state = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'due' END::control.job_state,
-            run_at = CASE WHEN attempts >= max_attempts THEN run_at ELSE ${retryAt} END,
+        SET state = CASE WHEN ${terminal} OR attempts >= max_attempts THEN 'dead' ELSE 'due' END::control.job_state,
+            run_at = CASE WHEN ${terminal} OR attempts >= max_attempts THEN run_at ELSE ${retryAt} END,
             failure_code = ${request.code}::control.job_failure,
-            dead_lettered_at = CASE WHEN attempts >= max_attempts THEN ${request.now}::timestamptz ELSE NULL END,
+            dead_lettered_at = CASE WHEN ${terminal} OR attempts >= max_attempts THEN ${request.now}::timestamptz ELSE NULL END,
             lease_owner = NULL,
             lease_expires_at = NULL,
             attempt_deadline_at = NULL,
@@ -372,8 +412,13 @@ export function createJobQueue(options: JobQueueOptions): PostgresJobQueue {
         // was observed holding. Both halves matter: the lock stops two reapers
         // fighting, and the CAS stops a reaper stealing a lease that was renewed
         // between the select and the update.
+        // `kind` is selected because the ladder is per kind: a reaped
+        // `ingest_pull` and a reaped `consolidate` must come back at their own
+        // policy's next rung, and a sweep that computed one backoff for both
+        // would quietly return the connector lane to the 30-second ladder every
+        // time a worker died mid-poll.
         const candidates = rowsOf(await tx`
-          SELECT job_id, lease_token, attempts, max_attempts, attempt_deadline_at
+          SELECT job_id, kind, lease_token, attempts, max_attempts, attempt_deadline_at
           FROM control.job
           WHERE state = 'running'
             AND (lease_expires_at <= ${stealBefore} OR attempt_deadline_at <= ${request.now})
@@ -389,7 +434,10 @@ export function createJobQueue(options: JobQueueOptions): PostgresJobQueue {
             candidate.attempt_deadline_at.getTime() <= request.now.getTime();
           const code: JobFailureCode = overran ? 'attempt_timed_out' : 'lease_stolen';
           const exhausted = candidate.attempts >= candidate.max_attempts;
-          const retryAt = new Date(request.now.getTime() + backoffMs(candidate.attempts, backoff));
+          const retryAt = new Date(
+            request.now.getTime() +
+              backoffMs(candidate.attempts, backoffFor(candidate.kind as JobKind)),
+          );
 
           // The steal increments the token. That single increment is what turns
           // "the old worker should stop" into "the old worker cannot write".
@@ -473,7 +521,96 @@ export function createJobQueue(options: JobQueueOptions): PostgresJobQueue {
         throw error;
       }
     },
+
+    reviveLane(request: ReviveLaneRequest): Promise<ReviveLaneOutcome> {
+      return reviveDeadLane(sql, request);
+    },
   };
+}
+
+/**
+ * Put a lane's dead letter back into service, keyed on the lane.
+ *
+ * **Standalone, and taking a connection rather than a queue**, which is the
+ * shape `createLeaseChannel` already uses one function down and for a related
+ * reason: the two callers that need this are not the worker fleet. The web app
+ * holds `controlSql` and reads `control.job` directly (that is how the connector
+ * panel is rendered); the operator surface holds the same handle. Making them
+ * compose a `JobQueue` — with a lease channel, a backoff config and a job-id
+ * minter — to move one row would be a queue built to be used once.
+ * `createJobQueue` delegates to this, so there is one statement and not two.
+ *
+ * ============================================================================
+ * WHY IT REVIVES RATHER THAN DISCARDS
+ * ============================================================================
+ *
+ * The neighbouring recovery (`src/control/connector-lanes.ts`) *discards* the
+ * row and lets the cadence enqueue a fresh one, and its argument — a row put
+ * back into circulation carrying a `lease_token` some straggler may still
+ * believe it holds is a fence that has stopped fencing — is right for a
+ * disconnect. It is not the shape this one wants, for two reasons:
+ *
+ *   * **The fence is `state = 'running'`, not the token alone.** Every worker
+ *     write (`complete`, `fail`, `heartbeat`, `reclaim`) carries that predicate
+ *     as well as the token, and a revived row is `due`. A straggler holding the
+ *     old token therefore cannot write to it before some worker claims it — and
+ *     the claim increments the token, so it cannot write after either.
+ *   * **A discard is invisible to the person who pressed the button.** It leaves
+ *     nothing in the queue, so the panel reads *connected* and the user waits
+ *     for the connector's own cadence to come round before anything is even
+ *     queued. A revived row is `due` immediately, which is what *try this again*
+ *     means and what the panel then honestly reports.
+ *
+ * ============================================================================
+ * THE ROW IT WILL NOT TOUCH
+ * ============================================================================
+ *
+ * `AND state = 'dead'` is the whole of the safety. Keyed on the lane, the
+ * tempting statement is "set this lane back to attempt zero" — which, run
+ * against a **healthy** lane on attempt three of its ladder, hands a connector
+ * that is currently failing an unlimited retry budget and moves its next attempt
+ * to now. It is the same class as the reset that `clearDeadLetter` guards
+ * against, and it is the case `test/worker/retry-policy.test.ts` builds
+ * deliberately.
+ *
+ * `enqueue`'s quarantine clause keeps at most one dead row per lane, so the
+ * `UPDATE` matches one row. If that invariant were ever broken, the partial
+ * unique index refuses the second and the whole statement rolls back rather than
+ * opening two jobs for one lane.
+ */
+export async function reviveDeadLane(
+  sql: SQL,
+  request: ReviveLaneRequest,
+): Promise<ReviveLaneOutcome> {
+  try {
+    const revived = rowsOf(await sql`
+      UPDATE control.job
+      SET state = 'due',
+          attempts = 0,
+          run_at = ${request.now},
+          -- Why the job is here is recorded rather than inferred, and somebody
+          -- pressing a button is not the cadence coming round.
+          trigger_reason = 'user_request'::control.job_trigger,
+          dead_lettered_at = NULL,
+          failure_code = NULL,
+          finished_at = NULL,
+          lease_owner = NULL,
+          lease_expires_at = NULL,
+          attempt_deadline_at = NULL,
+          updated_at = ${request.now}
+      WHERE tenant_id = ${request.tenantId}
+        AND kind = ${request.kind}::control.job_kind
+        AND target = ${request.target}::control.job_target
+        AND state = 'dead'
+      RETURNING *
+    `);
+    const row = revived[0];
+    if (row === undefined) return { revived: false, reason: 'no_dead_lane' };
+    return { revived: true, job: toJobRecord(row) };
+  } catch (error) {
+    if (uniqueViolation(error)) return { revived: false, reason: 'already_open' };
+    throw error;
+  }
 }
 
 /** SQLSTATE 23505. Bun surfaces the code on `errno`; the message is prose. */

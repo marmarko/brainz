@@ -302,26 +302,71 @@ function lossSentence(status: ConnectorStatus): string {
 }
 
 /**
+ * How far along the ladder this lane is, when the queue can say.
+ *
+ * Silent when either number is missing — a lane polled by a fleet older than the
+ * per-kind policy has no budget recorded, and "0 of 0 attempts" is worse than
+ * nothing.
+ */
+function ladderSentence(status: ConnectorStatus): string {
+  if (status.attempts <= 0 || status.maxAttempts <= 0) return '';
+  return (
+    ` That is ${status.attempts} failed attempt${status.attempts === 1 ? '' : 's'} out of ` +
+    `${status.maxAttempts} before it stops trying.`
+  );
+}
+
+/**
  * What one source's status says, in a sentence rather than a struct.
  *
  * The states come from `connector-panel.ts`, whose header carries the reason
  * each is the most this app can honestly claim. The copy's job is to not
  * over-claim them: `unknown` is *as far as this brain can tell*, because
  * attached-but-never-polled and never-attached are the same rows.
+ *
+ * **Three of these sentences answer the same question and must not blur into
+ * each other.** A user whose connector is not working needs to know which world
+ * they are in — it retries on its own and roughly when (`retrying`), it needs
+ * them to reconnect (`blocked`), or it gave up and there is a button
+ * (`failing`) — because the three have different answers and only one of them
+ * costs the user anything. The previous copy had one sentence for the last two
+ * and ended it with *"disconnecting and connecting again restarts the polling"*,
+ * which was the right instruction for a revoked grant, a wasted
+ * re-authorization for an outage, and — while a dead lane could not be cleared
+ * at all — untrue for both.
  */
 function connectorStatusSentence(status: ConnectorStatus): string {
   const cause = causeSentence(status.cause);
   switch (status.state) {
     case 'failing':
+      // It spent its whole ladder. Nothing is required of the user, so nothing
+      // is asked of them beyond the one press that costs them nothing.
       return (
-        `<p class="failing">Connected, and <strong>no longer being polled</strong>. The last check ` +
-        `failed${status.lastCheckedAt === null ? '' : ` at ${moment(status.lastCheckedAt)}`} and it ` +
-        `stopped retrying.` +
-        // The cause first, because it decides whether the instruction that used
-        // to be unconditional here — reconnect — is the right one at all.
+        `<p class="failing">Connected, and <strong>no longer being polled</strong>. The check kept ` +
+        `failing and gave up${status.lastCheckedAt === null ? '' : `, most recently at ${moment(status.lastCheckedAt)}`}.` +
+        `${ladderSentence(status)}` +
+        // The cause first, because it decides whether the instruction after it
+        // is the right one at all.
         `${cause === null ? ' Nothing recorded why.' : ` ${cause}`}` +
         `${lossSentence(status)}` +
-        `${status.cause === 'auth_expired' ? '' : ' If it stays like this, disconnecting and connecting again restarts the polling.'}` +
+        ` <strong>Use the button below to try it again.</strong> That starts the checks from ` +
+        `scratch and does not cost you a reconnection.` +
+        `</p>`
+      );
+    case 'blocked':
+      // It stopped early and deliberately: the provider refused us in a way no
+      // amount of asking again resolves. Deliberately NOT offered the retry
+      // button — pressing it would fail in the same place, in seconds.
+      return (
+        `<p class="failing">Connected at your provider, but <strong>we can no longer read it</strong>. ` +
+        `The checks have stopped${status.lastCheckedAt === null ? '' : ` — the last one was at ${moment(status.lastCheckedAt)}`}, ` +
+        `rather than retrying for days against an answer that will not change.` +
+        `${cause === null ? '' : ` ${cause}`}` +
+        `${lossSentence(status)}` +
+        // Only when the cause has not already given the instruction. The
+        // `auth_expired` sentence says exactly this, and saying it twice reads
+        // as a page that does not know what it is telling you.
+        `${status.cause === 'auth_expired' ? '' : ' Disconnect this source and connect it again to start the checks.'}` +
         `</p>`
       );
     case 'retrying':
@@ -329,9 +374,15 @@ function connectorStatusSentence(status: ConnectorStatus): string {
       // queued and running exactly like a healthy one, and telling a user whose
       // grant was revoked that a check is running now is how they find out four
       // failures later, from an error they cannot act on.
+      //
+      // **"around", never "at".** The fleet is woken by a cron every thirty
+      // minutes, so the queue's `run_at` is the earliest a retry can happen and
+      // not the moment it will. A time stated to the second would be wrong most
+      // of the time in the one direction a user notices.
       return (
         `<p class="failing">Connected, and the last check <strong>did not work</strong>. It is ` +
-        `trying again automatically.` +
+        `trying again on its own${status.nextAttemptAt === null ? '' : ` — the next attempt is due around ${moment(status.nextAttemptAt)}`}.` +
+        `${ladderSentence(status)}` +
         `${cause === null ? '' : ` ${cause}`}` +
         `${lossSentence(status)}` +
         `${status.lastCheckedAt === null ? '' : ` The last check that finished was ${moment(status.lastCheckedAt)}.`}` +
@@ -373,23 +424,39 @@ function connectorStatusSentence(status: ConnectorStatus): string {
 }
 
 /**
- * One source: what it is, what is known about it, and the two things that can
- * be done to it.
+ * One source: what it is, what is known about it, and the things that can be
+ * done to it.
  *
- * **One form, two named submits, no script.** The app's policy has no
- * `script-src`, so the control cannot be a `fetch` and cannot be a button that
- * "does" anything: it is a form, and which button was pressed arrives as
- * `intent` because a browser sends the name and value of the submit that fired
- * and of no other. A form submitted by the Enter key sends neither, which is
- * why `app.ts` reads an absent intent as `connect` — the non-destructive half.
+ * **One form, named submits, no script.** The app's policy has no `script-src`,
+ * so the control cannot be a `fetch` and cannot be a button that "does"
+ * anything: it is a form, and which button was pressed arrives as `intent`
+ * because a browser sends the name and value of the submit that fired and of no
+ * other. A form submitted by the Enter key sends neither, which is why `app.ts`
+ * reads an absent intent as `connect` — the non-destructive half.
+ *
+ * **The retry control is a submit on that same form, and it could not be a
+ * link.** A `GET /api/connectors?intent=retry` would be fired by every
+ * link-prefetching browser, every crawler that follows an `href`, and every
+ * chat client that unfurls a pasted dashboard URL — each of them silently
+ * re-opening a lane the fleet had deliberately closed. It writes, so it is a
+ * POST.
+ *
+ * **It is offered only on `failing`.** A `blocked` lane died because the
+ * provider refuses us; a retry there would fail again within seconds of being
+ * pressed, and a button that visibly does nothing is worse than no button. That
+ * copy asks for a reconnection instead, which is the thing that actually works.
  */
 function connectorRow(status: ConnectorStatus): string {
   const source = escapeHtml(status.source);
+  const retry =
+    status.state === 'failing'
+      ? `\n    <button type="submit" name="intent" value="retry">Try ${source} again</button>`
+      : '';
   return `<li>
   <p class="source-name">${source}</p>
   ${connectorStatusSentence(status)}
   <form method="post" action="${CONNECTORS_PATH}">
-    <input type="hidden" name="source" value="${source}">
+    <input type="hidden" name="source" value="${source}">${retry}
     <button type="submit" name="intent" value="connect">Connect ${source}</button>
     <button type="submit" name="intent" value="disconnect">Disconnect ${source}</button>
   </form>

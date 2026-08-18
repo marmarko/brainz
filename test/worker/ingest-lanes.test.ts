@@ -474,11 +474,16 @@ describe('a failed poll is diagnosable', () => {
       // assertion that stops the rest of the case passing vacuously.
       expect(unrecorded).toEqual([]);
 
-      // 1. The job row. Still `handler_error`, and still the runner's own
-      //    vocabulary — from the queue's side a handler threw, which is true.
-      //    What changed is that this is no longer the only thing recorded.
+      // 1. The job row. `handler_error` is still the runner's own vocabulary —
+      //    from the queue's side a handler threw, which is true — but the lane
+      //    is **dead on attempt one of twelve**, and that is the whole ruling:
+      //    a withdrawn permission is not a thing that comes back if you ask it
+      //    eleven more times over two days. Every rung spent on it is a provider
+      //    call and a tenant-database wake spent re-confirming an answer, while
+      //    the one person who could fix it in thirty seconds is told the
+      //    connector is retrying.
       const job = await jobState();
-      expect(job).toMatchObject({ state: 'due', attempts: 1, failure: 'handler_error' });
+      expect(job).toMatchObject({ state: 'dead', attempts: 1, failure: 'handler_error' });
 
       // 2. The health record: the cause, in the ingest log's vocabulary, in the
       //    control plane — reachable without a tenant connection and without a
@@ -491,18 +496,29 @@ describe('a failed poll is diagnosable', () => {
         lastSuccessAt: null,
       });
 
-      // 3. The panel. `retrying`, not `checking`: the lane is queued because the
-      //    last attempt failed, and before this it was rendered as a healthy
-      //    check in progress for the whole length of the retry ladder.
+      // 3. The panel. `blocked`, which is the state that says *this one needs
+      //    you*: the lane died below its budget, and only a deliberate terminal
+      //    stop can do that. Not `retrying` — nothing is being retried — and
+      //    not `failing`, which is the lane that spent its whole ladder and
+      //    wants a button rather than a person.
       const [status] = await statuses();
-      expect(status).toMatchObject({ state: 'retrying', cause: 'auth_expired' });
+      expect(status).toMatchObject({
+        state: 'blocked',
+        cause: 'auth_expired',
+        attempts: 1,
+        maxAttempts: 12,
+      });
 
       // 4. The sentence. The cause has to survive being turned into copy, and
       //    the copy has to name the one action that fixes THIS cause.
       const page = dashboard([status as ConnectorStatus]);
-      expect(page).toContain('did not work');
+      expect(page).toContain('we can no longer read it');
       expect(page).toContain('The provider stopped accepting our access');
       expect(page).toContain('Disconnecting and connecting again is the fix');
+      // And it must NOT offer the retry control: pressing it would put the lane
+      // straight back to `dead` on the next wake, which is a button that
+      // visibly does nothing.
+      expect(page).not.toContain('value="retry"');
 
       // 5. The operator, over `/admin`, with no tenant handle anywhere in it.
       const answer = await adminDispatch(
@@ -515,8 +531,52 @@ describe('a failed poll is diagnosable', () => {
         { source: 'gmail', ingest_failure_code: 'auth_expired', cause: 'auth_expired' },
       ]);
       expect(content['lanes']).toMatchObject([
-        { source: 'gmail', state: 'due', attempts: 1, job_failure_code: 'handler_error' },
+        { source: 'gmail', state: 'dead', attempts: 1, job_failure_code: 'handler_error' },
       ]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a provider that is merely down keeps the lane, and the panel says when it tries next',
+    async () => {
+      // The other side of the ruling, and the one the incident was about. The
+      // *same* handler, the *same* runner, one different refusal — and the lane
+      // survives with a rung of the connector ladder in front of it rather than
+      // a dead letter behind it.
+      await enqueueClaimable('ingest_pull', 'gmail');
+
+      await runnerWith({
+        ingest_pull: createIngestPullHandler({
+          control: controlSql,
+          profile: HOSTED_PROFILE,
+          health: health(),
+          openTenant,
+          openSource: connectorSourceOpener(runtimeRefusing('provider_error')),
+        }),
+      }).runOnce({ now: NOW });
+      expect(unrecorded).toEqual([]);
+
+      const job = await jobState();
+      expect(job).toMatchObject({ state: 'due', attempts: 1 });
+
+      // The rung itself, asserted as a floor rather than as a number: fifteen
+      // minutes is the shortest thing equal jitter can produce off a
+      // thirty-minute base, and the whole point is that it is not the thirty
+      // *seconds* that burned this lane's ancestor in four minutes.
+      const scheduled = (await controlSql`
+        SELECT run_at FROM control.job WHERE kind = 'ingest_pull'`) as Array<{ run_at: Date }>;
+      const runAt = scheduled[0]?.run_at as Date;
+      expect(runAt.getTime() - NOW.getTime()).toBeGreaterThanOrEqual(15 * 60_000);
+
+      const [status] = await statuses();
+      expect(status).toMatchObject({ state: 'retrying', cause: 'provider_error' });
+      expect(status?.nextAttemptAt?.getTime()).toBe(runAt.getTime());
+
+      const page = dashboard([status as ConnectorStatus]);
+      expect(page).toContain('trying again on its own');
+      expect(page).toContain('the next attempt is due around');
+      expect(page).toContain('out of 12 before it stops trying');
     },
     TEST_TIMEOUT_MS,
   );

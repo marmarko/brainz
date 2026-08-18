@@ -22,6 +22,7 @@
 
 import {
   jobFailureCodeOf,
+  jobRetryableOf,
   type CompleteRequest,
   type JobKind,
   type JobLease,
@@ -191,9 +192,18 @@ export function createJobRunner(deps: RunnerDeps): JobRunner {
         // the container can read. `jobFailureCodeOf` refuses anything outside
         // the enum, so a handler cannot widen the vocabulary or smuggle text
         // into it.
+        //
+        // **The second reading is whether asking again could help.** A ladder
+        // long enough to outlive a provider outage — which is what
+        // `ingest_pull` now has — is also long enough to spend two days asking
+        // a provider that already said the permission was withdrawn. So a
+        // handler may declare its failure terminal, `jobRetryableOf` refuses
+        // anything but a literal `false`, and an aborted lease overrules it:
+        // our own interruption must never be the thing that kills a lane.
         const outcome = await deps.queue.fail(lease, {
           now: clock(),
           code: jobFailureCodeOf(error, controller.signal.aborted),
+          terminal: !jobRetryableOf(error, controller.signal.aborted),
         });
         return outcome.applied ? 'failed' : 'superseded';
       } catch (storeError) {

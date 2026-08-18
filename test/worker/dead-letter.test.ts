@@ -23,6 +23,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import type { SQL } from 'bun';
 
+import { retryPolicyFor } from '../../src/worker/jobs.ts';
 import { createJobQueue, type PostgresJobQueue } from '../../src/worker/queue.ts';
 import { connect, countJobs, createControlPlane, dropControlPlane, seedTenant, type ControlFixture } from './fixture.ts';
 
@@ -214,7 +215,11 @@ describe('a poison job exhausts its ladder and is quarantined', () => {
     // or one bad connector silently ends all ingestion for that user.
     await queue.enqueue({ tenantId: TENANT, kind: 'ingest_pull', target: 'gmail', trigger: 'connector_cadence', now: T0 });
     let at = T0;
-    for (let attempt = 1; attempt <= 5; attempt++) {
+    // The lane's own budget rather than the literal five: `RETRY_POLICY` gives
+    // `ingest_pull` a longer ladder than the other kinds, and a loop that
+    // hard-coded the old number would leave the lane alive and assert the
+    // quarantine of a job that had not been quarantined.
+    for (let attempt = 1; attempt <= retryPolicyFor('ingest_pull').maxAttempts; attempt++) {
       const lease = await queue.claim({
         owner: `w${attempt}`,
         now: at,

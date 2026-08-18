@@ -413,6 +413,9 @@ export function connectorGateQueue(
     reclaim: (request) => queue.reclaim(request),
     listDeadLetters: (request) => queue.listDeadLetters(request),
     clearDeadLetter: (jobId, request) => queue.clearDeadLetter(jobId, request),
+    // Delegated unchanged, deliberately: the gate rewrites where a *new* job
+    // goes, and a revive names a lane that already exists.
+    reviveLane: (request) => queue.reviveLane(request),
   };
 }
 
@@ -1268,6 +1271,13 @@ export class IngestPullFailure extends Error {
   readonly stopReason: PullStopReason | 'unknown';
   /** The ingest-log code the run recorded for itself. */
   readonly failureCode: IngestFailureCode;
+  /**
+   * `false` when the ladder should stop here. Read by
+   * `src/worker/jobs.ts:jobRetryableOf` — the same duck-typed channel
+   * `jobFailureCode` rides, for the same reason: a handler signals by throwing
+   * and there is no return path.
+   */
+  readonly jobRetryable: boolean;
 
   constructor(source: ConnectorSource, stopReason: PullStopReason | undefined) {
     const reason = stopReason ?? 'unknown';
@@ -1276,6 +1286,76 @@ export class IngestPullFailure extends Error {
     this.source = source;
     this.stopReason = reason;
     this.failureCode = stopReason === undefined ? 'provider_error' : stopCodeFor(stopReason);
+    this.jobRetryable = !pullStopIsTerminal(reason);
+  }
+}
+
+/**
+ * Would walking the whole ladder help, or is this the provider telling us to
+ * stop and go ask the user for something?
+ *
+ * ============================================================================
+ * THE RULING, REASON BY REASON
+ * ============================================================================
+ *
+ * **`auth_expired` is the only terminal one.** It is a 401 or a 403 after a
+ * token refresh has already been tried (`client.ts:classifyTokenFailure`), which
+ * means the grant is gone: withdrawn at the provider, expired, or scoped away.
+ * Nothing this fleet can do changes that answer, so twelve attempts across two
+ * days is twelve provider calls and twelve tenant-database wakes spent
+ * confirming it — while the dashboard says *retrying* and the one person who
+ * could fix it in thirty seconds is not asked. The lane stops now and the panel
+ * says *reconnect*.
+ *
+ * **`provider_error` is retryable, and it is the case this whole change exists
+ * for.** A 5xx, a vendor deploy, a route we were building wrong — all land here,
+ * and all of them come back. This is the reason that burned three lanes in four
+ * minutes.
+ *
+ * **`rate_limited` is retryable and is the clearest of them:** the provider has
+ * literally said *ask again later*. Stopping would be reading a 429 as a refusal.
+ *
+ * **`cursor_invalid` is neither, and must not be made either.** It has its own
+ * recovery inside `runPull`: the cursor is discarded, a staleness event is
+ * logged, and the listing re-enters as a bounded, gated first import. It only
+ * reaches a thrown failure when that *second* listing also fails — at which
+ * point the honest reading is "the provider is refusing us", which is
+ * retryable. Marking it terminal would kill a lane that the first-import gate
+ * was about to repair.
+ *
+ * **`not_connected` is retryable, which is the one that looks wrong.** The
+ * ordinary not-connected — no stored state — never reaches here at all: the pull
+ * returns `refused` and the job completes. What reaches here is a *listing* that
+ * came back not-connected, which is the vendor and this brain disagreeing about
+ * whether an account is attached; the reconciliation pass that runs before every
+ * cadence tick is the thing that settles it, and it settles it in this lane's
+ * favour more often than not. Terminal here would dead-letter a connection
+ * midway through being adopted. Its ingest code is `cancelled`, whose panel copy
+ * is *it picks up where it left off* — which would be a lie on a dead lane.
+ *
+ * **`model_not_priced` is retryable.** It is our own configuration failing, and
+ * the remedy is a deploy — precisely the shipped-bug class this ladder was
+ * lengthened to survive.
+ *
+ * `budget_exhausted`, `identity_changed` and `not_attempted` never reach a
+ * thrown failure — the first two complete the job as `stopped` or `refused` with
+ * the cursor held — but they are named rather than left to a `default`, because
+ * a silent default is how a new stop reason inherits a ruling nobody made.
+ */
+export function pullStopIsTerminal(reason: PullStopReason | 'unknown'): boolean {
+  switch (reason) {
+    case 'auth_expired':
+      return true;
+    case 'rate_limited':
+    case 'provider_error':
+    case 'cursor_invalid':
+    case 'not_connected':
+    case 'model_not_priced':
+    case 'budget_exhausted':
+    case 'identity_changed':
+    case 'not_attempted':
+    case 'unknown':
+      return false;
   }
 }
 

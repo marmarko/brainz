@@ -37,9 +37,13 @@ function history(overrides: Partial<PullHistory> = {}): PullHistory {
     target: 'gmail',
     open: 0,
     openAttempts: 0,
+    openMaxAttempts: 0,
+    openRunAt: null,
     lastDoneAt: null,
     deadAt: null,
     deadCode: null,
+    deadAttempts: 0,
+    deadMaxAttempts: 0,
     ...overrides,
   };
 }
@@ -200,5 +204,96 @@ describe('the copy tells the user what to do, and only when there is something',
 
   test('no cause is not a cause', () => {
     expect(causeSentence(null)).toBeNull();
+  });
+});
+
+/**
+ * **Three worlds, and the panel used to have one sentence for two of them.**
+ *
+ * A user looking at a connector that is not working needs to know which of these
+ * they are in, because the three have different answers:
+ *
+ *   1. It failed and it will try again on its own — and roughly when.
+ *   2. It stopped, because the provider will not accept our access at all, and
+ *      only they can fix that.
+ *   3. It tried until it ran out of attempts and gave up — and there is a button.
+ *
+ * Before the retry policy was made per-kind, (2) and (3) were the same row: a
+ * revoked grant and a provider outage both burned the same five attempts and
+ * both landed on the same copy, *"Connected, and no longer being polled … If it
+ * stays like this, disconnecting and connecting again restarts the polling."*
+ * That sentence was the right instruction for (2), a waste of a
+ * re-authorization for (3), and — until a dead lane could be cleared at all —
+ * false for both.
+ *
+ * The three are told apart from `control.job` alone, which is the panel's
+ * standing discipline: a lane that stopped **below** its attempt budget was
+ * stopped deliberately, and one that reached the budget ran out.
+ */
+describe('the three worlds a failing connector can be in', () => {
+  test('a lane stopped below its budget reads as blocked, not as one that gave up', () => {
+    const status = statusFor(
+      'gmail',
+      history({ deadAt: NOW, deadCode: 'handler_error', deadAttempts: 1, deadMaxAttempts: 12 }),
+      'connected',
+      health(),
+    );
+    expect(status).toMatchObject({ state: 'blocked', cause: 'auth_expired', attempts: 1 });
+  });
+
+  test('a lane that reached its budget reads as failing, and carries the count', () => {
+    const status = statusFor(
+      'gmail',
+      history({ deadAt: NOW, deadCode: 'handler_error', deadAttempts: 12, deadMaxAttempts: 12 }),
+      'connected',
+      health({ ingestFailureCode: 'provider_error' }),
+    );
+    expect(status).toMatchObject({
+      state: 'failing',
+      cause: 'provider_error',
+      attempts: 12,
+      maxAttempts: 12,
+    });
+  });
+
+  test('a retrying lane says when the next attempt is due', () => {
+    // The half of "it will retry on its own" that a user actually needs. It is
+    // `run_at` on the open row and nothing inferred, so the panel can only say
+    // it when the queue has actually written one.
+    const soon = new Date(NOW.getTime() + 30 * 60_000);
+    const status = statusFor(
+      'gmail',
+      history({ open: 1, openAttempts: 2, openMaxAttempts: 12, openRunAt: soon }),
+      'connected',
+      health({ ingestFailureCode: 'provider_error' }),
+    );
+    expect(status).toMatchObject({
+      state: 'retrying',
+      nextAttemptAt: soon,
+      attempts: 2,
+      maxAttempts: 12,
+    });
+  });
+
+  test('a healthy lane offers no attempt count and no next attempt', () => {
+    const status = statusFor('gmail', history({ lastDoneAt: EARLIER }), 'connected', undefined);
+    expect(status).toMatchObject({
+      state: 'connected',
+      nextAttemptAt: null,
+      attempts: 0,
+      maxAttempts: 0,
+    });
+  });
+
+  test('a dead-lettered lane on a source the user removed is still not a red line', () => {
+    // The `blocked` reading must not escape the link check either: a source that
+    // was disconnected has no state worth alarming anybody about.
+    const status = statusFor(
+      'gmail',
+      history({ deadAt: NOW, deadCode: 'handler_error', deadAttempts: 1, deadMaxAttempts: 12 }),
+      'absent',
+      health(),
+    );
+    expect(status).toMatchObject({ state: 'absent', cause: null });
   });
 });

@@ -2157,6 +2157,105 @@ describe('the status beside each source says only what this brain can know', () 
    * would make the act of disconnecting render as a failure on the next page
    * load — the user pressed stop and is told something is broken.
    */
+  /**
+   * **The way back from a dead lane, for the person it happened to.**
+   *
+   * Until this existed, a connector that dead-lettered was recoverable in
+   * exactly two ways: an operator with a SQL client, or the user walking through
+   * their provider's consent screen again to recover from a failure that had
+   * nothing to do with their permission. The first is not a product and the
+   * second charges the user for our outage.
+   *
+   * Three properties, and the third is the one that could go wrong quietly.
+   */
+  async function deadLane(
+    source: 'gmail' | 'calendar' | 'drive',
+    counters: { attempts: number; maxAttempts: number },
+  ): Promise<void> {
+    await controlSql`
+      INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason,
+                               attempts, max_attempts,
+                               run_at, created_at, updated_at, finished_at, dead_lettered_at, failure_code)
+      VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', ${source}::control.job_target, 'dead',
+              'connector_cadence', ${counters.attempts}, ${counters.maxAttempts},
+              ${AT}, ${AT}, ${AT}, ${AT}, ${AT}, 'handler_error')`;
+  }
+
+  async function laneRow(source: string): Promise<{ state: string; attempts: number } | undefined> {
+    const rows = (await controlSql`
+      SELECT state::text AS state, attempts FROM control.job
+       WHERE tenant_id = ${TENANT} AND target = ${source}::control.job_target`) as Array<{
+      state: string;
+      attempts: number;
+    }>;
+    return rows[0];
+  }
+
+  test('a lane that gave up offers a retry control, and it is a POST and not a link', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await attachSource('drive');
+    await deadLane('drive', { attempts: 12, maxAttempts: 12 });
+
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).toContain('no longer being polled');
+    expect(page).toContain('value="retry"');
+    // The control writes, so it cannot be reachable by anything that follows an
+    // `href`: a prefetching browser, a crawler, or a chat client unfurling a
+    // pasted dashboard link would each silently re-open a lane the fleet closed.
+    expect(page).not.toContain('href="/api/connectors');
+  });
+
+  test('a lane the provider blocked offers no retry control, because pressing it would do nothing', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await attachSource('drive');
+    // Below its budget: only a terminal stop can produce this, and the remedy is
+    // the user's rather than a button's.
+    await deadLane('drive', { attempts: 1, maxAttempts: 12 });
+
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).toContain('we can no longer read it');
+    expect(page).not.toContain('value="retry"');
+  });
+
+  test('pressing it puts the lane back in service without touching the connection', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await attachSource('drive');
+    await deadLane('drive', { attempts: 12, maxAttempts: 12 });
+
+    const answer = await app()(post('/api/connectors', { source: 'drive', intent: 'retry' }, { cookie }));
+    expect(answer.status).toBe(200);
+    expect(await answer.json()).toMatchObject({ ok: true, revived: true });
+    expect(await laneRow('drive')).toEqual({ state: 'due', attempts: 0 });
+    // No vendor call: a retry is a control-plane row moving, and a fleet whose
+    // vendor configuration is broken is exactly the fleet full of dead lanes.
+    expect(recorded.disconnected).toEqual([]);
+    expect(recorded.minted).toEqual([]);
+  });
+
+  test('pressing it on a lane that is fine is not an error and changes nothing', async () => {
+    // The violating case at the route. A second press, a reconnect in another
+    // tab, or an operator who got there first all look like this — and each of
+    // them must leave a HEALTHY lane's attempt count exactly where it was,
+    // because resetting it would hand a connector that is currently failing an
+    // unlimited retry budget.
+    await reset();
+    const cookie = await signedIn('paid');
+    await attachSource('drive');
+    await controlSql`
+      INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason,
+                               attempts, max_attempts, run_at, created_at, updated_at)
+      VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'drive', 'due', 'connector_cadence',
+              3, 12, ${AT}, ${AT}, ${AT})`;
+
+    const answer = await app()(post('/api/connectors', { source: 'drive', intent: 'retry' }, { cookie }));
+    expect(answer.status).toBe(200);
+    expect(await answer.json()).toMatchObject({ ok: true, revived: false, reason: 'no_dead_lane' });
+    expect(await laneRow('drive')).toEqual({ state: 'due', attempts: 3 });
+  });
+
   test('the rows a disconnect writes are not read as a failure', async () => {
     await reset();
     const cookie = await signedIn('paid');

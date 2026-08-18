@@ -72,6 +72,8 @@ import {
 } from '../control/connector-pg.ts';
 import { discardConnectorLanes } from '../control/connector-lanes.ts';
 import type { ConnectorReconciler } from '../ingest/pipedream/reconcile.ts';
+import type { JobTarget } from '../worker/jobs.ts';
+import { reviveDeadLane } from '../worker/queue.ts';
 import { CONNECT_STEPS, claudeCodeCommand, connectionStatus, installLink } from './connect.ts';
 import { adminDispatch, createBrainOwnerDirectory } from './admin.ts';
 import { connectorStatuses } from './connector-panel.ts';
@@ -1090,6 +1092,7 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       const fields = await body(request);
       const intent = stringOf(fields, 'intent');
       if (intent === 'disconnect') return handleDisconnect(request, session, fields);
+      if (intent === 'retry') return handleRetry(request, session, fields);
       if (intent !== '' && intent !== 'connect') {
         return refusedConnector(
           request,
@@ -1120,6 +1123,96 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       } catch {
         return false;
       }
+    }
+
+    /**
+     * `intent=retry` — the way back from a dead lane, for the person it happened
+     * to.
+     *
+     * **Why this exists beside the operator's `requeue_connector`.** Both clear
+     * the same wreckage, and they are for different people. The operator's is
+     * for a fleet-wide defect: one of ours shipped, dead-lettered every affected
+     * brain's connectors, and got fixed — nobody should have to ask each of
+     * those users to re-consent at their provider to recover from our bug. This
+     * one is for the single user staring at a connector that stopped, who
+     * currently has exactly one remedy on this page and it costs them a trip
+     * through a consent screen they already completed once.
+     *
+     * **It reaches no vendor and needs none.** Nothing here revokes, mints or
+     * asks: it moves one row in the control plane from `dead` back to `due`. So
+     * unlike connect and disconnect it does *not* refuse on a deployment with no
+     * connector credential — a fleet that lost its vendor configuration is
+     * exactly the fleet whose lanes are full of dead letters, and a recovery
+     * that requires the broken thing to be working is not a recovery.
+     *
+     * **The tier gate is not applied either**, and that is the same argument
+     * once more: a lane can only be dead because it was polling, which means it
+     * was inside the gate when it was created. Refusing to *un-break* something
+     * a downgrade left behind would leave a permanent red line on a page with no
+     * control that clears it.
+     *
+     * `reviveDeadLane` decides, in one statement, whether there was anything to
+     * revive. This function does not look first — two presses of the button
+     * would both find the same row.
+     */
+    async function handleRetry(
+      request: Request,
+      session: Session,
+      fields: Record<string, unknown>,
+    ): Promise<Response> {
+      const source = stringOf(fields, 'source');
+      if (!(CONNECTOR_SOURCES as readonly string[]).includes(source)) {
+        return refusedConnector(
+          request,
+          'unknown_source',
+          'No such connector',
+          'This brain does not offer a connector by that name.',
+          400,
+        );
+      }
+
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) {
+        return refusedConnector(
+          request,
+          'no_brain_yet',
+          'This account has no brain yet',
+          'There is no brain here whose checks could be restarted.',
+          409,
+        );
+      }
+
+      const outcome = await reviveDeadLane(deps.controlSql, {
+        tenantId,
+        kind: 'ingest_pull',
+        target: source as JobTarget,
+        now: now(),
+      });
+
+      // **Both answers are `ok`, and the copy is what differs.** "There was
+      // nothing dead here" is not an error — it is what a second press, a
+      // reconnect in another tab, or an operator who got there first all look
+      // like, and answering 4xx to any of them would tell the user something
+      // went wrong when what happened is that they are already fine.
+      if (isFormPost(request)) {
+        return html(
+          renderPage({
+            kind: 'connector_notice',
+            heading: outcome.revived ? `Checking ${source} again` : `Nothing to restart`,
+            message: outcome.revived
+              ? `The checks for ${source} are queued again, from the beginning. The first one runs ` +
+                `on this brain's next wake, which is within about half an hour — nothing was ` +
+                `disconnected and you did not need to authorize anything again.`
+              : `Nothing here had stopped. ${source} is either being checked already or was ` +
+                `restarted a moment ago, so there was nothing for this to do.`,
+          }),
+        );
+      }
+      return json({
+        ok: true,
+        revived: outcome.revived,
+        ...(outcome.revived ? {} : { reason: outcome.reason }),
+      });
     }
 
     async function handleConnect(
