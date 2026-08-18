@@ -559,6 +559,48 @@ describe('a failed poll is diagnosable', () => {
   );
 
   test(
+    'a pull the fleet itself interrupted is not reported as our bug',
+    async () => {
+      await enqueueClaimable('ingest_pull', 'gmail');
+      const stopped = new AbortController();
+      stopped.abort();
+
+      const handler = createIngestPullHandler({
+        control: controlSql,
+        profile: HOSTED_PROFILE,
+        health: health(),
+        openTenant,
+        openSource: () => Promise.reject(new Error('the lease went away mid-pull')),
+      });
+      await handler({
+        lease: {
+          jobId: 'job-lost-lease',
+          tenantId: TENANT,
+          kind: 'ingest_pull',
+          target: 'gmail',
+          leaseToken: 1,
+          owner: 'worker-1',
+          expiresAt: NOW,
+          attemptDeadlineAt: NOW,
+          attempts: 1,
+          maxAttempts: 5,
+          debtObserved: 0,
+        },
+        signal: stopped.signal,
+        now: NOW,
+      }).catch(() => undefined);
+
+      // The same question the runner asks a moment later when it writes the job
+      // row. Without it, an ordinary redeploy puts "something went wrong on our
+      // side, it is ours to fix" on a user's dashboard.
+      expect(unrecorded).toEqual([]);
+      const banked = await readConnectorHealth(controlSql, { tenantId: TENANT });
+      expect(banked.get('gmail')).toMatchObject({ jobFailureCode: 'lease_stolen' });
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
     'a poll that works again clears the cause rather than leaving a red line',
     async () => {
       await enqueueClaimable('ingest_pull', 'gmail');

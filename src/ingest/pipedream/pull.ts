@@ -1465,10 +1465,16 @@ export function createIngestPullHandler(
       // work is banked, and the next tick resumes it without a retry budget.
       if (result.outcome === 'failed') throw new IngestPullFailure(source, result.stopReason);
     } catch (error) {
-      // Everything that did not get as far as a result: the source seam refusing,
-      // the runner losing its lease mid-pull, a bug in this path. `handler_error`
-      // is honest about all three — the alternative is a code invented here that
-      // means "we do not know", which is what `handler_error` already means.
+      // Everything that did not get as far as a result: the source seam
+      // refusing, the runner losing its lease mid-pull, a bug in this path.
+      //
+      // **The lease is asked about rather than assumed**, and it is the same
+      // question `runner.ts` asks a moment later when it writes the job row. A
+      // record that said `handler_error` for a pull the fleet itself
+      // interrupted would put "something went wrong on our side, it is ours to
+      // fix" on a user's dashboard for an ordinary redeploy. Everything else is
+      // `handler_error`, which already means "we do not know" and is the only
+      // honest answer for a throw nobody classified.
       if (!recorded) {
         await record({
           tenantId: lease.tenantId,
@@ -1476,7 +1482,7 @@ export function createIngestPullHandler(
           at: context.now,
           runOutcome: null,
           ingestFailureCode: null,
-          jobFailureCode: 'handler_error',
+          jobFailureCode: context.signal.aborted ? 'lease_stolen' : 'handler_error',
           itemsWritten: 0,
           itemsFailed: 0,
         });
