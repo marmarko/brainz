@@ -169,6 +169,14 @@ export function itemFailureFor(
       return { externalRef, reason: 'rate_limited', retryable: true };
     case 'auth_expired':
       return { externalRef, reason: 'auth_expired', retryable: true };
+    // **Named, because the default would lose the item.** A mint refusal
+    // carries the token endpoint's status — a 401 — and the default's verdict
+    // is `statusIsWorthRetrying`, which reads a 401 as a fact about the item
+    // and writes it off. It is not: this fleet never asked the provider about
+    // this message at all, so nothing whatever is known about it and the cursor
+    // must not move past it.
+    case 'fleet_auth_failed':
+      return { externalRef, reason: 'fleet_auth_failed', retryable: true };
     case 'not_connected':
       return { externalRef, reason: 'cancelled', retryable: true };
     case 'cursor_invalid':

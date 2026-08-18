@@ -227,7 +227,125 @@ export const FLEET_13_SURFACE: FleetSurface = {
   ],
 };
 
-export const FLEET_SURFACES: readonly FleetSurface[] = [FLEET_1_SURFACE, FLEET_13_SURFACE];
+/**
+ * Release 14: what a connector poll wrote into the tenant's own ingest log.
+ *
+ * **Why this surface exists and why now.** Rung 15 widens
+ * `ingest_log_failure_is_a_code` — the CHECK on `failure_code` — from six
+ * labels to seven, and a CHECK cannot be widened in place: it has to be dropped
+ * and re-added. `findExpandContractViolations` admits that pair statically, but
+ * static admission cannot see whether the replacement is *wider* or *narrower*;
+ * a rung that re-added a narrower constraint under the same name would pass the
+ * scanner and then refuse a code fleet-14 still writes, on the first poll after
+ * the rung lands. So the claim is paid for behaviourally, the way rung 14's
+ * `DROP NOT NULL` was: these are release 14's own statements, and the rollout
+ * test runs them against a database migrated to head.
+ *
+ * Every one of the six labels is written, not a representative sample. The
+ * failure this proves against is one label going missing from the replacement,
+ * and a sample would only catch it if it happened to be sampled.
+ *
+ * Transcribed from that release's `src/ingest/log.ts` — `openRun`,
+ * `sweepAbandonedRuns`, `finishRun`, `countRunItem`, `recordItem` and the
+ * `sourceStaleness` read — with bound parameters written out as literals.
+ */
+export const FLEET_14_SURFACE: FleetSurface = {
+  release: 'fleet-14',
+  schemaVersion: 14,
+  exchanges: [
+    {
+      what: 'opens a run row, counts an item against it, then closes it',
+      from: 'src/ingest/log.ts — openRun + countRunItem + finishRun',
+      statements: [
+        `INSERT INTO ingest_log (origin_context, source_type, outcome)
+         VALUES ('connector:gmail', 'email', 'running')
+         RETURNING ingest_id::text AS ingest_id`,
+        `UPDATE ingest_log
+            SET items_seen = items_seen + 1,
+                items_written = items_written + 1,
+                items_quarantined = items_quarantined + 0
+          WHERE ingest_id = (SELECT max(ingest_id) FROM ingest_log)::bigint`,
+        `UPDATE ingest_log
+            SET outcome = 'ok', failure_code = NULL, finished_at = now()
+          WHERE ingest_id = (SELECT max(ingest_id) FROM ingest_log)::bigint
+            AND outcome = 'running'`,
+      ],
+    },
+    {
+      what: 'closes a failed run under every failure code release 14 could produce',
+      from: 'src/ingest/log.ts — finishRun, over INGEST_FAILURE_CODES as it stood at rung 14',
+      // The six labels the constraint held before rung 15. If the widened
+      // constraint drops any of them, this exchange is where it shows —
+      // release 14 is still writing them while release 15 rolls out.
+      statements: [
+        'auth_expired',
+        'rate_limited',
+        'provider_error',
+        'parse_failed',
+        'budget_exhausted',
+        'cancelled',
+      ].flatMap((code) => [
+        `INSERT INTO ingest_log (origin_context, source_type, outcome)
+         VALUES ('connector:gmail', 'email', 'running')`,
+        `UPDATE ingest_log
+            SET outcome = 'failed', failure_code = '${code}', finished_at = now()
+          WHERE ingest_id = (SELECT max(ingest_id) FROM ingest_log)::bigint
+            AND outcome = 'running'`,
+      ]),
+    },
+    {
+      what: 'records one item that failed, already terminal',
+      from: 'src/ingest/log.ts — recordItem',
+      statements: [
+        `INSERT INTO ingest_log (
+           origin_context, source_type, external_ref, outcome, failure_code,
+           items_seen, items_written, items_quarantined, finished_at
+         ) VALUES (
+           'connector:gmail', 'email', 'gmail:m1', 'failed', 'provider_error',
+           1, 0, 0, now()
+         )`,
+      ],
+    },
+    {
+      what: 'sweeps a run that stopped reporting, then reads per-source staleness',
+      from: 'src/ingest/log.ts — sweepAbandonedRuns + sourceStaleness',
+      statements: [
+        `UPDATE ingest_log
+            SET outcome = 'cancelled', failure_code = 'cancelled', finished_at = now()
+          WHERE outcome = 'running'
+            AND external_ref IS NULL
+            AND origin_context = 'connector:gmail'
+            AND source_type = 'email'
+            AND started_at <= now() - make_interval(secs => 21600)
+          RETURNING ingest_id`,
+        `SELECT origin_context,
+                source_type,
+                max(coalesce(finished_at, started_at)) AS last_checked_at,
+                max(finished_at) FILTER (
+                  WHERE external_ref IS NULL AND items_written > 0) AS last_write_at,
+                coalesce(sum(items_seen) FILTER (WHERE external_ref IS NULL), 0)::int AS items_seen,
+                coalesce(sum(items_written) FILTER (WHERE external_ref IS NULL), 0)::int AS items_written,
+                count(*) FILTER (WHERE external_ref IS NULL AND outcome = 'running')::int AS running,
+                (array_agg(failure_code
+                             ORDER BY coalesce(finished_at, started_at) DESC, ingest_id DESC)
+                   FILTER (WHERE external_ref IS NULL AND outcome <> 'running'))[1] AS last_failure_code,
+                count(*) FILTER (WHERE external_ref IS NOT NULL AND outcome = 'failed')::int AS items_failed,
+                (array_agg(failure_code
+                             ORDER BY coalesce(finished_at, started_at) DESC, ingest_id DESC)
+                   FILTER (WHERE external_ref IS NOT NULL AND outcome = 'failed'))[1] AS last_item_failure_code
+           FROM ingest_log
+          GROUP BY origin_context, source_type
+          ORDER BY origin_context, source_type`,
+      ],
+    },
+  ],
+};
+
+export const FLEET_SURFACES: readonly FleetSurface[] = [
+  FLEET_1_SURFACE,
+  FLEET_13_SURFACE,
+  FLEET_14_SURFACE,
+];
 
 export interface SurfaceFailure {
   readonly what: string;

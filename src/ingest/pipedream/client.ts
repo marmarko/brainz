@@ -133,6 +133,14 @@ export const DEFAULT_BASE_URL = 'https://api.pipedream.com/v1';
  */
 export type PullFailureReason =
   | 'auth_expired'
+  /**
+   * **This fleet could not authenticate itself.** Not the user's grant — the
+   * `client_credentials` mint against the vendor's own `/oauth/token`, with the
+   * fleet-wide client id and secret. See {@link classifyTokenFailure} for why
+   * it is not `auth_expired` and {@link classifyHttpFailure} for the one that
+   * is.
+   */
+  | 'fleet_auth_failed'
   | 'rate_limited'
   | 'cursor_invalid'
   | 'provider_error'
@@ -510,11 +518,39 @@ export const OAUTH_RATE_KEY = 'oauth';
  * source" when the vendor merely asked us to wait. A connector that tells
  * somebody their Google grant died because the vendor was busy has lost their
  * trust for a reason that fixes itself in a second.
+ *
+ * ============================================================================
+ * WHY THE RESIDUAL IS `fleet_auth_failed` AND NOT `auth_expired`
+ * ============================================================================
+ * **This request has no user in it.** It is `grant_type=client_credentials`
+ * carrying `BRAINZ_PIPEDREAM_CLIENT_ID` and `BRAINZ_PIPEDREAM_CLIENT_SECRET` —
+ * one pair, shared by every tenant in the fleet — and it is aimed at the
+ * vendor's own endpoint rather than at anybody's Google account. Every answer
+ * it can give is a statement about *us*: 400 is a malformed body, 401 and 403
+ * are a rotated or mistyped secret, 404 is a `baseUrl` pointing at nothing, 422
+ * is a body the vendor parsed and rejected. None of them is evidence about a
+ * grant, because no grant was consulted.
+ *
+ * While this answered `auth_expired`, and `auth_expired` is terminal, a single
+ * rotated fleet credential marked **every tenant's every lane** dead — each one
+ * telling its owner to reconnect an account that was working perfectly, with no
+ * retry that could ever recover it once the credential was fixed. The failure
+ * the user could not cause, could not see, and could not repair was reported to
+ * them as their fault.
+ *
+ * So the residual bucket is the fleet's own, and it is **retryable**
+ * (`pull.ts:pullStopIsTerminal`): the remedy is an operator's — a redeploy, a
+ * secret rotation — and the lane must be alive to notice when it lands.
+ *
+ * **The two neighbours stay where they were**, and they are the reason this is
+ * a bucket rather than a status list. A 429 is the vendor asking us to wait and
+ * a 5xx or 408 is the vendor failing; both are the vendor's own condition,
+ * neither implicates our credential, and both already had the right code.
  */
 export function classifyTokenFailure(status: number): PullFailureReason {
   if (status === 429) return 'rate_limited';
   if (status >= 500 || status === 408) return 'provider_error';
-  return 'auth_expired';
+  return 'fleet_auth_failed';
 }
 
 /**
@@ -771,7 +807,24 @@ export function createPipedreamClient(options: {
     const body = parseJson(response.body) as { access_token?: unknown; expires_in?: unknown } | null;
     const token = body?.access_token;
     if (typeof token !== 'string' || token.length === 0) {
-      return { ok: false, reason: 'auth_expired', status: response.status };
+      // **A third case, filed with the second.** The vendor answered
+      // successfully and gave us nothing usable — so this is not a refusal, and
+      // it is certainly not a statement about anybody's grant. What decides the
+      // code is the consequence, and the consequence is identical to a refused
+      // mint: this fleet holds no token, every tenant's next call fails, and no
+      // tenant can do anything about it. `provider_error` would be the other
+      // candidate and it would bury this in the same bucket as every 502 the
+      // vendor ever answers, which is the one place an operator would never
+      // find it.
+      //
+      // What the code cannot carry, `detail` does — a static sentence, never a
+      // word of the body: these strings reach logs and erasure receipts.
+      return {
+        ok: false,
+        reason: 'fleet_auth_failed',
+        status: response.status,
+        detail: 'the vendor’s token endpoint answered 2xx with no access_token',
+      };
     }
     const reported =
       typeof body?.expires_in === 'number' && Number.isFinite(body.expires_in)

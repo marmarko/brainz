@@ -52,7 +52,22 @@ import type { SourceType } from '../core/write/write-path.ts';
 export const RUN_OUTCOMES = ['running', 'ok', 'failed', 'cancelled'] as const;
 export type RunOutcome = (typeof RUN_OUTCOMES)[number];
 
-/** `ingest_log_failure_is_a_code`, restated for the same reason. */
+/**
+ * `ingest_log_failure_is_a_code`, restated for the same reason.
+ *
+ * **Order is load-bearing and the list is append-only.** Two databases mirror
+ * it — the tenant's CHECK (rung 15) and `control.connector_ingest_failure` —
+ * and the second is a Postgres enum grown by `ALTER TYPE … ADD VALUE`, which
+ * appends. A label inserted in the middle here would leave a fresh control
+ * plane and an upgraded one holding the same six labels in different orders,
+ * and the pin in `test/control/connector-health.test.ts` compares the sequence.
+ * New codes go on the end.
+ *
+ * `fleet_auth_failed` is the seventh and it is deliberately not `auth_expired`:
+ * that one is the *user's* grant and is terminal, this one is brainz's own
+ * fleet-wide credential failing to mint and is retryable. See
+ * `src/ingest/pipedream/client.ts:classifyTokenFailure`.
+ */
 export const INGEST_FAILURE_CODES = [
   'auth_expired',
   'rate_limited',
@@ -60,6 +75,7 @@ export const INGEST_FAILURE_CODES = [
   'parse_failed',
   'budget_exhausted',
   'cancelled',
+  'fleet_auth_failed',
 ] as const;
 export type IngestFailureCode = (typeof INGEST_FAILURE_CODES)[number];
 

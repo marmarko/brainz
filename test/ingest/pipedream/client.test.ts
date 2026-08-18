@@ -375,9 +375,20 @@ describe('failure classification', () => {
     expect(classifyHttpFailure(418, {})).toBe('provider_error');
   });
 
-  test('a token refresh failure is auth_expired, not provider_error', async () => {
-    // The distinction is the whole staleness story: `provider_error` reads as a
-    // hiccup, `auth_expired` reads as "reconnect this source".
+  test('a refused token mint is the fleet’s failure, not the user’s expired grant', async () => {
+    // **This case used to assert the opposite, and the opposite was a fleet-wide
+    // outage waiting to happen.** It read: a refused mint is `auth_expired`, not
+    // `provider_error` — the reasoning being that a mint failure is an auth
+    // failure and `provider_error` reads as a hiccup. Both halves of that were
+    // right and the conclusion was still wrong, because there is no user in this
+    // request: it is `client_credentials` with the fleet-wide client id and
+    // secret. Once `auth_expired` became terminal, one rotated fleet secret
+    // dead-lettered every tenant's every lane and told each owner to reconnect
+    // an account that was working perfectly.
+    //
+    // `test/ingest/pipedream/fleet-auth.test.ts` carries the split in full —
+    // the retry policies, the panel copy and the operator's signal. What stays
+    // here is the classification at the seam that produces it.
     const transport = createScriptedTransport();
     transport.on('/oauth/token', { status: 401, body: { error: 'invalid_client' } });
     const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
@@ -391,6 +402,27 @@ describe('failure classification', () => {
       // refuses a proxy call with no connection before it ever mints one — the
       // vendor requires `account_id` on the proxy URL, so a source with nothing
       // attached is `not_connected` rather than a failed refresh.
+      accountId: 'apn_1',
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.reason).toBe('fleet_auth_failed');
+  });
+
+  test('a proxy refusal after a good mint is still the user’s expired grant', async () => {
+    // The half the split must not move. Same client, same shape, one difference:
+    // the token minted, so the 401 came back from a call made *with* it against
+    // an account this user attached. That is a revoked grant, it is terminal,
+    // and the panel asks for a reconnection.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/messages', { status: 403, body: { error: 'insufficient scope' } });
+    const client = createPipedreamClient({ config: CONFIG, transport, now: () => NOW });
+
+    const outcome = await client.request({
+      app: 'gmail',
+      method: 'GET',
+      path: '/messages',
+      externalUserId: 'a',
       accountId: 'apn_1',
     });
     expect(outcome.ok).toBe(false);

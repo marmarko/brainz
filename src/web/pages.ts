@@ -263,6 +263,19 @@ export function causeSentence(cause: string | null): string | null {
         'withdrawn or expired. <strong>Disconnecting and connecting again is the fix</strong>, ' +
         'and it is the only one of these you can do anything about.'
       );
+    case 'fleet_auth_failed':
+      // **The sentence this whole split exists to make possible.** The code it
+      // used to share said "the permission was withdrawn — reconnect", which
+      // for this cause is false in the fact and expensive in the instruction:
+      // the credential that failed is brainz's own, one pair for the entire
+      // fleet, and a re-authorization costs the user a trip to Google to fix
+      // something that was never theirs. So it says what is true and asks for
+      // nothing. What it does *not* say is the part an operator needs; that
+      // travels as the code, on `/admin connector_status`.
+      return (
+        'Our own connection to the service that carries your accounts stopped working. That is ' +
+        'ours, not yours — your accounts are untouched — and the checks keep trying while we fix it.'
+      );
     case 'rate_limited':
       return 'The provider asked us to slow down. Nothing to do — it backs off and tries again.';
     case 'budget_exhausted':
@@ -290,6 +303,31 @@ export function causeSentence(cause: string | null): string | null {
     default:
       return `The last check reported <code>${escapeHtml(cause)}</code>.`;
   }
+}
+
+/**
+ * The instruction the `blocked` copy appends, when there is one worth giving.
+ *
+ * A named function rather than the comparison it replaces, because the decision
+ * has two reasons behind it and an inline `cause === 'auth_expired'` could only
+ * ever record one:
+ *
+ *   * **`auth_expired` — already said.** {@link causeSentence} gives this exact
+ *     instruction, and a page that gives it twice reads as one that does not
+ *     know what it is telling you.
+ *   * **`fleet_auth_failed` — wrong to say at all.** The credential that failed
+ *     is the fleet's own. Reconnecting cannot repair it, and asking for one
+ *     spends a user's trip to their provider on a problem they do not have.
+ *     This cause is retryable, so it should never reach `blocked` — but copy
+ *     has to be right where it lands, not where it is expected to.
+ *
+ * Everything else keeps the instruction: a lane that stopped **below** its
+ * budget was stopped deliberately, and for a cause nothing here recognises,
+ * reconnecting is the best remedy this page can name.
+ */
+export function blockedReconnectSuffix(cause: string | null): string {
+  if (cause === 'auth_expired' || cause === 'fleet_auth_failed') return '';
+  return ' Disconnect this source and connect it again to start the checks.';
 }
 
 /** What the last attempt lost, when it lost anything. Silent otherwise. */
@@ -363,10 +401,10 @@ function connectorStatusSentence(status: ConnectorStatus): string {
         `rather than retrying for days against an answer that will not change.` +
         `${cause === null ? '' : ` ${cause}`}` +
         `${lossSentence(status)}` +
-        // Only when the cause has not already given the instruction. The
-        // `auth_expired` sentence says exactly this, and saying it twice reads
-        // as a page that does not know what it is telling you.
-        `${status.cause === 'auth_expired' ? '' : ' Disconnect this source and connect it again to start the checks.'}` +
+        // Only when there is an instruction worth giving. See
+        // `blockedReconnectSuffix` for the two causes that get none, and why
+        // they get none for different reasons.
+        `${blockedReconnectSuffix(status.cause)}` +
         `</p>`
       );
     case 'retrying':

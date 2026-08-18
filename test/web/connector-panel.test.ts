@@ -191,6 +191,10 @@ describe('the copy tells the user what to do, and only when there is something',
       'parse_failed',
       'budget_exhausted',
       'cancelled',
+      // The seventh ingest code. It is the one that must never carry the
+      // reconnect instruction — the credential that failed is the fleet's own —
+      // and `test/ingest/pipedream/fleet-auth.test.ts` asserts that half.
+      'fleet_auth_failed',
       'attempt_timed_out',
       'lease_stolen',
       'tenant_unavailable',

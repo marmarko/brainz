@@ -799,6 +799,11 @@ const EXPAND_ONLY_STATEMENTS: readonly RegExp[] = [
  * saying what now guarantees the value. Rung 14 pays that with a CHECK across
  * both embedding seats, and the frozen fleet surface proves the previous
  * release survives both halves.
+ *
+ * **`DROP CONSTRAINT` is not in this list and never will be**, because on its
+ * own it is exactly what it looks like. It is admitted only as half of a pair —
+ * see {@link constraintsAddedBy} — and the pairing is checked before this
+ * allowlist runs, so a lone drop still falls through to here and is refused.
  */
 const EXPAND_ONLY_ALTER_ACTIONS: readonly RegExp[] = [
   /^ADD COLUMN\b/i,
@@ -842,6 +847,9 @@ export function findExpandContractViolations(ddl: string): string[] {
   // heard of. Collected first because the two facts arrive in either order
   // inside one rung.
   const createdHere = tablesCreatedBy(statements);
+  // The other fact that arrives in either order: a constraint dropped in one
+  // statement and re-added in the next.
+  const readdedHere = constraintsAddedBy(statements);
 
   for (const statement of statements) {
     const head = statement.replace(/\s+/g, ' ').trim();
@@ -849,7 +857,9 @@ export function findExpandContractViolations(ddl: string): string[] {
 
     const alter = /^ALTER TABLE\s+(?:IF EXISTS\s+)?(?:ONLY\s+)?(\S+)\s+([\s\S]+)$/i.exec(head);
     if (alter) {
-      findings.push(...alterTableFindings(head, alter[1] ?? '', alter[2] ?? '', createdHere));
+      findings.push(
+        ...alterTableFindings(head, alter[1] ?? '', alter[2] ?? '', createdHere, readdedHere),
+      );
       continue;
     }
 
@@ -898,6 +908,59 @@ function tablesCreatedBy(statements: readonly string[]): Set<string> {
   return created;
 }
 
+/** One key for "this table's constraint of this name". Names are case-folded. */
+function constraintKey(table: string, name: string): string {
+  // Joined on an escaped NUL, spelled rather than embedded: a raw one in a
+  // source file is what `test/ai/boundary.test.ts` refuses, and it is right to.
+  return `${normalizeTableName(table)}\u0000${name.replace(/"/g, '').toLowerCase()}`;
+}
+
+/**
+ * Every `(table, constraint)` this rung ADDs — the half that licenses a drop.
+ *
+ * **Why a rung may drop a constraint at all, when it may not drop anything
+ * else.** A CHECK cannot be widened in place: constraints conjoin, so a second
+ * permissive one changes nothing while the first still stands. Admitting a
+ * seventh label to `ingest_log.failure_code` means dropping the six-label
+ * constraint and re-adding it wider under the same name — and rung 15 needed
+ * exactly that, to stop a fleet-credential failure being recorded as a user's
+ * revoked grant.
+ *
+ * That pair is not a contraction in the sense this guard protects. What it
+ * protects is a **previous fleet version still serving a tenant this rung has
+ * migrated**, and a strictly wider constraint narrows none of that release's
+ * statements: its writes still pass, its reads never had an opinion about the
+ * alphabet. The same reasoning that admitted `DROP NOT NULL` — the one action
+ * that widens rather than rewrites — admits this one.
+ *
+ * **What the pairing rule buys, and what it does not.** It refuses the shape
+ * that really does leave a guarantee behind: a lone `DROP CONSTRAINT`, with
+ * nothing put back. It cannot check that the replacement is *wider* — a rung
+ * could re-add a narrower constraint under the same name and pass here, and
+ * that would break the previous release's writes on the first row it refuses.
+ * That is the same residual `ADD CONSTRAINT` has always carried (this file's
+ * header names it), and it is paid by the same thing: the frozen fleet surface
+ * in `test/schema/rollout.test.ts`, which runs the previous release's own
+ * statements against a database this rung has migrated.
+ *
+ * `DROP CONSTRAINT … CASCADE` is not matched by the pairing shape and so is
+ * refused: the cascade reaches objects this rung never names, and re-adding the
+ * constraint does not bring them back.
+ */
+function constraintsAddedBy(statements: readonly string[]): Set<string> {
+  const added = new Set<string>();
+  for (const statement of statements) {
+    const head = statement.replace(/\s+/g, ' ').trim();
+    const alter = /^ALTER TABLE\s+(?:IF EXISTS\s+)?(?:ONLY\s+)?(\S+)\s+([\s\S]+)$/i.exec(head);
+    if (alter === null) continue;
+    for (const action of splitTopLevelCommas(alter[2] ?? '')) {
+      const match = /^ADD CONSTRAINT\s+(\S+)/i.exec(action);
+      if (match?.[1] !== undefined) added.add(constraintKey(alter[1] ?? '', match[1]));
+    }
+  }
+  return added;
+}
+
 /**
  * One `ALTER TABLE`, judged action by action.
  *
@@ -919,11 +982,26 @@ function alterTableFindings(
   table: string,
   body: string,
   createdHere: ReadonlySet<string>,
+  readdedHere: ReadonlySet<string>,
 ): string[] {
   const findings: string[] = [];
   const actions = splitTopLevelCommas(body);
 
   for (const action of actions) {
+    // Before the allowlist, because a paired drop is the one shape that is
+    // additive in effect and subtractive in spelling. Anchored end to end so
+    // `CASCADE` and `RESTRICT` fall through to the refusal below rather than
+    // riding along on a name that happens to match.
+    const dropped = /^DROP CONSTRAINT\s+(?:IF EXISTS\s+)?(\S+)\s*$/i.exec(action);
+    if (dropped !== null) {
+      if (!readdedHere.has(constraintKey(table, dropped[1] ?? ''))) {
+        findings.push(
+          `constraint dropped and not put back on ${normalizeTableName(table)}: ${JSON.stringify(action.slice(0, 80))} — a rung may drop a constraint only to re-add it under the same name in the same rung, which is how a CHECK is widened; a drop with nothing after it removes a guarantee the previous fleet version was written against`,
+        );
+      }
+      continue;
+    }
+
     if (!EXPAND_ONLY_ALTER_ACTIONS.some((shape) => shape.test(action))) {
       findings.push(
         `not an additive ALTER TABLE action on ${normalizeTableName(table)}: ${JSON.stringify(action.slice(0, 80))} in ${JSON.stringify(head.slice(0, 80))} — a multi-action ALTER is judged action by action, because the previous fleet version experiences each of them`,

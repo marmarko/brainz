@@ -250,6 +250,8 @@ function reasonForCode(code: IngestFailureCode): PullStopReason {
       return 'rate_limited';
     case 'auth_expired':
       return 'auth_expired';
+    case 'fleet_auth_failed':
+      return 'fleet_auth_failed';
     case 'budget_exhausted':
       return 'budget_exhausted';
     case 'cancelled':
@@ -357,6 +359,16 @@ function ingestCodeFor(reason: PullFailureReason): IngestFailureCode {
   switch (reason) {
     case 'auth_expired':
       return 'auth_expired';
+    // **Its own code, unlike `cursor_invalid` below, and the difference is who
+    // reads it.** A cursor invalidation is recovered inside this file and its
+    // precise record has a home on the connector state. A fleet credential
+    // failure has no recovery here at all: the remedy is an operator's, the
+    // blast radius is every tenant, and the surfaces that would carry the
+    // signal — `/admin connector_status`, the dashboard's cause — read this
+    // vocabulary and no other. Folded into `provider_error` it would be one
+    // more 502 in a bucket full of them.
+    case 'fleet_auth_failed':
+      return 'fleet_auth_failed';
     case 'rate_limited':
       return 'rate_limited';
     case 'not_connected':
@@ -1298,14 +1310,29 @@ export class IngestPullFailure extends Error {
  * THE RULING, REASON BY REASON
  * ============================================================================
  *
- * **`auth_expired` is the only terminal one.** It is a 401 or a 403 after a
- * token refresh has already been tried (`client.ts:classifyTokenFailure`), which
+ * **`auth_expired` is the only terminal one.** It is a 401 or a 403 from the
+ * *proxy* (`client.ts:classifyHttpFailure`) — a call made with a token this
+ * fleet successfully minted, against an account this user attached — which
  * means the grant is gone: withdrawn at the provider, expired, or scoped away.
  * Nothing this fleet can do changes that answer, so twelve attempts across two
  * days is twelve provider calls and twelve tenant-database wakes spent
  * confirming it — while the dashboard says *retrying* and the one person who
  * could fix it in thirty seconds is not asked. The lane stops now and the panel
  * says *reconnect*.
+ *
+ * **`fleet_auth_failed` is retryable, and it is the one that used to be
+ * `auth_expired`.** It is the vendor refusing brainz's own `client_credentials`
+ * mint (`client.ts:classifyTokenFailure`), which is a statement about the
+ * fleet-wide client id and secret and about nothing else. The two are opposite
+ * in every way that matters here: the grant failure is one tenant's and only
+ * they can fix it; the credential failure is every tenant's at once and **none
+ * of them can do anything about it**. Terminal was catastrophic in exactly that
+ * asymmetry — one rotated secret dead-lettered every lane in the fleet and told
+ * every user it was their account. The remedy is a rotation or a redeploy, and
+ * a lane that stopped trying would not notice it land, so the ladder runs. The
+ * signal an operator needs is the *code*, which reaches `/admin
+ * connector_status` and the panel's cause; the user is told what is true — it
+ * is ours, and it retries on its own.
  *
  * **`provider_error` is retryable, and it is the case this whole change exists
  * for.** A 5xx, a vendor deploy, a route we were building wrong — all land here,
@@ -1346,6 +1373,7 @@ export function pullStopIsTerminal(reason: PullStopReason | 'unknown'): boolean 
   switch (reason) {
     case 'auth_expired':
       return true;
+    case 'fleet_auth_failed':
     case 'rate_limited':
     case 'provider_error':
     case 'cursor_invalid':

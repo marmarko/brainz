@@ -184,7 +184,13 @@ export async function ingestLogRows(sql: SQL): Promise<
            outcome, failure_code, items_seen, items_written, items_quarantined,
            started_at, finished_at
       FROM ingest_log
-     ORDER BY ingest_id
+     -- Qualified, and it has to be. An unqualified ORDER BY ingest_id binds to
+     -- the OUTPUT column -- the ::text alias above -- so the rows come back in
+     -- string order: id 10 before id 9. It was invisible while every case here
+     -- inserted fewer than ten rows, and the first case to insert ten (the run
+     -- that writes one row per ingest failure code) read as a mapping bug in
+     -- the code under test. The table's own column is numeric.
+     ORDER BY ingest_log.ingest_id
   `) as never;
 }
 

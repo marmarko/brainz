@@ -34,7 +34,7 @@
 
 import type { SQL } from 'bun';
 
-import type { IngestFailureCode } from '../ingest/log.ts';
+import { INGEST_FAILURE_CODES, type IngestFailureCode } from '../ingest/log.ts';
 import type {
   ConnectorAttempt,
   ConnectorHealthRecorder,
@@ -54,26 +54,102 @@ async function storePresent(sql: SQL): Promise<boolean> {
   return rows[0]?.present === true;
 }
 
+/** The labels one enum in this file's DDL already holds, in declaration order. */
+async function enumLabels(sql: SQL, typeName: string): Promise<string[]> {
+  const rows = (await sql`
+    SELECT enumlabel::text AS label
+      FROM pg_enum
+     WHERE enumtypid = ${typeName}::regtype
+     ORDER BY enumsortorder
+  `) as unknown as { label: string }[];
+  return rows.map((row) => row.label);
+}
+
 /**
- * Create the table if this deployment does not have it yet.
+ * Teach an existing enum the labels the fleet has since learned.
+ *
+ * **Why this exists at all — the gap that made it necessary.**
+ * {@link ensureConnectorHealthSchema} used to return the moment the table was
+ * present, which is correct for a table and silently wrong for everything
+ * declared beside it. The DDL is applied *once per deployment, ever*: a control
+ * plane that has the table skips the file forever, so no enum in it could ever
+ * gain a label. Nothing would have said so, either — the recorder swallows its
+ * write errors to a sink by design, so the first attempt to store a new code
+ * would have failed quietly, one connector at a time, which is exactly the
+ * silence `control.connector_health` exists to end.
+ *
+ * So the create is now the conditional half and this is unconditional.
+ *
+ * **`ADD VALUE` rather than a recreate.** A Postgres enum cannot have a label
+ * inserted in the middle without dropping the type, and dropping it means
+ * dropping the columns typed by it. Appending is the only additive move, which
+ * is why the TypeScript constants this mirrors are append-only too — a label
+ * added in their middle would order differently here.
+ *
+ * Each `ALTER` is its own statement, outside any transaction this function
+ * opens: Postgres refuses to *use* a value added in the current transaction,
+ * and the first thing the caller does with it is store a row. Missing labels
+ * are added in the constant's own order so a deployment several labels behind
+ * ends up with the same sequence as a fresh one.
+ *
+ * Fail-open on a lost race and fail-closed on anything else: two instances
+ * booting together can both see a label missing, and the loser's `ADD VALUE …
+ * IF NOT EXISTS` is a no-op rather than an error — but a permission failure or
+ * a missing type is a deployment that cannot record a cause, and that must
+ * crash-loop visibly rather than answer a dashboard with a swallowed error.
+ */
+async function ensureEnumLabels(
+  sql: SQL,
+  typeName: string,
+  labels: readonly string[],
+): Promise<void> {
+  const present = new Set(await enumLabels(sql, typeName));
+  for (const label of labels) {
+    if (present.has(label)) continue;
+    // **Interpolated, because Postgres refuses a bind parameter here.**
+    // `ALTER TYPE` is a utility statement; `$1` is a syntax error in it, not a
+    // placeholder. Both operands are this repo's own frozen constants rather
+    // than anything a request can reach — but the check is written anyway,
+    // because "it cannot be input" is a property of today's callers and the
+    // anchored alphabet is a property of the statement.
+    if (!/^[a-z][a-z0-9_]*$/.test(label)) {
+      throw new Error(`refusing to add an unusable enum label to ${typeName}`);
+    }
+    try {
+      await sql.unsafe(`ALTER TYPE ${typeName} ADD VALUE IF NOT EXISTS '${label}'`);
+    } catch (error) {
+      // A lost race is a no-op; anything else is a deployment that cannot
+      // record a cause, and must crash-loop visibly.
+      if (!(await enumLabels(sql, typeName)).includes(label)) throw error;
+    }
+  }
+}
+
+/**
+ * Create the table if this deployment does not have it yet, then bring its
+ * vocabularies up to what this release can produce.
  *
  * Idempotent and advisory-locked, and the catch-and-re-ask is the shape
  * `secret-pg.ts` settled: two instances racing the catalog check can both pass
  * it, and the loser's `CREATE` fails on a type the winner just made.
  */
 export async function ensureConnectorHealthSchema(sql: SQL): Promise<void> {
-  if (await storePresent(sql)) return;
-
-  const ddl = await Bun.file(DDL_PATH).text();
-  try {
-    await sql.begin(async (tx) => {
-      await tx`SELECT pg_advisory_xact_lock(${CONNECTOR_HEALTH_LOCK_KEY})`;
-      if (await storePresent(tx)) return;
-      await tx.unsafe(ddl);
-    });
-  } catch (error) {
-    if (!(await storePresent(sql))) throw error;
+  if (!(await storePresent(sql))) {
+    const ddl = await Bun.file(DDL_PATH).text();
+    try {
+      await sql.begin(async (tx) => {
+        await tx`SELECT pg_advisory_xact_lock(${CONNECTOR_HEALTH_LOCK_KEY})`;
+        if (await storePresent(tx)) return;
+        await tx.unsafe(ddl);
+      });
+    } catch (error) {
+      if (!(await storePresent(sql))) throw error;
+    }
   }
+
+  // Unconditional, and after the create rather than inside it: a deployment
+  // that already had the table is precisely the one whose enum is behind.
+  await ensureEnumLabels(sql, 'control.connector_ingest_failure', INGEST_FAILURE_CODES);
 }
 
 /**

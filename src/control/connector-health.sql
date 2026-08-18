@@ -102,13 +102,27 @@ CREATE TYPE control.connector_run_outcome AS ENUM (
 
 -- `ingest_log.failure_code`'s vocabulary (`INGEST_FAILURE_CODES`). This is the
 -- cause when there was a run to have one.
+--
+-- **Append-only, and the order matters.** A control plane created before a
+-- label existed grows it through `ALTER TYPE … ADD VALUE`
+-- (`connector-health.ts:ensureEnumLabels`), which appends — so a label inserted
+-- in the middle here would leave fresh and upgraded deployments holding the
+-- same labels in different orders, and the pin in
+-- `test/control/connector-health.test.ts` compares the sequence.
+--
+-- `fleet_auth_failed` is the seventh: brainz's own fleet-wide credential
+-- failing to mint, which is a different failure from `auth_expired` — a
+-- *user's* grant being gone — with a different owner and the opposite retry
+-- policy. Sharing one code marked every tenant's every lane dead the first time
+-- the fleet secret was wrong.
 CREATE TYPE control.connector_ingest_failure AS ENUM (
   'auth_expired',
   'rate_limited',
   'provider_error',
   'parse_failed',
   'budget_exhausted',
-  'cancelled'
+  'cancelled',
+  'fleet_auth_failed'
 );
 
 -- `control.job.failure_code`'s vocabulary (`JOB_FAILURE_CODES`). This is the

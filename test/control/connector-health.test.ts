@@ -367,3 +367,108 @@ describe('a failure reason is a code, and cannot become a subject line', () => {
     expect(text).not.toContain('msg_881');
   });
 });
+
+/**
+ * **The gap this suite would not have caught, and the deployment it would have
+ * broken.**
+ *
+ * `ensureConnectorHealthSchema` used to return the instant the table existed.
+ * That is right for the table and silently wrong for the enums declared beside
+ * it: the DDL file is applied once per deployment ever, so a control plane that
+ * already had the table could never learn a label the fleet added later. Every
+ * test above runs against a control plane created from the *current* file, so
+ * every one of them passed while that was true.
+ *
+ * What it would have cost: the seventh ingest code lands, the fleet deploys,
+ * and the first connector to fail on a fleet credential tries to store
+ * `fleet_auth_failed` into a six-label enum. The write raises, the recorder
+ * hands the error to its sink and returns — by design, so a control-plane blip
+ * cannot walk a tenant up the retry ladder — and the dashboard shows an attempt
+ * with no cause at all. The one table built to end that silence would have been
+ * the thing producing it.
+ *
+ * So the fixture here is the shape a live deployment actually has: the type as
+ * it was *before* the label, the table already built on it, and `ensure` asked
+ * to catch up.
+ */
+describe('a control plane built before a code existed learns it', () => {
+  let old: ControlFixture;
+  let oldSql: SQL;
+
+  /** `connector-health.sql`, rewound to the six-label vocabulary. */
+  function ddlBeforeFleetAuth(): string {
+    const rewound = SCHEMA_SQL.replace(/,\s*\n\s*'fleet_auth_failed'\n\)/, '\n)');
+    // The rewind must have done something, or this whole describe is asserting
+    // that the current file equals itself.
+    if (rewound === SCHEMA_SQL) throw new Error('the six-label rewind matched nothing');
+    return rewound;
+  }
+
+  beforeAll(async () => {
+    old = await createControlPlane('connectorhealthold');
+    oldSql = connect(old);
+    await oldSql.unsafe(ddlBeforeFleetAuth());
+    await seedTenant(oldSql, TENANT);
+  }, 60_000);
+
+  afterAll(async () => {
+    await oldSql?.close();
+    if (old !== undefined) await dropControlPlane(old);
+  });
+
+  test('the table it already has is not rebuilt, and the enum it is missing is', async () => {
+    const before = (await oldSql`
+      SELECT enumlabel::text AS label FROM pg_enum
+       WHERE enumtypid = 'control.connector_ingest_failure'::regtype
+       ORDER BY enumsortorder`) as unknown as { label: string }[];
+    expect(before.map((row) => row.label)).toEqual(
+      INGEST_FAILURE_CODES.filter((code) => code !== 'fleet_auth_failed'),
+    );
+
+    await ensureConnectorHealthSchema(oldSql);
+
+    const after = (await oldSql`
+      SELECT enumlabel::text AS label FROM pg_enum
+       WHERE enumtypid = 'control.connector_ingest_failure'::regtype
+       ORDER BY enumsortorder`) as unknown as { label: string }[];
+    // In the constant's order, not merely present: `ADD VALUE` appends, so an
+    // upgraded deployment and a fresh one agree only while the constant is
+    // append-only. The pin at the top of this file compares the same sequence.
+    expect(after.map((row) => row.label)).toEqual([...INGEST_FAILURE_CODES]);
+  });
+
+  test('and the cause it could not store before is stored, not swallowed', async () => {
+    // The consequence, which is the only version of this worth asserting: a
+    // label present in `pg_enum` and a row that will not insert are the same
+    // outage. The sink rethrows here, so a swallowed failure fails the test.
+    await ensureConnectorHealthSchema(oldSql);
+    const health = createControlPlaneConnectorHealth(oldSql, (error) => {
+      throw error;
+    });
+    await health.record({
+      tenantId: TENANT,
+      source: 'gmail',
+      at: NOW,
+      runOutcome: 'failed',
+      ingestFailureCode: 'fleet_auth_failed',
+      jobFailureCode: null,
+      itemsWritten: 0,
+      itemsFailed: 0,
+    });
+
+    const stored = (await readConnectorHealth(oldSql, { tenantId: TENANT })).get('gmail');
+    expect(causeOf(stored)).toBe('fleet_auth_failed');
+  });
+
+  test('running it again changes nothing', async () => {
+    // Idempotence is the property that lets every web and worker instance call
+    // this at boot. A second pass that raised would crash-loop the fleet.
+    await ensureConnectorHealthSchema(oldSql);
+    await ensureConnectorHealthSchema(oldSql);
+    const labels = (await oldSql`
+      SELECT enumlabel::text AS label FROM pg_enum
+       WHERE enumtypid = 'control.connector_ingest_failure'::regtype
+       ORDER BY enumsortorder`) as unknown as { label: string }[];
+    expect(labels.map((row) => row.label)).toEqual([...INGEST_FAILURE_CODES]);
+  });
+});

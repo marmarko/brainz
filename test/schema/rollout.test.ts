@@ -46,6 +46,7 @@ import {
 import {
   FLEET_1_SURFACE,
   FLEET_13_SURFACE,
+  FLEET_14_SURFACE,
   FLEET_SURFACES,
   runFleetSurface,
 } from './fleet-surface.ts';
@@ -128,6 +129,68 @@ describe('every rung is additive, statically', () => {
     // Nor may it carry a trailing clause the anchor would otherwise let through.
     expect(
       findExpandContractViolations('ALTER TABLE fact ALTER COLUMN embedding DROP NOT NULL CASCADE;'),
+    ).toHaveLength(1);
+  });
+
+  test('a constraint may be dropped only to be put back, which is how a CHECK widens', () => {
+    // Rung 15 needs it. A CHECK cannot be widened in place — constraints
+    // conjoin, so a second permissive one changes nothing while the first
+    // stands — and admitting `fleet_auth_failed` to `ingest_log.failure_code`
+    // means dropping the six-label constraint and re-adding it wider. The pair
+    // is additive in effect: every code the previous release writes still
+    // passes, and nothing it reads is narrowed.
+    expect(
+      findExpandContractViolations(`
+        ALTER TABLE ingest_log DROP CONSTRAINT ingest_log_failure_is_a_code;
+        ALTER TABLE ingest_log ADD CONSTRAINT ingest_log_failure_is_a_code CHECK (
+          failure_code IS NULL OR failure_code IN ('auth_expired', 'fleet_auth_failed')
+        );
+      `),
+    ).toEqual([]);
+
+    // **The violating case, which is the whole reason this is a pairing rule
+    // and not an allowlist entry.** A drop with nothing after it removes a
+    // guarantee the previous fleet version was written against, and reads
+    // identically at a glance.
+    expect(
+      findExpandContractViolations('ALTER TABLE ingest_log DROP CONSTRAINT ingest_log_failure_is_a_code;'),
+    ).toHaveLength(1);
+
+    // Same table, different name: putting *a* constraint back is not putting
+    // *this* one back. Without the name in the key, any rung that added
+    // anything would license dropping everything.
+    expect(
+      findExpandContractViolations(`
+        ALTER TABLE ingest_log DROP CONSTRAINT ingest_log_failure_is_a_code;
+        ALTER TABLE ingest_log ADD CONSTRAINT ingest_log_counts_are_positive CHECK (items_seen >= 0);
+      `),
+    ).toHaveLength(1);
+
+    // Same name, different table. A rung that widens one table's CHECK must not
+    // thereby license dropping the same-named constraint off another.
+    expect(
+      findExpandContractViolations(`
+        ALTER TABLE chunk DROP CONSTRAINT rows_are_scored;
+        ALTER TABLE fact ADD CONSTRAINT rows_are_scored CHECK (confidence >= 0);
+      `),
+    ).toHaveLength(1);
+
+    // `CASCADE` reaches objects this rung never names, and re-adding the
+    // constraint does not bring them back — so the pairing shape is anchored
+    // and a cascading drop falls through to the ordinary refusal.
+    expect(
+      findExpandContractViolations(`
+        ALTER TABLE ingest_log DROP CONSTRAINT ingest_log_failure_is_a_code CASCADE;
+        ALTER TABLE ingest_log ADD CONSTRAINT ingest_log_failure_is_a_code CHECK (failure_code IS NULL);
+      `),
+    ).toHaveLength(1);
+
+    // And the pairing does not launder its neighbours: a legitimate drop-and-
+    // re-add in one statement buys the `DROP COLUMN` beside it nothing.
+    expect(
+      findExpandContractViolations(
+        'ALTER TABLE ingest_log DROP CONSTRAINT c, ADD CONSTRAINT c CHECK (items_seen >= 0), DROP COLUMN outcome;',
+      ),
     ).toHaveLength(1);
   });
 
@@ -382,6 +445,28 @@ describe('the previous fleet version still serves a tenant migrated to the curre
     );
     expect(facts.some((statement) => statement.includes('embedding <=>'))).toBe(true);
     expect(facts.some((statement) => statement.trim().startsWith('UPDATE chunk SET embedding'))).toBe(true);
+  });
+
+  test('the release that rung 15 widens a CHECK under writes every label it widens', () => {
+    // Rung 15 drops and re-adds `ingest_log_failure_is_a_code`. The scanner
+    // admits the pair but cannot see that the replacement is *wider*, so this
+    // surface is the only thing that would catch a label going missing from it
+    // — and it only catches it if fleet-14 actually writes that label.
+    const runs = FLEET_14_SURFACE.exchanges.flatMap((exchange) => exchange.statements);
+    for (const code of [
+      'auth_expired',
+      'rate_limited',
+      'provider_error',
+      'parse_failed',
+      'budget_exhausted',
+      'cancelled',
+    ]) {
+      expect({ code, written: runs.some((statement) => statement.includes(`'${code}'`)) }).toEqual({
+        code,
+        written: true,
+      });
+    }
+    expect(runs.some((statement) => statement.trim().startsWith('INSERT INTO ingest_log'))).toBe(true);
   });
 
   test('one release of promise buys exactly one rung of tolerance', () => {

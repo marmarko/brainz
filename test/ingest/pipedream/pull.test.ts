@@ -35,6 +35,7 @@ import {
 import { sourceStaleness } from '../../../src/ingest/log.ts';
 import { pauseSource, readPausedSources, resumeSource } from '../../../src/ingest/pause.ts';
 import {
+  IngestPullFailure,
   createIngestPullHandler,
   enqueuePullIfDue,
   originContextFor,
@@ -476,6 +477,36 @@ describe('staleness events', () => {
     const drive = staleness.find((row) => row.originContext === originContextFor('drive', null));
     expect(drive?.lastFailureCode).toBe('auth_expired');
     expect(drive?.runInProgress).toBe(false);
+  });
+
+  test('a fleet credential failure is logged as its own code, not as a dead grant', async () => {
+    // The other half of the split, through the real log. `auth_expired` above is
+    // the user's grant and is terminal; this is brainz's own `client_credentials`
+    // mint failing, which no tenant can repair and which the ladder must keep
+    // retrying. If the two shared a code the panel would tell every user in the
+    // fleet to reconnect an account that was working.
+    //
+    // It reaches the tenant's own `ingest_log`, which means rung 15's widened
+    // CHECK is exercised here rather than asserted: before it, this row would
+    // not have inserted at all.
+    const states = await storeWith(stateFor('calendar'));
+    const source = createFakeSource('calendar', 'calendar', [
+      { ok: false, reason: 'fleet_auth_failed' },
+    ]);
+
+    const result = await pull(source, states);
+    expect(result.outcome).toBe('failed');
+    expect(result.stopReason).toBe('fleet_auth_failed');
+
+    const staleness = await sourceStaleness(fixture.tenantSql, { now: NOW });
+    const calendar = staleness.find(
+      (row) => row.originContext === originContextFor('calendar', null),
+    );
+    expect(calendar?.lastFailureCode).toBe('fleet_auth_failed');
+    expect(calendar?.runInProgress).toBe(false);
+
+    // And the lane it produces is one the runner will try again.
+    expect(new IngestPullFailure('calendar', result.stopReason).jobRetryable).toBe(true);
   });
 
   test('an invalidated cursor discards the cursor, logs the event, and re-imports through the gate', async () => {
