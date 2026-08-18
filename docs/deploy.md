@@ -585,6 +585,63 @@ unowned.
 `op=tenant_status&tenant_id=…` still answers the operational detail for one
 tenant once you know which one you mean.
 
+## "My mail is not arriving": why one connector stopped
+
+**Start here rather than with the container logs. There is nothing in them.** The
+pull handler writes its result to container stdout, and `wrangler tail` captures
+the Worker, not the container — so the line exists and nothing outside the
+container can read it. The run's own detail is in the tenant's `ingest_log`,
+behind a connection string sealed under a Worker secret. Neither is reachable
+from a terminal, which is why the answer comes out of the control plane instead:
+
+```bash
+curl -sS -H "Authorization: Bearer $BRAINZ_ADMIN_CREDENTIAL" \
+  "$ORIGIN/admin?op=connector_status&tenant_id=$TENANT" | jq '.content'
+```
+
+```json
+{
+  "lanes": [
+    { "source": "gmail", "state": "due", "attempts": 3, "max_attempts": 5,
+      "run_at": "2026-08-17T09:12:00.000Z", "job_failure_code": "handler_error" }
+  ],
+  "connectors": [
+    { "source": "gmail", "last_attempt_at": "2026-08-17T09:04:00.000Z",
+      "last_success_at": "2026-08-14T21:00:00.000Z", "run_outcome": "failed",
+      "ingest_failure_code": "auth_expired", "job_failure_code": null,
+      "cause": "auth_expired", "items_written": 0, "items_failed": 0 }
+  ]
+}
+```
+
+**Read `cause`, not `job_failure_code` on the lane.** The lane's code is the job
+queue's own vocabulary and its answer for any handler that threw is
+`handler_error` — true, and not the reason anybody is asking. `cause` is the
+attempt's own, and it separates the four things that look identical from the
+queue:
+
+| `cause` | What happened | Whose problem |
+|---|---|---|
+| `auth_expired` | the grant was withdrawn or expired | the **user's** — they reconnect, and the dashboard tells them so |
+| `rate_limited`, `provider_error` | the provider refused this attempt | nobody's; the ladder retries |
+| `budget_exhausted` | the tenant's spend cap stopped the import | the user's, and reconnecting does **not** fix it |
+| `tenant_unavailable` | the brain's own database could not be opened | ours — substrate, not connector |
+| `handler_error` | the code threw and named nothing | ours, and it is a bug |
+
+`items_failed` on the last attempt is the number that separates "nothing arrived
+this week" from "part of the mailbox is missing"; `last_success_at` separates a
+connector that broke on Friday from one that has never worked. Neither needs the
+tenant's database — the worker banks both at the end of every attempt, which is
+also why this answers for a tenant whose compute is suspended or unreachable.
+
+**What is deliberately not here:** which message, which subject, which sender.
+`control.connector_health` holds codes, counts and timestamps, and its column
+types cannot hold anything else. The per-item record stays in the tenant's own
+`ingest_log`, where a provider's id for somebody's mail belongs.
+
+The same facts reach the user in their own words on `/dashboard`, so a support
+reply can usually be "look at the panel" rather than a screenshot of this JSON.
+
 ## Tearing it down
 
 **`wrangler delete` removes the Worker and leaves the container application and
