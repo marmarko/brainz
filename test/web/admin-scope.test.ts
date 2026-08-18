@@ -43,6 +43,7 @@ import {
   adminDispatch,
   adminToolVerdict,
 } from '../../src/web/admin.ts';
+import { ensureConnectorHealthSchema } from '../../src/control/connector-health.ts';
 import { TOOL_NAMES } from '../../src/mcp/tools/index.ts';
 import { createGateway } from '../consolidate/fixture.ts';
 import {
@@ -74,6 +75,10 @@ let controlSql: SQL;
 beforeAll(async () => {
   fixture = await createControlPlane('adminscope');
   controlSql = connect(fixture);
+  // `connector_status` reads the table `src/web/serve.ts` ensures at boot.
+  // `createControlPlane` applies `schema.sql` alone, so a suite that composes
+  // past the entrypoint ensures for itself — as `app.test.ts` does beside it.
+  await ensureConnectorHealthSchema(controlSql);
   await seedTenant(controlSql, TENANT);
 }, 60_000);
 

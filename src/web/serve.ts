@@ -47,6 +47,7 @@ import {
   createPostgresConnectorLinks,
   ensureConnectorLinkSchema,
 } from '../control/connector-pg.ts';
+import { ensureConnectorHealthSchema } from '../control/connector-health.ts';
 import {
   createConnectorReconciler,
   createPipedreamAccountLister,
@@ -123,6 +124,12 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
   // user's button with a 500. Idempotent and advisory-locked, so whichever
   // fleet boots first does the work.
   await ensureConnectorLinkSchema(controlSql);
+  // The same argument for the table beside it: this fleet never writes a
+  // connector's health, but it reads one on every dashboard load and on every
+  // `/admin connector_status`, and a web instance that booted before any worker
+  // had ever polled would answer both with `relation does not exist` — which is
+  // a 500 on the page whose whole job is to explain a failure.
+  await ensureConnectorHealthSchema(controlSql);
 
   const handle = createWebApp({
     sql,

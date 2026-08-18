@@ -36,6 +36,7 @@ import type { JobLease } from '../../../src/worker/jobs.ts';
 import { createGateway } from '../../core/write/fixture.ts';
 import { TENANT, countRows, createIngestFixture, type IngestFixture } from '../fixture.ts';
 import { createFakeSource, mailBody, page } from './fixture.ts';
+import { createRecordingHealth } from './health-fixture.ts';
 
 let fixture: IngestFixture;
 
@@ -300,6 +301,7 @@ describe('the loss is visible', () => {
 
     const seen: PullResult[] = [];
     const handler = createIngestPullHandler({
+      health: createRecordingHealth(),
       control: fixture.controlSql,
       profile: HOSTED_PROFILE,
       openTenant: () => Promise.resolve(fixture.runtime),
@@ -331,6 +333,7 @@ describe('the loss is visible', () => {
       { ok: false, reason: 'auth_expired' },
     ]);
     const handler = createIngestPullHandler({
+      health: createRecordingHealth(),
       control: fixture.controlSql,
       profile: HOSTED_PROFILE,
       openTenant: () => Promise.resolve(fixture.runtime),

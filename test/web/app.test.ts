@@ -31,6 +31,7 @@ import {
   ensureConnectorLinkSchema,
   markConnectPending,
 } from '../../src/control/connector-pg.ts';
+import { ensureConnectorHealthSchema } from '../../src/control/connector-health.ts';
 import { generateSealingKeyMaterial, importSealingKey } from '../../src/control/sealed.ts';
 import { connectSource } from '../../src/ingest/cursor.ts';
 import { BRAIN_SETUP_PATH, escapeHtml } from '../../src/web/pages.ts';
@@ -307,6 +308,9 @@ beforeAll(async () => {
   // tables a fleet ensures for itself are each ensured by whoever needs them,
   // the same way `oauth-sweep.test.ts` ensures the authorization store.
   await ensureConnectorLinkSchema(controlSql);
+  // And the health table beside it, ensured at boot by the same entrypoint:
+  // the dashboard reads a connector's last attempt out of it on every render.
+  await ensureConnectorHealthSchema(controlSql);
   recorded = { byokPuts: [], byokRevokes: [], minted: [], disconnected: [], severed: [], provisioned: [] };
 }, 60_000);
 
@@ -1966,7 +1970,24 @@ describe('the status beside each source says only what this brain can know', () 
     expect(page).toContain('A check is queued or running now');
   });
 
-  test('a dead-lettered lane reads as failing, and names the code', async () => {
+  /**
+   * **This case used to assert that the page printed `handler_error`, and that
+   * was the defect rather than the guarantee.**
+   *
+   * `handler_error` is `control.job`'s vocabulary for "a handler threw" — the
+   * runner's generic bucket, which covers a revoked grant, an exhausted spend
+   * cap, an unreachable brain and a bug in our own code in exactly the same
+   * five syllables. Printing it at the person whose mail has stopped arriving
+   * tells them nothing they can act on, and the instruction that used to follow
+   * it — disconnect and connect again — is right for one of those causes and
+   * wrong for the rest.
+   *
+   * So what is asserted now is the **cause**, which arrives from
+   * `control.connector_health` in the ingest log's own vocabulary, and the fact
+   * that the queue's code does NOT reach the page. A lane with no health record
+   * (this one) says so plainly rather than inventing a reason.
+   */
+  test('a dead-lettered lane reads as failing, and does not print the queue’s own code at the user', async () => {
     await reset();
     const cookie = await signedIn('paid');
     await attachSource('drive');
@@ -1976,8 +1997,32 @@ describe('the status beside each source says only what this brain can know', () 
       VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'drive', 'dead', 'connector_cadence',
               ${AT}, ${AT}, ${AT}, ${AT}, ${AT}, 'handler_error')`;
     const page = await (await app()(get('/dashboard', { cookie }))).text();
-    expect(page).toContain('handler_error');
     expect(page).toContain('no longer being polled');
+    expect(page).not.toContain('handler_error');
+    expect(page).toContain('Nothing recorded why');
+  });
+
+  test('and when something did record why, the page says what it was', async () => {
+    await reset();
+    const cookie = await signedIn('paid');
+    await attachSource('drive');
+    await controlSql`
+      INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason,
+                               run_at, created_at, updated_at, finished_at, dead_lettered_at, failure_code)
+      VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'drive', 'dead', 'connector_cadence',
+              ${AT}, ${AT}, ${AT}, ${AT}, ${AT}, 'handler_error')`;
+    // What the worker banks at the end of a pull the provider refused. The job
+    // row is unchanged from the case above — the only difference is that the
+    // cause exists somewhere this page can read without a tenant connection.
+    await controlSql`
+      INSERT INTO control.connector_health (tenant_id, source, last_attempt_at, run_outcome, ingest_failure_code)
+      VALUES (${TENANT}, 'drive'::control.connector_health_source, ${AT},
+              'failed'::control.connector_run_outcome,
+              'auth_expired'::control.connector_ingest_failure)`;
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).toContain('The provider stopped accepting our access');
+    expect(page).toContain('Disconnecting and connecting again is the fix');
+    expect(page).not.toContain('handler_error');
   });
 
   /**

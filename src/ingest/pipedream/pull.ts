@@ -92,6 +92,7 @@ import {
 import type {
   EnqueueOutcome,
   EnqueueRefusal,
+  JobFailureCode,
   JobLease,
   JobQueue,
   JobTrigger,
@@ -299,8 +300,19 @@ export interface PullCounts {
   readonly attachments: number;
 }
 
+/**
+ * What a pull did, as a closed set.
+ *
+ * Named rather than left inline on {@link PullResult} because the control
+ * plane's `connector_run_outcome` enum restates it — `src/control/
+ * connector-health.sql` — and a test parses that file and compares the two. An
+ * inline union is a vocabulary nothing can check.
+ */
+export const PULL_OUTCOMES = ['completed', 'stopped', 'deferred', 'refused', 'failed'] as const;
+export type PullOutcome = (typeof PULL_OUTCOMES)[number];
+
 export interface PullResult {
-  readonly outcome: 'completed' | 'stopped' | 'deferred' | 'refused' | 'failed';
+  readonly outcome: PullOutcome;
   readonly mode: PullMode;
   readonly runId: string | null;
   readonly decision: GateDecision | null;
@@ -1195,6 +1207,126 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
 // The `ingest_pull` handler.
 // ---------------------------------------------------------------------------
 
+/**
+ * One attempt at one source, in the vocabulary each layer already owns.
+ *
+ * **Two code columns, and neither vocabulary is new.** `ingestFailureCode` is
+ * `ingest_log.failure_code`'s (`src/ingest/log.ts`) — the run reached the
+ * provider and something said no. `jobFailureCode` is `control.job`'s
+ * (`src/worker/jobs.ts`) — there was no run to have a code, so the only thing
+ * that can be said is what the runner would say. A third vocabulary invented
+ * here would be the thing that makes a failure untranslatable between the log,
+ * the queue and the page.
+ *
+ * **What is deliberately absent: anything a user wrote.** No subject, no sender,
+ * no snippet, not the provider's id for the item, and no error message. Counts,
+ * codes and an instant. The control-plane column types refuse the rest a second
+ * time, but this type is where it stops being possible to try.
+ */
+export interface ConnectorAttempt {
+  readonly tenantId: string;
+  readonly source: ConnectorSource;
+  readonly at: Date;
+  /** What the pull said it did. Null when no pull produced a result. */
+  readonly runOutcome: PullOutcome | null;
+  readonly ingestFailureCode: IngestFailureCode | null;
+  readonly jobFailureCode: JobFailureCode | null;
+  readonly itemsWritten: number;
+  readonly itemsFailed: number;
+}
+
+/**
+ * Where the attempt goes, as a port.
+ *
+ * **Required rather than optional**, which is the opposite of {@link
+ * PullHandlerDeps.onResult} and deliberately so. `onResult` is a live
+ * notification a deployment may not want; this is the only durable record of
+ * *why* a poll failed that anything outside the tenant's own database can read,
+ * and a deployment that composed the handler without one would be back to the
+ * state this port exists to end — a failure whose cause is written to container
+ * stdout and nowhere else. An absent-able dependency is a dependency somebody
+ * forgets to wire, and this codebase has paid for that shape more than once.
+ *
+ * Implementations must not throw: see `src/control/connector-health.ts`. A
+ * record of an attempt that already happened is never worth failing the job for.
+ */
+export interface ConnectorHealthRecorder {
+  record(attempt: ConnectorAttempt): Promise<void>;
+}
+
+/**
+ * A pull that reached the provider and was refused.
+ *
+ * The job row records this as `handler_error` and that is correct rather than
+ * lazy: from the runner's side a handler threw, and `control.job.failure_code`
+ * is the runner's vocabulary. The *cause* — which of the provider's refusals it
+ * was, or that a budget stopped it — is on the health record, in the ingest
+ * log's vocabulary, written before this is thrown.
+ */
+export class IngestPullFailure extends Error {
+  readonly source: ConnectorSource;
+  readonly stopReason: PullStopReason | 'unknown';
+  /** The ingest-log code the run recorded for itself. */
+  readonly failureCode: IngestFailureCode;
+
+  constructor(source: ConnectorSource, stopReason: PullStopReason | undefined) {
+    const reason = stopReason ?? 'unknown';
+    super(`ingest_pull for '${source}' failed against the provider: ${reason}`);
+    this.name = 'IngestPullFailure';
+    this.source = source;
+    this.stopReason = reason;
+    this.failureCode = stopReason === undefined ? 'provider_error' : stopCodeFor(stopReason);
+  }
+}
+
+/**
+ * The brain this job is for could not be opened.
+ *
+ * **The distinction this exists to make.** Before it, an unreachable tenant
+ * database and a bug in the pull path were the same `handler_error` on the job
+ * row, and the two have opposite remedies: one is a substrate incident that will
+ * clear on its own and must not be chased, the other is ours and will not.
+ * `tenant_unavailable` has been in `JOB_FAILURE_CODES` since U10 and nothing
+ * ever wrote it.
+ *
+ * The message names the tenant and the source and nothing else; the original is
+ * carried as `cause`, for the fleet's own stderr, because a connection failure's
+ * text is the ordinary way a DSN travels.
+ */
+export class TenantUnreachableError extends Error {
+  readonly jobFailureCode = 'tenant_unavailable' as const;
+  readonly tenantId: string;
+
+  constructor(tenantId: string, source: ConnectorSource, cause: unknown) {
+    super(`the brain for '${tenantId}' could not be opened to poll '${source}'`, { cause });
+    this.name = 'TenantUnreachableError';
+    this.tenantId = tenantId;
+  }
+}
+
+/** The attempt a finished pull describes. */
+export function attemptFor(
+  lease: { readonly tenantId: string },
+  source: ConnectorSource,
+  at: Date,
+  result: PullResult,
+): ConnectorAttempt {
+  // A completed run has nothing to explain, and the control plane's CHECK
+  // refuses a row that claims otherwise. Derived here rather than trusted,
+  // because a code left on a recovered connector is a red line nobody can clear.
+  const failed = result.outcome !== 'completed' && result.stopReason !== undefined;
+  return {
+    tenantId: lease.tenantId,
+    source,
+    at,
+    runOutcome: result.outcome,
+    ingestFailureCode: failed ? stopCodeFor(result.stopReason as PullStopReason) : null,
+    jobFailureCode: null,
+    itemsWritten: result.counts.written,
+    itemsFailed: result.counts.failed,
+  };
+}
+
 export interface PullHandlerDeps {
   readonly control: SQL;
   readonly profile: NamedProfile;
@@ -1229,6 +1361,12 @@ export interface PullHandlerDeps {
    * still the ingest log; this is the live one, for whatever composes the fleet.
    */
   readonly onResult?: (result: PullResult, lease: JobLease) => void | Promise<void>;
+  /**
+   * Where the attempt's own outcome is banked, so "why is my mail not arriving"
+   * has an answer that does not need a shell on the container. See {@link
+   * ConnectorHealthRecorder} for why this one is not optional.
+   */
+  readonly health: ConnectorHealthRecorder;
 }
 
 /**
@@ -1245,10 +1383,44 @@ export function createIngestPullHandler(
   return async (context: JobContext): Promise<void> => {
     const { lease } = context;
     if (!isConnectorSource(lease.target)) {
+      // Not an attempt at a connector — it names a target no connector has — so
+      // there is no source whose health this could be recorded against.
       throw new Error(`ingest_pull handler claimed a job targeting '${lease.target}'`);
     }
+    const source = lease.target;
 
-    const tenant = await deps.openTenant(lease.tenantId);
+    /**
+     * **Exactly one health record per attempt.** The failure path below rethrows
+     * after recording, and the catch has to be able to tell "this attempt has
+     * already said what happened" from "this attempt died before it could". A
+     * flag rather than an `instanceof`, because the throws it must not
+     * double-record are not all of one type.
+     */
+    let recorded = false;
+    const record = async (attempt: ConnectorAttempt): Promise<void> => {
+      recorded = true;
+      await deps.health.record(attempt);
+    };
+
+    let tenant: TenantRuntime;
+    try {
+      tenant = await deps.openTenant(lease.tenantId);
+    } catch (error) {
+      // Outside the try below on purpose: there is no tenant handle to close,
+      // and this is the one failure whose cause the job row can carry on its own.
+      await record({
+        tenantId: lease.tenantId,
+        source,
+        at: context.now,
+        runOutcome: null,
+        ingestFailureCode: null,
+        jobFailureCode: 'tenant_unavailable',
+        itemsWritten: 0,
+        itemsFailed: 0,
+      });
+      throw new TenantUnreachableError(lease.tenantId, source, error);
+    }
+
     try {
       const opened = await deps.openSource(tenant, lease.target);
       const state = await opened.states.read(lease.target);
@@ -1280,6 +1452,10 @@ export function createIngestPullHandler(
       });
 
       await deps.onResult?.(result, lease);
+      // Before the throw below, not after: the record of *why* is the whole
+      // point, and a failure that threw its way past this would be the state
+      // this port exists to end.
+      await record(attemptFor(lease, source, context.now, result));
 
       // **A pull that never reached the provider is not a job that succeeded.**
       // Returning quietly marks the job complete, and the source then waits a
@@ -1287,11 +1463,25 @@ export function createIngestPullHandler(
       // rate-limited listing is exactly the condition a backed-off retry
       // exists for. A `stopped` run is *not* thrown on: its cursor is held, its
       // work is banked, and the next tick resumes it without a retry budget.
-      if (result.outcome === 'failed') {
-        throw new Error(
-          `ingest_pull for '${lease.target}' failed against the provider: ${result.stopReason ?? 'unknown'}`,
-        );
+      if (result.outcome === 'failed') throw new IngestPullFailure(source, result.stopReason);
+    } catch (error) {
+      // Everything that did not get as far as a result: the source seam refusing,
+      // the runner losing its lease mid-pull, a bug in this path. `handler_error`
+      // is honest about all three — the alternative is a code invented here that
+      // means "we do not know", which is what `handler_error` already means.
+      if (!recorded) {
+        await record({
+          tenantId: lease.tenantId,
+          source,
+          at: context.now,
+          runOutcome: null,
+          ingestFailureCode: null,
+          jobFailureCode: 'handler_error',
+          itemsWritten: 0,
+          itemsFailed: 0,
+        });
       }
+      throw error;
     } finally {
       await deps.closeTenant?.(tenant);
     }

@@ -43,6 +43,7 @@ import {
   type IngestFixture,
 } from '../fixture.ts';
 import { createFakeSource, mailBody, page } from './fixture.ts';
+import { createRecordingHealth } from './health-fixture.ts';
 
 let fixture: IngestFixture;
 
@@ -185,6 +186,7 @@ describe('a first import too big for one pass', () => {
     ]);
 
     const handler = createIngestPullHandler({
+      health: createRecordingHealth(),
       control: fixture.controlSql,
       profile: HOSTED_PROFILE,
       openTenant: () => Promise.resolve(fixture.runtime),
@@ -231,6 +233,7 @@ describe('a first import too big for one pass', () => {
     ]);
 
     const handler = createIngestPullHandler({
+      health: createRecordingHealth(),
       control: fixture.controlSql,
       profile: HOSTED_PROFILE,
       openTenant: () => Promise.resolve(fixture.runtime),
@@ -339,6 +342,7 @@ describe('the ceiling actually holds', () => {
     ]);
 
     const handler = createIngestPullHandler({
+      health: createRecordingHealth(),
       control: fixture.controlSql,
       profile: HOSTED_PROFILE,
       openTenant: () => Promise.resolve(fixture.runtime),

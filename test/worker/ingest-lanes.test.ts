@@ -57,7 +57,17 @@ import {
   type ConnectorState,
 } from '../../src/ingest/cursor.ts';
 import type { PullPage } from '../../src/ingest/pipedream/sources/types.ts';
+import type { PullFailureReason } from '../../src/ingest/pipedream/client.ts';
 import { pauseSource } from '../../src/ingest/pause.ts';
+// The three surfaces a failed poll has to reach. See the block at the bottom of
+// the `ingest_pull` section for why this file — and only this file — crosses
+// from the worker fleet into the web app's rendering.
+import {
+  connectorStatuses,
+  type ConnectorStatus,
+} from '../../src/web/connector-panel.ts';
+import { renderPage } from '../../src/web/pages.ts';
+import { adminDispatch } from '../../src/web/admin.ts';
 import { HOSTED_PROFILE } from '../../src/ai/routing.ts';
 import { ACTIVE_EMBEDDING_SEAT, seatColumnSql } from '../../src/schema/embedding-seat.ts';
 import { fleetIdentity, tenantNamespace } from '../../src/control/secrets.ts';
@@ -71,6 +81,11 @@ import {
   markConnectPending,
   type ConnectorLinks,
 } from '../../src/control/connector-pg.ts';
+import {
+  createControlPlaneConnectorHealth,
+  ensureConnectorHealthSchema,
+  readConnectorHealth,
+} from '../../src/control/connector-health.ts';
 import { generateSealingKeyMaterial, importSealingKey } from '../../src/control/sealed.ts';
 import {
   createConnectorReconciler,
@@ -116,6 +131,8 @@ beforeAll(async () => {
   leaseSql = connectControl(control, 2);
   // The connector link table, which both deployed entrypoints ensure at boot.
   await ensureConnectorLinkSchema(controlSql);
+  // And the health table beside it, for the same reason and by the same call.
+  await ensureConnectorHealthSchema(controlSql);
   SEALED_KEY = await importSealingKey(generateSealingKeyMaterial());
   brain = await provisionFixture('ingestlanes_brain');
   brainSql = connectTenant(brain);
@@ -153,6 +170,7 @@ async function resetBrain(): Promise<void> {
 
 beforeEach(async () => {
   await controlSql`DELETE FROM control.job`;
+  await controlSql`DELETE FROM control.connector_health`;
   await controlSql`DELETE FROM control.tenant`;
   await resetBrain();
   await seedTenant(controlSql, TENANT);
@@ -170,6 +188,21 @@ beforeEach(async () => {
  */
 function openTenant(): Promise<TenantRuntime> {
   return Promise.resolve(tenant);
+}
+
+/**
+ * The real control-plane recorder, over the real table.
+ *
+ * Not a spy. What is under test in this file is the fleet's wiring, and "the
+ * cause reached a database two other surfaces can read" is a claim only a
+ * database can settle. `unrecorded` collects anything the write itself threw —
+ * the recorder is deliberately fail-open, so a suite that did not look at this
+ * would pass with the record never written, which is the failure the whole
+ * arrangement exists to end.
+ */
+const unrecorded: unknown[] = [];
+function health() {
+  return createControlPlaneConnectorHealth(controlSql, (error) => unrecorded.push(error));
 }
 
 async function enqueueClaimable(
@@ -274,6 +307,7 @@ describe('the `ingest_pull` lane', () => {
         ingest_pull: createIngestPullHandler({
           control: controlSql,
           profile: HOSTED_PROFILE,
+          health: health(),
           openTenant,
           openSource: connectorSourceOpener(runtime),
         }),
@@ -315,6 +349,7 @@ describe('the `ingest_pull` lane', () => {
         ingest_pull: createIngestPullHandler({
           control: controlSql,
           profile: HOSTED_PROFILE,
+          health: health(),
           openTenant,
           openSource: connectorSourceOpener(undefined),
         }),
@@ -362,6 +397,246 @@ describe('the `ingest_pull` lane', () => {
 
       expect(pass.claimed).toBe(0);
       expect((await jobState()).state).toBe('due');
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// A failed poll, from the provider's refusal to the sentence the user reads.
+//
+// **Why this block crosses into `src/web/`, which nothing else in this file
+// does.** The defect it pins is not in any one module — every module was doing
+// what it said. The vendor's refusal was classified correctly by `runPull`, the
+// run row recorded `auth_expired` in the tenant's own log, the handler threw,
+// the runner banked `handler_error`, the panel rendered the queue honestly, and
+// the person whose mail had stopped arriving was told a check was running. The
+// only place that composition is wrong is end to end, so the test is end to end.
+//
+// A case that asserts the panel says "failing" would have passed throughout.
+// What is asserted here is the CAUSE, at each surface it has to survive.
+// ---------------------------------------------------------------------------
+
+describe('a failed poll is diagnosable', () => {
+  /** A source that refuses the listing outright — a revoked grant, in one step. */
+  function runtimeRefusing(reason: PullFailureReason, state = connected()): ConnectorRuntime {
+    const states = createInMemoryConnectorStore([state]);
+    return {
+      states: () => Promise.resolve([state]),
+      open: (_tenant, source) =>
+        Promise.resolve({
+          source: createFakeSource(source, SOURCE_TYPE_FOR[source], [{ ok: false, reason }]),
+          states,
+        }),
+    };
+  }
+
+  /** The dashboard, for a tenant whose link the panel should read as live. */
+  function statuses(): Promise<readonly ConnectorStatus[]> {
+    return connectorStatuses(controlSql, {
+      tenantId: TENANT,
+      sources: ['gmail'],
+      links: new Map([['gmail', 'connected']]),
+    });
+  }
+
+  /** The page a browser gets, rendered from those statuses. */
+  function dashboard(connectors: readonly ConnectorStatus[]): string {
+    return renderPage({
+      kind: 'dashboard',
+      tier: 'internal',
+      status: 'ready',
+      tenantId: TENANT,
+      connectorsAvailable: true,
+      connectors,
+      providers: [],
+    });
+  }
+
+  test(
+    'the provider’s refusal reaches the job row, the health record, the panel and /admin',
+    async () => {
+      await enqueueClaimable('ingest_pull', 'gmail');
+
+      const pass = await runnerWith({
+        ingest_pull: createIngestPullHandler({
+          control: controlSql,
+          profile: HOSTED_PROFILE,
+          health: health(),
+          openTenant,
+          openSource: connectorSourceOpener(runtimeRefusing('auth_expired')),
+        }),
+      }).runOnce({ now: NOW });
+      expect(pass.outcomes.failed).toBe(1);
+      // The recorder is fail-open by design. If the write had thrown, everything
+      // below would still be checkable against an empty table, so this is the
+      // assertion that stops the rest of the case passing vacuously.
+      expect(unrecorded).toEqual([]);
+
+      // 1. The job row. Still `handler_error`, and still the runner's own
+      //    vocabulary — from the queue's side a handler threw, which is true.
+      //    What changed is that this is no longer the only thing recorded.
+      const job = await jobState();
+      expect(job).toMatchObject({ state: 'due', attempts: 1, failure: 'handler_error' });
+
+      // 2. The health record: the cause, in the ingest log's vocabulary, in the
+      //    control plane — reachable without a tenant connection and without a
+      //    shell on the container.
+      const banked = await readConnectorHealth(controlSql, { tenantId: TENANT });
+      expect(banked.get('gmail')).toMatchObject({
+        runOutcome: 'failed',
+        ingestFailureCode: 'auth_expired',
+        jobFailureCode: null,
+        lastSuccessAt: null,
+      });
+
+      // 3. The panel. `retrying`, not `checking`: the lane is queued because the
+      //    last attempt failed, and before this it was rendered as a healthy
+      //    check in progress for the whole length of the retry ladder.
+      const [status] = await statuses();
+      expect(status).toMatchObject({ state: 'retrying', cause: 'auth_expired' });
+
+      // 4. The sentence. The cause has to survive being turned into copy, and
+      //    the copy has to name the one action that fixes THIS cause.
+      const page = dashboard([status as ConnectorStatus]);
+      expect(page).toContain('did not work');
+      expect(page).toContain('The provider stopped accepting our access');
+      expect(page).toContain('Disconnecting and connecting again is the fix');
+
+      // 5. The operator, over `/admin`, with no tenant handle anywhere in it.
+      const answer = await adminDispatch(
+        { controlSql, owners: { owners: () => Promise.resolve({ ok: true, owners: [] }) } },
+        { name: 'connector_status', args: { tenant_id: TENANT } },
+      );
+      expect(answer.ok).toBe(true);
+      const content = (answer as { content: Record<string, unknown> }).content;
+      expect(content['connectors']).toMatchObject([
+        { source: 'gmail', ingest_failure_code: 'auth_expired', cause: 'auth_expired' },
+      ]);
+      expect(content['lanes']).toMatchObject([
+        { source: 'gmail', state: 'due', attempts: 1, job_failure_code: 'handler_error' },
+      ]);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a brain that cannot be opened is not the same failure as a bug in our code',
+    async () => {
+      await enqueueClaimable('ingest_pull', 'gmail');
+
+      const pass = await runnerWith({
+        ingest_pull: createIngestPullHandler({
+          control: controlSql,
+          profile: HOSTED_PROFILE,
+          health: health(),
+          // What `connectTenant` does when the secret store will not resolve.
+          openTenant: () =>
+            Promise.reject(new Error('no resolvable connection secret for this tenant')),
+          openSource: connectorSourceOpener(runtimeRefusing('auth_expired')),
+        }),
+      }).runOnce({ now: NOW });
+      expect(pass.outcomes.failed).toBe(1);
+      expect(unrecorded).toEqual([]);
+
+      // `tenant_unavailable` has been in `JOB_FAILURE_CODES` since U10 and
+      // nothing ever wrote it. This is the one cause the job row can carry on
+      // its own, and it is the one a read-through port into the tenant's own
+      // database could never have reported.
+      expect(await jobState()).toMatchObject({ failure: 'tenant_unavailable' });
+      const banked = await readConnectorHealth(controlSql, { tenantId: TENANT });
+      expect(banked.get('gmail')).toMatchObject({
+        runOutcome: null,
+        ingestFailureCode: null,
+        jobFailureCode: 'tenant_unavailable',
+      });
+
+      const [status] = await statuses();
+      expect(status).toMatchObject({ state: 'retrying', cause: 'tenant_unavailable' });
+      expect(dashboard([status as ConnectorStatus])).toContain('could not be reached');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a poll that works again clears the cause rather than leaving a red line',
+    async () => {
+      await enqueueClaimable('ingest_pull', 'gmail');
+      const failing = runnerWith({
+        ingest_pull: createIngestPullHandler({
+          control: controlSql,
+          profile: HOSTED_PROFILE,
+          health: health(),
+          openTenant,
+          openSource: connectorSourceOpener(runtimeRefusing('rate_limited')),
+        }),
+      });
+      await failing.runOnce({ now: NOW });
+      expect((await readConnectorHealth(controlSql, { tenantId: TENANT })).get('gmail')).toMatchObject(
+        { ingestFailureCode: 'rate_limited' },
+      );
+
+      // The retry, an hour later, against a provider that is answering again.
+      const later = new Date(NOW.getTime() + 3_600_000);
+      await controlSql`UPDATE control.job SET run_at = ${NOW} WHERE kind = 'ingest_pull'`;
+      const recovered = await runnerWith({
+        ingest_pull: createIngestPullHandler({
+          control: controlSql,
+          profile: HOSTED_PROFILE,
+          health: health(),
+          openTenant,
+          openSource: connectorSourceOpener(
+            runtimeWith(connected(), {
+              items: [],
+              tombstones: [],
+              failures: [],
+              nextCursor: { kind: 'delta', value: 'h-2' },
+              outsideWindow: null,
+              accountKey: 'owner@example.test',
+            }),
+          ),
+        }),
+      }).runOnce({ now: later });
+      expect(recovered.outcomes.completed).toBe(1);
+      expect(unrecorded).toEqual([]);
+
+      // **Overwritten, NULL included.** A coalescing upsert here is how a
+      // connector that recovered keeps a red code forever, which is the
+      // "staleness display nobody can clear" the panel header forbids.
+      const banked = await readConnectorHealth(controlSql, { tenantId: TENANT });
+      expect(banked.get('gmail')).toMatchObject({
+        runOutcome: 'completed',
+        ingestFailureCode: null,
+        jobFailureCode: null,
+        lastSuccessAt: later,
+      });
+      const [status] = await statuses();
+      expect(status).toMatchObject({ state: 'connected', cause: null });
+      expect(dashboard([status as ConnectorStatus])).not.toContain('did not work');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a connector nothing has recorded reads exactly as it did before this record existed',
+    async () => {
+      // The upgrade case, and the reason the panel treats an absent record as
+      // "nothing to say" rather than as "no cause, so it must be fine": a
+      // connector last polled by a fleet older than this table has a job row and
+      // no health row, and inventing a reason for it would be worse than the gap.
+      await enqueueClaimable('ingest_pull', 'gmail');
+      await controlSql`
+        UPDATE control.job SET state = 'due', attempts = 2, failure_code = 'handler_error'
+         WHERE kind = 'ingest_pull'`;
+
+      const [status] = await statuses();
+      expect(status).toMatchObject({ state: 'retrying', cause: null, itemsFailed: 0 });
+      const page = dashboard([status as ConnectorStatus]);
+      expect(page).toContain('did not work');
+      // No invented cause, and — the part that matters — no instruction the user
+      // cannot act on.
+      expect(page).not.toContain('provider stopped accepting');
+      expect(page).not.toContain('handler_error');
     },
     TEST_TIMEOUT_MS,
   );

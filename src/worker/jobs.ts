@@ -90,6 +90,51 @@ export const JOB_FAILURE_CODES = [
 ] as const;
 export type JobFailureCode = (typeof JOB_FAILURE_CODES)[number];
 
+/**
+ * What a handler may say about its own failure, so `handler_error` stops being
+ * the answer to every question.
+ *
+ * **Why a property on the error rather than a parameter.** A handler signals
+ * failure by throwing; there is no return channel, and giving one to the
+ * `JobHandler` type would mean every handler that does not care declares it.
+ * So the classification rides on the thrown value, and {@link jobFailureCodeOf}
+ * reads it.
+ *
+ * **Why it is duck-typed rather than an exported error class.** This module is
+ * U10's vocabulary and it is imported by every handler; a base class here would
+ * invert that, and an `instanceof` check across module instances is the fragile
+ * half of that arrangement anyway. Anything carrying the property is understood,
+ * and anything else is `handler_error`, which is what it was before.
+ *
+ * **It cannot widen the vocabulary and that is the point.** The value is checked
+ * for membership in {@link JOB_FAILURE_CODES}, so a handler that assigned a
+ * provider's error text to it — the ordinary way somebody's subject line reaches
+ * a content-free database — records `handler_error` and the text goes nowhere.
+ * The column's enum would refuse it a second time; this is the first.
+ */
+export interface JobFailureCause {
+  readonly jobFailureCode?: unknown;
+}
+
+function isJobFailureCode(value: unknown): value is JobFailureCode {
+  return (JOB_FAILURE_CODES as readonly unknown[]).includes(value);
+}
+
+/**
+ * Which code a failed attempt is recorded under.
+ *
+ * `aborted` wins over anything the handler claims, and it is checked first: the
+ * fence is the truth about whether this worker still owned the job, and a
+ * handler that noticed some other problem on its way out does not get to
+ * relabel a stolen lease as its own failure.
+ */
+export function jobFailureCodeOf(error: unknown, aborted: boolean): JobFailureCode {
+  if (aborted) return 'lease_stolen';
+  if (typeof error !== 'object' || error === null) return 'handler_error';
+  const claimed = (error as JobFailureCause).jobFailureCode;
+  return isJobFailureCode(claimed) ? claimed : 'handler_error';
+}
+
 /** One row of `control.job`. */
 export interface JobRecord {
   readonly jobId: string;

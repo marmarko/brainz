@@ -41,14 +41,24 @@
  * counts, states, spend totals, queue depth, pool depth — plus one listing that
  * says which of those rows a person owns ({@link tenantDirectory}), because an
  * operator who cannot answer that deletes brains by prefix and finds out
- * afterwards. Every one of them is a number, a state, or an identifier the fleet
- * minted. None of them is a word a user wrote.
+ * afterwards, and one that says why a tenant's connector is not polling
+ * ({@link connectorStatus}), because before it the answer was a job row reading
+ * `handler_error` and then nothing. Every one of them is a number, a state, or
+ * an identifier the fleet minted. None of them is a word a user wrote.
+ *
+ * **Property 1 above survives {@link connectorStatus}, and that is the reason it
+ * is shaped the way it is.** The detail it reports is written by the worker into
+ * a content-free control-plane table rather than read out of the tenant's
+ * database through a port — so this module still receives no tenant handle, and
+ * the containment stays structural rather than becoming a projection somebody
+ * has to keep narrow. `src/control/connector-health.sql` argues the trade.
  */
 
 import { createHash } from 'node:crypto';
 import type { SQL } from 'bun';
 
 import { grantOperatorTier, revokeOperatorTier } from '../control/billing.ts';
+import { causeOf, readConnectorHealth } from '../control/connector-health.ts';
 
 /**
  * The nine names on the wire, plus `synthesize`, exactly as
@@ -106,6 +116,7 @@ export const ADMIN_OPERATIONS = [
   'tenant_status',
   'pool_status',
   'queue_status',
+  'connector_status',
   'grant_internal_tier',
   'revoke_internal_tier',
 ] as const;
@@ -395,6 +406,13 @@ export async function adminDispatch(deps: AdminDeps, request: AdminRequest): Pro
       return { ok: true, content: await poolStatus(deps.controlSql) };
     case 'queue_status':
       return { ok: true, content: await queueStatus(deps.controlSql) };
+    case 'connector_status': {
+      const tenantId = namedTenant(request);
+      if (tenantId === null) {
+        return { ok: false, code: 'invalid_params', message: 'tenant_id is required.' };
+      }
+      return { ok: true, content: await connectorStatus(deps.controlSql, tenantId) };
+    }
     case 'tenant_status': {
       const tenantId = namedTenant(request);
       if (tenantId === null) {
@@ -611,6 +629,97 @@ async function tenantDirectory(
       total: counted,
       truncated: counted > rows.length,
     },
+  };
+}
+
+/**
+ * **Why one connector is not polling, without a shell on a container.**
+ *
+ * **The gap this closes.** `queue_status` counts jobs by state and kind, which
+ * answers "is the fleet moving" and nothing else; `tenant_status` reads the
+ * tenant row, which knows nothing about connectors. So the operator's answer to
+ * "my mail stopped arriving" was `control.job.failure_code` — the string
+ * `handler_error`, the runner's bucket for any handler that threw — and after
+ * that, nothing, anywhere. The run's own detail lives in the tenant's
+ * `ingest_log`, which needs a tenant connection this surface does not have and
+ * must not acquire.
+ *
+ * **So the detail comes the other way.** `control.connector_health` is written
+ * by the worker at the end of every attempt, from inside the process that
+ * already holds the tenant handle — `src/control/connector-health.sql` carries
+ * the argument, including why that beats a read-through port. This operation is
+ * two content-free control-plane reads joined in memory, and R11 is untouched:
+ * no tenant connection, no secret namespace, `scope_denied` on `recall` still
+ * means what it meant.
+ *
+ * **The two halves answer different questions and both are needed.** The queue
+ * says whether the lane is moving — how many attempts it has spent, whether it
+ * dead-lettered, when it next runs. The health record says why the last attempt
+ * did not work, in the vocabulary of whichever layer knew: the ingest log's when
+ * a run got far enough to record one, the queue's when it did not. A lane
+ * retrying under backoff has a `due` row that looks exactly like a healthy one,
+ * and only the pair tells them apart.
+ *
+ * Every field is a code from a closed set, a count, or an instant. There is no
+ * item id here and no message text: `ingest_log.external_ref` is the provider's
+ * own id for one of somebody's messages, and it stays in their database.
+ */
+async function connectorStatus(sql: SQL, tenantId: string): Promise<Record<string, unknown>> {
+  const lanes = await sql<
+    {
+      target: string;
+      state: string;
+      attempts: number;
+      max_attempts: number;
+      run_at: Date;
+      failure_code: string | null;
+      finished_at: Date | null;
+      dead_lettered_at: Date | null;
+    }[]
+  >`
+    SELECT target::text AS target, state::text AS state, attempts, max_attempts, run_at,
+           failure_code::text AS failure_code, finished_at, dead_lettered_at
+      FROM control.job
+     WHERE tenant_id = ${tenantId} AND kind = 'ingest_pull'
+       AND state IN ('due', 'running', 'dead')
+     ORDER BY target, run_at DESC`;
+
+  const health = await readConnectorHealth(sql, { tenantId });
+
+  return {
+    tenant_id: tenantId,
+    // The open and dead lanes only. `done` rows accumulate one per poll per
+    // source and an operator reading a connector does not want a poll history —
+    // when the last attempt worked is `last_success_at` below, in one field.
+    lanes: lanes.map((lane) => ({
+      source: lane.target,
+      state: lane.state,
+      attempts: lane.attempts,
+      max_attempts: lane.max_attempts,
+      run_at: lane.run_at,
+      // Named for what it is. This is the runner's reading, and on a pull that
+      // reached the provider and was refused it says `handler_error` — which is
+      // true and is not the cause. The cause is in `last_attempt` below.
+      job_failure_code: lane.failure_code,
+      finished_at: lane.finished_at,
+      dead_lettered_at: lane.dead_lettered_at,
+    })),
+    connectors: [...health.values()]
+      .map((record) => ({
+        source: record.source,
+        last_attempt_at: record.lastAttemptAt,
+        last_success_at: record.lastSuccessAt,
+        run_outcome: record.runOutcome,
+        // Both codes, unmerged. Which vocabulary answered is itself the fact an
+        // operator reads: an ingest code means the attempt reached the provider,
+        // and a job code means it never got that far.
+        ingest_failure_code: record.ingestFailureCode,
+        job_failure_code: record.jobFailureCode,
+        cause: causeOf(record),
+        items_written: record.itemsWritten,
+        items_failed: record.itemsFailed,
+      }))
+      .sort((left, right) => left.source.localeCompare(right.source)),
   };
 }
 

@@ -49,6 +49,10 @@ import {
   ensureConnectorLinkSchema,
 } from '../control/connector-pg.ts';
 import {
+  createControlPlaneConnectorHealth,
+  ensureConnectorHealthSchema,
+} from '../control/connector-health.ts';
+import {
   createConnectorReconciler,
   createPipedreamAccountLister,
   type ConnectorReconciler,
@@ -138,6 +142,12 @@ export async function startWorkerFleet(
   // and a worker that booted before any web instance had ever served a connect
   // would otherwise fail every tick on `relation does not exist`.
   await ensureConnectorLinkSchema(controlSql);
+  // Third table, and this fleet is the one that WRITES it: every `ingest_pull`
+  // attempt banks its outcome there, and the dashboard and `/admin` both read a
+  // failed poll's cause out of it. Ensured at boot rather than on first write —
+  // a missing table would turn every attempt's record into a logged error and
+  // leave the product back where it started, with the cause on stdout.
+  await ensureConnectorHealthSchema(controlSql);
 
   const queue = createJobQueue({ sql: controlSql });
   const leases = createLeaseChannel({ sql: leaseSql });
@@ -278,6 +288,18 @@ export async function startWorkerFleet(
     openTenant: async (tenantId) => (await openIngestTenant(tenantId)).runtime,
     closeTenant: (tenant) => tenant.sql.close(),
     openSource: connectorSourceOpener(connectors.runtime),
+    // The durable half. `onResult` below still writes the live line, and it is
+    // still unreadable from outside the container — `wrangler tail` captures the
+    // Worker, not this process — which is precisely why the same facts now land
+    // in a table two other surfaces can read.
+    health: createControlPlaneConnectorHealth(controlSql, (error) => {
+      process.stderr.write(
+        `${JSON.stringify({
+          event: 'connector_health_unrecorded',
+          message: error instanceof Error ? error.message : String(error),
+        })}\n`,
+      );
+    }),
     onResult(result, lease) {
       process.stdout.write(
         `${JSON.stringify({

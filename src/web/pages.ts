@@ -231,21 +231,111 @@ function moment(at: Date): string {
 }
 
 /**
+ * What a failure code means to the person whose mail is not arriving, and what
+ * — if anything — they can do about it.
+ *
+ * **A sentence per code, and the codes are two closed vocabularies rather than
+ * this file's invention:** `ingest_log.failure_code`'s
+ * (`src/ingest/log.ts:INGEST_FAILURE_CODES`) where a run got far enough to
+ * record one, and `control.job.failure_code`'s (`src/worker/jobs.ts`) where it
+ * did not. Both reach this page through `control.connector_health`.
+ *
+ * **Why the second half of each sentence matters more than the first.** The
+ * panel used to render the queue's own code — `handler_error` — verbatim, and
+ * tell every user the same thing: disconnect and connect again. That is the
+ * right instruction for exactly one of these causes and wrong for the rest: it
+ * does nothing for a rate limit, nothing for an unreachable database, and for an
+ * exhausted spend cap it costs the user a re-authorization and then fails again
+ * in the same place. So the branch is on the cause, and the honest answer for
+ * most of them is *nothing, it retries on its own*.
+ *
+ * An unrecognised code renders as itself rather than as a guess: a connector
+ * polled by a fleet older than this record has no cause at all, and inventing
+ * one would be worse than the gap.
+ */
+export function causeSentence(cause: string | null): string | null {
+  switch (cause) {
+    case null:
+      return null;
+    case 'auth_expired':
+      return (
+        'The provider stopped accepting our access — usually because the permission was ' +
+        'withdrawn or expired. <strong>Disconnecting and connecting again is the fix</strong>, ' +
+        'and it is the only one of these you can do anything about.'
+      );
+    case 'rate_limited':
+      return 'The provider asked us to slow down. Nothing to do — it backs off and tries again.';
+    case 'budget_exhausted':
+      return (
+        'This brain’s spending cap stopped the import before it finished. Nothing was lost: ' +
+        'the check resumes from where it stopped once there is room under the cap.'
+      );
+    case 'provider_error':
+      return 'The provider refused the request. Nothing to do — it tries again on its own.';
+    case 'parse_failed':
+      return 'Something came back in a shape we could not read. That one is ours to fix.';
+    case 'cancelled':
+      return 'The check stopped before it finished. It picks up where it left off.';
+    case 'tenant_unavailable':
+      return (
+        'Your brain’s database could not be reached when the check ran. That is ours, not ' +
+        'yours, and the check retries on its own.'
+      );
+    case 'attempt_timed_out':
+      return 'The check ran out of time. It retries, and picks up where it left off.';
+    case 'lease_stolen':
+      return 'The check was interrupted and handed to another worker. It retries.';
+    case 'handler_error':
+      return 'Something went wrong on our side. It retries, and it is ours to fix.';
+    default:
+      return `The last check reported <code>${escapeHtml(cause)}</code>.`;
+  }
+}
+
+/** What the last attempt lost, when it lost anything. Silent otherwise. */
+function lossSentence(status: ConnectorStatus): string {
+  if (status.itemsFailed <= 0) return '';
+  return (
+    ` The last check could not import ${status.itemsFailed} ` +
+    `item${status.itemsFailed === 1 ? '' : 's'}.`
+  );
+}
+
+/**
  * What one source's status says, in a sentence rather than a struct.
  *
- * The four states come from `connector-panel.ts`, whose header carries the
- * reason each is the most this app can honestly claim. The copy's job is to not
+ * The states come from `connector-panel.ts`, whose header carries the reason
+ * each is the most this app can honestly claim. The copy's job is to not
  * over-claim them: `unknown` is *as far as this brain can tell*, because
  * attached-but-never-polled and never-attached are the same rows.
  */
 function connectorStatusSentence(status: ConnectorStatus): string {
+  const cause = causeSentence(status.cause);
   switch (status.state) {
     case 'failing':
       return (
-        `<p class="failing">Connected, and <strong>no longer being polled</strong>. The last check ended in ` +
-        `<code>${escapeHtml(status.failureCode ?? 'an unrecorded failure')}</code>` +
-        `${status.lastCheckedAt === null ? '' : ` at ${moment(status.lastCheckedAt)}`}, and it stopped ` +
-        `retrying. Disconnecting and connecting again is the way to restart it.</p>`
+        `<p class="failing">Connected, and <strong>no longer being polled</strong>. The last check ` +
+        `failed${status.lastCheckedAt === null ? '' : ` at ${moment(status.lastCheckedAt)}`} and it ` +
+        `stopped retrying.` +
+        // The cause first, because it decides whether the instruction that used
+        // to be unconditional here — reconnect — is the right one at all.
+        `${cause === null ? ' Nothing recorded why.' : ` ${cause}`}` +
+        `${lossSentence(status)}` +
+        `${status.cause === 'auth_expired' ? '' : ' If it stays like this, disconnecting and connecting again restarts the polling.'}` +
+        `</p>`
+      );
+    case 'retrying':
+      // Deliberately NOT the `checking` sentence. A lane on its third attempt is
+      // queued and running exactly like a healthy one, and telling a user whose
+      // grant was revoked that a check is running now is how they find out four
+      // failures later, from an error they cannot act on.
+      return (
+        `<p class="failing">Connected, and the last check <strong>did not work</strong>. It is ` +
+        `trying again automatically.` +
+        `${cause === null ? '' : ` ${cause}`}` +
+        `${lossSentence(status)}` +
+        `${status.lastCheckedAt === null ? '' : ` The last check that finished was ${moment(status.lastCheckedAt)}.`}` +
+        `</p>`
       );
     case 'checking':
       return (
@@ -253,7 +343,13 @@ function connectorStatusSentence(status: ConnectorStatus): string {
         `${status.lastCheckedAt === null ? ', and none has finished yet' : `; last checked ${moment(status.lastCheckedAt)}`}.</p>`
       );
     case 'connected':
-      return `<p>Connected. Last checked ${status.lastCheckedAt === null ? 'at an unrecorded time' : moment(status.lastCheckedAt)}.</p>`;
+      return (
+        `<p>Connected. Last checked ${status.lastCheckedAt === null ? 'at an unrecorded time' : moment(status.lastCheckedAt)}.` +
+        // A `stopped` or `refused` run completes its job — the cursor is held and
+        // the next tick resumes it — so this is the one place a user is told
+        // that the last check came back short rather than empty.
+        `${cause === null || status.itemsFailed <= 0 ? '' : ` ${cause}`}${lossSentence(status)}</p>`
+      );
     // The half hour between authorizing and the first poll, said out loud. A
     // user who is told only "connected" and then sees nothing arrive concludes
     // it is broken; a user given the number waits.

@@ -60,6 +60,7 @@ import {
 } from '../fixture.ts';
 import { screenshotBytes } from '../../media/fixture.ts';
 import { createFakeSource, mailBody, page } from './fixture.ts';
+import { createRecordingHealth } from './health-fixture.ts';
 
 let fixture: IngestFixture;
 
@@ -1126,6 +1127,7 @@ describe('the ingest_pull handler', () => {
 
     let observed: PullResult | null = null;
     const handler = createIngestPullHandler({
+      health: createRecordingHealth(),
       control: fixture.controlSql,
       profile: HOSTED_PROFILE,
       storage: fixture.storage,

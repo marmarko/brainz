@@ -21,6 +21,7 @@
  */
 
 import {
+  jobFailureCodeOf,
   type CompleteRequest,
   type JobKind,
   type JobLease,
@@ -183,9 +184,16 @@ export function createJobRunner(deps: RunnerDeps): JobRunner {
     } catch (error) {
       running.delete(lease.jobId);
       try {
+        // The handler's own reading of its failure, where it offered one. Before
+        // this, every thrown error was `handler_error` — "a tenant database
+        // nobody could reach" and "our code has a bug" were the same row, and
+        // the difference was written to container stdout, which nothing outside
+        // the container can read. `jobFailureCodeOf` refuses anything outside
+        // the enum, so a handler cannot widen the vocabulary or smuggle text
+        // into it.
         const outcome = await deps.queue.fail(lease, {
           now: clock(),
-          code: controller.signal.aborted ? 'lease_stolen' : 'handler_error',
+          code: jobFailureCodeOf(error, controller.signal.aborted),
         });
         return outcome.applied ? 'failed' : 'superseded';
       } catch (storeError) {
