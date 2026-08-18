@@ -649,7 +649,9 @@ way until it is cleared, and there are exactly two things that clear it: the
 user's own disconnect, and this.
 
 ```bash
-curl -sS -X POST -H "authorization: Bearer $BRAINZ_ADMIN_CREDENTIAL" \
+curl -sS -X POST \
+  -H "Authorization: Bearer $BRAINZ_ADMIN_CREDENTIAL" \
+  -H "Origin: $ORIGIN" \
   "$ORIGIN/admin?op=requeue_connector&tenant_id=$TENANT&source=gmail" | jq '.content'
 ```
 
@@ -659,7 +661,11 @@ curl -sS -X POST -H "authorization: Bearer $BRAINZ_ADMIN_CREDENTIAL" \
 
 `POST` only, for the reason the tier grants are: an operator action reachable by
 GET is an action a bookmark, a shell-history recall or a link pasted into a
-ticket can fire, with the tenant id in the URL of every one of them.
+ticket can fire, with the tenant id in the URL of every one of them. The
+`Origin` header is required for the same reason it is on the grants — every
+state-changing request to this app is refused without one, and a `403 this
+request carries no Origin header` from a command that looks right is this rule
+and not a broken credential.
 
 It clears the lane and enqueues nothing itself — the cadence already decides
 whether a source is due, whether the user paused it, and whether a lane is open,
