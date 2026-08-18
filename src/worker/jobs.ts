@@ -461,10 +461,12 @@ export const DEFAULT_MAX_ATTEMPTS = 5;
  *
  * **`maxMs` is 6 hours, and it is the number that matters most.** The cap, not
  * the attempt count, sets what a lane that is genuinely broken costs forever
- * after: at a 6-hour cap and equal jitter, a dead-in-all-but-name lane makes at
- * most 4 provider calls a day and wakes the tenant's database 4 times. Three
- * connectors on one brain is 12. That is small enough to be affordable and large
- * enough that a recovery inside a working day is noticed on the same day.
+ * after: equal jitter puts a capped rung between 3 and 6 hours, so a
+ * dead-in-all-but-name lane makes **4 to 8** provider calls a day and wakes the
+ * tenant's database as many times. Three connectors on one brain is 12 to 24.
+ * That is small enough to be affordable and frequent enough that a recovery
+ * inside a working day is noticed on the same day. The worst case is the number
+ * that matters and it is the one `test/worker/retry-policy.test.ts` bounds.
  *
  * **`maxAttempts` is 12, and it follows from the cap plus a horizon.** With a
  * 30-minute base doubling to a 6-hour cap, twelve attempts put the *last* one
