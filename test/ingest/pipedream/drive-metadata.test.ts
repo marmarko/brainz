@@ -79,7 +79,11 @@ async function driveStore(cursor: { kind: 'delta'; value: string } | null): Prom
  * that passed them would be testing a fleet nobody deploys — which is exactly
  * how the wedge survived a green suite.
  */
-async function pull(transport: ScriptedTransport, states: ConnectorStateStore) {
+async function pull(
+  transport: ScriptedTransport,
+  states: ConnectorStateStore,
+  options: { readonly maxItems?: number } = {},
+) {
   return runPull({
     tenant: fixture.runtime,
     control: fixture.controlSql,
@@ -89,6 +93,7 @@ async function pull(transport: ScriptedTransport, states: ConnectorStateStore) {
     now: NOW,
     interactive: false,
     window: 'all',
+    ...(options.maxItems === undefined ? {} : { maxItems: options.maxItems }),
   });
 }
 
@@ -247,11 +252,32 @@ describe('a drive pull is metadata-only, and therefore completes', () => {
     expect(targets(transport).length).toBe(2);
   });
 
-  test('the listing asks for exactly the fields the page is built from', async () => {
-    const transport = backfillTransport();
-    await pull(transport, await driveStore(null));
+  test('both legs ask for exactly the fields the page is built from, and for the same ones', async () => {
+    const backfill = backfillTransport();
+    await pull(backfill, await driveStore(null));
 
-    const listing = targets(transport).find((target) => target.includes('/drive/v3/files?')) ?? '';
+    const changes = withToken(createScriptedTransport());
+    changes.on('/drive/v3/changes', { status: 200, body: { newStartPageToken: 'p-200', changes: [] } });
+    await pull(changes, await driveStore({ kind: 'delta', value: 'p-199' }));
+
+    /** The `file(...)` projection out of a `fields` parameter, from either leg. */
+    function projection(target: string): string {
+      const fields = new URL(target).searchParams.get('fields') ?? '';
+      return fields.slice(fields.indexOf('file'));
+    }
+
+    const listing = targets(backfill).find((target) => target.includes('/drive/v3/files?')) ?? '';
+    const feed = targets(changes).find((target) => target.includes('/drive/v3/changes?')) ?? '';
+    expect(listing.length).toBeGreaterThan(0);
+    expect(feed.length).toBeGreaterThan(0);
+
+    // **The two legs must ask for the same thing.** They both build the same
+    // page for the same file; a projection that drifted would give one file two
+    // bodies, so every delta would rewrite what the backfill wrote and every
+    // backfill would rewrite what the delta wrote — a re-chunk and an embedding
+    // per file per pull, forever, with nothing about the file having changed.
+    expect(projection(feed)).toContain(projection(listing).replace(/^files\(/, 'file(').slice(0, -1));
+
     const fields = new URL(listing).searchParams.get('fields') ?? '';
     for (const field of [
       'id',
@@ -317,6 +343,25 @@ describe('a drive pull is metadata-only, and therefore completes', () => {
        WHERE p.origin_context = ${DRIVE_ORIGIN} AND c.deleted_at IS NULL
     `) as Array<{ chars: number }>;
     expect(rows[0]?.chars ?? 0).toBeLessThan(400 * (FILES.length + 1));
+  });
+
+  test('files past this pull\u2019s ceiling hold the cursor rather than being sliced away', async () => {
+    // A listing offers a page once. A ceiling that silently dropped the tail
+    // would advance past files the provider will not mention again — the same
+    // permanent hole a skipped change is, arriving through a budget instead of
+    // a bug. The remedy an operator has is a larger ceiling, and the held
+    // cursor is what gives them time to reach for it.
+    const transport = backfillTransport();
+
+    const result = await pull(transport, await driveStore(null), { maxItems: 2 });
+
+    // Written or unchanged depending on what earlier tests in this file already
+    // put in the brain; what matters is that two were attempted and the rest
+    // were accounted for rather than dropped.
+    expect(result.counts.written + result.counts.unchanged).toBe(2);
+    expect(result.counts.failed).toBe(FILES.length - 2);
+    expect(result.cursorAdvanced).toBe(false);
+    expect(result.outcome).toBe('stopped');
   });
 
   test('a second pull is unchanged, and a trashed file is still tombstoned', async () => {

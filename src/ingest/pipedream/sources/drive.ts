@@ -390,10 +390,16 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
     if (!listed.ok) return { ok: false, reason: listed.reason };
 
     const body = asRecord(listed.value);
+    // **Not sliced here.** `collect` is the one place that decides what happens
+    // to a file this pull has no room for, and its answer is a retryable row
+    // that holds the cursor — a `.slice` above it would drop the tail silently
+    // and the file would never be offered again. Measured against the live
+    // vendor on 2026-08-17: Google honours `pageSize`, so this branch does not
+    // fire in production; it fires for a provider that overshoots, which is
+    // exactly when the difference between "accounted for" and "gone" matters.
     const files = asArray(body?.['files'])
       .map(asRecord)
-      .filter((file): file is Record<string, unknown> => file !== null)
-      .slice(0, request.maxItems);
+      .filter((file): file is Record<string, unknown> => file !== null);
 
     const { items, failures } = collect(request, files);
     const nextPageToken = asString(body?.['nextPageToken'] ?? null);
