@@ -191,7 +191,12 @@ ARG BUN_VERSION=1.3.14
 # instance keeps serving the version whose disconnect cannot detach a mailbox.
 # Web fleet is where the button is; the worker fleet shares the client and is
 # rebuilt anyway. Deterministic reload (`containers delete` then `deploy`).
-ARG FLEET_CONFIG_EPOCH=13
+# 13 -> 14: the Pipedream proxy URL shape. Every connector poll asked the
+# vendor for a route it does not have and got 404, logged as provider_error --
+# eight consecutive failed runs across all three sources, because they share one
+# URL builder. Code inside the image, so warm worker instances keep asking the
+# wrong route until replaced.
+ARG FLEET_CONFIG_EPOCH=14
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
