@@ -714,3 +714,73 @@ describe('construction validates what it is handed', () => {
     ).toThrow();
   });
 });
+
+/**
+ * **The money a throw walked away with.**
+ *
+ * The reservation is taken as the last synchronous statement before the first
+ * `await`, and every *typed* exit below it gives the reservation back. A
+ * backend fault in the key store is not a typed exit: `src/control/secrets.ts`
+ * is explicit that "the store is down" must never be flattened into "this
+ * tenant does not exist", so it propagates as an exception — straight past the
+ * `reservation.release()` that only the `!key.ok` branch runs.
+ *
+ * What that cost was not the throw, which the caller sees and handles. It was
+ * the next call on the same budget: the run's cap had a hole in it the size of
+ * the estimate, and a later call was refused `budget_exhausted` against a cap
+ * with room to spare — a refusal that named the wrong cause and sent whoever
+ * read it looking at spend limits.
+ */
+describe('a key store that throws does not keep the reservation', () => {
+  function throwingKeyStore() {
+    return {
+      resolve: async () => {
+        throw new Error('control plane is unreachable');
+      },
+      write: async () => ({ ok: true as const }),
+      revokeAll: async () => ({ ok: true as const }),
+    };
+  }
+
+  test('the throw still propagates — it is not flattened into a typed refusal', async () => {
+    const { gateway } = gatewayWith({
+      keys: { store: throwingKeyStore() as never, hosted: HOSTED_KEYS },
+    });
+    await expect(
+      gateway.call({
+        op: 'embedding',
+        tenantId: ALICE,
+        caller: fleetIdentity(ALICE),
+        budget: createBudget({ label: 'run', capMicroUsd: 1_000_000 }),
+        input: inputFor('embedding'),
+      }),
+    ).rejects.toThrow('control plane is unreachable');
+  });
+
+  test('the reservation is returned, so the next call is not refused against a cap with room', async () => {
+    const { gateway } = gatewayWith({
+      keys: { store: throwingKeyStore() as never, hosted: HOSTED_KEYS },
+    });
+    // One cap, many calls — the per-run shape `src/ingest/pipedream/pull.ts`
+    // uses, which is what made the leak survive long enough to mislead.
+    const budget = createBudget({ label: 'run', capMicroUsd: 1_000_000 });
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await gateway
+        .call({
+          op: 'embedding',
+          tenantId: ALICE,
+          caller: fleetIdentity(ALICE),
+          budget,
+          input: inputFor('embedding'),
+        })
+        .catch(() => undefined);
+    }
+
+    // The discriminating numbers. Before the fix `reservedMicroUsd()` grew by
+    // the estimate on every throw and never came back down; `spentMicroUsd()`
+    // stays zero either way, because nothing was ever bought.
+    expect(budget.reservedMicroUsd()).toBe(0);
+    expect(budget.spentMicroUsd()).toBe(0);
+  });
+});

@@ -690,14 +690,29 @@ export function createModelGateway(options: ModelGatewayOptions): ModelGateway {
         };
       }
 
-      const key = await resolveProviderKey({
-        caller,
-        tenantId,
-        provider: route.provider,
-        ...(request.apiKey === undefined ? {} : { explicitKey: request.apiKey }),
-        store: keys.store,
-        hosted: keys.hosted,
-      });
+      // **Caught only to give the reservation back.** A backend fault in the key
+      // store propagates by design — `src/control/secrets.ts` is explicit that
+      // "the store is down" must never be flattened into "this tenant does not
+      // exist" — but the reservation taken above is held by a `let` in this
+      // closure, not by a `finally`, so a throw here walked away with it. The
+      // budget is per-run, so the leak was bounded to one run and spent itself
+      // as a `budget_exhausted` on some *later* call in the same run: a refusal
+      // naming a cap that had plenty of room, blamed on the wrong thing. The
+      // rethrow is what keeps the propagation the store asked for.
+      let key: Awaited<ReturnType<typeof resolveProviderKey>>;
+      try {
+        key = await resolveProviderKey({
+          caller,
+          tenantId,
+          provider: route.provider,
+          ...(request.apiKey === undefined ? {} : { explicitKey: request.apiKey }),
+          store: keys.store,
+          hosted: keys.hosted,
+        });
+      } catch (error) {
+        reservation.release();
+        throw error;
+      }
       if (!key.ok) {
         reservation.release();
         return { ok: false, reason: key.reason === 'scope_denied' ? 'scope_denied' : 'key_unavailable' };
