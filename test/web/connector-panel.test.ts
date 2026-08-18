@@ -275,6 +275,21 @@ describe('the three worlds a failing connector can be in', () => {
     });
   });
 
+  test('a first check that has never failed is not given a next-attempt time', () => {
+    // A `checking` lane has a `run_at` like any other queued row — it is when
+    // the fleet may claim it, not when it will "try again". Reporting it would
+    // be the `retrying`-for-`checking` confusion in a second place: a user
+    // told their working first check has a retry scheduled reads that as
+    // something having already gone wrong.
+    const status = statusFor(
+      'gmail',
+      history({ open: 1, openAttempts: 0, openMaxAttempts: 12, openRunAt: NOW }),
+      'connected',
+      undefined,
+    );
+    expect(status).toMatchObject({ state: 'checking', nextAttemptAt: null });
+  });
+
   test('a healthy lane offers no attempt count and no next attempt', () => {
     const status = statusFor('gmail', history({ lastDoneAt: EARLIER }), 'connected', undefined);
     expect(status).toMatchObject({

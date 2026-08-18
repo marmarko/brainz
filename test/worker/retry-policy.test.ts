@@ -205,6 +205,47 @@ describe('the queue reads the policy rather than a global default', () => {
     expect(cycleGap).toBeLessThanOrEqual(MINUTE);
   });
 
+  test('a lane whose worker died comes back on its own kind’s ladder, not on one rule for all', async () => {
+    // **The path that silently undoes the whole policy.** `fail` is not the only
+    // writer of `run_at`: `reclaim` reaps a lane whose worker died or overran and
+    // schedules the next attempt itself. Every redeploy reaps whatever was in
+    // flight, so a reclaim that computed one backoff for every kind would put
+    // connector lanes back on the 30-second ladder on a schedule — and it would
+    // do it invisibly, because the failure it is recovering from is ours.
+    const claimAndAbandon = async (kind: JobKind, target: 'gmail' | 'whole_brain') => {
+      const enqueued = await queue.enqueue({
+        tenantId: TENANT,
+        kind,
+        target,
+        trigger: 'user_request',
+        now: T0,
+      });
+      if (!enqueued.enqueued) throw new Error('fixture: the enqueue was refused');
+      const lease = await queue.claim({
+        owner: 'a-worker-that-dies',
+        now: T0,
+        leaseTtlMs: 30_000,
+        maxAttemptMs: CONFIG.maxAttemptMs,
+        kinds: [kind],
+      });
+      if (lease === undefined) throw new Error('fixture: nothing claimable');
+      return enqueued.job.jobId;
+    };
+
+    const pullId = await claimAndAbandon('ingest_pull', 'gmail');
+    const cycleId = await claimAndAbandon('consolidate', 'whole_brain');
+
+    // Past the lease and past the grace: both are now reapable.
+    const later = new Date(T0.getTime() + 5 * MINUTE);
+    const reaped = await queue.reclaim({ now: later, stealGraceMs: 15_000 });
+    expect(reaped.length).toBe(2);
+
+    const pullRunAt = (await readJobRow(sql, pullId))['run_at'] as Date;
+    const cycleRunAt = (await readJobRow(sql, cycleId))['run_at'] as Date;
+    expect(pullRunAt.getTime() - later.getTime()).toBeGreaterThanOrEqual(15 * MINUTE);
+    expect(cycleRunAt.getTime() - later.getTime()).toBeLessThanOrEqual(MINUTE);
+  });
+
   test('a connector lane that keeps failing dies beyond the horizon, not inside four minutes', async () => {
     const enqueued = await queue.enqueue({
       tenantId: TENANT,
