@@ -249,7 +249,13 @@ ARG BUN_VERSION=1.3.14
 # pre-deploy runs of 397s writing 54. Its premise was also false: the container
 # is not stopped when the 5m window lapses -- a lane was claimed 28 minutes
 # after the cron.
-ARG FLEET_CONFIG_EPOCH=19
+# 19 -> 20: Drive is metadata-only. The adapter no longer exports a native
+# document or downloads a binary, so no listing carries objects, `PullPage.media`
+# and the runner's step 7a are gone, and the cursor is no longer held by a
+# storage seam this fleet has never composed. Warm instances keep the old
+# adapter, which is the one that wedges: deterministic reload against the worker
+# fleet.
+ARG FLEET_CONFIG_EPOCH=20
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
