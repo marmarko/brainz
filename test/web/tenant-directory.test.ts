@@ -33,7 +33,7 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import type { SQL } from 'bun';
+import { SQL } from 'bun';
 
 import { createWebApp } from '../../src/web/app.ts';
 import {
@@ -530,5 +530,143 @@ describe('who cannot read it', () => {
     // 404 rather than 401, the way the rest of `/admin` fails closed.
     expect(response.status).toBe(404);
     expect(text).not.toContain(ANNA.tenant);
+  });
+});
+
+/**
+ * `/admin?op=tenant_reconcile` — the question underneath the directory.
+ *
+ * The directory answers *what exists and whose is it*. This answers *which of
+ * these is residue, and what does it still hold* — because two of the four
+ * lifecycle states are unreachable in production: nothing in `src/` writes
+ * `deleting`, `eraseAccount` has no caller, and a `failed` row's retry path is
+ * unreachable because the one production caller mints a fresh tenant id every
+ * time. So a failed signup leaves a billable database forever and nothing
+ * sweeps it.
+ *
+ * **Driven through the real handler, because the properties are about the
+ * surface**: that it is reachable by GET (a read an operator will actually run,
+ * which is the whole argument for `tenant_directory` being one too), that it
+ * carries no address, and that it destroys nothing — this composition is handed
+ * no teardown port at all, so `acts: false` is a fact about capability rather
+ * than a promise about behaviour.
+ */
+describe('/admin?op=tenant_reconcile names residue and never grades it', () => {
+  interface ResidueRow {
+    readonly tenant_id: string;
+    readonly residue: string;
+    readonly owned: boolean;
+    readonly holds: readonly string[];
+    readonly proposal: string;
+    readonly refused_because: string | null;
+  }
+
+  async function reconcile(): Promise<{
+    status: number;
+    rows: ResidueRow[];
+    acts: boolean;
+    text: string;
+  }> {
+    const response = await app()(get('/admin?op=tenant_reconcile', authorized));
+    const text = await response.text();
+    const body = JSON.parse(text) as { content?: { residue?: ResidueRow[]; acts?: boolean } };
+    return {
+      status: response.status,
+      rows: body.content?.residue ?? [],
+      acts: body.content?.acts === true,
+      text,
+    };
+  }
+
+  beforeEach(reset);
+
+  test('a live owned tenant is reported, refused by name, and proposed for nothing', async () => {
+    await seedFleet();
+    // A failed signup: the row that today stays forever, with a Neon project
+    // behind it that no connection string reaches.
+    await controlSql`
+      INSERT INTO control.tenant (tenant_id, state, tier, schema_version, fts_language,
+                                  neon_project_id, failure_code)
+      VALUES ('t-abandoned', 'failed'::control.tenant_state, 'free', 0, 'simple',
+              'proj-t-abandoned', 'schema_apply_failed'::control.provisioning_failure)`;
+
+    const { status, rows, acts } = await reconcile();
+    expect(status).toBe(200);
+    expect(acts).toBe(false);
+
+    const byId = new Map(rows.map((row) => [row.tenant_id, row]));
+    // Anna is ready and owned. Both facts are reported and the refusal names the
+    // one that decides: reaching ready, not ownership — a live row is excluded
+    // whatever else is true of it.
+    expect(byId.get(ANNA.tenant)).toMatchObject({
+      residue: 'live',
+      owned: true,
+      proposal: 'none',
+      refused_because: 'reached_ready',
+    });
+    // The canary is ready and owned by nobody. Every heuristic a `safe_to_delete`
+    // grade could be built from says disposable, and this surface still proposes
+    // nothing — that heuristic is the one that deleted a real user's brain.
+    expect(byId.get(CANARY_TENANT)).toMatchObject({
+      residue: 'live',
+      owned: false,
+      proposal: 'none',
+      refused_because: 'reached_ready',
+    });
+    // Brendan's row is mid-provisioning and his: a run may still be moving, and
+    // a sweep is not the thing that decides that.
+    expect(byId.get(BRENDAN.tenant)).toMatchObject({
+      residue: 'provisioning_in_flight',
+      proposal: 'none',
+      refused_because: 'provisioning_in_flight',
+    });
+    // And the one that is genuinely residue: a project nobody owns and nothing
+    // will ever finish.
+    expect(byId.get('t-abandoned')).toMatchObject({
+      residue: 'failed_with_project',
+      owned: false,
+      proposal: 'teardown',
+    });
+    expect(byId.get('t-abandoned')?.holds).toEqual(['control_row', 'neon_project']);
+  });
+
+  test('and it publishes no address, no digest and no provider id', async () => {
+    await seedFleet();
+    const { text } = await reconcile();
+
+    // The local parts are distinctive, so this is an assertion about the
+    // response rather than about a coincidence. The digest is checked too: the
+    // directory publishes one deliberately and this surface does not, because a
+    // residue report is the artifact most likely to be pasted into a ticket.
+    expect(text).not.toContain('anna.mailbox');
+    expect(text).not.toContain('widget-co.example');
+    expect(text).not.toContain(expectedDigest(ANNA.email));
+    expect(text).not.toContain('proj-');
+    expect(text).not.toContain('tenant/');
+  });
+
+  test('an unreachable owner lookup refuses rather than reporting it all as unowned', async () => {
+    await seedFleet();
+    // The real directory over an identity database that is not there, which is
+    // the ordinary way this fails: two databases, one of them down. Driven at
+    // `adminDispatch` rather than through the handler because the property is
+    // about the *decision*, and because a test that dropped a table to produce
+    // the error would leave the fixture's schema behind for whatever runs next.
+    const unreachable = createBrainOwnerDirectory(
+      new SQL('postgres://postgres@127.0.0.1:1/no_such_identity_database', { max: 1 }),
+    );
+
+    const refusal = await adminDispatch(
+      { controlSql, owners: unreachable },
+      { name: 'tenant_reconcile' },
+    );
+
+    // "I could not see the owners" and "nobody owns these" are different
+    // sentences, and an operator acts on them identically if the surface prints
+    // the same thing for both. Since the thing they act on is a deletion, the
+    // difference is the whole safety property.
+    expect(refusal.ok).toBe(false);
+    expect(JSON.stringify(refusal)).toContain('Refusing');
+    expect(JSON.stringify(refusal)).not.toContain('proposal');
   });
 });

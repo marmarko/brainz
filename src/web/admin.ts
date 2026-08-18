@@ -60,6 +60,8 @@ import type { SQL } from 'bun';
 import { grantOperatorTier, revokeOperatorTier } from '../control/billing.ts';
 import { causeOf, readConnectorHealth } from '../control/connector-health.ts';
 import { discardConnectorLanes } from '../control/connector-lanes.ts';
+import { createReconcilePorts } from '../control/reconcile-ports.ts';
+import { reconcileTenants } from '../control/reconcile.ts';
 import { CONNECTOR_SOURCES, isConnectorSource } from '../ingest/cursor.ts';
 
 /**
@@ -118,6 +120,7 @@ export const ADMIN_TOOL_SCOPE: Readonly<Record<string, 'denied'>> = Object.freez
 export const ADMIN_OPERATIONS = [
   'fleet_status',
   'tenant_directory',
+  'tenant_reconcile',
   'tenant_status',
   'pool_status',
   'queue_status',
@@ -409,6 +412,67 @@ export async function adminDispatch(deps: AdminDeps, request: AdminRequest): Pro
       return { ok: true, content: await fleetStatus(deps.controlSql) };
     case 'tenant_directory':
       return tenantDirectory(deps.controlSql, deps.owners, requestedLimit(request));
+    /**
+     * **What the fleet is paying for that nothing will ever finish.**
+     *
+     * `tenant_directory` answers "what exists and whose is it" over every row.
+     * This answers the question underneath it — *which of these is residue, and
+     * what does it still hold* — because two of the four lifecycle states are
+     * unreachable in production: nothing in `src/` writes `deleting`,
+     * `eraseAccount` has no caller, and a `failed` row's retry path is
+     * unreachable because the one production caller mints a fresh tenant id
+     * every time. So a failed signup leaves a billable database forever and
+     * nothing sweeps it.
+     *
+     * **A read, and it stays a read.** It is deliberately outside
+     * {@link ADMIN_WRITE_OPERATIONS} for the reason `tenant_directory` is: the
+     * hazard the method gate answers is a link that *acts*, and this one cannot.
+     * `createReconcilePorts` is handed no teardown, so acting is not declined
+     * here — it is absent. The containment is in what comes back: a class, a
+     * proposal, a boolean for ownership, and never an address, a project id or a
+     * secret namespace.
+     */
+    case 'tenant_reconcile': {
+      const outcome = await reconcileTenants(
+        createReconcilePorts({ controlSql: deps.controlSql, owners: deps.owners }),
+        { limit: requestedLimit(request) },
+      );
+      if (!outcome.ok) {
+        // The same refusal `tenant_directory` makes, for the same reason:
+        // reporting every tenant as unowned because the owner lookup was
+        // unreachable is the incident again, with the operator's own tooling
+        // telling them it was safe.
+        return {
+          ok: false,
+          code: 'invalid_params',
+          message:
+            'The owner lookup is unavailable, so this cannot say which residue belongs to somebody. ' +
+            'Refusing rather than reporting it all as unowned.',
+        };
+      }
+      return {
+        ok: true,
+        content: {
+          residue: outcome.findings.map((finding) => ({
+            tenant_id: finding.tenantId,
+            residue: finding.residue,
+            // A boolean, never a domain or a digest. `tenant_directory` is where
+            // an operator goes for that, and it is one lookup away; a reconciler
+            // report is the artifact most likely to be pasted somewhere.
+            owned: finding.owned,
+            holds: finding.holds,
+            proposal: finding.proposal,
+            refused_because: finding.refusedBecause ?? null,
+          })),
+          total: outcome.total,
+          truncated: outcome.truncated,
+          // Said out loud rather than implied by an absent field: this surface
+          // holds no teardown port, so no answer it gives can have destroyed
+          // anything.
+          acts: false,
+        },
+      };
+    }
     case 'pool_status':
       return { ok: true, content: await poolStatus(deps.controlSql) };
     case 'queue_status':

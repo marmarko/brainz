@@ -255,6 +255,35 @@ export interface TenantRecord {
   readonly failureCode: ProvisioningFailureCode | null;
 }
 
+/**
+ * Whether this row ever served a user, and therefore whether destroying what it
+ * names is forbidden.
+ *
+ * **Lifted out of {@link cleanUpAfterFailedAttempt} so a second caller reuses
+ * the rule rather than restating it.** `src/control/reconcile.ts` sweeps residue
+ * left by runs that never finished, which is the same question asked from the
+ * other end of time — and the failure it is guarding against is the one that
+ * already happened once, when a deployment's tenants were deleted by name
+ * prefix and one of them was a real user's brain. Two spellings of "is this
+ * live?" is one spelling too many when the answer decides a deletion.
+ *
+ * **`readyAt` is checked as well as `state`, and that is not belt-and-braces.**
+ * The row that used to make the cleanup path reachable was one whose `state` had
+ * been overwritten by a straggling run while its `readyAt` stayed — a shape
+ * `schema.sql` now refuses to store (`only_served_tenants_carry_a_ready_at`),
+ * but the check is what noticed it, and a constraint that exists today is not a
+ * reason to stop asking the question that found it.
+ *
+ * Takes the two fields rather than a whole {@link TenantRecord} so a caller
+ * holding a narrower projection can still ask.
+ */
+export function hasReachedReady(record: {
+  readonly state: TenantState;
+  readonly readyAt: number | null;
+}): boolean {
+  return record.state === 'ready' || record.readyAt !== null;
+}
+
 /** An absent key means "leave that column alone"; `null` means "clear it". */
 export interface TenantPatch {
   readonly state?: TenantState;
@@ -927,11 +956,8 @@ async function cleanUpAfterFailedAttempt(
 ): Promise<void> {
   // Rule 3, made mechanical. A ready tenant reaching this function means the
   // lease failed to hold and a live user is about to lose their database; that
-  // must abort loudly rather than proceed on a suspicion. `readyAt` is checked
-  // as well as `state` because the row that used to make this reachable was one
-  // whose state had been overwritten while its `readyAt` stayed — a shape
-  // `schema.sql` now refuses to store.
-  if (record.state === 'ready' || record.readyAt !== null) {
+  // must abort loudly rather than proceed on a suspicion.
+  if (hasReachedReady(record)) {
     throw new Error('invariant: cleanup must never run against a tenant that reached ready');
   }
 

@@ -585,6 +585,49 @@ unowned.
 `op=tenant_status&tenant_id=…` still answers the operational detail for one
 tenant once you know which one you mean.
 
+### What the fleet is paying for that nothing will ever finish
+
+`op=tenant_directory` says what exists. `op=tenant_reconcile` says which of it is
+**residue** — a row no code path will ever advance — and what that row still
+holds. Also a read, also a plain GET:
+
+```bash
+curl -sS -H "Authorization: Bearer $BRAINZ_ADMIN_CREDENTIAL" \
+  "$ORIGIN/admin?op=tenant_reconcile" |
+  jq -r '.content.residue[]
+         | [ .tenant_id, .residue, (if .owned then "OWNED" else "unowned" end),
+             .proposal, (.refused_because // "-") ]
+         | @tsv'
+```
+
+```
+t-aaa111  live                    OWNED    none      reached_ready
+t-bbb222  live                    unowned  none      reached_ready
+t-ccc333  failed_with_project     unowned  teardown  -
+t-ddd444  provisioning_in_flight  OWNED    none      provisioning_in_flight
+```
+
+The `residue` column names the provisioning step the row died after, and it is a
+column fact rather than a guess: `failed_before_project` means the vendor was
+never called, `failed_with_project` means **there is a database you are paying
+for that nothing reaches**, `failed_with_credential` means live credential
+material as well. `teardown_interrupted` is an account closure that started and
+stopped. `orphan_secret` and `orphan_brain_link` are residue that outlived its
+control-plane row — usually the trace of a deletion done by hand.
+
+Why any of this exists: a failed signup does not clean itself up. The retry that
+was supposed to is only reachable when something re-provisions **the same tenant
+id**, and the signup flow mints a fresh one every time, so the failed row and its
+Neon project stay forever.
+
+**This endpoint deletes nothing and cannot.** The composition behind it is handed
+no teardown capability at all — `acts: false` in the body says so — and the
+`proposal` column is a recommendation for a human, not a queued action. It also
+grades nothing: there is no "safe to delete" verdict here for the same reason
+there is none in the directory. Read `owned` before you act on anything, and if
+the operation answers `400` saying the owner lookup is unavailable, that is the
+same deliberate refusal the directory makes.
+
 ## "My mail is not arriving": why one connector stopped
 
 **Start here rather than with the container logs. There is nothing in them.** The
