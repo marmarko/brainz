@@ -42,6 +42,49 @@ import { advertisedTools, toolByName, type Endpoint } from './tools/index.ts';
 export const PROTOCOL_VERSION = '2026-07-28';
 
 /**
+ * The revisions `initialize` may answer with, newest first.
+ *
+ * **The failure this closes.** `initialize` used to answer `PROTOCOL_VERSION`
+ * whatever the client asked for. The spec is the other way round: a server that
+ * can serve the requested revision MUST echo it, and a client that receives a
+ * revision it does not know SHOULD disconnect. So a connector built against an
+ * older revision was told, correctly and fatally, that it was talking to
+ * something it could not speak — and a disconnect during discovery renders as an
+ * empty tool list rather than as an error, which is why this surfaced as "this
+ * connector has no tools available" and not as a failure anyone could read.
+ *
+ * **Why the list starts at 2025-06-18 rather than at the first revision.**
+ * JSON-RPC batching was mandatory before it and removed in it; this surface has
+ * never decoded a batch. Echoing an older revision would be a promise of a
+ * framing we do not parse, which trades a legible refusal for a wrong answer.
+ * Anything outside the list is answered with `PROTOCOL_VERSION` — the spec's
+ * own fallback, and the branch that lets a client decide for itself whether it
+ * can proceed.
+ *
+ * Everything this surface adds beyond the base is additive `_meta` and named
+ * extensions, which an older client ignores by construction. That is what makes
+ * echoing an older revision honest rather than merely accommodating.
+ */
+export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = [
+  PROTOCOL_VERSION,
+  '2025-11-25',
+  '2025-06-18',
+];
+
+/**
+ * The revision to answer a given `initialize` with.
+ *
+ * Deliberately total: a missing, non-string or unknown `protocolVersion` all
+ * resolve to `PROTOCOL_VERSION`, because the one thing this must never do is
+ * throw on the first message of every session.
+ */
+export function negotiateProtocolVersion(requested: unknown): string {
+  return typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
+    ? requested
+    : PROTOCOL_VERSION;
+}
+
+/**
  * The model-facing keys. Frozen: additive forever.
  *
  * `degraded` — why this read was partial, as a named shape (never a bare bool).

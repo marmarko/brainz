@@ -36,18 +36,11 @@ import { sourceStaleness } from '../../../src/ingest/log.ts';
 import { pauseSource, readPausedSources, resumeSource } from '../../../src/ingest/pause.ts';
 import {
   IngestPullFailure,
-  createIngestPullHandler,
   enqueuePullIfDue,
   originContextFor,
   runPull,
-  type PullResult,
 } from '../../../src/ingest/pipedream/pull.ts';
-import type { JobLease } from '../../../src/worker/jobs.ts';
-import {
-  externalRefFor,
-  type PulledMedia,
-} from '../../../src/ingest/pipedream/sources/types.ts';
-import { selectPendingAttachments } from '../../../src/core/media/ocr-phase.ts';
+import { externalRefFor } from '../../../src/ingest/pipedream/sources/types.ts';
 import { acceptMedia, transcriptRefFor } from '../../../src/core/media/accept.ts';
 import {
   CALLER,
@@ -61,7 +54,6 @@ import {
 } from '../fixture.ts';
 import { screenshotBytes } from '../../media/fixture.ts';
 import { createFakeSource, mailBody, page } from './fixture.ts';
-import { createRecordingHealth } from './health-fixture.ts';
 
 let fixture: IngestFixture;
 
@@ -104,8 +96,6 @@ interface PullOptions {
   readonly interactive?: boolean;
   readonly queue?: IngestFixture['queue'];
   readonly now?: Date;
-  /** False runs the pull with nowhere to put an object, which is its own case. */
-  readonly withStorage?: boolean;
 }
 
 async function pull(
@@ -120,9 +110,6 @@ async function pull(
     source,
     states,
     now: options.now ?? NOW,
-    ...(options.withStorage === false
-      ? {}
-      : { storage: fixture.storage, rawStore: fixture.rawStore }),
     ...(options.window === undefined ? {} : { window: options.window }),
     ...(options.interactive === undefined ? {} : { interactive: options.interactive }),
     ...(options.queue === undefined ? {} : { queue: options.queue }),
@@ -704,209 +691,46 @@ describe('the ingest log', () => {
 });
 
 /**
- * The objects a listing carries.
+ * What a pull's **tombstone sweep** does to stored objects.
  *
- * U21 built `acceptMedia` and the transcribe phase and nothing in `src/ingest/`
- * called either, so a Drive full of screenshots imported as a Drive full of
- * failure rows and the transcribe queue was empty by construction. What the
- * block below has to prove is *reachability* — an attachment row, its bytes in
- * the store, and the queue predicate actually selecting it — plus the property
- * the refusal path got right and must keep: nothing is silently dropped.
+ * No pull produces an object any more: Drive was the only adapter that ever
+ * populated `PullPage.media`, and Drive is metadata-only. The objects a brain
+ * holds arrive through the folder importer (`src/ingest/import/run.ts`), which
+ * still calls `acceptMedia` — so they are seeded that way here, which is also
+ * how they are produced in the fleet.
  *
- * The assertions are on the gateway and on the rows. A summary field is what a
- * phase reports about itself, and a phase that never ran reports whatever its
- * initial value was.
+ * What still has to hold is the half a deletion reaches. The sweep matched
+ * `page.external_ref` only, and an attachment is not a page: neither the
+ * attachment row nor the transcript page written from it — `attachment:{id}`, a
+ * different ref on a different table — was reachable by any deletion path, so a
+ * file the user deleted upstream stayed searchable through its transcribed text
+ * indefinitely. That is what this block grades, and none of it depends on where
+ * the bytes came from.
  */
-describe('the objects a listing carries', () => {
+describe('a pull retires the stored objects it deletes', () => {
   const DRIVE_ORIGIN = originContextFor('drive', null);
 
-  function mediaItem(id: string, overrides: Partial<PulledMedia> = {}): PulledMedia {
-    return {
-      externalRef: externalRefFor('drive', id),
-      mediaType: 'image/png',
-      bytes: screenshotBytes(),
-      ...overrides,
-    };
-  }
-
-  async function attachments(where = 'true'): Promise<
-    Array<{
-      object_key: string;
-      media_type: string;
-      byte_size: string | number | null;
-      ocr_text: string | null;
-      quarantined: boolean;
-      origin_context: string;
-    }>
-  > {
-    return (await fixture.tenantSql.unsafe(
-      `SELECT object_key, media_type, byte_size, ocr_text, origin_context,
-              (quarantined_at IS NOT NULL) AS quarantined
-         FROM attachment WHERE ${where} ORDER BY attachment_id`,
-    )) as never;
+  /** One stored object at an origin, through the seam the folder importer uses. */
+  async function storeObject(origin: string, externalRef: string): Promise<string> {
+    const accepted = await acceptMedia(
+      { sql: fixture.tenantSql, storage: fixture.storage, store: fixture.rawStore },
+      {
+        tenantId: TENANT,
+        caller: CALLER,
+        originContext: origin,
+        mediaType: 'image/png',
+        bytes: screenshotBytes(),
+        externalId: externalRef,
+      },
+    );
+    expect(accepted.ok).toBe(true);
+    return (accepted as { attachmentId: string }).attachmentId;
   }
 
   async function itemRow(externalRef: string) {
     const rows = await ingestLogRows(fixture.tenantSql);
     return rows.filter((row) => row.external_ref === externalRef).at(-1);
   }
-
-  test('a screenshot is preserved, queued for transcription, and costs no model call', async () => {
-    const states = await storeWith(stateFor('drive'));
-    const source = createFakeSource('drive', 'document', [
-      page({ media: [mediaItem('shot-1')], nextCursor: { kind: 'delta', value: 'd-1' } }),
-    ]);
-
-    const before = fixture.transport.calls.length;
-    const result = await pull(source, states, { window: 'all' });
-
-    expect(result.outcome).toBe('completed');
-    expect(result.counts.attachments).toBe(1);
-    expect(result.counts.failed).toBe(0);
-    // **Acceptance is not extraction.** Not one provider call: the transcription
-    // this queues is U11's, paid out of a phase budget, and a write path that
-    // quietly OCR'd would show up only on the bill.
-    expect(fixture.transport.calls.length).toBe(before);
-
-    const rows = await attachments(`origin_context = '${DRIVE_ORIGIN}'`);
-    expect(rows.length).toBe(1);
-    expect(rows[0]?.media_type).toBe('image/png');
-    expect(Number(rows[0]?.byte_size)).toBe(screenshotBytes().length);
-    // NULL, not '': `ocr_text IS NULL` is what "still queued" means.
-    expect(rows[0]?.ocr_text).toBeNull();
-    expect(rows[0]?.quarantined).toBe(false);
-
-    // The bytes are actually there, byte for byte. A row pointing at an object
-    // that is not there is a transcription the cycle queues, pays a phase stop
-    // for, and never resolves.
-    const stored = await fixture.rawStore.get(rows[0]!.object_key as never);
-    expect([...(stored?.bytes ?? [])]).toEqual([...screenshotBytes()]);
-
-    // And the queue the whole unit exists for actually selects it. This is the
-    // assertion that would have failed for the entire life of U21.
-    const objectKey = rows[0]?.object_key ?? '';
-    expect(objectKey.length).toBeGreaterThan(0);
-    const pending = await selectPendingAttachments(fixture.tenantSql, { limit: 10 });
-    expect(pending.map((entry) => entry.objectKey)).toContain(objectKey);
-
-    // Counted on the run row: `acceptMedia` advances no counter of its own, so
-    // a loop that forgot to would leave the run reporting a clean, empty pull.
-    const runRow = (await ingestLogRows(fixture.tenantSql)).find((row) => row.ingest_id === result.runId);
-    expect(runRow?.items_seen).toBe(1);
-    expect(runRow?.items_written).toBe(1);
-    expect((await itemRow(externalRefFor('drive', 'shot-1')))?.outcome).toBe('ok');
-  });
-
-  test('the same file offered again costs nothing and creates nothing', async () => {
-    const states = await storeWith(stateFor('drive'));
-    const source = createFakeSource('drive', 'document', [
-      page({ media: [mediaItem('shot-1')], nextCursor: { kind: 'delta', value: 'd-2' } }),
-    ]);
-    const before = await attachments(`origin_context = '${DRIVE_ORIGIN}'`);
-
-    const result = await pull(source, states, { window: 'all' });
-
-    expect(result.counts.attachments).toBe(1);
-    expect((await attachments(`origin_context = '${DRIVE_ORIGIN}'`)).length).toBe(before.length);
-    // `unchanged` is `ok` with nothing written — the table's vocabulary has four
-    // outcomes over five dispositions, and `items_written` is what tells the
-    // second sighting of a file from the first.
-    const again = await itemRow(externalRefFor('drive', 'shot-1'));
-    expect(again?.outcome).toBe('ok');
-    expect(again?.items_written).toBe(0);
-    expect(again?.items_quarantined).toBe(0);
-  });
-
-  test('an object the store refuses leaves a row AND holds the cursor', async () => {
-    // The one mistake in this file no later pull can correct. A provider offers
-    // a change once; a cursor that steps over a *preservation* failure means the
-    // user's screenshot is gone from the brain for good, over a bad minute in
-    // the object store.
-    const states = await storeWith(stateFor('drive'));
-    const source = createFakeSource('drive', 'document', [
-      page({ media: [mediaItem('shot-lost')], nextCursor: { kind: 'delta', value: 'd-lost' } }),
-    ]);
-    fixture.rawStore.failNextPut();
-
-    const result = await pull(source, states, { window: 'all' });
-
-    expect(result.counts.attachments).toBe(0);
-    expect(result.counts.failed).toBe(1);
-    expect(result.cursorAdvanced).toBe(false);
-    expect(await countRows(fixture.tenantSql, 'attachment', `object_key LIKE '%'`)).toBeGreaterThanOrEqual(0);
-    const row = await itemRow(externalRefFor('drive', 'shot-lost'));
-    expect(row?.outcome).toBe('failed');
-    expect(row?.failure_code).toBe('provider_error');
-  });
-
-  test('an object the brain cannot read leaves a row and does NOT hold the cursor', async () => {
-    // The other direction, and it is not symmetrical: asking again produces the
-    // identical refusal, so holding here would wedge the source forever on a
-    // file that is never going to become readable.
-    const states = await storeWith(stateFor('drive'));
-    const source = createFakeSource('drive', 'document', [
-      page({
-        media: [mediaItem('memo', { mediaType: 'audio/mp4' })],
-        nextCursor: { kind: 'delta', value: 'd-memo' },
-      }),
-    ]);
-
-    const result = await pull(source, states, { window: 'all' });
-
-    expect(result.counts.failed).toBe(1);
-    expect(result.cursorAdvanced).toBe(true);
-    const row = await itemRow(externalRefFor('drive', 'memo'));
-    expect(row?.outcome).toBe('failed');
-    expect(row?.failure_code).toBe('parse_failed');
-    expect(await countRows(fixture.tenantSql, 'attachment', `media_type = 'audio/mp4'`)).toBe(0);
-  });
-
-  test('nowhere to put an object is a row per object, not a silence', async () => {
-    // A fleet wired without an object store must not look like a fleet with
-    // nothing to import. The row says what happened and the cursor holds, so the
-    // files are still offered once the wiring is fixed.
-    const states = await storeWith(stateFor('drive'));
-    const source = createFakeSource('drive', 'document', [
-      page({ media: [mediaItem('unwired')], nextCursor: { kind: 'delta', value: 'd-unwired' } }),
-    ]);
-
-    const result = await pull(source, states, { window: 'all', withStorage: false });
-
-    expect(result.counts.attachments).toBe(0);
-    expect(result.counts.failed).toBe(1);
-    expect(result.cursorAdvanced).toBe(false);
-    expect((await itemRow(externalRefFor('drive', 'unwired')))?.failure_code).toBe('provider_error');
-  });
-
-  test('a junk-quarantined object is stored, and stays out of the transcribe queue', async () => {
-    // The junk gate in front of the meter, applied to media: a tracking pixel is
-    // preserved (R23 — extraction improves, and the fleet cannot re-derive from
-    // bytes it no longer has) and never costs a vision call, because the queue
-    // predicate excludes it. The structural saving, not a careful caller.
-    const states = await storeWith(stateFor('drive'));
-    const source = createFakeSource('drive', 'document', [
-      page({
-        media: [
-          mediaItem('pixel', { junk: { headers: { 'List-Unsubscribe': '<https://x.test/u>' } } }),
-        ],
-        nextCursor: { kind: 'delta', value: 'd-pixel' },
-      }),
-    ]);
-
-    const result = await pull(source, states, { window: 'all' });
-
-    expect(result.counts.attachments).toBe(1);
-    const hidden = await attachments(`quarantined_at IS NOT NULL`);
-    expect(hidden.length).toBe(1);
-    const hiddenKey = hidden[0]?.object_key ?? '';
-    expect(hiddenKey.length).toBeGreaterThan(0);
-    const pending = await selectPendingAttachments(fixture.tenantSql, { limit: 50 });
-    expect(pending.map((entry) => entry.objectKey)).not.toContain(hiddenKey);
-    const row = await itemRow(externalRefFor('drive', 'pixel'));
-    expect(row?.outcome).toBe('ok');
-    expect(row?.items_quarantined).toBe(1);
-    expect(row?.items_written).toBe(0);
-  });
 
   /**
    * A file the user deleted upstream, and the two rows that outlive it.
@@ -922,17 +746,6 @@ describe('the objects a listing carries', () => {
    * tables, and a sweep that retired only the attachment would leave the
    * searchable half standing while every count in this test still read right.
    */
-  async function attachmentIdIn(origin: string): Promise<string> {
-    const rows = (await fixture.tenantSql`
-      SELECT attachment_id::text AS id FROM attachment
-       WHERE origin_context = ${origin} AND deleted_at IS NULL
-       ORDER BY attachment_id DESC LIMIT 1
-    `) as Array<{ id: string }>;
-    const id = rows[0]?.id;
-    if (id === undefined) throw new Error(`no live attachment on ${origin}`);
-    return id;
-  }
-
   /** The transcript the OCR phase writes, through the write path it writes it on. */
   async function writeTranscript(attachmentId: string, origin: string, body: string) {
     const receipt = await ingestDocument(
@@ -957,15 +770,13 @@ describe('the objects a listing carries', () => {
     const ref = externalRefFor('drive', 'shot-gone');
     const states = await storeWith(stateFor('drive'));
     const source = createFakeSource('drive', 'document', [
-      page({ media: [mediaItem('shot-gone')], nextCursor: { kind: 'delta', value: 'd-gone-1' } }),
       page({
         tombstones: [{ externalRef: ref, reason: 'deleted' }],
         nextCursor: { kind: 'delta', value: 'd-gone-2' },
       }),
     ]);
 
-    await pull(source, states, { window: 'all' });
-    const attachmentId = await attachmentIdIn(DRIVE_ORIGIN);
+    const attachmentId = await storeObject(DRIVE_ORIGIN, ref);
     await writeTranscript(attachmentId, DRIVE_ORIGIN, mailBody('the wifi password is on this page'));
 
     // Both halves live, or nothing below grades anything.
@@ -975,7 +786,7 @@ describe('the objects a listing carries', () => {
       await countRows(fixture.tenantSql, 'attachment', `attachment_id = ${attachmentId} AND deleted_at IS NULL`),
     ).toBe(1);
 
-    const second = await pull(source, states);
+    const second = await pull(source, states, { window: 'all' });
     expect(second.counts.tombstoned).toBeGreaterThan(0);
 
     // The row that says the object exists...
@@ -1002,21 +813,18 @@ describe('the objects a listing carries', () => {
     // the sweep; nothing backfills them, because the only value a migration
     // could write is a guess and `object_key` is a hash that does not run
     // backwards. What fills the column is a *sighting* — and the sighting that
-    // matters is the `unchanged` one, because that is a poller's most common
-    // outcome and the path on which nothing else is written at all.
+    // matters is the `unchanged` one, because that is the common outcome and
+    // the path on which nothing else is written at all.
     const ref = externalRefFor('drive', 'shot-heal');
     const states = await storeWith(stateFor('drive'));
     const source = createFakeSource('drive', 'document', [
-      page({ media: [mediaItem('shot-heal')], nextCursor: { kind: 'delta', value: 'd-heal-1' } }),
-      page({ media: [mediaItem('shot-heal')], nextCursor: { kind: 'delta', value: 'd-heal-2' } }),
       page({
         tombstones: [{ externalRef: ref, reason: 'deleted' }],
         nextCursor: { kind: 'delta', value: 'd-heal-3' },
       }),
     ]);
 
-    await pull(source, states, { window: 'all' });
-    const attachmentId = await attachmentIdIn(DRIVE_ORIGIN);
+    const attachmentId = await storeObject(DRIVE_ORIGIN, ref);
 
     // Put the row back into the shape every pre-rung attachment is in.
     await fixture.tenantSql`
@@ -1030,11 +838,10 @@ describe('the objects a listing carries', () => {
       ),
     ).toBe(1);
 
-    // The same file, offered again. Nothing about the object changed, so this
-    // is the `unchanged` path: no object written, no row rewritten, one
-    // observation recorded.
-    const again = await pull(source, states);
-    expect(again.counts.attachments).toBe(1);
+    // The same object, offered again. Nothing about it changed, so this is the
+    // `unchanged` path: no object written, no row rewritten, one observation
+    // recorded — and the ref filled in.
+    expect(await storeObject(DRIVE_ORIGIN, ref)).toBe(attachmentId);
     expect(
       await countRows(
         fixture.tenantSql,
@@ -1045,7 +852,7 @@ describe('the objects a listing carries', () => {
 
     // ...and the point of healing it: the row is now reachable by the deletion
     // it was invisible to a moment ago.
-    const swept = await pull(source, states);
+    const swept = await pull(source, states, { window: 'all' });
     expect(swept.counts.tombstoned).toBeGreaterThan(0);
     expect(
       await countRows(fixture.tenantSql, 'attachment', `attachment_id = ${attachmentId} AND deleted_at IS NULL`),
@@ -1133,65 +940,5 @@ describe('the objects a listing carries', () => {
       await countRows(fixture.tenantSql, 'attachment', `attachment_id = ${attachmentId} AND deleted_at IS NULL`),
     ).toBe(0);
     expect(await pageCount(transcriptRef)).toBe(0);
-  });
-});
-
-describe('the ingest_pull handler', () => {
-  test('carries the object store through, so a background pull can take media', async () => {
-    // The handler is where a connector actually runs in production. One that
-    // opened a media-capable source and then ran it with nowhere to put the
-    // bytes would reproduce the exact shape this whole change exists to close:
-    // working code the fleet never reaches.
-    const states = await storeWith(stateFor('drive'));
-    const source = createFakeSource('drive', 'document', [
-      page({
-        media: [
-          {
-            externalRef: externalRefFor('drive', 'handler-shot'),
-            mediaType: 'image/png',
-            bytes: screenshotBytes(),
-          },
-        ],
-        nextCursor: { kind: 'delta', value: 'd-handler' },
-      }),
-    ]);
-
-    let observed: PullResult | null = null;
-    const handler = createIngestPullHandler({
-      health: createRecordingHealth(),
-      control: fixture.controlSql,
-      profile: HOSTED_PROFILE,
-      storage: fixture.storage,
-      rawStore: fixture.rawStore,
-      openTenant: () => Promise.resolve(fixture.runtime),
-      openSource: () => Promise.resolve({ source, states }),
-      onResult: (result) => {
-        observed = result;
-      },
-    });
-
-    const lease: JobLease = {
-      jobId: 'job-media-1',
-      tenantId: TENANT,
-      kind: 'ingest_pull',
-      target: 'drive',
-      leaseToken: 1,
-      owner: 'worker-1',
-      expiresAt: new Date(NOW.getTime() + 60_000),
-      attemptDeadlineAt: new Date(NOW.getTime() + 600_000),
-      attempts: 1,
-      maxAttempts: 5,
-      debtObserved: 0,
-    };
-
-    await handler({ lease, signal: new AbortController().signal, now: NOW });
-
-    expect(observed).not.toBeNull();
-    expect((observed as unknown as PullResult).counts.attachments).toBe(1);
-    expect((observed as unknown as PullResult).counts.failed).toBe(0);
-    const rows = (await fixture.tenantSql`
-      SELECT object_key FROM attachment WHERE media_type = 'image/png' AND ocr_text IS NULL
-    `) as Array<{ object_key: string }>;
-    expect(rows.length).toBeGreaterThan(0);
   });
 });

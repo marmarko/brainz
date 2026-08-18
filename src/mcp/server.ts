@@ -71,7 +71,7 @@ import { sameOriginRefusal } from '../web/app.ts';
 // process this one cannot see — which is how this page came to say "open your
 // dashboard — it can build one" about a dashboard that could not.
 import { BRAIN_SETUP_PATH, escapeHtml } from '../web/pages.ts';
-import { PROTOCOL_VERSION } from './envelope.ts';
+import { negotiateProtocolVersion } from './envelope.ts';
 import { readClientCapabilities, UI_EXTENSION } from './client-capabilities.ts';
 import { listResources, readResource } from './resources.ts';
 import { inputSchemaFor, listedTools, type Endpoint } from './tools/index.ts';
@@ -211,7 +211,7 @@ async function handleRpc(deps: ServerDeps, request: Request, endpoint: Endpoint)
   switch (body.method) {
     case 'initialize':
       return rpcResult(id, {
-        protocolVersion: PROTOCOL_VERSION,
+        protocolVersion: negotiateProtocolVersion(body.params?.protocolVersion),
         // Resources are advertised because U14's panel is one, and it is the
         // only one: everything readable about the brain goes through the fenced
         // tool handlers. Prompts are user-controlled everywhere, so advertising
@@ -244,6 +244,16 @@ async function handleRpc(deps: ServerDeps, request: Request, endpoint: Endpoint)
 
     case 'resources/list':
       return rpcResult(id, { resources: listResources(clientCapabilities) });
+
+    // Answered because the `resources` capability above is what invites it: a
+    // client that discovers resources asks for both lists, and `-32601` to one
+    // half of a capability the server itself advertised is a contradiction the
+    // client resolves by abandoning discovery. There are no templates to return
+    // and there is no plan for any — every parameterised read is a fenced tool —
+    // so the honest answer is an empty list, which is a different statement from
+    // "no such method".
+    case 'resources/templates/list':
+      return rpcResult(id, { resourceTemplates: [] });
 
     case 'resources/read': {
       const uri = typeof body.params?.uri === 'string' ? body.params.uri : '';

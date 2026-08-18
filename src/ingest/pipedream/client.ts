@@ -67,24 +67,23 @@ export interface HttpRequest {
   readonly url: string;
   readonly headers: Readonly<Record<string, string>>;
   readonly body?: string;
-  /**
-   * Answer in bytes rather than in text.
-   *
-   * A screenshot decoded as UTF-8 and re-encoded is not that screenshot: every
-   * byte that is not a legal sequence becomes U+FFFD, and the object stored
-   * under the tenant's prefix is a corrupted file that no decoder will ever
-   * open. So a media fetch asks for {@link HttpResponse.bytes}, and a transport
-   * that cannot supply them says so by leaving the field absent rather than by
-   * handing back a mangled string.
-   */
-  readonly binary?: boolean;
 }
 
+/**
+ * **Text only, and that is a deliberate narrowing.**
+ *
+ * This port carried a `binary` flag and a `bytes` field, because Drive
+ * downloaded screenshots and PDFs and `response.text()` turns a byte that is not
+ * a legal UTF-8 sequence into U+FFFD — a stored object no decoder will ever
+ * open. Drive is metadata-only now (`sources/drive.ts`), which left the seam
+ * with no producer and no consumer anywhere in `src/`. It was removed rather
+ * than kept warm: an unexercised transport capability is a claim nothing checks.
+ * Gmail attachments would restore it deliberately, alongside the composer that
+ * passes an object store; `git log` is the shelf.
+ */
 export interface HttpResponse {
   readonly status: number;
   readonly body: string;
-  /** Present only for a `binary` request, and only from a transport that can. */
-  readonly bytes?: Uint8Array;
   readonly headers?: Readonly<Record<string, string>>;
 }
 
@@ -101,15 +100,7 @@ export function fetchTransport(): HttpTransport {
         headers: { ...request.headers },
         ...(request.body === undefined ? {} : { body: request.body }),
       });
-      if (request.binary !== true) return { status: response.status, body: await response.text() };
-
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      // A failed binary fetch answers with a JSON error, and the classifier
-      // upstream reads `body` to tell a 429 from a dead file. A successful one
-      // is a picture, and decoding it to a string to throw the string away is
-      // the whole payload in memory twice.
-      const ok = response.status >= 200 && response.status < 300;
-      return { status: response.status, body: ok ? '' : new TextDecoder().decode(bytes), bytes };
+      return { status: response.status, body: await response.text() };
     },
   };
 }
@@ -183,15 +174,8 @@ export interface ProviderRequest {
   readonly query?: Readonly<Record<string, string | number | boolean | undefined>>;
   readonly externalUserId: string;
   readonly accountId?: string | null;
-  /** Answer as text rather than JSON — a Drive file body, not a metadata blob. */
+  /** Answer as text rather than JSON. No provider path in this fleet needs it today. */
   readonly raw?: boolean;
-  /**
-   * Answer as bytes. The value is a `Uint8Array`, or `null` when the transport
-   * in use cannot produce one — never a string, because a string is a
-   * screenshot that has been through a UTF-8 round trip and is no longer that
-   * screenshot.
-   */
-  readonly binary?: boolean;
 }
 
 /**
@@ -840,7 +824,7 @@ export function createPipedreamClient(options: {
 
   async function call(
     request: HttpRequest & { readonly rateKey?: string },
-  ): Promise<ClientOutcome<{ status: number; body: string; bytes?: Uint8Array }>> {
+  ): Promise<ClientOutcome<{ status: number; body: string }>> {
     const authorized = await authorize();
     if (!authorized.ok) return authorized;
 
@@ -851,7 +835,6 @@ export function createPipedreamClient(options: {
       url: request.url,
       headers: { ...request.headers, authorization: `Bearer ${authorized.value}` },
       ...(request.body === undefined ? {} : { body: request.body }),
-      ...(request.binary === true ? { binary: true } : {}),
     });
 
     if (response.status < 200 || response.status >= 300) {
@@ -865,14 +848,7 @@ export function createPipedreamClient(options: {
       };
     }
 
-    return {
-      ok: true,
-      value: {
-        status: response.status,
-        body: response.body,
-        ...(response.bytes === undefined ? {} : { bytes: response.bytes }),
-      },
-    };
+    return { ok: true, value: { status: response.status, body: response.body } };
   }
 
   return {
@@ -977,13 +953,8 @@ export function createPipedreamClient(options: {
         url: providerUrl(config, request, accountId),
         headers: proxyHeaders(config),
         rateKey: request.app,
-        ...(request.binary === true ? { binary: true } : {}),
       });
       if (!outcome.ok) return outcome;
-      // `null` rather than the text body when a transport cannot answer in
-      // bytes: the caller must be able to tell "no bytes" from "here are some
-      // bytes", and a decoded string would look exactly like the second one.
-      if (request.binary === true) return { ok: true, value: outcome.value.bytes ?? null };
       return { ok: true, value: request.raw === true ? outcome.value.body : parseJson(outcome.value.body) };
     },
 

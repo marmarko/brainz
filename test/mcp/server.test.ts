@@ -331,3 +331,66 @@ describe('the flow, over HTTP', () => {
     expect(response.status).toBe(400);
   });
 });
+
+/**
+ * The handshake a connector actually performs, as opposed to the one this suite
+ * used to perform on its behalf.
+ *
+ * Every test above asked for the revision the server already served, so the
+ * whole negotiation branch was exercised by nothing: `initialize` answered
+ * `PROTOCOL_VERSION` unconditionally and the suite agreed with it unconditionally.
+ * A client built against an older revision was therefore told it was talking to
+ * something it could not speak, and its disconnect during discovery renders in a
+ * connector list as an empty tool list rather than as an error — which is the
+ * shape this pair of gaps was reported in.
+ */
+describe('the discovery handshake', () => {
+  test('a revision this surface can serve is echoed rather than overridden', async () => {
+    for (const requested of ['2025-06-18', '2025-11-25', '2026-07-28']) {
+      const response = await server.fetch(rpc('initialize', { protocolVersion: requested }));
+      const body = (await response.json()) as { result: { protocolVersion: string } };
+      expect(body.result.protocolVersion).toBe(requested);
+    }
+  });
+
+  test('a revision this surface cannot serve is answered with the one it does', async () => {
+    // `2025-03-26` and everything before it made JSON-RPC batching mandatory,
+    // and this surface has never decoded a batch. Echoing it would promise a
+    // framing we do not parse — the spec's fallback is to name our own revision
+    // and let the client decide whether it can proceed.
+    for (const requested of ['2024-11-05', '2025-03-26', 'not-a-version']) {
+      const response = await server.fetch(rpc('initialize', { protocolVersion: requested }));
+      const body = (await response.json()) as { result: { protocolVersion: string } };
+      expect(body.result.protocolVersion).toBe('2026-07-28');
+    }
+  });
+
+  test('a missing protocolVersion is answered, not thrown on', async () => {
+    const response = await server.fetch(rpc('initialize', {}));
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { result: { protocolVersion: string } };
+    expect(body.result.protocolVersion).toBe('2026-07-28');
+  });
+
+  test('both halves of the advertised resources capability answer', async () => {
+    // The capability advertised in `initialize` is what invites both calls.
+    // `-32601` to one half of a capability the server itself claimed is a
+    // contradiction, and a client resolves it by abandoning discovery.
+    const initialize = await server.fetch(rpc('initialize', { protocolVersion: '2026-07-28' }));
+    const capabilities = (await initialize.json()) as { result: { capabilities: Record<string, unknown> } };
+    expect(capabilities.result.capabilities.resources).toBeDefined();
+
+    for (const method of ['resources/list', 'resources/templates/list']) {
+      const response = await server.fetch(rpc(method, {}));
+      const body = (await response.json()) as { result?: unknown; error?: unknown };
+      expect(body.error).toBeUndefined();
+      expect(body.result).toBeDefined();
+    }
+  });
+
+  test('templates are an empty list under the key the spec names', async () => {
+    const response = await server.fetch(rpc('resources/templates/list', {}));
+    const body = (await response.json()) as { result: { resourceTemplates: unknown[] } };
+    expect(body.result.resourceTemplates).toEqual([]);
+  });
+});

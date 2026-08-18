@@ -141,8 +141,6 @@ async function pull(source: ReturnType<typeof createFakeSource>, states: Connect
     source,
     states,
     now: NOW,
-    storage: fixture.storage,
-    rawStore: fixture.rawStore,
   });
 }
 

@@ -1,37 +1,75 @@
 /**
- * Google Drive, thin.
+ * Google Drive, metadata only.
  *
- * Drive's change feed is the cleanest of the three about deletion and the
- * messiest about content. A change carries `removed: true` when the file left
- * the user's view entirely, and a `file.trashed` flag when it went to the bin;
- * both are tombstones here, because a document in the bin must stop answering
- * queries whatever the mechanism was.
+ * **The founder's ruling, verbatim in effect: "we shouldn't be storing files
+ * from the drive, just filename and metadata."** Asked to choose between three
+ * readings they picked the strictest. Drive contributes a filename and the
+ * metadata around it and no document text at all — including native Google Docs
+ * and Sheets, which this adapter used to export to `text/plain` and `text/csv`.
+ * `recall` can tell the user a file exists, what it is, whose it is and where to
+ * open it; it will not answer from the contents of a document they wrote. That
+ * is the intended trade and it is a scope reduction rather than an
+ * optimisation.
  *
  * **Upstream: `PROVIDER_API_BASE['google_drive']` — `https://www.googleapis.com`.**
  * Named once in that table rather than here, because `app` already says which
- * upstream this is. This adapter is the one that makes the proxy's encoding
- * load-bearing: a 44-character file id — the everyday length — puts the `?` of
- * `?alt=media` at an offset where standard base64 emits a raw `/`, which splits
- * the proxy's path segment and is answered `404` before Google is ever reached.
- * Every download below depends on that segment being base64**url**.
+ * upstream this is.
  *
- * **A binary file is never decoded leniently.** A PDF or a PNG run through a
- * text decoder becomes a page of replacement characters with a vector attached
- * to it: it costs an embedding call and pollutes retrieval with a document that
- * says nothing. That was the whole argument for the failure row this adapter
- * used to write for every image — and the failure row was only ever half the
- * answer, because it meant a Drive full of screenshots imported as a Drive full
- * of failures and U21's transcribe queue stayed empty for good.
+ * ============================================================================
+ * WHAT THIS ALSO FIXES, AND WHY IT DISSOLVES RATHER THAN PATCHES IT
+ * ============================================================================
  *
- * So: a binary whose content type U21 can read is **fetched as bytes** and
- * offered as media. It is preserved by the runner and transcribed later, in the
- * cycle, under a phase budget. A binary U21 cannot read still gets the honest
- * failure row, and so does one the provider says is too big to hold — refused
- * from the *listing*, before a download, because the listing already states the
- * size and a two-gigabyte file should never become a request.
+ * Drive had never once recorded a successful run. It was the only adapter that
+ * populated `PullPage.media`, and `pull.ts` step 7a answers a listing that
+ * carries objects when the handler was composed with neither a `TenantStorage`
+ * nor a `RawStore` — which is every deployment of this fleet — by counting each
+ * object failed, setting `incomplete = 'provider_error'`, and refusing to save
+ * a cursor at step 10. So page one of the backfill replayed every thirty
+ * minutes forever, roughly 10 MB a cycle, and the files behind it were never
+ * offered at all. Measured per run against the live account on 2026-08-17: 8
+ * `ok`, 4 `parse_failed`, **11 `provider_error`** — PDFs and PNGs the adapter
+ * had fetched *successfully* and was refused only because there was nowhere to
+ * keep them.
+ *
+ * Metadata-only removes the media path, so the wedge goes with its cause. No
+ * object store, no download, no export. **One provider call per page — the
+ * listing itself — and zero per file.** A video, a PDF, an empty Doc and a
+ * 57 MB deck are now the same thing: a filename with metadata.
+ *
+ * ============================================================================
+ * WHICH METADATA, AND WHY THESE
+ * ============================================================================
+ *
+ * The test is whether a person searching their brain can **recognise the file
+ * and go open it**. `fields` is an explicit parameter on both calls below, so a
+ * narrower projection is both cheaper and a smaller data footprint — which is
+ * the point of the change, and the reason nothing is asked for that does not
+ * reach the page:
+ *
+ *   * `name` — the filename, and now the whole value of the source. It is the
+ *     page title *and* the first line of the body, because the full-text arm
+ *     recalls on `content_tsv OR title_tsv` and a bare filename needs both.
+ *   * `mimeType` — what kind of thing it is, rendered as a human word as well as
+ *     the raw type: "spreadsheet" is a term a person searches with and
+ *     `application/vnd.google-apps.spreadsheet` is not.
+ *   * `webViewLink` — the "go open it" half. Without it recall can say a file
+ *     exists and cannot say where.
+ *   * `owners(displayName,emailAddress)` — whose file it is. Often the only
+ *     thing that tells two similarly named files apart ("the deck alice shared").
+ *   * `createdTime` / `modifiedTime` — when it appeared and when it last moved.
+ *     `modifiedTime` is also the page's `occurredAt`.
+ *   * `size` — recognition again: the 46 MB recording is not the 5 KB note.
+ *   * `trashed` — never on the page; it is how the changes feed says "gone".
+ *
+ * **What is deliberately not asked for, and the reason is one rule.** Every
+ * field that reaches the body is part of `page.content_sha256`, so a field that
+ * changes without the file changing rewrites the page, re-chunks it and pays for
+ * an embedding for nothing. `starred` and `shared` are exactly that. `parents`
+ * is a folder *id*, which needs a second provider call per file to become a name
+ * a human recognises — the cost this change exists to remove. `fileExtension`
+ * is already in the name.
  */
 
-import { MAX_MEDIA_BYTES, classifyMedia } from '../../../core/media/accept.ts';
 import type { ProviderApi } from '../client.ts';
 import {
   asArray,
@@ -41,7 +79,6 @@ import {
   boundBody,
   ceilingFailureFor,
   externalRefFor,
-  itemFailureFor,
   joinResumeCursor,
   splitResumeCursor,
   type ProviderListOutcome,
@@ -49,7 +86,6 @@ import {
   type ProviderSource,
   type PulledFailure,
   type PulledItem,
-  type PulledMedia,
   type PulledTombstone,
 } from './types.ts';
 
@@ -59,163 +95,165 @@ const PAGE_SIZE = 100;
 /**
  * **A folder is not a document that failed to parse — it is not a document.**
  *
- * Drive's listing and its change feed both carry folders, and every one of them
- * used to reach `classifyMedia`, be refused for a content type that is not a
- * content type, and land in `ingest_log` as `parse_failed`. Measured against a
- * live account on 2026-08-17: 4 folders in the first 26 entries, so four bogus
- * refusals per run against a folder tree that never changes — and
- * `items_failed` is the number the connector panel shows an operator, so the
- * surface a stalled connector is diagnosed from was reporting 18 refusals where
- * 14 files had genuinely been refused.
+ * Measured against a live account on 2026-08-17: 4 folders in the first 26
+ * entries. Before `a80d146` every one of them became a `parse_failed` row, and
+ * `items_failed` is the number the connector panel shows an operator — so the
+ * surface a stalled connector is diagnosed from reported 18 refusals where 14
+ * files had genuinely been refused. It still costs a slice of `maxItems` if it
+ * arrives, which is why the guard is here as well as in the listing's `q`.
  */
 const GOOGLE_FOLDER = 'application/vnd.google-apps.folder';
 
-const GOOGLE_DOC = 'application/vnd.google-apps.document';
-const GOOGLE_SHEET = 'application/vnd.google-apps.spreadsheet';
-const GOOGLE_SLIDES = 'application/vnd.google-apps.presentation';
+/**
+ * Exactly the projection the body is built from. Asked for on both the listing
+ * and the changes feed, so the two produce byte-identical bodies for the same
+ * file state — otherwise a file would flip between `replaced` and `unchanged`
+ * depending on which leg saw it.
+ */
+export const DRIVE_FILE_FIELDS =
+  'id,name,mimeType,trashed,createdTime,modifiedTime,size,webViewLink,owners(displayName,emailAddress)';
 
-const FILE_FIELDS = 'id,name,mimeType,trashed,modifiedTime,size';
+/**
+ * A word a person would search with, for the content types a Drive actually
+ * holds. Small on purpose: what is not named falls through to the raw type,
+ * which is honest, and a table that tried to name every media type would be a
+ * second thing to keep true.
+ */
+const KIND_BY_MIME: Readonly<Record<string, string>> = {
+  'application/vnd.google-apps.document': 'Google Docs document',
+  'application/vnd.google-apps.spreadsheet': 'Google Sheets spreadsheet',
+  'application/vnd.google-apps.presentation': 'Google Slides presentation',
+  'application/vnd.google-apps.form': 'Google Form',
+  'application/vnd.google-apps.drawing': 'Google Drawing',
+  'application/vnd.google-apps.script': 'Google Apps Script',
+  'application/vnd.google-apps.shortcut': 'Drive shortcut',
+  'application/pdf': 'PDF',
+};
 
-/** Mime types this unit can turn into prose without a model. */
-function isTextual(mimeType: string): boolean {
-  return (
-    mimeType.startsWith('text/') ||
-    mimeType === 'application/json' ||
-    mimeType === 'application/xml' ||
-    mimeType === 'application/rtf'
-  );
+function kindFor(mimeType: string): string | null {
+  const named = KIND_BY_MIME[mimeType];
+  if (named !== undefined) return named;
+  switch (mimeType.split('/')[0]) {
+    case 'image':
+      return 'image';
+    case 'video':
+      return 'video';
+    case 'audio':
+      return 'audio';
+    case 'text':
+      return 'text file';
+    default:
+      return null;
+  }
 }
 
-function exportMimeFor(mimeType: string): string | null {
-  if (mimeType === GOOGLE_DOC || mimeType === GOOGLE_SLIDES) return 'text/plain';
-  if (mimeType === GOOGLE_SHEET) return 'text/csv';
-  return null;
+const SIZE_UNITS = ['KB', 'MB', 'GB', 'TB'] as const;
+
+/**
+ * A size a person recognises. Rounded, because this is a recognition aid and
+ * not an accounting record — and deterministic, because it is part of the
+ * digest.
+ */
+function humanSize(raw: unknown): string | null {
+  const text = asString(raw);
+  if (text === null || !/^\d+$/.test(text)) return null;
+  const bytes = Number(text);
+  if (!Number.isSafeInteger(bytes)) return null;
+  if (bytes < 1024) return `${bytes} bytes`;
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < SIZE_UNITS.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${Math.round(value)} ${SIZE_UNITS[unit]}`;
 }
 
-/** Drive states `size` as a decimal string, and only for binary files. */
-function declaredSize(file: Record<string, unknown>): number | null {
-  const raw = asString(file.size);
-  if (raw === null || !/^\d+$/.test(raw)) return null;
-  const size = Number(raw);
-  return Number.isSafeInteger(size) ? size : null;
+/**
+ * Normalised rather than echoed. The provider states RFC 3339; parsing and
+ * re-emitting means a change in how Google formats a timestamp is not a change
+ * to every page's digest.
+ */
+function instant(raw: unknown): string | null {
+  return asDate(raw)?.toISOString() ?? null;
+}
+
+function ownersOf(file: Record<string, unknown>): string | null {
+  const named = asArray(file['owners'])
+    .map(asRecord)
+    .flatMap((owner) => {
+      if (owner === null) return [];
+      const name = asString(owner['displayName']);
+      const email = asString(owner['emailAddress']);
+      if (name === null && email === null) return [];
+      if (name === null) return [email as string];
+      return [email === null ? name : `${name} (${email})`];
+    });
+  return named.length === 0 ? null : named.join(', ');
+}
+
+/**
+ * The page body for one Drive file — **the single builder**, shared by the
+ * backfill leg, the delta leg and the one-shot reconciliation of the pages
+ * written under the old behaviour. Exported for that third caller: a second
+ * copy of this function would give the same file two digests and rewrite every
+ * page the next time either one ran.
+ *
+ * It is never empty. `chunkDocument` returns no chunks for a blank body and
+ * `ingestDocument` answers `empty_document` — which would fail the item, hold
+ * the cursor, and reproduce the wedge this change removes — so the constant
+ * line below is load-bearing rather than decorative.
+ */
+export function driveMetadataBody(file: Record<string, unknown>): string {
+  const name = asString(file['name']);
+  const mimeType = asString(file['mimeType']);
+  const kind = mimeType === null ? null : kindFor(mimeType);
+  const lines: string[] = [];
+
+  if (name !== null) lines.push(name, '');
+  lines.push('Google Drive file.');
+  if (mimeType !== null) {
+    lines.push(`Type: ${kind === null ? mimeType : `${kind} (${mimeType})`}`);
+  }
+
+  const owners = ownersOf(file);
+  if (owners !== null) lines.push(`Owner: ${owners}`);
+  const size = humanSize(file['size']);
+  if (size !== null) lines.push(`Size: ${size}`);
+  const created = instant(file['createdTime']);
+  if (created !== null) lines.push(`Created: ${created}`);
+  const modified = instant(file['modifiedTime']);
+  if (modified !== null) lines.push(`Modified: ${modified}`);
+  const link = asString(file['webViewLink']);
+  if (link !== null) lines.push(`Link: ${link}`);
+
+  return boundBody(lines.join('\n'));
 }
 
 export function createDriveSource(api: ProviderApi): ProviderSource {
   /**
-   * A file U21 can read, fetched as bytes.
-   *
-   * The size check is against the *listing*, before the request: nothing here
-   * streams, so an unbounded object is the whole file in memory on the way to
-   * the object store — and a listing that says two gigabytes should never
-   * become a download. `acceptMedia` re-checks at the boundary for the files
-   * Drive did not size.
+   * Files to pages. **Nothing here reaches the network**, which is the whole
+   * shape of the change: the listing already carried every field the page is
+   * made of, so the per-file leg that used to export, download and refuse is
+   * gone rather than disabled.
    */
-  async function fetchMedia(
-    request: ProviderListRequest,
-    file: Record<string, unknown>,
-    externalRef: string,
-    mediaType: string,
-  ): Promise<PulledMedia | PulledFailure> {
-    const size = declaredSize(file);
-    if (size !== null && size > MAX_MEDIA_BYTES) {
-      return { externalRef, reason: 'parse_failed', retryable: false };
-    }
-
-    const id = asString(file.id) ?? '';
-    const outcome = await api.request({
-      app: APP,
-      method: 'GET',
-      path: `/drive/v3/files/${encodeURIComponent(id)}`,
-      query: { alt: 'media' },
-      externalUserId: request.externalUserId,
-      accountId: request.accountId ?? null,
-      binary: true,
-    });
-    if (!outcome.ok) return itemFailureFor(externalRef, outcome);
-
-    const bytes = outcome.value instanceof Uint8Array ? outcome.value : null;
-    if (bytes === null) {
-      // The client in use cannot answer in bytes. That is a fact about this
-      // deployment, not about the file, so the cursor holds: a fleet that gains
-      // a binary-capable transport tomorrow must be offered this change again,
-      // and the alternative is a user's screenshots skipped for good by a
-      // configuration nobody noticed.
-      return { externalRef, reason: 'provider_error', retryable: true };
-    }
-    if (bytes.length === 0 || bytes.length > MAX_MEDIA_BYTES) {
-      return { externalRef, reason: 'parse_failed', retryable: false };
-    }
-    return { externalRef, mediaType, bytes };
-  }
-
-  async function fetchContent(
-    request: ProviderListRequest,
-    file: Record<string, unknown>,
-  ): Promise<PulledItem | PulledMedia | PulledFailure> {
-    const id = asString(file.id);
-    if (id === null) return { externalRef: null, reason: 'parse_failed', retryable: false };
-    const externalRef = externalRefFor('drive', id);
-    const mimeType = asString(file.mimeType) ?? '';
-    const exportMime = exportMimeFor(mimeType);
-
-    if (exportMime === null && !isTextual(mimeType)) {
-      // Drive states its own content type for its own object, so it is used
-      // rather than sniffed — and `classifyMedia` refuses anything outside the
-      // closed set regardless, which is what keeps a voice memo out.
-      const verdict = classifyMedia(mimeType);
-      if (verdict.ok) return await fetchMedia(request, file, externalRef, verdict.mediaType);
-      return { externalRef, reason: 'parse_failed', retryable: false };
-    }
-
-    const outcome = await api.request({
-      app: APP,
-      method: 'GET',
-      path:
-        exportMime === null
-          ? `/drive/v3/files/${encodeURIComponent(id)}`
-          : `/drive/v3/files/${encodeURIComponent(id)}/export`,
-      query: exportMime === null ? { alt: 'media' } : { mimeType: exportMime },
-      externalUserId: request.externalUserId,
-      accountId: request.accountId ?? null,
-      raw: true,
-    });
-    // The provider's own status decides whether the cursor may move past this
-    // file: a 429 collapsed into `provider_error` reads as "this document is
-    // broken" and the edit is never offered again.
-    if (!outcome.ok) return itemFailureFor(externalRef, outcome);
-
-    const text = typeof outcome.value === 'string' ? outcome.value : '';
-    // A NUL byte is legal UTF-8 and never appears in a document a human wrote.
-    if (text.trim().length === 0 || text.includes('\u0000')) {
-      return { externalRef, reason: 'parse_failed', retryable: false };
-    }
-
-    return {
-      externalRef,
-      title: asString(file.name),
-      body: boundBody(text),
-      occurredAt: asDate(file.modifiedTime),
-    };
-  }
-
-  async function collect(
+  function collect(
     request: ProviderListRequest,
     files: ReadonlyArray<Record<string, unknown>>,
-  ): Promise<{ items: PulledItem[]; media: PulledMedia[]; failures: PulledFailure[] }> {
+  ): { items: PulledItem[]; failures: PulledFailure[] } {
     const items: PulledItem[] = [];
-    const media: PulledMedia[] = [];
     const failures: PulledFailure[] = [];
     // **Above the ceiling on purpose.** A slot spent on a folder is a slot no
-    // file gets, so the skip has to happen before the budget is counted rather
-    // than inside `fetchContent`. The listing refuses folders at the provider
-    // (see `backfill`); the changes feed takes no `q`, so this is the only
-    // guard that covers a folder created or renamed since the last pull.
-    const candidates = files.filter((file) => asString(file.mimeType) !== GOOGLE_FOLDER);
+    // file gets, so the skip has to happen before the budget is counted. The
+    // listing refuses folders at the provider (see `backfill`); the changes feed
+    // takes no `q`, so this is the only guard covering a folder created or
+    // renamed since the last pull.
+    const candidates = files.filter((file) => asString(file['mimeType']) !== GOOGLE_FOLDER);
     const ceiling = Math.max(0, request.maxItems);
     // Beyond the ceiling is accounted for, not sliced away: a retryable row
-    // holds the cursor, so the change is offered again rather than skipped.
+    // holds the cursor, so the file is offered again rather than skipped.
     for (const file of candidates.slice(ceiling)) {
-      const id = asString(file.id);
+      const id = asString(file['id']);
       failures.push(
         id === null
           ? { externalRef: null, reason: 'parse_failed', retryable: false }
@@ -223,12 +261,22 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
       );
     }
     for (const file of candidates.slice(0, ceiling)) {
-      const fetched = await fetchContent(request, file);
-      if ('reason' in fetched) failures.push(fetched);
-      else if ('bytes' in fetched) media.push(fetched);
-      else items.push(fetched);
+      const id = asString(file['id']);
+      if (id === null) {
+        // A file the provider named nothing: there is no idempotency key to
+        // write it under, so it cannot become a page and asking again cannot
+        // change that.
+        failures.push({ externalRef: null, reason: 'parse_failed', retryable: false });
+        continue;
+      }
+      items.push({
+        externalRef: externalRefFor('drive', id),
+        title: asString(file['name']),
+        body: driveMetadataBody(file),
+        occurredAt: asDate(file['modifiedTime']),
+      });
     }
-    return { items, media, failures };
+    return { items, failures };
   }
 
   async function delta(request: ProviderListRequest): Promise<ProviderListOutcome> {
@@ -239,7 +287,7 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
       query: {
         pageToken: request.cursor ?? '',
         pageSize: Math.min(PAGE_SIZE, Math.max(1, request.maxItems)),
-        fields: `nextPageToken,newStartPageToken,changes(fileId,removed,file(${FILE_FIELDS}))`,
+        fields: `nextPageToken,newStartPageToken,changes(fileId,removed,file(${DRIVE_FILE_FIELDS}))`,
       },
       externalUserId: request.externalUserId,
       accountId: request.accountId ?? null,
@@ -250,48 +298,47 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
     const tombstones: PulledTombstone[] = [];
     const live: Record<string, unknown>[] = [];
 
-    for (const entry of asArray(body?.changes)) {
+    for (const entry of asArray(body?.['changes'])) {
       const change = asRecord(entry);
       if (change === null) continue;
-      const fileId = asString(change.fileId);
-      const file = asRecord(change.file);
+      const fileId = asString(change['fileId']);
+      const file = asRecord(change['file']);
 
-      if (change.removed === true) {
+      if (change['removed'] === true) {
         if (fileId !== null) {
           tombstones.push({ externalRef: externalRefFor('drive', fileId), reason: 'removed' });
         }
         continue;
       }
-      if (file !== null && file.trashed === true) {
-        const id = asString(file.id) ?? fileId;
+      if (file !== null && file['trashed'] === true) {
+        const id = asString(file['id']) ?? fileId;
         if (id !== null) {
           tombstones.push({ externalRef: externalRefFor('drive', id), reason: 'trashed' });
         }
         continue;
       }
       // A change with neither a file nor a removal flag says nothing about the
-      // file's content; treating it as live would fetch a file that may not
+      // file; treating it as live would write a page for something that may not
       // exist. It is skipped rather than guessed at.
       if (file !== null) live.push(file);
     }
 
-    const { items, media, failures } = await collect(request, live);
-    const nextPageToken = asString(body?.nextPageToken ?? null);
-    const newStartPageToken = asString(body?.newStartPageToken ?? null);
+    const { items, failures } = collect(request, live);
+    const nextPageToken = asString(body?.['nextPageToken'] ?? null);
+    const newStartPageToken = asString(body?.['newStartPageToken'] ?? null);
 
     return {
       ok: true,
       page: {
         items,
-        media,
         tombstones,
         failures,
         // **A truncated change page is still a delta.** The changes feed's own
-        // `nextPageToken` is what `/drive/v3/changes` wants next — it is a delta
-        // cursor in every sense. Labelling it `backfill` sends the next pull
-        // down the first-import leg, which fetches a brand-new start token and
-        // hands this changes token to `/drive/v3/files`: the wrong endpoint,
-        // a token it cannot use, and the rest of the change feed lost.
+        // `nextPageToken` is what `/drive/v3/changes` wants next. Labelling it
+        // `backfill` sends the next pull down the first-import leg, which
+        // fetches a brand-new start token and hands this changes token to
+        // `/drive/v3/files`: the wrong endpoint, a token it cannot use, and the
+        // rest of the change feed lost.
         nextCursor:
           nextPageToken !== null
             ? { kind: 'delta', value: nextPageToken }
@@ -318,7 +365,7 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
         accountId: request.accountId ?? null,
       });
       if (!start.ok) return { ok: false, reason: start.reason };
-      startPageToken = asString(asRecord(start.value)?.startPageToken ?? null);
+      startPageToken = asString(asRecord(start.value)?.['startPageToken'] ?? null);
     }
 
     const listed = await api.request({
@@ -327,7 +374,7 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
       path: '/drive/v3/files',
       query: {
         pageSize: Math.min(PAGE_SIZE, Math.max(1, request.maxItems)),
-        fields: `nextPageToken,files(${FILE_FIELDS})`,
+        fields: `nextPageToken,files(${DRIVE_FILE_FIELDS})`,
         // The folder clause is the provider's half of the guard in `collect`:
         // asked for here, a folder never costs a slice of `maxItems` in the
         // first place. Live, that is 4 of every 26 entries — 15% of a first
@@ -343,19 +390,18 @@ export function createDriveSource(api: ProviderApi): ProviderSource {
     if (!listed.ok) return { ok: false, reason: listed.reason };
 
     const body = asRecord(listed.value);
-    const files = asArray(body?.files)
+    const files = asArray(body?.['files'])
       .map(asRecord)
       .filter((file): file is Record<string, unknown> => file !== null)
       .slice(0, request.maxItems);
 
-    const { items, media, failures } = await collect(request, files);
-    const nextPageToken = asString(body?.nextPageToken ?? null);
+    const { items, failures } = collect(request, files);
+    const nextPageToken = asString(body?.['nextPageToken'] ?? null);
 
     return {
       ok: true,
       page: {
         items,
-        media,
         tombstones: [],
         failures,
         nextCursor:

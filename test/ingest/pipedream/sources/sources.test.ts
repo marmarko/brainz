@@ -16,7 +16,6 @@
 
 import { describe, expect, test } from 'bun:test';
 
-import { MAX_MEDIA_BYTES } from '../../../../src/core/media/accept.ts';
 import {
   PROVIDER_API_BASE,
   createPipedreamClient,
@@ -25,7 +24,6 @@ import { createCalendarSource } from '../../../../src/ingest/pipedream/sources/c
 import { createDriveSource } from '../../../../src/ingest/pipedream/sources/drive.ts';
 import { createGmailSource } from '../../../../src/ingest/pipedream/sources/gmail.ts';
 import { externalRefFor } from '../../../../src/ingest/pipedream/sources/types.ts';
-import { screenshotBytes } from '../../../media/fixture.ts';
 import { CONFIG, createScriptedTransport, withToken, type ScriptedResponse } from '../fixture.ts';
 
 const NOW = new Date('2026-08-13T10:00:00.000Z');
@@ -522,7 +520,6 @@ describe('drive', () => {
         ],
       },
     });
-    transport.on('/files/f3', { status: 200, body: 'the strategy document body' });
 
     const source = createDriveSource(client(transport));
     const outcome = await source.list({
@@ -541,7 +538,12 @@ describe('drive', () => {
       externalRefFor('drive', 'f2'),
     ]);
     expect(outcome.page.items[0]?.externalRef).toBe(externalRefFor('drive', 'f3'));
-    expect(outcome.page.items[0]?.body).toContain('strategy document');
+    // The page is the file's name and metadata, and the fetch that used to
+    // produce a body is gone: no `/export`, no `alt=media`, no request for this
+    // file at all.
+    expect(outcome.page.items[0]?.title).toBe('strategy.txt');
+    expect(outcome.page.items[0]?.body).toContain('strategy.txt');
+    expect(proxyTargets(transport).some((target) => target.includes('/files/f3'))).toBe(false);
     expect(outcome.page.nextCursor).toEqual({ kind: 'delta', value: 'p-9' });
   });
 
@@ -555,95 +557,71 @@ describe('drive', () => {
   const delta = { ...CONNECTION, mode: 'delta', cursor: 'p-8', since: null, maxItems: 100, now: NOW } as const;
 
   /**
-   * **A file id of the everyday Drive length, and the length is the point.**
+   * **Every file type is now one route, and it issues no per-file call.**
    *
-   * `https://www.googleapis.com/drive/v3/files/{id}?alt=media` puts the `?` at
-   * index `42 + len(id)`, and when that index is ≡ 2 (mod 3) — which 44
-   * characters is, and 44 is what an ordinary Drive id has — standard base64
-   * encodes it as a raw `/`. A raw `/` splits the proxy's single path segment
-   * and the vendor answers `404` before Google is ever reached. So this id is
-   * what makes an encoding regression fail *here*, in the adapter that
-   * downloads, rather than only in the builder's alphabet assertion.
+   * These four used to be four: a native Doc exported to `text/plain`, a
+   * spreadsheet to `text/csv`, a PDF and a PNG fetched as bytes, a voice memo
+   * refused outright, and a two-gigabyte file refused from the listing so it
+   * never became a request. The founder's ruling collapses all of them —
+   * "we shouldn't be storing files from the drive, just filename and metadata"
+   * — and the collapse is asserted as an absence of requests rather than as an
+   * absence of media, because the requests are what cost money and what wedged
+   * the source.
+   *
+   * The byte-fidelity test and the base64url path-segment test that stood here
+   * were deleted rather than adapted: with no download there is no path segment
+   * to guard and no bytes to round-trip. `client.test.ts` still owns the
+   * encoder's own alphabet.
    */
-  const EVERYDAY_FILE_ID = 'fake-drive-file-id-at-the-everyday-44-length';
+  test('a doc, a sheet, a pdf, an image and a video are all just metadata', async () => {
+    const files = [
+      { id: 'f-doc', name: 'Board update', mimeType: 'application/vnd.google-apps.document' },
+      { id: 'f-sheet', name: 'Runway model', mimeType: 'application/vnd.google-apps.spreadsheet' },
+      { id: 'f-pdf', name: 'certificate.pdf', mimeType: 'application/pdf', size: '216327' },
+      { id: 'f-png', name: 'wifi.png', mimeType: 'image/png', size: '278' },
+      { id: 'f-video', name: 'demo.mp4', mimeType: 'video/mp4', size: String(4 * 1024 ** 3) },
+    ].map((file) => ({
+      ...file,
+      trashed: false,
+      createdTime: '2026-01-04T09:00:00.000Z',
+      modifiedTime: '2026-08-12T09:00:00.000Z',
+      webViewLink: `https://drive.example-drive.test/file/d/${file.id}/view`,
+      owners: [{ displayName: 'alice-example', emailAddress: 'alice@widget-co.example' }],
+    }));
 
-  test('a screenshot arrives as media, byte for byte', async () => {
-    // It is never decoded leniently into a page of noise — that much was always
-    // right. What was wrong is that the honest failure row was the *end* of it:
-    // a Drive full of screenshots imported as a Drive full of failures, and
-    // U21's transcribe queue stayed permanently empty.
     const transport = withToken(createScriptedTransport());
-    transport.on(
-      '/changes?',
-      changeFor({
-        id: EVERYDAY_FILE_ID,
-        name: 'photo.png',
-        mimeType: 'image/png',
-        trashed: false,
-        size: '278',
-      }),
-    );
-    const bytes = screenshotBytes();
-    transport.on(`/files/${EVERYDAY_FILE_ID}`, { status: 200, body: '', bytes });
+    transport.on('/changes?', {
+      status: 200,
+      body: { newStartPageToken: 'p-9', changes: files.map((file) => ({ fileId: file.id, file })) },
+    });
 
     const outcome = await createDriveSource(client(transport)).list(delta);
 
     expect(outcome.ok).toBe(true);
     if (!outcome.ok) return;
-    expect(outcome.page.items.length).toBe(0);
-    expect(outcome.page.failures.length).toBe(0);
-    const media = outcome.page.media?.[0];
-    expect(media?.externalRef).toBe(externalRefFor('drive', EVERYDAY_FILE_ID));
-    expect(media?.mediaType).toBe('image/png');
-    // Byte-for-byte, and the fixture carries a NUL, a lone 0xFF and an illegal
-    // UTF-8 pair precisely so a string round trip cannot survive this.
-    expect([...(media?.bytes ?? [])]).toEqual([...bytes]);
-    // Fetched as bytes, not as text: the request that produced them said so.
-    const fetched = transport.requests.find((request) =>
-      request.target.includes(`/files/${EVERYDAY_FILE_ID}`),
-    );
-    expect(fetched?.binary).toBe(true);
-    // And the segment that carried it stayed inside the URL-safe alphabet. This
-    // exact download is the one a standard-base64 encoder breaks.
-    const segment = new URL(fetched?.url ?? '').pathname.split('/proxy/')[1] ?? '';
-    expect(segment).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(outcome.page.failures).toEqual([]);
+    expect(outcome.page.items.map((item) => item.title)).toEqual(files.map((file) => file.name));
+    // A four-gigabyte video is a page now, and it cost nothing: the size that
+    // used to refuse it from the listing is a line on the page instead.
+    expect(outcome.page.items[4]?.body).toContain('4 GB');
+    // One call — the changes feed. Not one per file.
+    expect(proxyTargets(transport).length).toBe(1);
   });
 
-  test('a voice memo is still refused, and visibly', async () => {
-    // The closed set is the point of `classifyMedia`: opening the media door
-    // must not open it to everything. A user who sends a voice memo has asked
-    // for a feature that does not exist, and the row is what says so.
-    const transport = withToken(createScriptedTransport());
-    transport.on(
-      '/changes?',
-      changeFor({ id: 'f5', name: 'memo.m4a', mimeType: 'audio/mp4', trashed: false, size: '900' }),
-    );
-
-    const outcome = await createDriveSource(client(transport)).list(delta);
-
-    expect(outcome.ok).toBe(true);
-    if (!outcome.ok) return;
-    expect(outcome.page.media ?? []).toEqual([]);
-    expect(outcome.page.failures[0]?.externalRef).toBe(externalRefFor('drive', 'f5'));
-    expect(outcome.page.failures[0]?.reason).toBe('parse_failed');
-    // And it was never downloaded. A refusal that fetches first is a refusal
-    // that already paid for the thing it refused.
-    expect(transport.requests.some((request) => request.target.includes('/files/f5'))).toBe(false);
-  });
-
-  test('an oversize file is refused from the listing, before it is fetched', async () => {
-    // Nothing here streams, so an unbounded object is the whole file in memory
-    // on the way to the object store. The listing already states the size; a
-    // two-gigabyte PDF must never become a request.
+  test('the body carries what a person needs to recognise the file and open it', async () => {
     const transport = withToken(createScriptedTransport());
     transport.on(
       '/changes?',
       changeFor({
-        id: 'f6',
-        name: 'scans.pdf',
-        mimeType: 'application/pdf',
+        id: 'f-recognise',
+        name: 'Q3 board deck',
+        mimeType: 'application/vnd.google-apps.presentation',
         trashed: false,
-        size: String(MAX_MEDIA_BYTES + 1),
+        size: '57600544',
+        createdTime: '2013-01-09T08:46:49.002Z',
+        modifiedTime: '2026-08-04T04:06:32.913Z',
+        webViewLink: 'https://docs.example-drive.test/presentation/d/f-recognise/edit',
+        owners: [{ displayName: 'alice-example', emailAddress: 'alice@widget-co.example' }],
       }),
     );
 
@@ -651,32 +629,60 @@ describe('drive', () => {
 
     expect(outcome.ok).toBe(true);
     if (!outcome.ok) return;
-    expect(outcome.page.media ?? []).toEqual([]);
-    expect(outcome.page.failures[0]?.reason).toBe('parse_failed');
-    expect(outcome.page.failures[0]?.retryable).toBe(false);
-    expect(transport.requests.some((request) => request.target.includes('/files/f6'))).toBe(false);
+    const body = outcome.page.items[0]?.body ?? '';
+    // The filename first and unlabelled, because it is the whole value of the
+    // source and the full-text arm ranks on the chunk body.
+    expect(body.startsWith('Q3 board deck\n')).toBe(true);
+    // A word a person searches with, beside the type only a machine reads.
+    expect(body).toContain('Google Slides presentation (application/vnd.google-apps.presentation)');
+    expect(body).toContain('Owner: alice-example (alice@widget-co.example)');
+    expect(body).toContain('Size: 55 MB');
+    expect(body).toContain('Created: 2013-01-09T08:46:49.002Z');
+    expect(body).toContain('Modified: 2026-08-04T04:06:32.913Z');
+    expect(body).toContain('Link: https://docs.example-drive.test/presentation/d/f-recognise/edit');
+    // `occurredAt` is the provider's own modified time, so the page orders and
+    // windows by when the file last moved.
+    expect(outcome.page.items[0]?.occurredAt?.toISOString()).toBe('2026-08-04T04:06:32.913Z');
   });
 
-  test('a client that cannot answer in bytes holds the cursor rather than skipping the file', async () => {
-    // This is a fact about how the fleet is wired, not about the file. A
-    // non-retryable row here would advance the cursor past a change the
-    // provider offers exactly once, and the user's screenshots would be gone
-    // for good because of a transport nobody noticed was text-only.
+  test('a file described by nothing but an id still has a body, because an empty one is not a page', async () => {
+    // `chunkDocument` returns no chunks for a blank body and `ingestDocument`
+    // answers `empty_document`, so a body that can come out empty is an item
+    // the runner counts failed. The changes feed returns exactly this shape for
+    // a file whose metadata the grant can no longer read.
     const transport = withToken(createScriptedTransport());
-    transport.on(
-      '/changes?',
-      changeFor({ id: 'f7', name: 'wifi.png', mimeType: 'image/png', trashed: false }),
-    );
-    // No `bytes` on the answer: a transport that only speaks text.
-    transport.on('/files/f7', { status: 200, body: 'not the bytes' });
+    transport.on('/changes?', {
+      status: 200,
+      body: { newStartPageToken: 'p-9', changes: [{ fileId: 'f-bare', file: { id: 'f-bare' } }] },
+    });
 
     const outcome = await createDriveSource(client(transport)).list(delta);
 
     expect(outcome.ok).toBe(true);
     if (!outcome.ok) return;
-    expect(outcome.page.media ?? []).toEqual([]);
-    expect(outcome.page.failures[0]?.reason).toBe('provider_error');
-    expect(outcome.page.failures[0]?.retryable).toBe(true);
+    expect(outcome.page.failures).toEqual([]);
+    expect(outcome.page.items[0]?.title).toBeNull();
+    expect((outcome.page.items[0]?.body ?? '').trim().length).toBeGreaterThan(0);
+  });
+
+  test('a file the provider named nothing cannot become a page, and asking again will not help', async () => {
+    // There is no idempotency key without an id, so this is the one refusal the
+    // metadata path still has — and it must not hold the cursor, or the source
+    // wedges on a row that is never going to grow an id.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/changes?', {
+      status: 200,
+      body: { newStartPageToken: 'p-9', changes: [{ fileId: 'f-nameless', file: { name: 'x' } }] },
+    });
+
+    const outcome = await createDriveSource(client(transport)).list(delta);
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.items).toEqual([]);
+    expect(outcome.page.failures).toEqual([
+      { externalRef: null, reason: 'parse_failed', retryable: false },
+    ]);
   });
 
   /**
@@ -714,7 +720,6 @@ describe('drive', () => {
     // the adapter's job is to turn provider objects into pages.
     expect(outcome.page.failures).toEqual([]);
     expect(outcome.page.items).toEqual([]);
-    expect(outcome.page.media ?? []).toEqual([]);
     // And it cost no request. A folder has no bytes to download and no export
     // to ask for, so reaching the network for one is a call that can only fail.
     expect(proxyTargets(transport).some((target) => target.includes('folder-1'))).toBe(false);
@@ -810,21 +815,14 @@ describe('a page that could not be finished', () => {
     expect(outcome.page.failures[0]?.retryable).toBe(false);
   });
 
-  test('a 429 on a drive file fetch is rate-limited and retryable', async () => {
+  test('a 429 on the drive listing is rate-limited, and there is no per-file fetch to rate-limit', async () => {
+    // Drive used to have two places a 429 could land — the listing and the
+    // per-file fetch — and the second one had to be told apart from a dead file
+    // or the change was never offered again. Metadata-only leaves exactly one:
+    // the listing itself, whose refusal is the whole page's, so the cursor is
+    // untouched and the pull retries.
     const transport = withToken(createScriptedTransport());
-    transport.on('/changes?', {
-      status: 200,
-      body: {
-        newStartPageToken: 'p-9',
-        changes: [
-          {
-            fileId: 'fr1',
-            file: { id: 'fr1', name: 'plan.txt', mimeType: 'text/plain', trashed: false },
-          },
-        ],
-      },
-    });
-    transport.on('/files/fr1', { status: 429, body: { error: 'slow down' } });
+    transport.on('/changes?', { status: 429, body: { error: 'slow down' } });
 
     const source = createDriveSource(client(transport));
     const outcome = await source.list({
@@ -836,10 +834,9 @@ describe('a page that could not be finished', () => {
       now: NOW,
     });
 
-    expect(outcome.ok).toBe(true);
-    if (!outcome.ok) return;
-    expect(outcome.page.failures[0]?.reason).toBe('rate_limited');
-    expect(outcome.page.failures[0]?.retryable).toBe(true);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.reason).toBe('rate_limited');
   });
 
   test('a truncated history page resumes the page rather than jumping to the mailbox head', async () => {
@@ -1170,7 +1167,7 @@ describe('each adapter names its verified upstream', () => {
     expect(targets[0]).not.toContain('calendar.googleapis.com');
   });
 
-  test('drive addresses the listing and the download alike', async () => {
+  test('drive addresses the change token and the listing, and nothing else', async () => {
     const transport = withToken(createScriptedTransport());
     transport.on('/changes/startPageToken', { status: 200, body: { startPageToken: 'p-1' } });
     transport.on('/drive/v3/files?', {
@@ -1181,7 +1178,6 @@ describe('each adapter names its verified upstream', () => {
         ],
       },
     });
-    transport.on('/files/doc-1/export', { status: 200, body: 'the strategy document, at some length' });
 
     await createDriveSource(client(transport)).list({
       ...CONNECTION,
@@ -1193,7 +1189,9 @@ describe('each adapter names its verified upstream', () => {
     });
 
     const targets = proxyTargets(transport);
-    expect(targets.length).toBe(3);
+    // Two, not three: the export that used to follow every native document is
+    // gone. A first import of a thousand files is still two calls per page.
+    expect(targets.length).toBe(2);
     for (const target of targets) {
       expect(target.startsWith('https://www.googleapis.com/drive/v3/')).toBe(true);
     }

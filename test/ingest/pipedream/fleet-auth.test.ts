@@ -102,7 +102,6 @@ function failedPull(stopReason: PullStopReason): PullResult {
       failed: 0,
       tombstoned: 0,
       suppressed: 0,
-      attachments: 0,
     },
     widen: { excludedItems: 0, windowDays: null, outsideWindow: null },
     attemptedItems: 0,

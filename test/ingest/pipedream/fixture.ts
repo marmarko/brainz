@@ -53,15 +53,6 @@ export function testStorage(): TenantStorage {
 export interface ScriptedResponse {
   readonly status: number;
   readonly body: unknown;
-  /**
-   * What a `binary: true` request gets back.
-   *
-   * Separate from `body` on purpose: a screenshot that arrived as a JS string
-   * has already been through a UTF-8 round trip and is no longer that
-   * screenshot, so a fixture that let bytes come from `body` would be unable to
-   * fail the very corruption it is meant to catch.
-   */
-  readonly bytes?: Uint8Array;
   readonly headers?: Readonly<Record<string, string>>;
 }
 
@@ -205,16 +196,9 @@ export function createScriptedTransport(): ScriptedTransport {
       const chosen = rule === undefined ? missing : typeof rule.answer === 'function' ? rule.answer() : rule.answer;
       if (rule !== undefined) rule.used = true;
       const text = typeof chosen.body === 'string' ? chosen.body : JSON.stringify(chosen.body);
-      const ok = chosen.status >= 200 && chosen.status < 300;
       return Promise.resolve({
         status: chosen.status,
-        // The production transport answers a successful binary fetch with an
-        // empty `body` and the bytes beside it; a failed one still carries the
-        // provider's JSON, because that is what the 429-vs-dead-file classifier
-        // reads. Mirrored here so a test cannot pass against a shape the fleet
-        // does not produce.
-        body: request.binary === true && ok ? '' : text,
-        ...(request.binary === true && chosen.bytes !== undefined ? { bytes: chosen.bytes } : {}),
+        body: text,
         ...(chosen.headers === undefined ? {} : { headers: chosen.headers }),
       });
     },
