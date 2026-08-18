@@ -150,6 +150,14 @@ export async function ensureConnectorHealthSchema(sql: SQL): Promise<void> {
   // Unconditional, and after the create rather than inside it: a deployment
   // that already had the table is precisely the one whose enum is behind.
   await ensureEnumLabels(sql, 'control.connector_ingest_failure', INGEST_FAILURE_CODES);
+
+  // Additive and idempotent, for the reason the enum teaching above is: the DDL
+  // file is applied once per deployment ever, so a control plane that already
+  // has the table would never gain a column declared in it. `IF NOT EXISTS`
+  // makes a second fleet booting concurrently a no-op rather than an error.
+  await sql.unsafe(
+    'ALTER TABLE control.connector_health ADD COLUMN IF NOT EXISTS ingest_failure_status smallint',
+  );
 }
 
 /**
@@ -169,7 +177,7 @@ export function createControlPlaneConnectorHealth(
         await sql`
           INSERT INTO control.connector_health (
             tenant_id, source, last_attempt_at, last_success_at,
-            run_outcome, ingest_failure_code, job_failure_code,
+            run_outcome, ingest_failure_code, ingest_failure_status, job_failure_code,
             items_written, items_failed, updated_at
           ) VALUES (
             ${attempt.tenantId},
@@ -178,6 +186,7 @@ export function createControlPlaneConnectorHealth(
             ${attempt.runOutcome === 'completed' ? attempt.at : null},
             ${attempt.runOutcome}::control.connector_run_outcome,
             ${attempt.ingestFailureCode}::control.connector_ingest_failure,
+            ${attempt.ingestFailureStatus},
             ${attempt.jobFailureCode}::control.connector_job_failure,
             ${attempt.itemsWritten}, ${attempt.itemsFailed}, ${attempt.at}
           )
@@ -195,6 +204,10 @@ export function createControlPlaneConnectorHealth(
                  -- upsert here is a red line nobody can clear.
                  run_outcome         = ${attempt.runOutcome}::control.connector_run_outcome,
                  ingest_failure_code = ${attempt.ingestFailureCode}::control.connector_ingest_failure,
+                 -- Overwritten with the code it belongs to, NULL included: a
+                 -- status outliving its reason is the red line this table's
+                 -- header refuses.
+                 ingest_failure_status = ${attempt.ingestFailureStatus},
                  job_failure_code    = ${attempt.jobFailureCode}::control.connector_job_failure,
                  items_written       = ${attempt.itemsWritten},
                  items_failed        = ${attempt.itemsFailed},
@@ -222,6 +235,16 @@ export interface ConnectorHealthView {
   readonly lastSuccessAt: Date | null;
   readonly runOutcome: PullOutcome | null;
   readonly ingestFailureCode: IngestFailureCode | null;
+  /**
+   * The provider's HTTP status behind the code, or null.
+   *
+   * It belongs on this type by this type's own rule: a status is a code, not a
+   * word a user wrote, so it can cross to `/admin` and the dashboard without
+   * either of them holding a tenant handle. It is the difference between a
+   * credential rejected, a limit reached and an outage — three remedies that
+   * otherwise arrive wearing one `embed_transport_failed`.
+   */
+  readonly ingestFailureStatus: number | null;
   readonly jobFailureCode: JobFailureCode | null;
   readonly itemsWritten: number;
   readonly itemsFailed: number;
@@ -250,6 +273,7 @@ export async function readConnectorHealth(
            last_success_at,
            run_outcome::text         AS run_outcome,
            ingest_failure_code::text AS ingest_failure_code,
+           ingest_failure_status     AS ingest_failure_status,
            job_failure_code::text    AS job_failure_code,
            items_written,
            items_failed
@@ -261,6 +285,7 @@ export async function readConnectorHealth(
     last_success_at: Date | null;
     run_outcome: string | null;
     ingest_failure_code: string | null;
+    ingest_failure_status: number | null;
     job_failure_code: string | null;
     items_written: number;
     items_failed: number;
@@ -277,6 +302,11 @@ export async function readConnectorHealth(
       // rest of the fleet has never heard of could reach a rendered page.
       runOutcome: (row.run_outcome as PullOutcome | null) ?? null,
       ingestFailureCode: (row.ingest_failure_code as IngestFailureCode | null) ?? null,
+      // Read from the row, not defaulted. A default here would discard the one
+      // field this whole path exists to carry, and it would do it silently —
+      // the same shape as the drop at the layer below that hid a status for a
+      // day.
+      ingestFailureStatus: row.ingest_failure_status ?? null,
       jobFailureCode: (row.job_failure_code as JobFailureCode | null) ?? null,
       itemsWritten: row.items_written,
       itemsFailed: row.items_failed,

@@ -492,6 +492,7 @@ describe('a failed poll is diagnosable', () => {
       expect(banked.get('gmail')).toMatchObject({
         runOutcome: 'failed',
         ingestFailureCode: 'auth_expired',
+        ingestFailureStatus: null,
         jobFailureCode: null,
         lastSuccessAt: null,
       });
@@ -609,6 +610,7 @@ describe('a failed poll is diagnosable', () => {
       expect(banked.get('gmail')).toMatchObject({
         runOutcome: null,
         ingestFailureCode: null,
+        ingestFailureStatus: null,
         jobFailureCode: 'tenant_unavailable',
       });
 
@@ -710,6 +712,7 @@ describe('a failed poll is diagnosable', () => {
       expect(banked.get('gmail')).toMatchObject({
         runOutcome: 'completed',
         ingestFailureCode: null,
+        ingestFailureStatus: null,
         jobFailureCode: null,
         lastSuccessAt: later,
       });

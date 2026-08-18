@@ -125,6 +125,7 @@ describe('the record answers "why is this connector not polling"', () => {
       at: NOW,
       runOutcome: 'failed',
       ingestFailureCode: 'auth_expired',
+      ingestFailureStatus: null,
       jobFailureCode: null,
       itemsWritten: 0,
       itemsFailed: 0,
@@ -134,6 +135,7 @@ describe('the record answers "why is this connector not polling"', () => {
     expect(stored).toMatchObject({
       runOutcome: 'failed',
       ingestFailureCode: 'auth_expired',
+      ingestFailureStatus: null,
       jobFailureCode: null,
       lastSuccessAt: null,
     });
@@ -155,6 +157,7 @@ describe('the record answers "why is this connector not polling"', () => {
         at: NOW,
         runOutcome: null,
         ingestFailureCode: null,
+        ingestFailureStatus: null,
         jobFailureCode: code,
         itemsWritten: 0,
         itemsFailed: 0,
@@ -180,6 +183,7 @@ describe('the record answers "why is this connector not polling"', () => {
       at: NOW,
       runOutcome: 'failed',
       ingestFailureCode: 'rate_limited',
+      ingestFailureStatus: null,
       jobFailureCode: null,
       itemsWritten: 0,
       itemsFailed: 3,
@@ -191,6 +195,7 @@ describe('the record answers "why is this connector not polling"', () => {
       at: later,
       runOutcome: 'completed',
       ingestFailureCode: null,
+      ingestFailureStatus: null,
       jobFailureCode: null,
       itemsWritten: 12,
       itemsFailed: 0,
@@ -204,6 +209,7 @@ describe('the record answers "why is this connector not polling"', () => {
     expect(stored).toMatchObject({
       runOutcome: 'completed',
       ingestFailureCode: null,
+      ingestFailureStatus: null,
       jobFailureCode: null,
       itemsWritten: 12,
       itemsFailed: 0,
@@ -224,6 +230,7 @@ describe('the record answers "why is this connector not polling"', () => {
       at: worked,
       runOutcome: 'completed',
       ingestFailureCode: null,
+      ingestFailureStatus: null,
       jobFailureCode: null,
       itemsWritten: 4,
       itemsFailed: 0,
@@ -234,6 +241,7 @@ describe('the record answers "why is this connector not polling"', () => {
       at: NOW,
       runOutcome: 'failed',
       ingestFailureCode: 'auth_expired',
+      ingestFailureStatus: null,
       jobFailureCode: null,
       itemsWritten: 0,
       itemsFailed: 0,
@@ -343,6 +351,7 @@ describe('a failure reason is a code, and cannot become a subject line', () => {
       at: NOW,
       runOutcome: 'failed',
       ingestFailureCode: 'provider_error',
+      ingestFailureStatus: null,
       jobFailureCode: jobFailureCodeOf(carrying, false),
       itemsWritten: 0,
       itemsFailed: 2,
@@ -477,6 +486,7 @@ describe('a control plane built before a code existed learns it', () => {
       at: NOW,
       runOutcome: 'failed',
       ingestFailureCode: 'fleet_auth_failed',
+      ingestFailureStatus: null,
       jobFailureCode: null,
       itemsWritten: 0,
       itemsFailed: 0,
@@ -496,5 +506,80 @@ describe('a control plane built before a code existed learns it', () => {
        WHERE enumtypid = 'control.connector_ingest_failure'::regtype
        ORDER BY enumsortorder`) as unknown as { label: string }[];
     expect(labels.map((row) => row.label)).toEqual([...INGEST_FAILURE_CODES]);
+  });
+});
+
+/**
+ * **The status survives the round trip, or it is decoration.**
+ *
+ * `embed_transport_failed` says a provider refused; it does not say whether the
+ * refusal was a credential, a limit or an outage, and those are three different
+ * remedies. The gateway already has the number — `src/ai/gateway.ts` keeps the
+ * status and discards everything else a provider echoes, which is exactly what
+ * makes it safe to store — and it was being dropped one hop from the surface
+ * that needed it.
+ *
+ * This asserts the whole path, because "carried" is a claim about every hop and
+ * a single defaulted field silently voids it. While writing this, the read
+ * mapping did exactly that: `ingestFailureStatus: null` in place of the column,
+ * with the write path and the schema both correct. The suite was green.
+ */
+describe('the provider status survives the round trip', () => {
+  test('a status written with its code is read back beside it', async () => {
+    await clear();
+    const health = createControlPlaneConnectorHealth(sql, (error) => {
+      throw error;
+    });
+    await health.record({
+      tenantId: TENANT,
+      source: 'calendar',
+      at: NOW,
+      runOutcome: 'stopped',
+      ingestFailureCode: 'embed_transport_failed',
+      ingestFailureStatus: 403,
+      jobFailureCode: null,
+      itemsWritten: 0,
+      itemsFailed: 0,
+    });
+
+    const view = await readConnectorHealth(sql, { tenantId: TENANT });
+    expect(view.get('calendar')?.ingestFailureCode).toBe('embed_transport_failed');
+    // The assertion the defaulted read passed and this one does not.
+    expect(view.get('calendar')?.ingestFailureStatus).toBe(403);
+  });
+
+  test('a recovered connector carries no status, exactly as it carries no code', async () => {
+    await clear();
+    const health = createControlPlaneConnectorHealth(sql, (error) => {
+      throw error;
+    });
+    await health.record({
+      tenantId: TENANT,
+      source: 'calendar',
+      at: NOW,
+      runOutcome: 'stopped',
+      ingestFailureCode: 'embed_transport_failed',
+      ingestFailureStatus: 429,
+      jobFailureCode: null,
+      itemsWritten: 0,
+      itemsFailed: 0,
+    });
+    await health.record({
+      tenantId: TENANT,
+      source: 'calendar',
+      at: NOW,
+      runOutcome: 'completed',
+      ingestFailureCode: null,
+      ingestFailureStatus: null,
+      jobFailureCode: null,
+      itemsWritten: 7,
+      itemsFailed: 0,
+    });
+
+    const view = await readConnectorHealth(sql, { tenantId: TENANT });
+    // Overwritten, NULL included. A status outliving its reason is the second
+    // red line nobody can clear.
+    expect(view.get('calendar')?.ingestFailureCode).toBeNull();
+    expect(view.get('calendar')?.ingestFailureStatus).toBeNull();
   });
 });

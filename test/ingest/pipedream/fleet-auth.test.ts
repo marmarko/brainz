@@ -120,6 +120,7 @@ function panelCauseFor(stopReason: PullStopReason): string | null {
     lastSuccessAt: null,
     runOutcome: attempt.runOutcome,
     ingestFailureCode: attempt.ingestFailureCode,
+    ingestFailureStatus: null,
     jobFailureCode: attempt.jobFailureCode,
     itemsWritten: attempt.itemsWritten,
     itemsFailed: attempt.itemsFailed,

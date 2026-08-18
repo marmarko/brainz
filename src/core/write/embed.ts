@@ -184,7 +184,19 @@ export type EmbedOutcome =
        */
       readonly modelId: string | null;
     }
-  | { readonly ok: false; readonly reason: string };
+  | {
+      readonly ok: false;
+      readonly reason: string;
+      /**
+       * The provider's HTTP status, when the failure was a refusal rather than a
+       * decision made before the call. Carried because `src/ai/gateway.ts` says
+       * why it is the one thing safe to keep — "the status, and nothing else" —
+       * and because it is the difference between a credential rejected, a limit
+       * reached and an outage, which are three different remedies wearing one
+       * `transport_failed`. Null when nothing answered.
+       */
+      readonly providerStatus?: number | null;
+    };
 
 /**
  * One gateway call per batch, with the outcome passed back as data.
@@ -207,7 +219,13 @@ export async function embedTexts(request: EmbedRequest): Promise<EmbedOutcome> {
     input: { kind: 'embedding', texts: request.texts },
   });
 
-  if (!result.ok) return { ok: false, reason: result.reason };
+  if (!result.ok) {
+    return {
+      ok: false,
+      reason: result.reason,
+      ...('providerStatus' in result ? { providerStatus: result.providerStatus } : {}),
+    };
+  }
   if (result.output.kind !== 'embedding') return { ok: false, reason: 'op_kind_mismatch' };
   if (result.output.vectors.length !== request.texts.length) {
     return { ok: false, reason: 'embedding_count_mismatch' };
@@ -260,6 +278,8 @@ export interface BacklogResult {
   readonly remaining: number;
   /** Set when the pass stopped early; the rows stay in the backlog. */
   readonly failure?: string;
+  /** The provider's status behind {@link failure}, when one answered. */
+  readonly failureStatus?: number | null;
 }
 
 /**
@@ -311,7 +331,12 @@ export async function runChunkEmbedBacklog(options: {
     });
 
     if (!outcome.ok) {
-      return { embedded, remaining: await backlogSize(options.sql, seat.column), failure: outcome.reason };
+      return {
+        embedded,
+        remaining: await backlogSize(options.sql, seat.column),
+        failure: outcome.reason,
+        ...(outcome.providerStatus === undefined ? {} : { failureStatus: outcome.providerStatus }),
+      };
     }
 
     // **What answered has to be what this backlog is for.** The rows were

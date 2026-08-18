@@ -55,6 +55,7 @@ function health(overrides: Partial<ConnectorHealthView> = {}): ConnectorHealthVi
     lastSuccessAt: null,
     runOutcome: 'failed',
     ingestFailureCode: 'auth_expired',
+    ingestFailureStatus: null,
     jobFailureCode: null,
     itemsWritten: 0,
     itemsFailed: 0,

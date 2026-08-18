@@ -175,6 +175,13 @@ CREATE TABLE control.connector_health (
 
   run_outcome          control.connector_run_outcome,
   ingest_failure_code  control.connector_ingest_failure,
+
+  -- The provider's HTTP status behind the code, when something answered. A
+  -- number and never a body: the header below refuses subject lines, and a
+  -- status is the one part of a provider's reply that is a code rather than
+  -- content. Null when the failure was decided before any call was made.
+  ingest_failure_status smallint,
+
   job_failure_code     control.connector_job_failure,
 
   -- What the last attempt moved. Counts, and deliberately only counts: **a

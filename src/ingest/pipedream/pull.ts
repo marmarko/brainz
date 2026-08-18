@@ -312,6 +312,16 @@ export type PullOutcome = (typeof PULL_OUTCOMES)[number];
 
 export interface PullResult {
   readonly outcome: PullOutcome;
+  /**
+   * The provider's HTTP status behind {@link stopReason}, when the stop was a
+   * refusal something answered rather than a decision made before the call.
+   *
+   * A status is the one piece of a provider's reply that is safe to keep — the
+   * gateway says so where it discards the rest — and it is what separates a
+   * credential rejected from a limit reached from an outage, three remedies
+   * that otherwise arrive wearing one `embed_transport_failed`.
+   */
+  readonly stopStatus?: number | null;
   readonly mode: PullMode;
   readonly runId: string | null;
   readonly decision: GateDecision | null;
@@ -969,6 +979,8 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
      * written. What it does do is hold the cursor — see step 10.
      */
     let incomplete: PullStopReason | undefined;
+    /** Set with {@link incomplete}, and only by the setter that wins. */
+    let stopStatus: number | null | undefined;
 
     for (const failure of listed.failures) {
       counts.failed += 1;
@@ -1098,7 +1110,15 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
       // in `backlog.failure` and was being thrown away one line from the surface
       // that needed it. Which of the two arrived decides where an operator
       // looks, and looking in the wrong one cost six hours.
-      else if (backlog.failure !== undefined) incomplete ??= embedStopFor(backlog.failure);
+      else if (backlog.failure !== undefined) {
+        if (incomplete === undefined) {
+          incomplete = embedStopFor(backlog.failure);
+          // Captured beside the reason rather than derived later: by the time the
+          // result is assembled the backlog is out of scope, which is how the
+          // status came to be dropped one hop from the surface that needed it.
+          stopStatus = backlog.failureStatus ?? null;
+        }
+      }
     }
 
     // ------------------------------------------------------------------
@@ -1135,6 +1155,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
         cursorAdvanced,
         cursorInvalidated,
         stopReason,
+        ...(stopStatus === undefined ? {} : { stopStatus }),
       };
     }
 
@@ -1190,6 +1211,16 @@ export interface ConnectorAttempt {
   /** What the pull said it did. Null when no pull produced a result. */
   readonly runOutcome: PullOutcome | null;
   readonly ingestFailureCode: IngestFailureCode | null;
+  /**
+   * The provider's HTTP status behind {@link ingestFailureCode}, or null.
+   *
+   * A number, never a body. `src/ai/gateway.ts` keeps the status and discards
+   * everything else a provider echoes, for the reason this table's own header
+   * gives: a failure reason is a code and a timestamp, not a subject line. A
+   * status is a code — and it is the one that separates a credential rejected
+   * from a limit reached from an outage.
+   */
+  readonly ingestFailureStatus: number | null;
   readonly jobFailureCode: JobFailureCode | null;
   readonly itemsWritten: number;
   readonly itemsFailed: number;
@@ -1384,6 +1415,9 @@ export function attemptFor(
     at,
     runOutcome: result.outcome,
     ingestFailureCode: failed ? stopCodeFor(result.stopReason as PullStopReason) : null,
+    // Only on a failed attempt, for `ingestFailureCode`'s reason: a status left
+    // on a recovered connector is a second red line nobody can clear.
+    ingestFailureStatus: failed ? (result.stopStatus ?? null) : null,
     jobFailureCode: null,
     itemsWritten: result.counts.written,
     itemsFailed: result.counts.failed,
@@ -1469,6 +1503,7 @@ export function createIngestPullHandler(
         at: context.now,
         runOutcome: null,
         ingestFailureCode: null,
+        ingestFailureStatus: null,
         jobFailureCode: 'tenant_unavailable',
         itemsWritten: 0,
         itemsFailed: 0,
@@ -1535,6 +1570,7 @@ export function createIngestPullHandler(
           at: context.now,
           runOutcome: null,
           ingestFailureCode: null,
+          ingestFailureStatus: null,
           jobFailureCode: context.signal.aborted ? 'lease_stolen' : 'handler_error',
           itemsWritten: 0,
           itemsFailed: 0,
