@@ -660,6 +660,68 @@ describe('a failed poll is diagnosable', () => {
     TEST_TIMEOUT_MS,
   );
 
+  /**
+   * **A pull that is running right now has spent an attempt on being run, and
+   * the panel counted it as an attempt that failed.**
+   *
+   * `claim` sets `state = 'running'` and `attempts = attempts + 1` in the same
+   * statement, so a healthy first pull is `running` with `attempts = 1` for as
+   * long as it takes to run — minutes, on a mailbox. `openAttempts` read that
+   * column raw, `attempts > 0` meant `retrying`, and `retrying` renders as
+   * *"Connected, and the last check did not work"*. On a source whose poll takes
+   * a meaningful fraction of its cadence, that is what the user sees most of the
+   * time, about a check that is working.
+   *
+   * It is the same class of defect `retrying` was added to fix, one state over:
+   * the panel describing a lane as something other than what it is doing. The
+   * distinction is between attempts already **spent and failed** and the attempt
+   * **in flight**, and only the row's own state tells them apart.
+   */
+  test(
+    'a pull that is running for the first time is a check, not a retry',
+    async () => {
+      const jobId = await enqueueClaimable('ingest_pull', 'gmail');
+      // Exactly what `claim` does, and the reason this is not a fixture
+      // convenience: the two columns move together, so a `running` row can never
+      // carry the attempt count of a lane that has failed.
+      await controlSql`
+        UPDATE control.job
+           SET state = 'running', attempts = 1, lease_token = 1,
+               lease_owner = 'a-worker', lease_expires_at = ${new Date(NOW.getTime() + 60_000)},
+               attempt_deadline_at = ${new Date(NOW.getTime() + 60_000)},
+               heartbeat_at = ${NOW}
+         WHERE job_id = ${jobId}::uuid`;
+
+      const [status] = await statuses();
+      expect(status).toMatchObject({ state: 'checking', cause: null });
+      const page = dashboard([status as ConnectorStatus]);
+      expect(page).toContain('queued or running');
+      expect(page).not.toContain('did not work');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a pull running after two failures is still a retry, and says so',
+    async () => {
+      const jobId = await enqueueClaimable('ingest_pull', 'gmail');
+      // Third attempt in flight: two are spent and failed, this one is running.
+      // Discounting the in-flight attempt must not discount the ladder behind it.
+      await controlSql`
+        UPDATE control.job
+           SET state = 'running', attempts = 3, lease_token = 3,
+               lease_owner = 'a-worker', lease_expires_at = ${new Date(NOW.getTime() + 60_000)},
+               attempt_deadline_at = ${new Date(NOW.getTime() + 60_000)},
+               heartbeat_at = ${NOW}
+         WHERE job_id = ${jobId}::uuid`;
+
+      const [status] = await statuses();
+      expect(status).toMatchObject({ state: 'retrying' });
+      expect(dashboard([status as ConnectorStatus])).toContain('did not work');
+    },
+    TEST_TIMEOUT_MS,
+  );
+
   test(
     'a connector nothing has recorded reads exactly as it did before this record existed',
     async () => {

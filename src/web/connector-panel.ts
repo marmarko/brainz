@@ -128,12 +128,23 @@ export interface PullHistory {
   /** Rows in `due` or `running`. */
   readonly open: number;
   /**
-   * Attempts already spent by the open row.
+   * Attempts already spent **and failed** by the open row — not the attempt in
+   * flight.
    *
    * The difference between "queued" and "queued again because it failed", and
    * the reason it comes off the open row rather than off a count of dead ones: a
    * lane on attempt three of five has never dead-lettered and never completed,
    * so every other column here reads exactly like a healthy first check.
+   *
+   * **`control.job.attempts` is not this number for a `running` row, and reading
+   * it as if it were made every healthy pull render as a failure.** `claim` sets
+   * `state = 'running'` and `attempts = attempts + 1` in one statement, so a
+   * first pull is `running` with `attempts = 1` for however long it takes to
+   * run — minutes, on a mailbox, against a five-minute cadence. Counted raw,
+   * that is `attempts > 0`, which is `retrying`, which renders as *"the last
+   * check did not work"* about a check that is working, for most of the time the
+   * connector exists. The row's own state is the only thing that tells the
+   * in-flight attempt from the spent ones, so the query discounts it there.
    */
   readonly openAttempts: number;
   readonly lastDoneAt: Date | null;
@@ -268,8 +279,13 @@ export async function connectorStatuses(
   >`
     SELECT target::text                                                    AS target,
            count(*) FILTER (WHERE state IN ('due', 'running'))::int        AS open,
-           coalesce(max(attempts) FILTER (
-             WHERE state IN ('due', 'running')), 0)::int                   AS open_attempts,
+           -- The attempt in flight is discounted; the ones behind it are not.
+           -- See PullHistory.openAttempts: claim increments attempts as it sets
+           -- running, so a healthy first pull carries a 1 that means "this one
+           -- is happening", not "one has failed".
+           coalesce(max(
+             CASE WHEN state = 'running' THEN greatest(attempts - 1, 0) ELSE attempts END
+           ) FILTER (WHERE state IN ('due', 'running')), 0)::int           AS open_attempts,
            max(finished_at) FILTER (WHERE state = 'done')                  AS last_done_at,
            max(dead_lettered_at) FILTER (WHERE state = 'dead')             AS dead_at,
            (array_agg(failure_code::text ORDER BY dead_lettered_at DESC)
