@@ -51,7 +51,12 @@ import {
   type ReviveLaneOutcome,
   type ReviveLaneRequest,
 } from './jobs.ts';
-import { attemptDeadlineAt, leaseExpiryAt, type ConnectionBound } from './locks.ts';
+import {
+  attemptDeadlineAt,
+  attemptOverranBeforeLeaseLapsed,
+  leaseExpiryAt,
+  type ConnectionBound,
+} from './locks.ts';
 
 /**
  * Re-exported from where the policy now lives (`jobs.ts`), so the ladder length
@@ -418,7 +423,13 @@ export function createJobQueue(options: JobQueueOptions): PostgresJobQueue {
         // would quietly return the connector lane to the 30-second ladder every
         // time a worker died mid-poll.
         const candidates = rowsOf(await tx`
-          SELECT job_id, kind, lease_token, attempts, max_attempts, attempt_deadline_at
+          -- lease_expires_at is read as well as filtered on, because the
+          -- failure code below has to compare the two arms against each other
+          -- rather than against this sweep's clock. It is already in the WHERE
+          -- clause and already in the ORDER BY, so this is one more column on a
+          -- row the statement was reading anyway.
+          SELECT job_id, kind, lease_token, attempts, max_attempts,
+                 attempt_deadline_at, lease_expires_at
           FROM control.job
           WHERE state = 'running'
             AND (lease_expires_at <= ${stealBefore} OR attempt_deadline_at <= ${request.now})
@@ -429,10 +440,22 @@ export function createJobQueue(options: JobQueueOptions): PostgresJobQueue {
 
         const reclaimed: JobRecord[] = [];
         for (const candidate of candidates) {
-          const overran =
-            candidate.attempt_deadline_at !== null &&
-            candidate.attempt_deadline_at.getTime() <= request.now.getTime();
-          const code: JobFailureCode = overran ? 'attempt_timed_out' : 'lease_stolen';
+          // Which arm fired, decided on the row's own two timestamps. Asking
+          // "has the deadline passed by now" instead named every container the
+          // platform killed an overrun, because a reap that arrives half an
+          // hour late arrives after a fifteen-minute ceiling whatever the
+          // holder was doing — and the one code worth escalating on meant
+          // nothing.
+          const code: JobFailureCode = attemptOverranBeforeLeaseLapsed(
+            {
+              leaseExpiresAt: candidate.lease_expires_at,
+              attemptDeadlineAt: candidate.attempt_deadline_at,
+            },
+            request.now,
+            { stealGraceMs: request.stealGraceMs },
+          )
+            ? 'attempt_timed_out'
+            : 'lease_stolen';
           const exhausted = candidate.attempts >= candidate.max_attempts;
           const retryAt = new Date(
             request.now.getTime() +

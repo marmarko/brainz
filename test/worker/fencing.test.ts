@@ -323,3 +323,108 @@ describe('the stealing rule and the SQL that implements it agree', () => {
     expect(wedged?.failureCode).toBe('attempt_timed_out');
   });
 });
+
+describe('the failure code names the arm that fired, not the moment the reaper looked', () => {
+  /**
+   * `attempt_timed_out` and `lease_stolen` are read by humans deciding whether a
+   * lane needs a bigger budget or a healthier container, and one of them was
+   * being written by a clock that belongs to neither.
+   *
+   * `reclaim` runs inside a tick. A fleet that sheds its container after five
+   * idle minutes and is woken by a half-hourly cron leaves a dead holder's row
+   * `running` for longer than the attempt ceiling — so by the time anyone looks,
+   * `attempt_deadline_at <= now` is true of *every* dead holder, and the label
+   * says "this attempt ran long" about an attempt that stopped in its first
+   * minute. The evidence for an overrun is not when the reaper arrived; it is
+   * whether the holder was still heartbeating when its own deadline passed.
+   */
+
+  const DEADLINE = new Date(T0.getTime() + MAX_ATTEMPT_MS);
+
+  /** One connector lane, claimed at T0 with the shipped lease geometry. */
+  async function claimLane(target: 'gmail' | 'calendar' | 'drive') {
+    const enqueued = await queue.enqueue({
+      tenantId: TENANT,
+      kind: 'ingest_pull',
+      target,
+      trigger: 'connector_cadence',
+      now: T0,
+    });
+    expect(enqueued.enqueued).toBe(true);
+    const lease = await queue.claim({
+      owner: `worker-${target}`,
+      now: T0,
+      leaseTtlMs: LEASE_TTL_MS,
+      maxAttemptMs: MAX_ATTEMPT_MS,
+      kinds: ['ingest_pull'],
+    });
+    if (lease === undefined) throw new Error('fixture: claim found nothing');
+    return lease;
+  }
+
+  test('a holder that stopped heartbeating before its deadline is stolen, not timed out', async () => {
+    // Zero renewals: the container was killed mid-attempt, so the lease lapsed
+    // at T0+30s and the deadline it never reached passed at T0+5m with nobody
+    // holding the job. The reaper turns up five minutes after that.
+    await claimLane('gmail');
+
+    const taken = await queue.reclaim({
+      now: new Date(DEADLINE.getTime() + 5 * 60_000),
+      stealGraceMs: STEAL_GRACE_MS,
+    });
+
+    expect(taken).toHaveLength(1);
+    expect(taken[0]?.failureCode).toBe('lease_stolen');
+  });
+
+  test('reaper latency does not change the verdict', async () => {
+    // One geometry, four observation times. `reclaim` consumes the row it
+    // takes, so the lane is rebuilt identically between instants rather than
+    // reaped four times — same claim, same TTL, same absent heartbeat, and the
+    // only thing that differs is when somebody looked.
+    //
+    // The first instant is deliberately *before* the deadline, where only the
+    // lease arm has fired. Without it the other three agree on the wrong answer
+    // and the assertion is vacuous.
+    const instants = [
+      new Date(T0.getTime() + LEASE_TTL_MS + STEAL_GRACE_MS + 1),
+      new Date(DEADLINE.getTime() + 1_000),
+      new Date(DEADLINE.getTime() + 5 * 60_000),
+      new Date(DEADLINE.getTime() + 30 * 60_000),
+    ];
+
+    const verdicts: (string | null | undefined)[] = [];
+    for (const at of instants) {
+      await sql`DELETE FROM control.job`;
+      await claimLane('gmail');
+      const taken = await queue.reclaim({ now: at, stealGraceMs: STEAL_GRACE_MS });
+      expect(taken).toHaveLength(1);
+      verdicts.push(taken[0]?.failureCode);
+    }
+
+    // Named rather than merely compared: four instants that agreed on
+    // `attempt_timed_out` would be just as invariant and just as wrong.
+    expect(verdicts).toEqual(['lease_stolen', 'lease_stolen', 'lease_stolen', 'lease_stolen']);
+  });
+
+  test('a holder that heartbeated past its deadline keeps the timed-out label even when the reap is late', async () => {
+    // The overrun this code exists to name: the worker was alive at the instant
+    // its own ceiling passed, then stopped. A rule that read only "the lease has
+    // lapsed by now" would relabel this `lease_stolen` and erase the one signal
+    // worth escalating on.
+    const lease = await claimLane('calendar');
+    const channel = createLeaseChannel({ sql: leaseSql });
+
+    const renewAt = new Date(DEADLINE.getTime() - 5_000);
+    const beat = await channel.heartbeat(lease, { now: renewAt, leaseTtlMs: LEASE_TTL_MS });
+    expect(beat.applied).toBe(true);
+
+    const taken = await queue.reclaim({
+      now: new Date(DEADLINE.getTime() + 30 * 60_000),
+      stealGraceMs: STEAL_GRACE_MS,
+    });
+
+    expect(taken).toHaveLength(1);
+    expect(taken[0]?.failureCode).toBe('attempt_timed_out');
+  });
+});

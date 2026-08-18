@@ -134,6 +134,47 @@ export function isStealable(job: LeaseView, now: Date, config: Pick<LeaseConfig,
   return job.leaseExpiresAt.getTime() + config.stealGraceMs <= now.getTime();
 }
 
+/**
+ * Which arm of the stealing rule actually described this attempt.
+ *
+ * `isStealable` answers *whether* a row may be taken; this answers *why*, and
+ * the two are different questions. Reaper latency is unbounded — `reclaim` runs
+ * only inside a tick, and a fleet that sheds at five idle minutes with a
+ * half-hourly cron can leave a dead holder unnoticed for longer than
+ * `maxAttemptMs`. Testing the deadline against the reaper's `now` therefore
+ * labels every such death `attempt_timed_out`, because thirty minutes is longer
+ * than fifteen and the deadline arm wins by construction rather than by
+ * evidence. The code that means "this attempt ran too long" was being written
+ * about attempts that stopped in their first minute.
+ *
+ * So both firing instants are compared, and both are stored on the row, written
+ * by the holder through the holder's own clock: the attempt overran only if its
+ * deadline arrived while the holder was still heartbeating — at or before the
+ * lease went stealable. A wedged handler renews forever, so its lease arm never
+ * precedes its deadline and it keeps the label the deadline exists to give it.
+ * Nothing here reads the reaper's observation time, which is what makes the
+ * verdict a property of the row rather than of when somebody looked at it.
+ *
+ * The name is not `attemptOverran` on purpose: this is a **label**, not a
+ * stealability predicate, and it must never migrate into the WHERE clause.
+ */
+export function attemptOverranBeforeLeaseLapsed(
+  job: Pick<LeaseView, 'leaseExpiresAt' | 'attemptDeadlineAt'>,
+  now: Date,
+  config: Pick<LeaseConfig, 'stealGraceMs'>,
+): boolean {
+  const deadline = job.attemptDeadlineAt;
+  if (deadline === null || deadline.getTime() > now.getTime()) return false;
+
+  // A running row with no expiry cannot exist — `running_jobs_hold_a_lease`
+  // refuses it. If one somehow does, there is no evidence the holder died
+  // first, so the deadline keeps the label it had before this arm existed:
+  // relabel only on positive proof.
+  if (job.leaseExpiresAt === null) return true;
+
+  return deadline.getTime() <= job.leaseExpiresAt.getTime() + config.stealGraceMs;
+}
+
 /** When a claim or renewal taken at `now` expires. */
 export function leaseExpiryAt(now: Date, leaseTtlMs: number): Date {
   return new Date(now.getTime() + leaseTtlMs);

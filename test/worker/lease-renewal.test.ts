@@ -32,6 +32,7 @@ import { createJobQueue, createLeaseChannel, type PostgresJobQueue } from '../..
 import {
   assertDedicatedLeaseChannel,
   assertLeaseConfig,
+  attemptOverranBeforeLeaseLapsed,
   DEFAULT_LEASE_CONFIG,
   MIN_HEARTBEATS_PER_LEASE,
 } from '../../src/worker/locks.ts';
@@ -247,5 +248,94 @@ describe('a lease configuration that manufactures stealing is refused', () => {
     expect(() => assertLeaseConfig({ ...DEFAULT_LEASE_CONFIG, stealGraceMs: -1 })).toThrow(
       /before it expires/,
     );
+  });
+});
+
+describe('which arm described the attempt, as arithmetic on the row alone', () => {
+  /**
+   * The label's whole value is that it reads nothing the reaper brought with it.
+   * `reclaim` fires from a tick, and the gap between a holder dying and a tick
+   * noticing is unbounded — so a rule that asked "has the deadline passed by
+   * now" answered yes about every dead holder and named them all overruns.
+   *
+   * Both instants below are written by the holder, through the holder's own
+   * clock, and the grace is the same constant the stealing rule uses. `now`
+   * appears only to establish that the deadline has passed at all.
+   */
+
+  const GRACE = { stealGraceMs: STEAL_GRACE_MS };
+  const DEADLINE = new Date(T0.getTime() + MAX_ATTEMPT_MS);
+  const LATE = new Date(DEADLINE.getTime() + 30 * 60_000);
+
+  test('a deadline still in the future has not been crossed by anything', () => {
+    expect(
+      attemptOverranBeforeLeaseLapsed(
+        { leaseExpiresAt: new Date(T0.getTime() + LEASE_TTL_MS), attemptDeadlineAt: DEADLINE },
+        new Date(DEADLINE.getTime() - 1),
+        GRACE,
+      ),
+    ).toBe(false);
+  });
+
+  test('a running row with no expiry keeps the label it has today', () => {
+    // `running_jobs_hold_a_lease` refuses this row, so nothing reaches here
+    // through `reclaim`. It is answered anyway, and answered the way the code
+    // answered before the arm existed: there is no evidence the holder died
+    // first, and a relabel wants positive proof rather than a missing field.
+    expect(
+      attemptOverranBeforeLeaseLapsed({ leaseExpiresAt: null, attemptDeadlineAt: DEADLINE }, LATE, GRACE),
+    ).toBe(true);
+  });
+
+  test('an absent deadline is not an overrun', () => {
+    expect(
+      attemptOverranBeforeLeaseLapsed(
+        { leaseExpiresAt: new Date(T0.getTime() + LEASE_TTL_MS), attemptDeadlineAt: null },
+        LATE,
+        GRACE,
+      ),
+    ).toBe(false);
+  });
+
+  test('a lease that went stealable one millisecond before the deadline is a death, not an overrun', () => {
+    // The comparison is against the instant the *lease arm* fires, which is
+    // expiry plus the grace — not bare expiry. A boundary asserted against
+    // expiry alone would be off by the grace window and green for the wrong
+    // reason.
+    expect(
+      attemptOverranBeforeLeaseLapsed(
+        {
+          leaseExpiresAt: new Date(DEADLINE.getTime() - STEAL_GRACE_MS - 1),
+          attemptDeadlineAt: DEADLINE,
+        },
+        LATE,
+        GRACE,
+      ),
+    ).toBe(false);
+  });
+
+  test('the two arms firing at the same instant is an overrun', () => {
+    // Undecidable on the evidence, and it is resolved towards the deadline on
+    // purpose: this is the band a wedged handler's last renewal lands in, and
+    // the deadline is the only term that can name it.
+    expect(
+      attemptOverranBeforeLeaseLapsed(
+        {
+          leaseExpiresAt: new Date(DEADLINE.getTime() - STEAL_GRACE_MS),
+          attemptDeadlineAt: DEADLINE,
+        },
+        LATE,
+        GRACE,
+      ),
+    ).toBe(true);
+  });
+
+  test('a holder still renewing at its deadline overran, however late the reap', () => {
+    const renewedPast = {
+      leaseExpiresAt: new Date(DEADLINE.getTime() + LEASE_TTL_MS),
+      attemptDeadlineAt: DEADLINE,
+    };
+    expect(attemptOverranBeforeLeaseLapsed(renewedPast, new Date(DEADLINE.getTime() + 1), GRACE)).toBe(true);
+    expect(attemptOverranBeforeLeaseLapsed(renewedPast, LATE, GRACE)).toBe(true);
   });
 });
