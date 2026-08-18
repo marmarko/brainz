@@ -255,7 +255,12 @@ ARG BUN_VERSION=1.3.14
 # storage seam this fleet has never composed. Warm instances keep the old
 # adapter, which is the one that wedges: deterministic reload against the worker
 # fleet.
-ARG FLEET_CONFIG_EPOCH=20
+# 20 -> 21: independent verification of the metadata-only Drive. Epoch 20 was
+# built and deployed by the change's author; this rebuilds the same tree after a
+# second pass over its gates, its scope cut and its live behaviour, and forces
+# the worker fleet to be replaced again so the run that is watched afterwards is
+# one this checkout produced rather than one it inherited.
+ARG FLEET_CONFIG_EPOCH=21
 
 # ---------------------------------------------------------------------------
 # Stage 1 — dependencies. Isolated so the lockfile is the only cache key, and
