@@ -783,7 +783,7 @@ cycle, a lost lease, or the clock read *between* two phases.
 |---|---|---|
 | `model_unavailable` | the gateway could not complete the call: a rate limit, a 5xx, a dropped connection, a key that would not resolve, a scope that was denied | usually the provider, and usually transient. Waiting is the remedy. No page is ever blamed for it, however long it lasts |
 | `input_rejected` | the provider read the request and refused it — a 400/413/422-class status | the request, not the provider. Waiting does not fix it: the payload has to get smaller or the seat wider |
-| `bad_output` | the model answered with something this code cannot read | a prompt or an input problem, not a provider one. Waiting does not fix it. Only a whole-batch phase reports it — on a per-item phase an unreadable answer is one item skipped, and never reaches this column |
+| `bad_output` | the model answered with something this code cannot read | a prompt, an input or a routing problem, not a provider one. Waiting does not fix it. On `synopsis` it means the answer was of the wrong *kind* — a seat wired to the wrong op, which fails every page — and not merely unreadable text, which is one page skipped and never reaches this column |
 | `payload_unavailable` | `transcribe` only: the stored object was not there | object storage or the prefix credential; the attachment is deliberately not marked done |
 | `budget_exhausted` | this phase asked for money the cap would not give | matches `stop_reason`; the phase named is the first one to want it, not the expensive one |
 | `out_of_time` | the attempt's clock ran out inside this phase | matches `stop_reason`; see the phase-cost table below |
@@ -830,8 +830,9 @@ would fail identically, so the phase stops on the **first** such answer, names
 So a `stopped_phase_code` on `synopsis` now always means "systemic", never "one
 page was odd". A brain whose pages cannot be summarised produces **no code at
 all**; it produces a completing cycle with a non-zero skip count, which is the
-next section. `transcribe` — the cycle's other per-item loop — still stops on its
-first bad item.
+next section. `transcribe` — the cycle's other per-item loop — has not been
+changed and still stops on its first bad item, so a code from it still can mean
+one attachment.
 
 ### Pages the summariser could not read
 

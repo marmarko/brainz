@@ -287,8 +287,11 @@ async function chat(deps: ModelPhaseDeps, phase: ModelPhase, prompt: Prompt): Pr
 
   if (!result.ok) return { ok: false, ...stopFor(result) };
   // A chat op that answered with an embedding is KTD13's table pointing at the
-  // wrong seat. Never durable: the page is not what is wrong, and a routing bug
-  // would otherwise retire every page it touched.
+  // wrong seat. **Never durable, and that word now decides where the failure
+  // lands**: a routing bug is a fact about the configuration, not about the
+  // page, and it would meet every remaining item identically — so a per-item
+  // loop stops on it at once rather than skipping a whole candidate set past a
+  // misrouted seat, one paid call at a time.
   if (result.output.kind !== 'chat') return { ok: false, stop: 'bad_output', durable: false };
   return {
     ok: true,
