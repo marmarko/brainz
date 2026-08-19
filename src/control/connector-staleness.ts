@@ -232,7 +232,26 @@ export function freshnessOf(input: ConnectorFreshnessInput): ConnectorFreshnessR
   });
 
   if (input.link !== 'connected') return report('not_connected');
-  if (input.attempt === undefined) return report('unpolled');
+  if (input.attempt === undefined) {
+    // **Graced, not exempt.** This branch used to return `unpolled`
+    // unconditionally, and `unpolled` is not in `ALARMING` — so a connected link
+    // with no health row read green forever, with no threshold and no expiry. A
+    // whole fleet in that state answered `ok`, which is the exact silence this
+    // module exists to end: nothing had ever polled any of it, and nothing said
+    // so.
+    //
+    // Past its first window it is `unattended`, which is the reading it deserves
+    // — not "this connector failed" but "nothing is attending this connector",
+    // the dead-scheduler signature. `attemptingSince === null` is read as
+    // expired here for the reason the field's own doc gives: on the surface
+    // whose job is to notice, "I cannot tell how long this has been waiting"
+    // must not answer "so assume it just started".
+    const waiting =
+      input.attemptingSince === null
+        ? Number.POSITIVE_INFINITY
+        : elapsedSeconds(input.attemptingSince, input.now);
+    return report(waiting <= firstSuccessGraceSeconds(input.source) ? 'unpolled' : 'unattended');
+  }
 
   const { lastSuccessAt, runOutcome } = input.attempt;
 

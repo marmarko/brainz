@@ -123,7 +123,15 @@ describe('the clock is last_success_at, and NULL is not a reading of it', () => 
     // Two different sentences and two different remedies: nothing has run, versus
     // it runs and has never worked. A rule that answered `unknown` for both would
     // hide the second inside the first.
-    expect(state({ attempted: false })).toBe('unpolled');
+    //
+    // **Inside the first window, and the window is the point.** This case used to
+    // be asserted on the helper's default `attemptingSince` of seven days ago,
+    // which made it a claim that a connector nothing had polled for a WEEK reads
+    // healthy — the state is not in `ALARMING`, so that was green forever with no
+    // threshold and no expiry. The distinction it means to draw is real; it just
+    // belongs where a connector could still plausibly be starting up. Past the
+    // window it is `unattended`, asserted below.
+    expect(state({ attempted: false, attemptingSince: ago(60_000) })).toBe('unpolled');
   });
 
   test('never-succeeded inside its first window is `starting`, not an alarm', () => {
@@ -232,5 +240,56 @@ describe('the fleet verdict is one field a monitor can page on', () => {
     expect(fleetConnectorVerdict(['current', 'slipping', 'stale'])).toBe('stalled');
     expect(fleetConnectorVerdict(['never_succeeded'])).toBe('stalled');
     expect(fleetConnectorVerdict(['unattended'])).toBe('stalled');
+  });
+});
+
+/**
+ * **The hole the false-negative pass found: green forever.**
+ *
+ * `unpolled` short-circuited before `attemptingSince` was ever consulted and is
+ * not in `ALARMING`, so a connected link with no health row read healthy with no
+ * threshold and no expiry — a fleet of a thousand of them answered `ok`. That is
+ * the same silence the ten-hour outage was, arriving through the one door the
+ * rule left open: not "the poll failed" but "nothing ever polled".
+ */
+describe('a connector nothing has ever polled does not stay green forever', () => {
+  const NOW = new Date('2026-08-19T12:00:00.000Z');
+  const ago = (seconds: number) => new Date(NOW.getTime() - seconds * 1000);
+
+  test('inside its first window it is still starting up, and quiet', () => {
+    const report = freshnessOf({
+      source: 'gmail',
+      link: 'connected',
+      attempt: undefined,
+      attemptingSince: ago(60),
+      now: NOW,
+    });
+    expect(report.state).toBe('unpolled');
+    expect(isAlarming(report.state)).toBe(false);
+  });
+
+  test('past its first window nothing is attending it, and that is an alarm', () => {
+    const report = freshnessOf({
+      source: 'gmail',
+      link: 'connected',
+      attempt: undefined,
+      attemptingSince: ago(60 * 60 * 24),
+      now: NOW,
+    });
+    expect(report.state).toBe('unattended');
+    // The assertion that was false before: this state now pages.
+    expect(isAlarming(report.state)).toBe(true);
+  });
+
+  test('an undateable wait is read as expired, never as young', () => {
+    const report = freshnessOf({
+      source: 'gmail',
+      link: 'connected',
+      attempt: undefined,
+      attemptingSince: null,
+      now: NOW,
+    });
+    expect(report.state).toBe('unattended');
+    expect(isAlarming(report.state)).toBe(true);
   });
 });
