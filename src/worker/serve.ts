@@ -202,6 +202,13 @@ export async function startWorkerFleet(
           // preceded a dead lane, visible here before it becomes one, and
           // nothing else in this log would show it.
           more_to_do: result.moreToDo,
+          // Which phase stopped it, and with what code. Both are closed
+          // vocabularies, so this line stays as content-free as the reason
+          // beside it. It is also on the run record now — this log is a
+          // convenience for whoever can read the container's output, and the
+          // reason the columns exist is that on this fleet nobody can.
+          stopped_phase: result.stoppedPhase?.phase ?? null,
+          stopped_phase_code: result.stoppedPhase?.code ?? null,
           wall_clock_ms: result.wallClockMs,
           model_calls: result.modelCalls,
           spent_micro_usd: result.spentMicroUsd,

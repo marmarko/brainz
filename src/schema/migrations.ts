@@ -62,6 +62,7 @@ export const MIGRATIONS: readonly TenantMigration[] = [
   { version: 17, name: 'embed-cause-split', file: 'migrations/v17-embed-cause-split.sql' },
   { version: 18, name: 'retraction', file: 'migrations/v18-retraction.sql' },
   { version: 19, name: 'cycle-resume', file: 'migrations/v19-cycle-resume.sql' },
+  { version: 20, name: 'stopped-phase', file: 'migrations/v20-stopped-phase.sql' },
 ];
 
 /** The version this code applies to a fresh tenant, derived rather than typed twice. */

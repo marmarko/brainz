@@ -31,6 +31,16 @@
  *                         interrupted" and "this brain is long" want different
  *                         responses from whoever reads the run record.
  *
+ * **Three of those exits name the phase they happened in, on the row.**
+ * `phase_failed`, `budget_exhausted` and `out_of_time` are all things a
+ * particular phase reported, and until rung 20 the run record kept only the
+ * aggregate word. A brain sat at `phase_failed` with a flat fact count for hours
+ * while the phase and its code existed in `PhaseRecord[]` — in this process's
+ * memory and on one line of a container's stdout that nothing outside the
+ * container can read. `stoppedPhase` is the half of that picture that survives:
+ * one member of `CYCLE_PHASES`, one member of `PHASE_STOPS`, no sentence. The
+ * other three exits name nothing, because nothing a phase did caused them.
+ *
  * **A checkpoint's subject is money, so only model phases are skipped by one.**
  * That asymmetry is KTD11's "never re-pays model calls" read literally, and it
  * is the one this file had before a wall-clock incident and has again. The
@@ -99,6 +109,7 @@ import {
   isModelPhase,
   type CyclePhase,
   type ModelPhase,
+  type PhaseAttribution,
 } from './phases.ts';
 
 export interface CycleDeps {
@@ -198,6 +209,19 @@ export interface CycleResult {
    * unfinished for reasons that read differently.
    */
   readonly moreToDo: boolean;
+  /**
+   * Which phase stopped this cycle and with what code, or `null`.
+   *
+   * The one field of `phases` that survives the process. `PhaseRecord[]` is the
+   * full picture and it only ever existed in memory and on a container's
+   * stdout — which is why a brain stuck at `stop_reason: 'phase_failed'` could
+   * be observed for hours without anybody being able to say which phase. This
+   * pair goes on the run record.
+   *
+   * `null` when no phase is answerable: the clock read *between* two phases, a
+   * lost lease, or a cycle that finished.
+   */
+  readonly stoppedPhase: PhaseAttribution | null;
   readonly phases: readonly PhaseRecord[];
   readonly wallClockMs: number;
   readonly spentMicroUsd: number;
@@ -254,6 +278,15 @@ export async function runConsolidationCycle(
   let modelCalls = 0;
   let refined = false;
   let stop: StopReason = 'complete';
+  /**
+   * The phase the stop is attributable to, set at the same moment `stop` is.
+   *
+   * Kept beside `stop` rather than derived afterwards from `phases`, because the
+   * two disagree in the case that matters: a `cancelled` cycle has a phase that
+   * reported `out_of_time` and nothing to attribute — the lease went, not the
+   * phase — and a scan of the records after the loop would happily name it.
+   */
+  let stoppedPhase: PhaseAttribution | null = null;
 
   for (const phase of CYCLE_PHASES) {
     if (stop !== 'complete') {
@@ -368,6 +401,11 @@ export async function runConsolidationCycle(
         // repeatedly on the same tenant — the answer is another round trip
         // removed from a phase, not a checkpoint added to this loop.
         stop = attempt.stop() ?? 'out_of_time';
+        // Attributed only for the clock. A `cancelled` run lost its lease, which
+        // is something that happened *to* the cycle: naming the phase that
+        // happened to be in flight would point an operator at whichever phase is
+        // slowest rather than at the deploy or the steal that took the lease.
+        if (stop === 'out_of_time') stoppedPhase = { phase, code: 'out_of_time' };
       }
 
       phases.push({
@@ -413,8 +451,15 @@ export async function runConsolidationCycle(
       // phase no longer re-selects a page it has already summarised, so the next
       // attempt starts where this one stopped without a row to say so.
       stop = attempt.stop() ?? 'out_of_time';
+      if (stop === 'out_of_time') stoppedPhase = { phase, code: 'out_of_time' };
     } else {
       stop = outcome.stopped === 'budget_exhausted' ? 'budget_exhausted' : 'phase_failed';
+      // **The line the whole rung is for.** `phase_failed` covers three codes
+      // that want three different responses — a provider that went away, a
+      // provider that answered with something this code cannot read, and a
+      // stored payload that was not there — and until this was written down they
+      // were one word on the run record.
+      stoppedPhase = { phase, code: outcome.stopped };
     }
 
     phases.push({
@@ -442,6 +487,7 @@ export async function runConsolidationCycle(
     modelCalls,
     phasesRun: ran,
     wallClockMs,
+    stoppedPhase,
     now: options.now,
   };
 
@@ -460,6 +506,7 @@ export async function runConsolidationCycle(
     dreamt,
     stopReason,
     moreToDo,
+    stoppedPhase,
     phases,
     wallClockMs,
     spentMicroUsd: spent,

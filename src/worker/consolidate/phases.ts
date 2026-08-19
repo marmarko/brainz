@@ -77,6 +77,62 @@ export const CYCLE_PHASES: readonly CyclePhase[] = [...DETERMINISTIC_PHASES, ...
  */
 export const FREE_TIER_PHASES: readonly CyclePhase[] = DETERMINISTIC_PHASES;
 
+/**
+ * Why a phase stopped short. `null` means it finished its work.
+ *
+ * **It lives here, beside the phase names, because the two are one vocabulary.**
+ * A run record that says which phase stopped the cycle has to say what it
+ * stopped with, and both halves are persisted against a CHECK in rung 20 — so
+ * the alphabet the database accepts is this array, and `test/consolidate/
+ * schema.test.ts` is what holds the two in agreement. Declared as data rather
+ * than only as a type for the same reason `CYCLE_PHASES` is: a union type cannot
+ * be enumerated at runtime, and a check that cannot be enumerated is a check
+ * written out by hand somewhere else.
+ *
+ * `payload_unavailable` is U21's: the transcription phase reads bytes out of
+ * object storage, and an object that is not there is neither a budget problem
+ * nor a model problem. Marking the attachment done instead would retire a
+ * payload nobody ever read, which is the one thing R23 promised not to do.
+ *
+ * `out_of_time` is not a failure. The attempt's wall clock ran out (or its lease
+ * was lost) part way through a phase that calls the model **once per item**; the
+ * items already applied are applied, and the cycle re-reads the precise reason
+ * off the budget so `cancelled` and `out_of_time` stay distinguishable on the
+ * run record.
+ *
+ * A phase stopping that way banks **no checkpoint**, on purpose — the previous
+ * fleet version reads any checkpoint row as a completion. Its progress is
+ * durable in the content instead, which is why `selectIngestedPages` grew an
+ * already-summarised predicate: the next attempt simply does not select what
+ * this one finished.
+ *
+ * **`cancelled` is deliberately not a member.** A lost lease is something the
+ * *run* suffered, not something a phase reported, and admitting it here would
+ * make the column mean two things at once.
+ */
+export const PHASE_STOPS = [
+  'budget_exhausted',
+  'model_unavailable',
+  'bad_output',
+  'payload_unavailable',
+  'out_of_time',
+] as const;
+
+export type PhaseStop = (typeof PHASE_STOPS)[number];
+
+/**
+ * Which phase a cycle stopped in, and the code it stopped with.
+ *
+ * `null` where a cycle stopped for a reason no phase is answerable for — the
+ * clock read *between* two phases, a lease lost, or a cycle that simply
+ * finished. A pair invented for those cases would name a phase that did nothing
+ * wrong, which is worse than the aggregate reason it was meant to improve on.
+ */
+export interface PhaseAttribution {
+  readonly phase: CyclePhase;
+  readonly code: PhaseStop;
+}
+
 export type PhaseTier = 'deterministic' | 'model';
 
 const MODEL_PHASE_SET = new Set<string>(MODEL_PHASES);

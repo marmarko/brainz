@@ -31,6 +31,7 @@ import {
   MIGRATIONS,
   readMigrationDdl,
 } from '../../src/schema/migrations.ts';
+import { CYCLE_PHASES, PHASE_STOPS } from '../../src/worker/consolidate/phases.ts';
 import {
   connect,
   dropFixtureDatabase,
@@ -149,6 +150,118 @@ describe('the per-cycle run record', () => {
       SELECT dreamt, stop_reason FROM consolidation_run ORDER BY run_id DESC LIMIT 1
     `) as Array<{ dreamt: boolean; stop_reason: string }>;
     expect(rows[0]).toEqual({ dreamt: false, stop_reason: 'free_tier' });
+  });
+});
+
+/**
+ * The phase attribution rung 20 adds, checked against the database's own
+ * alphabet rather than against the file that was supposed to write it.
+ *
+ * **Both columns are closed vocabularies, and the vocabularies are the code's.**
+ * The CHECKs spell out `CYCLE_PHASES` and `PHASE_STOPS`, which is one fact in
+ * two places, so the assertion below is that the two places agree: every member
+ * the cycle can produce is a value the database accepts, and a value the cycle
+ * cannot produce is one it refuses. Without that, a phase added to `phases.ts`
+ * would start failing its own run record's CHECK the first time it stopped a
+ * cycle — at exactly the moment somebody needed to read it.
+ *
+ * The refusals matter more than the admissions. A column that took free text
+ * here is one prompt away from holding the provider's sentence, and the phase a
+ * cycle stopped in is at its most tempting to describe rather than to name.
+ */
+describe('rung 20 — which phase stopped the cycle', () => {
+  test('every phase the cycle can stop in is a value the run record accepts', async () => {
+    for (const phase of CYCLE_PHASES) {
+      await sql.unsafe(
+        `INSERT INTO consolidation_run (trigger_reason, tier, stopped_phase, stopped_phase_code)
+         VALUES ('time_ceiling', 'paid', $1, 'out_of_time')`,
+        [phase],
+      );
+    }
+    const rows = (await sql`
+      SELECT count(DISTINCT stopped_phase)::int AS n FROM consolidation_run
+       WHERE stopped_phase IS NOT NULL
+    `) as Array<{ n: number }>;
+    expect(rows[0]?.n).toBe(CYCLE_PHASES.length);
+  });
+
+  test('every code a phase can stop with is a value the run record accepts', async () => {
+    for (const code of PHASE_STOPS) {
+      await sql.unsafe(
+        `INSERT INTO consolidation_run (trigger_reason, tier, stopped_phase, stopped_phase_code)
+         VALUES ('time_ceiling', 'paid', 'synopsis', $1)`,
+        [code],
+      );
+    }
+    const rows = (await sql`
+      SELECT count(DISTINCT stopped_phase_code)::int AS n FROM consolidation_run
+       WHERE stopped_phase_code IS NOT NULL
+    `) as Array<{ n: number }>;
+    expect(rows[0]?.n).toBe(PHASE_STOPS.length);
+  });
+
+  test('a phase name nobody declared is refused by the database', async () => {
+    const state = await sqlstateOfFailure(
+      sql,
+      `INSERT INTO consolidation_run (trigger_reason, tier, stopped_phase, stopped_phase_code)
+       VALUES ('time_ceiling', 'paid', 'summarising the Q3 board deck', 'bad_output')`,
+    );
+    expect(state).toBe('23514');
+  });
+
+  test('a run-level stop reason is not a phase-level code', async () => {
+    // `cancelled`, `complete` and `free_tier` are things a *run* does. A phase
+    // never reports them, so admitting them here would make the column mean two
+    // things and make "which code did the phase stop with" unanswerable.
+    for (const reason of ['cancelled', 'complete', 'free_tier', 'phase_failed']) {
+      const state = await sqlstateOfFailure(
+        sql,
+        `INSERT INTO consolidation_run (trigger_reason, tier, stopped_phase, stopped_phase_code)
+         VALUES ('time_ceiling', 'paid', 'synopsis', '${reason}')`,
+      );
+      expect(state).toBe('23514');
+    }
+  });
+
+  test('half an attribution is refused — a phase with no code says nothing', async () => {
+    const orphanPhase = await sqlstateOfFailure(
+      sql,
+      `INSERT INTO consolidation_run (trigger_reason, tier, stopped_phase)
+       VALUES ('time_ceiling', 'paid', 'synopsis')`,
+    );
+    expect(orphanPhase).toBe('23514');
+
+    const orphanCode = await sqlstateOfFailure(
+      sql,
+      `INSERT INTO consolidation_run (trigger_reason, tier, stopped_phase_code)
+       VALUES ('time_ceiling', 'paid', 'bad_output')`,
+    );
+    expect(orphanCode).toBe('23514');
+  });
+
+  test('the previous fleet version writes neither column and is not refused', async () => {
+    // The rolling-deploy case, and the reason nothing here is tied to
+    // `stop_reason` or `dreamt` by a CHECK. An instance running the release
+    // before this rung resumes a run a newer instance attributed, completes it,
+    // and issues an UPDATE that names only the columns it knows about.
+    await sql.unsafe(`
+      INSERT INTO consolidation_run (trigger_reason, tier, stopped_phase, stopped_phase_code)
+      VALUES ('time_ceiling', 'paid', 'enrich', 'model_unavailable')
+    `);
+    await sql.unsafe(`
+      UPDATE consolidation_run
+         SET dreamt = true, stop_reason = 'complete', finished_at = now()
+       WHERE run_id = (SELECT max(run_id) FROM consolidation_run)
+    `);
+    const rows = (await sql`
+      SELECT dreamt, stop_reason, stopped_phase FROM consolidation_run
+       ORDER BY run_id DESC LIMIT 1
+    `) as Array<{ dreamt: boolean; stop_reason: string; stopped_phase: string | null }>;
+    // The old release leaves the attribution behind because it cannot see it.
+    // That is the price of the lookahead and it is the right one: a CHECK that
+    // refused this UPDATE would turn a rolling deploy into an outage, and the
+    // current release clears the pair itself on every write.
+    expect(rows[0]).toEqual({ dreamt: true, stop_reason: 'complete', stopped_phase: 'enrich' });
   });
 });
 

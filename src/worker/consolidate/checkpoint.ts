@@ -37,7 +37,7 @@ import type { SQL } from 'bun';
 
 import type { JobTrigger } from '../jobs.ts';
 import { NO_SPEND } from './estimate.ts';
-import type { CyclePhase } from './phases.ts';
+import type { CyclePhase, PhaseAttribution, PhaseStop } from './phases.ts';
 
 export type ConsolidationTier = 'free' | 'paid';
 
@@ -192,6 +192,19 @@ export interface FinishRequest {
   readonly modelCalls: number;
   readonly phasesRun: number;
   readonly wallClockMs: number;
+  /**
+   * Which phase stopped this cycle and with what code, or `null` when no phase
+   * is answerable for the stop.
+   *
+   * **Required rather than optional, because the field's job is to be
+   * overwritten.** A run stays open across attempts and both writers rewrite the
+   * same row, so a writer that only set these columns when it had something to
+   * say would leave a later attempt's success sitting under an earlier
+   * attempt's failure — a row naming a phase that stopped nothing, which is
+   * worse than the aggregate `stop_reason` it was added to improve on. `null`
+   * is a value here, not an absence.
+   */
+  readonly stoppedPhase: PhaseAttribution | null;
   readonly now: Date;
 }
 
@@ -212,6 +225,12 @@ export async function finishRun(sql: SQL, run: CycleRun, request: FinishRequest)
            model_calls = ${request.modelCalls},
            phases_run = ${request.phasesRun},
            wall_clock_ms = ${request.wallClockMs},
+           -- Written even though a completed cycle never has one. The run being
+           -- closed may be a run an earlier attempt attributed a failure to, and
+           -- a completed row still naming the phase that once stopped it is a
+           -- row that lies to the next reader.
+           stopped_phase = ${request.stoppedPhase?.phase ?? null},
+           stopped_phase_code = ${request.stoppedPhase?.code ?? null},
            finished_at = ${request.now}
      WHERE run_id = ${run.runId}::bigint
   `;
@@ -238,7 +257,14 @@ export async function recordProgress(sql: SQL, run: CycleRun, request: FinishReq
            spent_micro_usd = ${request.spentMicroUsd},
            model_calls = ${request.modelCalls},
            phases_run = ${request.phasesRun},
-           wall_clock_ms = ${request.wallClockMs}
+           wall_clock_ms = ${request.wallClockMs},
+           -- The reason this row is worth reading. The stop reason says a phase
+           -- failed; these two say WHICH phase and WHAT it reported, and without
+           -- them an operator with no access to the tenant's database has "a
+           -- phase failed" and nothing else — which is the state a brain with
+           -- 5,608 pages and 167 facts was diagnosed from.
+           stopped_phase = ${request.stoppedPhase?.phase ?? null},
+           stopped_phase_code = ${request.stoppedPhase?.code ?? null}
      WHERE run_id = ${run.runId}::bigint
   `;
 }
@@ -253,6 +279,13 @@ export interface RunRecord {
   readonly modelCalls: number;
   readonly phasesRun: number;
   readonly wallClockMs: number | null;
+  /**
+   * Which phase stopped the cycle, or `null`. Read back rather than left on the
+   * row for a hand-written SELECT: a column no reader surfaces is a column
+   * shaped for nobody, and the whole point of persisting it is that somebody
+   * without a psql session can see it.
+   */
+  readonly stoppedPhase: PhaseAttribution | null;
   readonly startedAt: Date;
   readonly finishedAt: Date | null;
 }
@@ -262,7 +295,8 @@ export async function readLatestRun(sql: SQL): Promise<RunRecord | undefined> {
   const rows = (await sql`
     SELECT run_id::text AS run_id, tier, dreamt, stop_reason,
            estimated_micro_usd::bigint AS estimated, spent_micro_usd::bigint AS spent,
-           model_calls, phases_run, wall_clock_ms, started_at, finished_at
+           model_calls, phases_run, wall_clock_ms, stopped_phase, stopped_phase_code,
+           started_at, finished_at
       FROM consolidation_run
      ORDER BY run_id DESC
      LIMIT 1
@@ -276,6 +310,8 @@ export async function readLatestRun(sql: SQL): Promise<RunRecord | undefined> {
     model_calls: number;
     phases_run: number;
     wall_clock_ms: number | null;
+    stopped_phase: CyclePhase | null;
+    stopped_phase_code: PhaseStop | null;
     started_at: Date;
     finished_at: Date | null;
   }>;
@@ -292,6 +328,13 @@ export async function readLatestRun(sql: SQL): Promise<RunRecord | undefined> {
     modelCalls: row.model_calls,
     phasesRun: row.phases_run,
     wallClockMs: row.wall_clock_ms,
+    // Reassembled only when both halves are there. The database's pairing CHECK
+    // makes a half-set row impossible to write, so this is the reader agreeing
+    // with the constraint rather than defending against it.
+    stoppedPhase:
+      row.stopped_phase === null || row.stopped_phase_code === null
+        ? null
+        : { phase: row.stopped_phase, code: row.stopped_phase_code },
     startedAt: row.started_at,
     finishedAt: row.finished_at,
   };

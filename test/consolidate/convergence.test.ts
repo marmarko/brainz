@@ -378,6 +378,11 @@ describe('a run left open by the clock is resumed without re-paying for it', () 
         modelCalls: 4,
         phasesRun: 7,
         wallClockMs: 840_000,
+        // The phase the clock caught, as rung 20 records it. Carried here so the
+        // resumed cycle below is resuming a row that names something — which is
+        // the state a real interrupted attempt leaves, and the state whose
+        // attribution the completing cycle has to clear.
+        stoppedPhase: { phase: 'synopsis', code: 'out_of_time' },
         now,
       });
 

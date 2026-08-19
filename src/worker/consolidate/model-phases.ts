@@ -61,36 +61,19 @@ import {
 } from './materialize.ts';
 import { unboundedAttempt, type AttemptBudget } from './deadline.ts';
 import { NO_SPEND } from './estimate.ts';
-import type { ModelPhase } from './phases.ts';
+import type { ModelPhase, PhaseStop } from './phases.ts';
 import { PHASE_OP } from './phases.ts';
 
 /**
  * Why a phase stopped short. `null` means it finished its work.
  *
- * `payload_unavailable` is U21's: the transcription phase reads bytes out of
- * object storage, and an object that is not there is neither a budget problem
- * nor a model problem. Marking the attachment done instead would retire a
- * payload nobody ever read, which is the one thing R23 promised not to do.
+ * Declared in `phases.ts` and re-exported here, where every caller already looks
+ * for it. It moved because rung 20 persists it beside the phase name on the run
+ * record, and the CHECK that guards that column has to be written against an
+ * array the code can enumerate — which puts the vocabulary next to
+ * `CYCLE_PHASES`, the other half of the same fact.
  */
-export type PhaseStop =
-  | 'budget_exhausted'
-  | 'model_unavailable'
-  | 'bad_output'
-  | 'payload_unavailable'
-  /**
-   * The attempt's wall clock ran out (or its lease was lost) part way through a
-   * phase that calls the model **once per item**. Not a failure: the items
-   * already applied are applied, and the cycle re-reads the precise reason off
-   * the budget so `cancelled` and `out_of_time` stay distinguishable on the run
-   * record.
-   *
-   * A phase stopping this way banks **no checkpoint**, on purpose — the previous
-   * fleet version reads any checkpoint row as a completion. Its progress is
-   * durable in the content instead, which is why `selectIngestedPages` grew an
-   * already-summarised predicate: the next attempt simply does not select what
-   * this one finished.
-   */
-  | 'out_of_time';
+export type { PhaseStop };
 
 export interface PhaseOutcome {
   readonly phase: ModelPhase;
