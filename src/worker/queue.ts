@@ -349,17 +349,10 @@ export function createJobQueue(options: JobQueueOptions): PostgresJobQueue {
           // the cycle runs, so zeroing it discards every signal that arrived
           // mid-cycle — and a blind subtraction would trip the schema's own
           // `pending_debt >= 0` CHECK at the worst possible moment.
-          //
-          // `last_cycle_at` moves only for a cycle that *finished*. A
-          // continuation — the same brain, more work, a fresh job — leaves it
-          // where it was, because the scheduler's rested window and its debounce
-          // arm are both measured from it and both would otherwise hold the
-          // tenant for thirty minutes over work it asked to resume at once.
           await tx`
             UPDATE control.tenant
             SET pending_debt = GREATEST(0, pending_debt - ${settle.debtObserved}),
-                last_cycle_at = CASE WHEN ${settle.moreToDo === true} THEN last_cycle_at
-                                     ELSE ${request.now} END,
+                last_cycle_at = ${request.now},
                 next_due_at = ${settle.nextDueAt},
                 updated_at = ${request.now}
             WHERE tenant_id = ${lease.tenantId}

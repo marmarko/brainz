@@ -745,64 +745,49 @@ has it:
 
 ```json
 {"event":"cycle","tenant":"t-…","stop_reason":"out_of_time",
- "more_to_do":true,"advanced":true,"wall_clock_ms":842000,
+ "more_to_do":true,"wall_clock_ms":842000,
  "model_calls":83,"spent_micro_usd":91200}
 ```
 
-`stop_reason` is the whole diagnosis, and the values split three ways:
+`stop_reason` is the whole diagnosis:
 
 | `stop_reason` | What it means | What to do |
 |---|---|---|
 | `complete` | every phase ran | nothing |
 | `free_tier` | the deterministic phases ran and no model was called | nothing — this is what the free tier is |
-| `out_of_time` | the attempt's wall clock ran out with work left | **nothing, if `advanced` is true** — see below |
-| `phase_does_not_fit` | a phase that has to run to the end would not have fitted what was left, so the cycle declined to start it | nothing on its first sighting; twice running is the alert — see below |
+| `out_of_time` | the attempt's wall clock ran out with work left | nothing on its own; the same tenant repeating it is the alert — see below |
 | `budget_exhausted` | the tenant's spend cap stopped the model phases | the user's cap, or the tier; waiting does not fix it |
 | `phase_failed` | a provider was unavailable or answered unreadably | usually nobody's; the next cycle resumes into the same run |
 | `cancelled` | the worker lost its lease or was shutting down | ordinary during a deploy |
 
-An eighth value, `abandoned`, is on run records and never on this line: no
-attempt reports it about itself. It is written onto a run that was left open for
-longer than a continuation lasts — a paused lane, a rollback, an operator's
-morning — so the work can carry on in a fresh one. Seeing it means a cycle went
-unclaimed for over a day, which is worth knowing about the *scheduler* and says
-nothing about the brain.
+**`out_of_time` is a clean stop, not a failure.** The cycle reads the deadline
+its own lease stamps, finishes the unit of work in flight, writes its run record
+and returns — where before it was *reaped*, which charged an attempt against a
+ladder that dead-letters after five. The run stays open, so the next scheduled
+cycle picks it up and skips the model phases already paid for. The tenant waits
+for its next slot like any other; nothing re-enqueues it.
 
-**`out_of_time` with `advanced: true` is a working system, not an incident.** A
-brain larger than one fifteen-minute attempt is consolidated over several: each
-attempt banks where it got to, the job completes normally rather than failing,
-and the tenant is settled as due again immediately instead of at its next
-24-hour ceiling. Expect a run of these lines minutes apart, `model_calls`
-accumulating, ending in one `complete`. Each is a **fresh job with a fresh
-attempt ladder**, so a brain that needs ten attempts is not being walked toward a
-dead letter.
+**The same tenant emitting it cycle after cycle is the thing to act on.** It
+means that brain's free tier no longer fits one attempt, and no amount of waiting
+changes that. The free tier is deliberately *not* checkpointed — it re-runs from
+the top every attempt — because at current phase costs it is seconds:
 
-**`advanced: false` is the one that needs a human, whatever the stop reason next
-to it.** It means the attempt banked nothing the next one can skip: no rows
-changed, no phase newly finished, no position moved forward. Re-running it would
-produce the same line for ever, which is why the fleet does *not* re-run it and
-lets the tenant wait for its ceiling instead. It is deliberately not the same
-thing as "a phase completed" — a run whose checkpoints are not being honoured
-re-runs its whole free tier every attempt, and counting that as progress is what
-would keep the lane spinning without moving.
+| phase | shape of its cost | measured |
+|---|---|---|
+| `dedup` | one read, plus one write per collapse | — |
+| `link_reconcile` | one entity resolution per implied edge, so per **fact** | 1,074 round trips / 214ms on a 5,608-page brain |
+| `staleness` | one read per batch of superseded pages | — |
+| `entity_merge` | one read, plus a few writes per merge | — |
+| `salience` | one read + one write per **500 pages** | 24 round trips on that brain, down from 11,217 |
+| `cluster` | one probe per unassigned chunk, one transaction per 100 seeds | down from five round trips per seed |
 
-There is one phase this can be about. `dedup` and `entity_merge` stop on the
-clock and keep what they collapsed, so they converge over attempts; `salience`
-and `cluster` hand over a cursor. `link_reconcile` can do neither — it removes
-live edges that are missing from a desired set built from every live fact, so
-there is no partial answer it could bank — and the cycle therefore declines to
-start it when its last measured duration is longer than what is left, reporting
-`phase_does_not_fit`.
-
-**`phase_does_not_fit` twice running, on attempts that start with a full budget,
-is the alert.** The first sighting is ordinary: the attempt had spent most of its
-clock elsewhere and the next one starts fresh. Two in a row means the phase has
-stopped fitting a whole attempt, and no number of retries changes that. Measured,
-reconciliation costs 214ms on a 5,608-page brain, so reaching this state means
-something else — a fact table orders of magnitude larger, or a tenant database
-that has become very slow. `consolidation_phase_timing` in the tenant database
-holds the number the cycle decided on; read it and `wall_clock_ms` before
-assuming which.
+So a tenant stuck on `out_of_time` is one whose numbers have outgrown that table
+— a fact set orders of magnitude larger, or a tenant database that has become
+very slow. Read `wall_clock_ms` on the log line first: it tells you which. **The
+fix is another round trip removed from whichever phase grew, not a checkpoint**;
+the phase costs above are what makes the free tier disposable, and a resume
+protocol was tried and removed because every version of it had a state a run
+could enter and not leave.
 
 **A `consolidate` lane that reached `dead` is the older failure and needs the
 same treatment as a connector.** It is what happened before a cycle could stop

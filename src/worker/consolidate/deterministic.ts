@@ -21,33 +21,31 @@
  *    therefore recomputes rather than remembers, which is what gives an edge
  *    attested by two pages the property of surviving one of them dropping it.
  *
- * **Every phase is interruptible, and two of them are resumable.** The cycle
- * runs under a wall-clock ceiling it did not choose (`locks.ts`), so a phase
- * that cannot be stopped can only be *reaped* — and a reaped phase banks no
- * position, so the next attempt walks the same rows in the same order and is
- * reaped in the same place. Each function below therefore takes an
+ * **Every phase is interruptible, and none of them resumes.** The cycle runs
+ * under a wall-clock ceiling it did not choose (`locks.ts`), so a phase that
+ * cannot be stopped can only be *reaped* — mid-write, with nothing on the run
+ * record to say what happened. Each function below therefore takes an
  * {@link AttemptBudget}, consults it between units of work, and returns a
- * {@link PhaseProgress} saying whether it finished. `salience` and `cluster` also
- * return a **cursor**, because they are the two whose work is a walk over an
- * ordered set and therefore the two where "where I got to" is expressible.
+ * {@link PhaseProgress} saying whether it finished. A phase that stopped starts
+ * again from the top on the next attempt, and that is the design: see the phase
+ * loop in `cycle.ts` for the measurement that makes redoing it affordable.
  *
- * **The rest are whole-set computations, and they split two ways.** Whether one
- * may yield to the clock without a cursor is not a question about cursors; it is
- * a question about whether restarting it costs anything.
+ * **What a phase may yield to is a question about whether restarting costs
+ * anything**, and it splits them two ways.
  *
  *   `dedup` and `entity_merge` are **monotone**: a collapsed fact gets a
  *   `superseded_by` and a merged entity gets a `deleted_at`, so both leave the
  *   set the next attempt reads. Restarting costs one whole-set read and finds
  *   strictly less to do, so these yield to the clock and converge by repetition
- *   — progress banked in the rows instead of in a checkpoint.
+ *   — progress banked in the rows rather than in a checkpoint. `staleness` is
+ *   monotone for the same reason: a page already marked is not selected again.
  *
  *   `link_reconcile` is **not**: the desired edge set has to be complete before
  *   anything is diffed against it, because an edge missing from a half-built
  *   set is an edge the diff deletes. It restarts identically however many
  *   attempts it is given, so it yields to a lost lease (`cancelled`) and never
- *   to the clock — and the *cycle* declines to enter it when its last measured
- *   duration does not fit what is left, which is the only honest thing to do
- *   with a phase that has to run to the end or not at all.
+ *   to the clock — stopping it on the clock would buy nothing and cost the
+ *   whole pass.
  *
  * That is affordable exactly because these are the cheap ones: measured on a
  * 5,608-page brain, dedup, link reconciliation, staleness and entity merge
@@ -86,32 +84,30 @@ import { unboundedAttempt, type AttemptBudget } from './deadline.ts';
 const LIVE_FACT = 'deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL';
 
 /**
- * How far a phase got, in the two states that are not "finished".
+ * Whether the phase ran to the end.
  *
- * `done: true` is the only value that lets the cycle bank a completion. The
- * other two are different in a way that matters to the next attempt:
- * `{done: false, cursor: X}` resumes at X, and `{done: false, cursor: null}` is a
- * phase that ran out of time without a position to hand over and will restart —
- * honest about the fact that its work is a whole-set computation rather than a
- * walk.
+ * `done: true` is what lets the cycle bank a completion. `false` means the
+ * attempt's clock ran out or its lease went, and the phase will be run again
+ * from the beginning — there is no position to hand over, deliberately, because
+ * a position is only worth banking if something reads it and nothing does. See
+ * the phase loop in `cycle.ts`.
  */
 export interface PhaseProgress {
   readonly done: boolean;
-  readonly cursor: string | null;
 }
 
-/** Finished. Written out so the three shapes are visible at every return site. */
-const FINISHED: PhaseProgress = Object.freeze({ done: true, cursor: null });
+/** Finished. Written out so both shapes are visible at every return site. */
+const FINISHED: PhaseProgress = Object.freeze({ done: true });
 
-/** Ran out of the attempt's clock with nothing to hand the next one. */
-const RESTARTS: PhaseProgress = Object.freeze({ done: false, cursor: null });
+/** Stopped part-way. The next attempt starts this phase over. */
+const RESTARTS: PhaseProgress = Object.freeze({ done: false });
 
 /**
- * The floor for every keyset cursor here.
+ * The floor for every keyset walk here.
  *
- * Both cursors are over `GENERATED ALWAYS AS IDENTITY` columns, which start at
- * 1, so "before the first row" is expressible as a value rather than as a null —
- * and a value keeps the resume path and the fresh path the *same* statement
+ * The columns walked are `GENERATED ALWAYS AS IDENTITY`, which start at 1, so
+ * "before the first row" is expressible as a value rather than as a null — which
+ * keeps every batch after the first and the batch before it the *same* statement
  * instead of two that can drift.
  */
 const CURSOR_START = '0';
@@ -381,15 +377,13 @@ export async function markStaleness(
   sql: SQL,
   options: {
     readonly now: Date;
-    /** Resume point from a previous attempt. Null starts at the first page. */
-    readonly cursor?: string | null;
     readonly budget?: AttemptBudget;
     readonly batch?: number;
   },
 ): Promise<StalenessResult & PhaseProgress> {
   const budget = options.budget ?? unboundedAttempt();
   const batch = Math.max(1, Math.trunc(options.batch ?? STALENESS_BATCH));
-  let cursor = options.cursor ?? CURSOR_START;
+  let cursor = CURSOR_START;
   let staled = 0;
   let factsInvalidated = 0;
 
@@ -464,7 +458,10 @@ export async function markStaleness(
 
     cursor = superseded[superseded.length - 1]?.stale_page_id ?? cursor;
     if (superseded.length < batch) return { staled, factsInvalidated, ...FINISHED };
-    if (budget.stop() !== null) return { staled, factsInvalidated, done: false, cursor };
+    // Monotone, so stopping here is safe without a position: every page this
+    // pass marked now has a `stale_at` and drops out of the query above, so the
+    // next attempt's walk starts at the beginning over strictly fewer rows.
+    if (budget.stop() !== null) return { staled, factsInvalidated, ...RESTARTS };
   }
 }
 
@@ -611,8 +608,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * Two statements per batch, so this is the constant that turns `2N + 1` round
  * trips into `2N/500 + 1`. Large enough that a 5,608-page brain costs 24 round
  * trips rather than 11,217; small enough that one batch's rows and one `unnest`
- * literal stay a comfortable object, and that a cursor banked at a batch
- * boundary loses at most this many pages' work to a reap.
+ * literal stay a comfortable object, and that a stop between batches loses at
+ * most this many pages' arithmetic.
  */
 export const SALIENCE_BATCH = 500;
 
@@ -641,20 +638,17 @@ function clamp01(value: number): number {
  * it rather than living on a different scale.
  *
  * **It walks in batches on a keyset, and that is the whole of why the cycle
- * converges.** The scoring arithmetic is unchanged — every page is still scored
- * on every pass, because the recency term decays with wall clock and a
+ * fits its attempt.** The scoring arithmetic is unchanged — every page is still
+ * scored on every pass, because the recency term decays with wall clock and a
  * "changed since last time" filter would leave a year-old page carrying a
  * year-old score. What changed is the shape: one read and one write per
- * {@link SALIENCE_BATCH} pages instead of two statements per page, and a cursor
- * at every batch boundary so an attempt that runs out of clock hands the next
- * one its position instead of its work.
+ * {@link SALIENCE_BATCH} pages instead of two statements per page. That is the
+ * 11,217-round-trip phase that was fifteen minutes on its own, in twenty-four.
  */
 export async function computeDeterministicSalience(
   sql: SQL,
   options: {
     readonly now: Date;
-    /** Resume point from a previous attempt. Null starts at the first page. */
-    readonly cursor?: string | null;
     readonly budget?: AttemptBudget;
     /** Pages per read/write pair. Bounds memory, not correctness. */
     readonly batch?: number;
@@ -662,7 +656,7 @@ export async function computeDeterministicSalience(
 ): Promise<SalienceResult & PhaseProgress> {
   const budget = options.budget ?? unboundedAttempt();
   const batch = Math.max(1, Math.trunc(options.batch ?? SALIENCE_BATCH));
-  let cursor = options.cursor ?? CURSOR_START;
+  let cursor = CURSOR_START;
   let scored = 0;
 
   for (;;) {
@@ -747,10 +741,10 @@ export async function computeDeterministicSalience(
     cursor = pages[pages.length - 1]?.page_id ?? cursor;
 
     // A short read means the last batch, and the phase is done regardless of the
-    // clock: checking the budget first would bank a cursor one row past the end
-    // and make the next attempt re-read an empty page to learn nothing.
+    // clock: checking the budget first would report an unfinished phase that had
+    // in fact scored every page there is.
     if (pages.length < batch) return { scored, ...FINISHED };
-    if (budget.stop() !== null) return { scored, done: false, cursor };
+    if (budget.stop() !== null) return { scored, ...RESTARTS };
   }
 }
 
@@ -816,13 +810,11 @@ export async function clusterByEmbedding(
      * a seed, so cluster coverage was permanently capped at the oldest 2,000
      * however many cycles ran.
      *
-     * A call that hits this ceiling reports `done: false` with a cursor — it
-     * stopped, and there is more — which is the same shape as running out of
-     * time and is honest for both.
+     * A call that hits this ceiling reports `done: false` — it stopped, and
+     * there is more — which is the same shape as running out of time and is
+     * honest for both.
      */
     readonly limit?: number;
-    /** Resume point from a previous attempt. Null rebuilds from scratch. */
-    readonly cursor?: string | null;
     readonly budget?: AttemptBudget;
     /** Seeds per amortized vector-scan transaction. */
     readonly batch?: number;
@@ -833,32 +825,21 @@ export async function clusterByEmbedding(
   const batch = Math.max(1, Math.trunc(options.batch ?? CLUSTER_SEED_BATCH));
   const ceiling =
     options.limit === undefined ? Number.POSITIVE_INFINITY : Math.max(1, Math.trunc(options.limit));
-  const resuming = options.cursor !== undefined && options.cursor !== null;
 
   const column = seatColumnSql(ACTIVE_EMBEDDING_SEAT.column);
   const assigned = new Set<string>();
 
-  if (resuming) {
-    // The greedy walk's entire state, recovered in one statement. `assigned` and
-    // `cluster_member` move in lockstep — a chunk is added to the set in the
-    // same step that writes its row — so the table *is* the set, and resuming
-    // does not need it carried across the process boundary in some side table.
-    const members = (await sql`SELECT chunk_id::text AS chunk_id FROM cluster_member`) as Array<{
-      chunk_id: string;
-    }>;
-    for (const member of members) assigned.add(member.chunk_id);
-  } else {
-    // A cycle recomputes clusters from scratch: membership is a function of the
-    // current corpus, and an incremental version would carry a chunk's cluster
-    // across an edit that moved it. Only on a *fresh* start, though — doing it
-    // on resume would delete the work the cursor was banked to protect, which is
-    // how this phase used to be strictly net-zero across an interrupted attempt.
-    await sql`DELETE FROM cluster_member`;
-    await sql`DELETE FROM content_cluster`;
-  }
+  // A cycle recomputes clusters from scratch: membership is a function of the
+  // current corpus, and an incremental version would carry a chunk's cluster
+  // across an edit that moved it. A call that stops part-way therefore leaves
+  // the corpus clustered as far as it got, and the next one rebuilds the lot —
+  // which is the same arithmetic as every other phase here, and is why the seed
+  // walk had to stop costing five round trips per seed before it was tolerable.
+  await sql`DELETE FROM cluster_member`;
+  await sql`DELETE FROM content_cluster`;
 
   const pool = candidatePoolFor({ limit: CLUSTER_POOL });
-  let cursor = options.cursor ?? CURSOR_START;
+  let cursor = CURSOR_START;
   let clusters = 0;
   let members = 0;
   let seen = 0;
@@ -950,7 +931,7 @@ export async function clusterByEmbedding(
     seen += seeds.length;
     cursor = seeds[seeds.length - 1]?.chunk_id ?? cursor;
 
-    if (seen >= ceiling) return { clusters, members, done: false, cursor };
-    if (budget.stop() !== null) return { clusters, members, done: false, cursor };
+    if (seen >= ceiling) return { clusters, members, ...RESTARTS };
+    if (budget.stop() !== null) return { clusters, members, ...RESTARTS };
   }
 }

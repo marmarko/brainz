@@ -1,5 +1,5 @@
 /**
- * The staleness fix point, across the attempt boundary it has to survive.
+ * The staleness fix point: an edge whose only support was just retired.
  *
  * **The seam.** Reconciliation reads the live fact set; staleness *changes* it;
  * and the plan's phase order puts reconciliation first. So the phase that moves
@@ -8,42 +8,24 @@
  * has just been retired is Gap #18's cancelled meeting still in the briefing,
  * and the fix point is the only thing that takes it down.
  *
- * That fix point was written for a cycle that ran the whole of staleness in one
- * call. It does not survive a cycle that resumes, and both halves of the failure
- * are pinned here:
+ * Both halves of the phase belong to one call, and that is the property under
+ * test twice over:
  *
- *   **The trigger was a per-call local.** `factsInvalidated` counts what *this*
- *   call retired. Once `markStaleness` walks on a keyset, the attempt that
- *   retires three hundred facts and the attempt that finishes the walk need not
- *   be the same one: attempt N+1 resumes past the rows attempt N superseded,
- *   finishes with `factsInvalidated === 0`, and never fires the fix point —
- *   while `link_reconcile`, banked complete in attempt N, is skipped on resume.
- *   Net: the edge stands and a reader sees a half-consolidated graph as whole.
+ *   **The whole cycle takes the edge down.** Staleness retires the claim and the
+ *   fix point removes the edge it supported, inside one pass, so a cycle that
+ *   reports itself complete has a graph that agrees with its facts.
  *
- *   **The fix point's own restart was discarded.** `reconcileAllEdges` reports
- *   `done: false` when it yields, and the call site ignored it and banked
- *   staleness complete regardless — a phase claiming a completion for work that
- *   did not happen, which the next attempt then skips.
- *
- * Both tests drive the shipped seam rather than a re-implementation of it: the
- * first calls the phase dispatcher directly, because the interruption it needs
- * is inside the fix point rather than at a phase boundary; the second builds the
- * state one attempt leaves and runs the *whole cycle* over it, because what it
- * asserts is what the next cycle does with that state.
+ *   **A phase does not bank a completion for work it triggered and did not
+ *   finish.** `reconcileAllEdges` reports `done: false` when it yields to a lost
+ *   lease, and dropping that on the floor would have staleness claim a
+ *   completion over an edge set nothing reconciled.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
-import {
-  bankPhaseProgress,
-  completePhase,
-  openRun,
-  recordProgress,
-} from '../../src/worker/consolidate/checkpoint.ts';
 import { runConsolidationCycle, runDeterministicPhase } from '../../src/worker/consolidate/cycle.ts';
 import { createAttemptBudget } from '../../src/worker/consolidate/deadline.ts';
 import { reconcileAllEdges } from '../../src/worker/consolidate/deterministic.ts';
-import { NO_SPEND } from '../../src/worker/consolidate/estimate.ts';
 import {
   CALLER,
   TENANT,
@@ -134,23 +116,12 @@ describe('a phase does not bank a completion for work it triggered and did not f
     async () => {
       await seedSupersededPair('mail:thread-1', 'Alice Chen');
       const now = new Date('2026-03-01T00:00:00Z');
-      const opened = await openRun(tenant.sql, {
-        trigger: 'time_ceiling',
-        tier: 'free',
-        now,
-        estimateMicroUsd: NO_SPEND,
-      });
 
       // The state a real cycle is in when it reaches staleness: reconciliation
       // has run over a fact set in which both claims are still live, so both
-      // edges stand and the phase is banked complete.
+      // edges stand.
       const reconciled = await reconcileAllEdges(tenant.sql, { taxonomyVersion: 1 });
       expect(reconciled.done).toBe(true);
-      await completePhase(tenant.sql, opened.run, 'link_reconcile', {
-        items: reconciled.added,
-        spentMicroUsd: NO_SPEND,
-        now,
-      });
       expect(await liveEmployers()).toEqual(['Acme Corp', 'Globex Ltd']);
 
       // The lease goes away while the fix-point reconcile is walking the fact
@@ -165,16 +136,13 @@ describe('a phase does not bank a completion for work it triggered and did not f
       dispossessed.abort();
 
       const outcome = await runDeterministicPhase(tenant.sql, 'staleness', {
-        run: opened.run,
         now,
-        cursor: null,
         attempt: createAttemptBudget({ signal: dispossessed.signal }),
       });
 
       // **The claim.** The reconcile's restart used to be dropped on the floor
-      // and the phase reported `done`, so the cycle banked staleness complete —
-      // and every later attempt skipped it, leaving the edge below standing for
-      // the life of the run.
+      // and the phase reported `done`, so the cycle banked staleness complete
+      // over an edge set nothing had reconciled.
       expect(outcome.done).toBe(false);
 
       // And the two facts that make that a real defect rather than a bookkeeping
@@ -187,83 +155,30 @@ describe('a phase does not bank a completion for work it triggered and did not f
   );
 });
 
-describe('the staleness fix point survives being split across attempts', () => {
+describe('a cycle that reports itself complete has a graph that agrees with its facts', () => {
   test(
-    'the attempt that finishes the walk still reconciles what an earlier one retired',
+    'staleness retires the claim and the fix point takes down the edge it supported',
     async () => {
-      const pair = await seedSupersededPair('mail:thread-2', 'Bella Novak');
+      await seedSupersededPair('mail:thread-2', 'Bella Novak');
       const now = new Date('2026-03-01T00:00:00Z');
-      const opened = await openRun(tenant.sql, {
-        trigger: 'time_ceiling',
-        tier: 'free',
-        now,
-        estimateMicroUsd: NO_SPEND,
-      });
 
-      const reconciled = await reconcileAllEdges(tenant.sql, { taxonomyVersion: 1 });
-      await completePhase(tenant.sql, opened.run, 'link_reconcile', {
-        items: reconciled.added,
-        spentMicroUsd: NO_SPEND,
-        now,
-      });
-      expect(await liveEmployers()).toEqual(['Acme Corp', 'Globex Ltd']);
-
-      // ---- Attempt N. It retires the fact and runs out of clock mid-walk. ----
-      //
-      // A batch of one and a budget of nothing is the two-line version of the
-      // measured case: three hundred facts superseded and committed, a cursor
-      // banked, the process out of time. Driven through the phase dispatcher
-      // rather than through `runConsolidationCycle`, because the cycle leaves
-      // every walk at its tuned batch and reaching a mid-walk stop through it
-      // would mean seeding five hundred superseded pages to assert one thing.
-      const stalenessN = await runDeterministicPhase(tenant.sql, 'staleness', {
-        run: opened.run,
-        now,
-        cursor: null,
-        attempt: createAttemptBudget({ budgetMs: 0 }),
-        batch: 1,
-      });
-      expect(stalenessN.done).toBe(false);
-      expect(stalenessN.cursor).toBe(pair.stalePageId);
-      // It really did retire the claim before it ran out — that is what makes
-      // the edge below unsupported, and what the next attempt cannot see.
-      expect(await countRows(tenant.sql, 'fact', 'superseded_by IS NOT NULL')).toBe(1);
-
-      await bankPhaseProgress(tenant.sql, opened.run, 'staleness', {
-        items: stalenessN.items,
-        cursor: stalenessN.cursor as string,
-        now,
-      });
-      await recordProgress(tenant.sql, opened.run, {
-        dreamt: false,
-        stopReason: 'out_of_time',
-        spentMicroUsd: NO_SPEND,
-        modelCalls: 0,
-        phasesRun: 2,
-        wallClockMs: 1,
-        now,
-      });
-
-      // ---- Attempt N+1. It resumes past those rows and finishes. ----
-      //
-      // A real cycle this time, on the clock, seconds later — the continuation
-      // the checkpoints are honoured for. Free tier so nothing is paid for and
-      // the deterministic tier is the whole cycle.
+      // Free tier, so nothing is paid for and the deterministic tier is the
+      // whole cycle. One pass, uninterrupted: `link_reconcile` runs over both
+      // live claims, `staleness` retires the older one, and the fix point inside
+      // that same phase reconciles what it just changed.
       const { gateway } = createGateway();
-      const next = await runConsolidationCycle(
+      const cycle = await runConsolidationCycle(
         { sql: tenant.sql, gateway, tenantId: TENANT, caller: CALLER },
         { trigger: 'time_ceiling', tier: 'free', now },
       );
-      expect(next.runId).toBe(opened.run.runId);
-      expect(next.stopReason).toBe('free_tier');
+      expect(cycle.stopReason).toBe('free_tier');
 
-      // **The claim.** This attempt's `markStaleness` resumes past the row the
-      // last one superseded, so it retires nothing and `factsInvalidated` is
-      // zero — and `link_reconcile` was banked complete before any of this
-      // happened, so on the old code it was skipped. The edge to the employer
-      // nothing states any more therefore survived a *completed* cycle, which is
-      // the strongest form of the defect: not "not yet reconciled" but
-      // "reconciled, and wrong".
+      // **The claim.** Reconciliation ran *before* staleness, so on the phase
+      // order alone the edge to the employer nothing states any more would still
+      // be standing — over a cycle that reported itself finished, which is the
+      // strongest form of the defect: not "not yet reconciled" but "reconciled,
+      // and wrong".
+      expect(await countRows(tenant.sql, 'fact', 'superseded_by IS NOT NULL')).toBe(1);
       expect(await liveEmployers()).toEqual(['Globex Ltd']);
     },
     SETUP_TIMEOUT_MS,

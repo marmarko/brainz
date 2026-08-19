@@ -1,35 +1,31 @@
 /**
- * The three phases that are not a walk, and what an exhausted budget means to
- * each of them.
+ * A whole-set phase against an exhausted budget: what it may do, and why.
  *
- * `salience` and `cluster` are walks over an ordered set, so "where I got to" is
- * a row id and an interrupted attempt hands the next one its position. The other
- * three are whole-set computations with no such position, and they used to be
- * treated as one kind because of that. They are two.
+ * No phase in this cycle resumes. A phase that stops is run again from the top
+ * next time, so the only question worth asking about an interruption is whether
+ * the work it committed *stays* committed — and for two of them the answer makes
+ * stopping strictly better than being reaped.
  *
  *   **`dedup` and `entity_merge` are monotone.** A collapsed fact gets a
  *   `superseded_by` and leaves the live set; a merged entity is tombstoned and
  *   leaves it too. So the read the next attempt makes is *strictly smaller* than
- *   the one this attempt made, and stopping mid-loop is real progress banked in
- *   the rows rather than in a checkpoint. They yielded only to a lost lease,
- *   which meant an attempt with four seconds left entered them and was reaped
- *   somewhere inside — the reap being the thing this whole seam exists to
- *   replace with a decision.
+ *   the one this attempt made, and stopping mid-loop banks real progress in the
+ *   rows. They yielded only to a lost lease, which meant an attempt with four
+ *   seconds left entered them and was reaped somewhere inside — the reap being
+ *   the thing the attempt budget exists to replace with a decision.
  *
  *   **`link_reconcile` is not.** It builds the desired edge set from every live
  *   fact and then diffs the live edges against it, so an edge missing from a
- *   half-built desired set is an edge the diff *deletes*. It cannot stop early
- *   and it cannot bank a position, and no amount of chunking changes that
- *   without changing what the phase means. The only safe thing to do with a
- *   budget it will not fit is to decline to start it — and to say so, because a
- *   phase the cycle keeps refusing is an operator's problem rather than the
- *   cycle's, and a cycle reaped in the middle of one says nothing at all.
+ *   half-built desired set is an edge the diff *deletes*. Stopping it on the
+ *   clock would throw the pass away, so it yields to a lost lease and to nothing
+ *   else. Affordable because it is small: 214ms on a 5,608-page brain.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
 import { runConsolidationCycle } from '../../src/worker/consolidate/cycle.ts';
-import { readPhaseTimings } from '../../src/worker/consolidate/checkpoint.ts';
+import { createAttemptBudget } from '../../src/worker/consolidate/deadline.ts';
+import { reconcileAllEdges } from '../../src/worker/consolidate/deterministic.ts';
 import {
   CALLER,
   TENANT,
@@ -122,9 +118,7 @@ describe('a monotone whole-set phase stops on the clock and keeps what it did', 
       expect(partial).toBeGreaterThan(0);
       expect(partial).toBeLessThan(GROUPS);
       expect(first.stopReason).toBe('out_of_time');
-      // Rows changed are progress even with no position to bank, which is what
-      // makes stopping here safe for the continuation gate.
-      expect(first.advanced).toBe(true);
+      expect(first.moreToDo).toBe(true);
 
       // And the work is *kept*. Each attempt's read is strictly smaller than the
       // last one's, because a collapsed fact is no longer live — so the phase
@@ -176,80 +170,35 @@ async function seedGraph(pages: number, from = 0): Promise<void> {
   }
 }
 
-describe('a phase that cannot be stopped part-way is not entered unless it fits', () => {
+describe('a phase that cannot be stopped part-way does not stop on the clock', () => {
   test(
-    'a measured reconciliation that will not fit is declined, by name, and run next attempt',
+    'reconciliation finishes a spent budget and yields only to a lost lease',
     async () => {
       await seedGraph(9);
-      const { gateway } = createGateway();
-      const deps = { sql: tenant.sql, gateway, tenantId: TENANT, caller: CALLER };
-      const now = new Date('2026-03-01T00:00:00Z');
 
-      // A first cycle, on a budget it comfortably fits, so every phase completes
-      // and every completion is measured.
-      const first = await runConsolidationCycle(deps, {
-        trigger: 'time_ceiling',
-        tier: 'free',
-        now,
-        clock: tickingClock(),
-        budgetMs: 1_000,
+      // A budget that was over before the call began. Every other phase would
+      // stop on this; reconciliation must not, because there is nothing it could
+      // hand over — an edge missing from a half-built desired set is an edge the
+      // diff below *deletes*, so a partial pass is not slow progress but damage.
+      const spent = await reconcileAllEdges(tenant.sql, {
+        taxonomyVersion: 1,
+        budget: createAttemptBudget({ budgetMs: 0 }),
       });
-      expect(first.stopReason).toBe('free_tier');
-      const measured = await readPhaseTimings(tenant.sql);
-      // A completing phase leaves a number behind, or the guard below has
-      // nothing to decide on and this whole seam is decoration.
-      expect(measured.has('link_reconcile')).toBe(true);
+      expect(spent.done).toBe(true);
       const settled = await liveEdges();
       expect(settled).toBeGreaterThan(0);
 
-      // Now the brain grows enough to matter and the measurement says so. Writing
-      // the row directly is the point of the guard being data-driven: what it
-      // does with "this phase takes longer than you have" must not depend on how
-      // long the fixture's database happens to take.
-      await tenant.sql`
-        UPDATE consolidation_phase_timing
-           SET last_duration_ms = 1000000
-         WHERE phase = 'link_reconcile'
-      `;
-      // Three people nobody has reconciled yet, so a refusal cannot be confused
-      // with a phase that had nothing to do.
-      await seedGraph(3, 9);
-
-      const refused = await runConsolidationCycle(deps, {
-        trigger: 'time_ceiling',
-        tier: 'free',
-        now,
-        clock: tickingClock(),
-        budgetMs: 100,
+      // A lost lease is different in kind: every write from that point is
+      // unfenced against the tenant's database, so continuing cannot help. It
+      // reports a restart and leaves the graph exactly as it found it.
+      const dispossessed = new AbortController();
+      dispossessed.abort();
+      const lost = await reconcileAllEdges(tenant.sql, {
+        taxonomyVersion: 1,
+        budget: createAttemptBudget({ signal: dispossessed.signal }),
       });
-
-      // **The claim.** The phase has to run to the end or not at all — a
-      // half-built desired set makes the diff delete edges nothing stopped
-      // stating — so entering it with less than it needs can only end in a reap.
-      // It is declined instead, under a name an operator can alert on, and the
-      // run stays open asking to be run again.
-      expect(refused.stopReason).toBe('phase_does_not_fit');
-      expect(refused.moreToDo).toBe(true);
-      const declined = refused.phases.find((record) => record.phase === 'link_reconcile');
-      expect(declined?.ran).toBe(false);
-      expect(declined?.stopped).toBe('phase_does_not_fit');
-      // Declining means declining: it did not half-run and leave the graph
-      // holding a diff against a fact set it never finished reading.
+      expect(lost.done).toBe(false);
       expect(await liveEdges()).toBe(settled);
-
-      // And the next attempt, whose budget starts full, runs it.
-      await tenant.sql`
-        UPDATE consolidation_phase_timing SET last_duration_ms = 1 WHERE phase = 'link_reconcile'
-      `;
-      const done = await runConsolidationCycle(deps, {
-        trigger: 'time_ceiling',
-        tier: 'free',
-        now,
-        clock: tickingClock(),
-        budgetMs: 1_000,
-      });
-      expect(done.stopReason).toBe('free_tier');
-      expect(await liveEdges()).toBeGreaterThan(settled);
     },
     SETUP_TIMEOUT_MS,
   );

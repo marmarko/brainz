@@ -17,14 +17,14 @@
  * checkpoint that outlived its cycle would skip the next cycle's work while
  * looking like thrift.
  *
- * **2b. Its subject is position, not only money.** KTD11's sentence is about
- * re-paying, and for a phase whose cost is a provider invoice a done-flag is the
- * whole answer. For a phase whose cost is *wall clock* it is not: the
- * deterministic tier re-ran in full on every attempt, committing its writes and
- * losing its place, so a brain large enough that the tier outlived one attempt
- * could never finish it — repeated identical work under a finite attempt
- * ceiling. Rung 19 adds `completed` and `phase_cursor`, and
- * {@link bankPhaseProgress} is how an interrupted phase says where it got to.
+ * **2b. Its subject is money, and only money.** A row here means "this phase is
+ * paid for", and only the model tier reads one. The deterministic tier is not
+ * checkpointed across attempts and re-runs from the top every time, which is
+ * affordable because the round-trip costs that made it unaffordable are gone —
+ * see the note on the phase loop in `cycle.ts`. A resumable position for the
+ * free tier was built once and removed: it bought nothing the batching had not
+ * already bought, and every version of it carried a state a run could enter and
+ * not leave.
  *
  * **3. Resuming is the default, and it is decided by the database.** An open run
  * — one with no `finished_at` — is a cycle that was killed, and the next cycle
@@ -37,7 +37,7 @@ import type { SQL } from 'bun';
 
 import type { JobTrigger } from '../jobs.ts';
 import { NO_SPEND } from './estimate.ts';
-import { isModelPhase, type CyclePhase } from './phases.ts';
+import type { CyclePhase } from './phases.ts';
 
 export type ConsolidationTier = 'free' | 'paid';
 
@@ -48,34 +48,16 @@ export type StopReason =
   | 'phase_failed'
   | 'cancelled'
   /**
-   * The attempt's wall clock ran out with work left. Not a failure and not a
-   * cap: the run stays open, a position is banked, and the correct response is
-   * to run the same cycle again immediately rather than to wait for a provider
-   * or for a spend window. See `deadline.ts`.
-   */
-  | 'out_of_time'
-  /**
-   * The run was open for longer than a continuation is, and was closed so a
-   * fresh one could start.
+   * The attempt's wall clock ran out with work left.
    *
-   * Never a *cycle's* stop reason — no attempt reports it about itself. It is
-   * written by {@link openRun} onto a run some earlier process left open and
-   * then never came back to, and it is on the closed row so an operator counting
-   * cycles can tell "we swept this" from "this finished". See the horizon in
-   * `cycle.ts`.
+   * Not a failure and not a cap. The cycle *decided* to stop between two units
+   * of work rather than being reaped inside one, so its writes are whole, its
+   * run record says what happened, and the phases it completed are banked. The
+   * run stays open and the next cycle resumes into it, skipping the model phases
+   * that are already paid for — the same treatment `budget_exhausted` and
+   * `phase_failed` have always had, for the same reason. See `deadline.ts`.
    */
-  | 'abandoned'
-  /**
-   * A phase that cannot be stopped part-way would not have fitted what was left
-   * of the attempt, so the cycle declined to start it.
-   *
-   * The run stays open and the correct response is the same as `out_of_time` —
-   * run it again, from the top of a fresh attempt's budget. It is a separate
-   * name because it is the one stop an operator may need to act on: a phase
-   * refused twice running is a phase that no longer fits a whole attempt, and no
-   * number of retries will change that.
-   */
-  | 'phase_does_not_fit';
+  | 'out_of_time';
 
 export interface CycleRun {
   readonly runId: string;
@@ -84,44 +66,16 @@ export interface CycleRun {
   readonly startedAt: Date;
 }
 
-/**
- * One phase's banked state within the open run.
- *
- * `completed` is what tells a finished phase from an interrupted one now that
- * presence of the row no longer can — see rung 19. `cursor` is where inside the
- * phase the last attempt stopped, opaque to this module: only the phase that
- * wrote it knows how to read it, which is what keeps the checkpoint table from
- * growing a column per phase.
- */
-export interface PhaseCheckpoint {
-  readonly completed: boolean;
-  readonly cursor: string | null;
-  /** Items this phase has done **across the whole run**, not this attempt. */
-  readonly items: number;
-  readonly spentMicroUsd: number;
-}
-
 export interface OpenedRun {
   readonly run: CycleRun;
   /** True when this call adopted a cycle a previous process left open. */
   readonly resumed: boolean;
   /**
-   * What each phase has banked against this run — completed phases and
-   * interrupted ones alike. A completed model phase is skipped rather than
-   * re-paid; an interrupted deterministic phase resumes from its cursor rather
-   * than restarting.
+   * Phases already banked against this run. Skipped rather than re-paid — and
+   * only the *model* ones are, because only a model phase's cost is a thing that
+   * cannot be paid twice. See the header's point 2b.
    */
-  readonly banked: ReadonlyMap<CyclePhase, PhaseCheckpoint>;
-  /**
-   * Why the open run stopped last time, or `null` for a run nobody has stopped.
-   *
-   * The cycle reads it to decide whether the deterministic tier's checkpoints
-   * still describe *now*. A run that stopped on the clock is being continued
-   * seconds later and its free work is still current; a run that stopped because
-   * a provider was unavailable may be resumed hours later over a brain that has
-   * ingested since, and its free work is not.
-   */
-  readonly previousStop: StopReason | null;
+  readonly done: ReadonlySet<CyclePhase>;
   /** What the resumed phases already spent, so the run's total stays a total. */
   readonly spentMicroUsd: number;
 }
@@ -131,7 +85,6 @@ interface RunRow {
   readonly trigger_reason: JobTrigger;
   readonly tier: ConsolidationTier;
   readonly started_at: Date;
-  readonly stop_reason: StopReason | null;
 }
 
 /**
@@ -149,23 +102,10 @@ export async function openRun(
     readonly tier: ConsolidationTier;
     readonly now: Date;
     readonly estimateMicroUsd: number;
-    /**
-     * How old an open run may be and still be **adopted** rather than swept.
-     *
-     * The cycle's continuation horizon, applied where adopting is decided —
-     * because "is this run still a continuation" and "do we adopt it" are one
-     * question with one answer, and answering them in two places is how the
-     * horizon came to be a state a run could enter and never leave.
-     *
-     * Absent means no sweep: every open run is adoptable, which is what a caller
-     * outside the cycle wants and what this function did before the horizon
-     * existed.
-     */
-    readonly horizonMs?: number;
   },
 ): Promise<OpenedRun> {
   const open = (await sql`
-    SELECT run_id::text AS run_id, trigger_reason, tier, started_at, stop_reason
+    SELECT run_id::text AS run_id, trigger_reason, tier, started_at
       FROM consolidation_run
      WHERE finished_at IS NULL
      ORDER BY run_id DESC
@@ -173,44 +113,12 @@ export async function openRun(
   `) as RunRow[];
 
   const existing = open[0];
-  const staleRun =
-    existing !== undefined &&
-    options.horizonMs !== undefined &&
-    options.now.getTime() - existing.started_at.getTime() >= options.horizonMs;
-
-  if (staleRun && existing !== undefined) {
-    // **Closed, not ignored.** Leaving it open and merely distrusting its
-    // checkpoints is the absorbing version: nothing advances `started_at`, so
-    // the run is past the horizon for ever and its whole deterministic tier
-    // restarts on every attempt from here to the heat death of the lane. Closing
-    // it is what makes the horizon terminate — the fresh run below gets a fresh
-    // `started_at` and re-runs the free work *once*, which is what the horizon
-    // was asking for.
-    //
-    // Spend, model calls, phases and wall clock are left exactly as the last
-    // attempt recorded them. This is a sweep, not a settlement, and a sweep that
-    // zeroed a real invoice would be losing the only record of it.
-    await sql`
-      UPDATE consolidation_run
-         SET stop_reason = 'abandoned', finished_at = ${options.now}
-       WHERE run_id = ${existing.run_id}::bigint
-    `;
-    await sql`DELETE FROM consolidation_checkpoint WHERE run_id = ${existing.run_id}::bigint`;
-  }
-
-  if (existing !== undefined && !staleRun) {
+  if (existing !== undefined) {
     const banked = (await sql`
-      SELECT phase, completed, phase_cursor, items,
-             spent_micro_usd::bigint AS spent
+      SELECT phase, spent_micro_usd::bigint AS spent
         FROM consolidation_checkpoint
        WHERE run_id = ${existing.run_id}::bigint
-    `) as Array<{
-      phase: string;
-      completed: boolean;
-      phase_cursor: string | null;
-      items: number;
-      spent: string;
-    }>;
+    `) as Array<{ phase: string; spent: string }>;
 
     return {
       run: {
@@ -220,18 +128,7 @@ export async function openRun(
         startedAt: existing.started_at,
       },
       resumed: true,
-      previousStop: existing.stop_reason,
-      banked: new Map(
-        banked.map((row) => [
-          row.phase as CyclePhase,
-          {
-            completed: row.completed,
-            cursor: row.phase_cursor,
-            items: row.items,
-            spentMicroUsd: Number(row.spent),
-          },
-        ]),
-      ),
+      done: new Set(banked.map((row) => row.phase as CyclePhase)),
       spentMicroUsd: banked.reduce((total, row) => total + Number(row.spent), 0),
     };
   }
@@ -244,7 +141,7 @@ export async function openRun(
   const created = (await sql`
     INSERT INTO consolidation_run (trigger_reason, tier, estimated_micro_usd, started_at)
     VALUES (${options.trigger}, ${options.tier}, ${options.estimateMicroUsd}, ${options.now})
-    RETURNING run_id::text AS run_id, trigger_reason, tier, started_at, stop_reason
+    RETURNING run_id::text AS run_id, trigger_reason, tier, started_at
   `) as RunRow[];
 
   const row = created[0];
@@ -258,8 +155,7 @@ export async function openRun(
       startedAt: row.started_at,
     },
     resumed: false,
-    previousStop: null,
-    banked: new Map<CyclePhase, PhaseCheckpoint>(),
+    done: new Set<CyclePhase>(),
     spentMicroUsd: NO_SPEND,
   };
 }
@@ -279,149 +175,13 @@ export async function completePhase(
   outcome: { readonly items: number; readonly spentMicroUsd: number; readonly now: Date },
 ): Promise<void> {
   await sql`
-    INSERT INTO consolidation_checkpoint (phase, run_id, items, spent_micro_usd, completed_at,
-                                          completed, phase_cursor)
-    VALUES (${phase}, ${run.runId}::bigint, ${outcome.items}, ${outcome.spentMicroUsd}, ${outcome.now},
-            true, NULL)
+    INSERT INTO consolidation_checkpoint (phase, run_id, items, spent_micro_usd, completed_at)
+    VALUES (${phase}, ${run.runId}::bigint, ${outcome.items}, ${outcome.spentMicroUsd}, ${outcome.now})
     ON CONFLICT (phase) DO UPDATE
       SET run_id = EXCLUDED.run_id,
           items = EXCLUDED.items,
           spent_micro_usd = EXCLUDED.spent_micro_usd,
-          completed_at = EXCLUDED.completed_at,
-          completed = true,
-          -- Cleared, not left: a completed phase with a stale position would
-          -- send the next attempt into the middle of work that is already done.
-          phase_cursor = NULL
-  `;
-}
-
-/**
- * Bank a phase **mid-flight**, so the next attempt resumes instead of restarting.
- *
- * The counterpart to {@link completePhase} and the reason rung 19 exists. A
- * deterministic phase that ran out of the attempt's wall clock has done real,
- * committed work and has no way to say so: presence of a checkpoint row used to
- * mean "finished", so the only honest thing such a phase could do was write
- * nothing — and the next attempt then walked the same rows in the same order and
- * was reaped at the same place. Five attempts, no progress, dead lane.
- *
- * **Deterministic phases only, and it throws rather than warns.** The previous
- * fleet version reads every checkpoint row as a completion and skips model
- * phases on that basis, so a partial row for a model phase would make a
- * mid-rolling-deploy instance skip a phase that had barely started. It ignores
- * deterministic rows entirely, which is exactly what makes a partial one safe
- * there. The rule is structural because the failure is silent and only happens
- * during a deploy — the worst place to discover a convention.
- */
-export async function bankPhaseProgress(
-  sql: SQL,
-  run: CycleRun,
-  phase: CyclePhase,
-  progress: { readonly items: number; readonly cursor: string; readonly now: Date },
-): Promise<void> {
-  if (isModelPhase(phase)) {
-    throw new Error(
-      `invariant: '${phase}' is a model phase and cannot bank a partial checkpoint — the previous fleet version reads any checkpoint row as a completion and would skip the phase mid-deploy`,
-    );
-  }
-  await sql`
-    INSERT INTO consolidation_checkpoint (phase, run_id, items, spent_micro_usd, completed_at,
-                                          completed, phase_cursor)
-    VALUES (${phase}, ${run.runId}::bigint, ${progress.items}, ${NO_SPEND}, ${progress.now},
-            false, ${progress.cursor})
-    ON CONFLICT (phase) DO UPDATE
-      SET run_id = EXCLUDED.run_id,
-          items = EXCLUDED.items,
-          completed_at = EXCLUDED.completed_at,
-          completed = false,
-          phase_cursor = EXCLUDED.phase_cursor
-  `;
-}
-
-/**
- * Whether the phase is banked as **finished** against this run.
- *
- * Asked rather than remembered, and that is the point. A phase that triggers
- * another phase's work — staleness re-running reconciliation over the fact set
- * it just changed — used to decide on a per-*call* local, which is a correct
- * answer only for a cycle that runs each phase exactly once. Under a resumable
- * walk the attempt that creates the debt and the attempt that discharges it are
- * different processes, and the only thing both can see is this table.
- */
-export async function phaseIsComplete(sql: SQL, run: CycleRun, phase: CyclePhase): Promise<boolean> {
-  const rows = (await sql`
-    SELECT completed
-      FROM consolidation_checkpoint
-     WHERE phase = ${phase} AND run_id = ${run.runId}::bigint
-  `) as Array<{ completed: boolean }>;
-  return rows[0]?.completed === true;
-}
-
-/**
- * Withdraw a phase's completion, because a later phase invalidated its inputs.
- *
- * **A DELETE, not an update to `completed = false`.** Rung 19's CHECK requires an
- * incomplete row to carry a position, and a whole-set phase has none to carry —
- * the only position it could offer is "from the beginning", which is what the
- * absence of a row already says. Writing a placeholder cursor would be inventing
- * a resume point for a phase that cannot resume.
- *
- * **Deterministic phases only.** Re-opening a model phase would re-pay for it,
- * which is the one thing KTD11's checkpoint exists to prevent — and the caller
- * that wanted to would be expressing a dependency the cycle's cheap→expensive
- * order says cannot exist. Structural rather than documented, for the same
- * reason {@link bankPhaseProgress} refuses the mirror case.
- */
-export async function reopenPhase(sql: SQL, run: CycleRun, phase: CyclePhase): Promise<void> {
-  if (isModelPhase(phase)) {
-    throw new Error(
-      `invariant: '${phase}' is a model phase and cannot be re-opened — a phase whose cost is a provider invoice is checkpointed so it is never paid for twice`,
-    );
-  }
-  await sql`
-    DELETE FROM consolidation_checkpoint
-     WHERE phase = ${phase} AND run_id = ${run.runId}::bigint
-  `;
-}
-
-/**
- * How long each phase took the last time it ran to completion.
- *
- * Read once per cycle and kept, rather than asked per phase: the answer cannot
- * change during an attempt (nothing but the end of a phase writes it), and six
- * round trips to learn one number each is the shape of round-trip cost this
- * whole seam was cut to remove.
- */
-export async function readPhaseTimings(sql: SQL): Promise<Map<CyclePhase, number>> {
-  const rows = (await sql`
-    SELECT phase, last_duration_ms::bigint AS last_duration_ms FROM consolidation_phase_timing
-  `) as Array<{ phase: string; last_duration_ms: string }>;
-  return new Map(rows.map((row) => [row.phase as CyclePhase, Number(row.last_duration_ms)]));
-}
-
-/**
- * Record what a phase cost, **only** when it ran to the end.
- *
- * A phase that stopped part-way took less than it costs, and banking that would
- * teach the guard the phase fits on evidence that says nothing of the kind. The
- * row is overwritten rather than accumulated: what a decision needs is how long
- * this takes on this brain now, and an average taken over a brain that has
- * doubled since is a more confident wrong answer.
- */
-export async function recordPhaseDuration(
-  sql: SQL,
-  phase: CyclePhase,
-  durationMs: number,
-  now: Date,
-): Promise<void> {
-  const bounded = Math.max(0, Math.round(durationMs));
-  if (!Number.isFinite(bounded)) return;
-  await sql`
-    INSERT INTO consolidation_phase_timing (phase, last_duration_ms, measured_at)
-    VALUES (${phase}, ${bounded}, ${now})
-    ON CONFLICT (phase) DO UPDATE
-      SET last_duration_ms = EXCLUDED.last_duration_ms,
-          measured_at = EXCLUDED.measured_at
+          completed_at = EXCLUDED.completed_at
   `;
 }
 

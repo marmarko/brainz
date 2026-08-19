@@ -19,11 +19,12 @@
  * signal is aborted as a courtesy, so a cooperative handler can stop burning
  * money; the guarantee comes from the store refusing the write.
  *
- * **A handler may also report that it is not finished.** See
- * {@link HandlerOutcome}: "the work is longer than one attempt" is a successful
- * completion that asks to be run again, and it is neither a failure nor a
- * finished cycle. Conflating it with either is what turned one large brain's
- * consolidation into a dead lane.
+ * **A handler finishes or it throws, and there is deliberately no third answer.**
+ * A return channel for "successful, but run me again at once" existed briefly,
+ * for a consolidation cycle that could not fit one attempt. The cycle fits now,
+ * and a handler that can re-enqueue itself is a loop whose bound lives in the
+ * handler rather than in the scheduler — which is the wrong place for it. A long
+ * job says so on its own record and waits for its next scheduled slot.
  */
 
 import {
@@ -55,33 +56,7 @@ export interface JobContext {
   readonly now: Date;
 }
 
-/**
- * What a handler may say about a *successful* attempt that is not the end of the
- * work.
- *
- * **Why there is a return channel at all.** A consolidation cycle over a large
- * brain does not fit one attempt's wall-clock ceiling, and before this the only
- * two things a handler could do were finish or throw. Finishing settled the
- * tenant as consolidated and pushed it to the next 24-hour ceiling; throwing
- * charged an attempt and, five of those later, dead-lettered the lane — which
- * `enqueueDuePulls` then counts as a lane already standing, so nothing polls the
- * tenant again until an operator clears it. Neither is what "there is more to
- * do" means, and inferring it from a failure code would be reading an outcome
- * off the shape of an error.
- *
- * Handlers that have nothing to add return `undefined`, which is what every
- * `Promise<void>` handler already does.
- */
-export interface HandlerOutcome {
-  /**
-   * The attempt succeeded and banked progress, and the same job should run
-   * again as soon as the fleet can. The job completes normally — a fresh row
-   * with a fresh attempt ladder, not a retry of this one.
-   */
-  readonly continuation?: boolean;
-}
-
-export type JobHandler = (context: JobContext) => Promise<HandlerOutcome | undefined | void>;
+export type JobHandler = (context: JobContext) => Promise<void>;
 
 /** Repeating-timer port, so the renewal interval is injectable. */
 export interface Ticker {
@@ -142,11 +117,7 @@ export interface RunnerDeps {
    * consolidation rule: subtract the debt this job observed and stamp the next
    * staggered ceiling slot. Returning `undefined` settles nothing.
    */
-  readonly settle?: (
-    lease: JobLease,
-    now: Date,
-    outcome: HandlerOutcome | undefined,
-  ) => CompleteRequest['settle'];
+  readonly settle?: (lease: JobLease, now: Date) => CompleteRequest['settle'];
   readonly ticker?: Ticker;
   readonly clock?: () => Date;
   /**
@@ -166,27 +137,9 @@ export interface JobRunner {
   start(): () => void;
 }
 
-/**
- * The default settle rule: consolidation moves the tenant's scheduling signals.
- *
- * **A continuation settles differently, and the difference is two columns.** The
- * debt is still subtracted — the job did observe it and did work against it, and
- * a counter that is never subtracted from only grows. What does not happen is
- * the tenant being marked as having *had* a cycle: `last_cycle_at` is what the
- * scheduler's rested window and its debounce arm both read, and stamping it over
- * a cycle that stopped half way would hold the brain for thirty minutes and then
- * a day. The due time goes to `now` instead of the next staggered ceiling, so the
- * next tick picks the tenant straight back up.
- */
-function defaultSettle(
-  lease: JobLease,
-  now: Date,
-  outcome: HandlerOutcome | undefined,
-): CompleteRequest['settle'] {
+/** The default settle rule: consolidation moves the tenant's scheduling signals. */
+function defaultSettle(lease: JobLease, now: Date): CompleteRequest['settle'] {
   if (lease.kind !== 'consolidate') return undefined;
-  if (outcome?.continuation === true) {
-    return { debtObserved: lease.debtObserved, nextDueAt: now, moreToDo: true };
-  }
   return {
     debtObserved: lease.debtObserved,
     nextDueAt: nextCeilingDueAt(lease.tenantId, now, ALPHA_CEILING_MS),
@@ -229,14 +182,13 @@ export function createJobRunner(deps: RunnerDeps): JobRunner {
     running.set(lease.jobId, { lease, controller });
     const handler = deps.handlers[lease.kind];
 
-    let handoff: HandlerOutcome | undefined;
     try {
       if (handler === undefined) {
         // Unreachable: claims are scoped to the handler keys. Thrown rather than
         // defaulted, because the fallback would be to dead-letter user work.
         throw new Error(`invariant: no handler for kind '${lease.kind}'`);
       }
-      handoff = (await handler({ lease, signal: controller.signal, now })) ?? undefined;
+      await handler({ lease, signal: controller.signal, now });
     } catch (error) {
       running.delete(lease.jobId);
       try {
@@ -274,7 +226,7 @@ export function createJobRunner(deps: RunnerDeps): JobRunner {
     running.delete(lease.jobId);
     try {
       const at = clock();
-      const settlement = settle(lease, at, handoff);
+      const settlement = settle(lease, at);
       const outcome = await deps.queue.complete(
         lease,
         settlement === undefined ? { now: at } : { now: at, settle: settlement },

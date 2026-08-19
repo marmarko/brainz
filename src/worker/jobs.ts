@@ -319,21 +319,6 @@ export interface CompleteRequest {
   readonly settle?: {
     readonly debtObserved: number;
     readonly nextDueAt: Date;
-    /**
-     * The attempt succeeded with work left — see `runner.ts`'s `HandlerOutcome`.
-     *
-     * `last_cycle_at` is **not** advanced when this is set, and that column is
-     * the whole reason the flag exists rather than the caller simply passing an
-     * earlier `nextDueAt`. The scheduler gates both of its arms on a rested
-     * window measured from `last_cycle_at`, so a half-finished cycle that
-     * stamped it would put the brain to sleep for thirty minutes and then, once
-     * `next_due_at` had also been pushed, for a day — which is the behaviour
-     * that let a brain ingest for a fortnight with 160 facts to show for it.
-     *
-     * The debt still comes off. The job did observe it and did work against it,
-     * and a counter that is only ever added to is not a signal.
-     */
-    readonly moreToDo?: boolean;
   };
 }
 
