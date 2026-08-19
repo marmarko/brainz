@@ -15,7 +15,7 @@
  * 28,799 of the pass's 30,850 round trips, against the other four deterministic
  * phases' combined 400ms.
  *
- * So there are four things to pin, and they are the four tests below:
+ * So there are five things to pin, and they are the five sections below:
  *
  *   1. **The deterministic prefix costs round trips per batch, not per page**,
  *      and it finishes in one attempt. This is the claim that makes redoing the
@@ -37,6 +37,18 @@
  *      per live fact, which is four whole attempts on the brain that
  *      dead-lettered. The corpus doubles inside that test and the statement
  *      count does not move.
+ *   5. **One page the model cannot summarise does not hold the rest of the brain
+ *      hostage.** The second failure this suite is written against, observed on
+ *      the same brain after the first was fixed: the cycle ran, did real work,
+ *      and stopped at `phase_failed` with the fact count flat at 167 over 5,608
+ *      pages. `runSynopsisPhase` returned on the *first* page it could not
+ *      summarise, which stopped the cycle, which left the run open, which left
+ *      `extract`'s checkpoint standing — and a model phase with a checkpoint
+ *      against an open run is skipped on every resume. So one unusable page
+ *      stopped extraction for every other page, permanently, and the brain that
+ *      looked broken was one page's worth of broken. That is the same shape as
+ *      the embed batch that wedged ingest: one un-processable item stopping
+ *      everything behind it.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
@@ -51,6 +63,10 @@ import { runConsolidationCycle, runDeterministicPhase } from '../../src/worker/c
 import { createAttemptBudget } from '../../src/worker/consolidate/deadline.ts';
 import { reconcileAllEdges } from '../../src/worker/consolidate/deterministic.ts';
 import { NO_SPEND } from '../../src/worker/consolidate/estimate.ts';
+import {
+  CONSECUTIVE_ITEM_FAILURE_LIMIT,
+  runSynopsisPhase,
+} from '../../src/worker/consolidate/model-phases.ts';
 import { DETERMINISTIC_PHASES } from '../../src/worker/consolidate/phases.ts';
 import {
   CALLER,
@@ -60,6 +76,7 @@ import {
   createTenantFixture,
   seedFact,
   seedPage,
+  uncappedBudget,
   type TenantFixture,
 } from './fixture.ts';
 
@@ -515,6 +532,168 @@ describe('reconciliation costs round trips per pass rather than per fact', () =>
       // 240 more live facts for at most a handful more statements. At the rate
       // this phase used to run, the same 240 facts cost about 2,000.
       expect(grown.statements - warm.statements).toBeLessThanOrEqual(8);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 5. The poison page, and the phase that used to stop on it.
+// ---------------------------------------------------------------------------
+
+/**
+ * The chain that turned one unusable page into a brain that stopped growing.
+ *
+ * Four links, and only the first one is about the page:
+ *
+ *   1. the synopsis phase calls the model once per page and returned on the
+ *      first answer it could not read;
+ *   2. a model phase that stops stops the cycle, at `phase_failed`;
+ *   3. a cycle that stops short leaves its run **open**, because that null
+ *      `finished_at` is what the next cycle resumes into;
+ *   4. a model phase with a checkpoint against an open run is skipped on every
+ *      resume — so `extract`, banked by an earlier attempt of the same run,
+ *      never ran again and the fact count could not move.
+ *
+ * The brain this was measured on had 5,608 pages and 167 facts, flat for hours,
+ * with `extract` holding a checkpoint at exactly its batch bound. Nothing was
+ * broken about extraction; it had finished once and was being skipped by a run
+ * that a later phase was holding open.
+ *
+ * So the property is not "the phase tolerates bad output" — it is **the cycle
+ * still reaches `complete`**, which is the only state that closes the run and
+ * clears the checkpoints. Both halves are asserted below, because the first one
+ * without the second is a phase that survived and a brain that did not.
+ */
+describe('a page the model cannot summarise does not stop the cycle', () => {
+  test(
+    'the other pages are summarised, the run closes, and its checkpoints go with it',
+    async () => {
+      const PAGES = 6;
+      const POISON = 'Thread 3';
+      await seedBrain(PAGES);
+
+      // One page answers with prose instead of JSON — the `bad_output` code, on
+      // one item out of six. Keyed on the title inside the prompt rather than on
+      // a call counter, because `selectIngestedPages` orders by salience and a
+      // counter would be asserting against whichever page happened to sort third.
+      const { gateway, transport } = createGateway({
+        chat: {
+          ...SCRIPT,
+          synopsis: (request) =>
+            request.input.kind === 'chat' && request.input.user.includes(POISON)
+              ? 'I am afraid I cannot summarise that.'
+              : JSON.stringify({ summary: 'A thread about a hire.' }),
+        },
+      });
+
+      const result = await runConsolidationCycle(
+        { sql: tenant.sql, gateway, tenantId: TENANT, caller: CALLER },
+        { trigger: 'time_ceiling', tier: 'paid', now: new Date() },
+      );
+
+      // **The claim.** Before the fix this was `phase_failed` at
+      // `{ phase: 'synopsis', code: 'bad_output' }`, with however many pages
+      // happened to sort ahead of the poison one summarised and the rest of the
+      // cycle — contradiction, salience refinement — never reached.
+      expect(result.stopReason).toBe('complete');
+      expect(result.stoppedPhase).toBeNull();
+      expect(result.dreamt).toBe(true);
+
+      // Every page was tried; five of the six were written down. The page that
+      // could not be summarised is counted, not silently dropped: it stays
+      // unsummarised, so the next cycle selects it and tries again.
+      expect(transport.callsFor('synopsis').length).toBe(PAGES);
+      expect(await summaryPages()).toBe(PAGES - 1);
+
+      // Links 3 and 4 of the chain, which are the ones that mattered. A closed
+      // run has no checkpoints, so the next cycle runs `extract` again — which
+      // is the whole of what "the fact count can move" means here.
+      const open = await countRows(tenant.sql, 'consolidation_run', 'finished_at IS NULL');
+      expect(open).toBe(0);
+      expect(await countRows(tenant.sql, 'consolidation_checkpoint')).toBe(0);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
+    'a provider that is down stops the phase after a bounded run of failures, not one call per page',
+    async () => {
+      const PAGES = 8;
+      await seedBrain(PAGES);
+
+      // The other half of the same decision. Skipping an item is only safe while
+      // "this item" and "the provider" stay distinguishable, and the thing that
+      // distinguishes them is that a broken provider fails *every* call. Without
+      // a bound, tolerating a per-item failure would buy 200 sequential calls
+      // into a provider that is down — a phase that costs a full attempt and a
+      // full batch of spend to discover what its first three calls already knew.
+      const { gateway, transport } = createGateway({
+        chat: SCRIPT,
+        failOn: 'synopsis',
+        failWith: new Error('provider down'),
+      });
+      const run = await openRun(tenant.sql, {
+        trigger: 'time_ceiling',
+        tier: 'paid',
+        now: new Date(),
+        estimateMicroUsd: NO_SPEND,
+      });
+
+      const outcome = await runSynopsisPhase({
+        sql: tenant.sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        runId: run.run.runId,
+        now: new Date(),
+        budget: uncappedBudget('synopsis'),
+      });
+
+      expect(outcome.stopped).toBe('model_unavailable');
+      expect(outcome.applied).toBe(0);
+      expect(transport.callsFor('synopsis').length).toBe(CONSECUTIVE_ITEM_FAILURE_LIMIT);
+      expect(CONSECUTIVE_ITEM_FAILURE_LIMIT).toBeLessThan(PAGES);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
+    'a phase that summarised nothing reports the failure rather than a quiet success',
+    async () => {
+      // Fewer pages than the consecutive bound, so the bound cannot be what
+      // stops this — and the phase still has to say something failed. A phase
+      // that skipped every item and returned `stopped: null` would bank a
+      // checkpoint saying `synopsis` is paid for, and would read on the run
+      // record exactly like a brain with nothing left to summarise. That is the
+      // "a refusal is carried out, never swallowed" rule at the point where
+      // per-item tolerance would quietly repeal it.
+      const PAGES = CONSECUTIVE_ITEM_FAILURE_LIMIT - 1;
+      await seedBrain(PAGES);
+
+      const { gateway, transport } = createGateway({
+        chat: { ...SCRIPT, synopsis: () => 'I am afraid I cannot summarise that.' },
+      });
+      const run = await openRun(tenant.sql, {
+        trigger: 'time_ceiling',
+        tier: 'paid',
+        now: new Date(),
+        estimateMicroUsd: NO_SPEND,
+      });
+
+      const outcome = await runSynopsisPhase({
+        sql: tenant.sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        runId: run.run.runId,
+        now: new Date(),
+        budget: uncappedBudget('synopsis'),
+      });
+
+      expect(transport.callsFor('synopsis').length).toBe(PAGES);
+      expect(outcome.applied).toBe(0);
+      expect(outcome.stopped).toBe('bad_output');
     },
     SETUP_TIMEOUT_MS,
   );

@@ -25,6 +25,26 @@
  *     R12's requirement, and the anti-loop guard's storage: a row without them is
  *     a row the next cycle cannot tell from evidence.
  *
+ * **A per-item failure is the item's until three in a row say otherwise.** The
+ * three properties above were written for the phases that call the model once
+ * for a whole batch, where "this answer failed" and "this phase failed" are the
+ * same sentence. `synopsis` calls it once per *page*, and there the two come
+ * apart: a page the model cannot summarise is one page's problem, and returning
+ * on it — which is what this file used to do — stopped the cycle, which left the
+ * run open, which left `extract`'s checkpoint standing, which skipped extraction
+ * on every resume. One unusable page out of 5,608 pinned a brain at 167 facts.
+ *
+ * So a per-item loop skips the item and keeps going, bounded by
+ * {@link CONSECUTIVE_ITEM_FAILURE_LIMIT}: a run of failures that long is not an
+ * item any more, it is the provider or the prompt, and continuing would buy two
+ * hundred sequential calls to discover what the first three already said. The
+ * bound is on *consecutive* failures rather than total, because a total would
+ * make a brain with four scattered unusable pages permanently unable to get past
+ * the fourth. `budget_exhausted` and `out_of_time` are exempt and stop at once —
+ * neither is anything the item did. And a phase that applied nothing while
+ * failing at something reports the failure regardless of the bound, or property
+ * 1 would be repealed by the tolerance rather than bounded by it.
+ *
  * **What no phase does is mutate on the model's say-so.** ≥0.8 applies, 0.5–0.8
  * queues for a human, <0.5 is counted and dropped. The contradiction phase does
  * not even have an apply branch: R12 says handling is report-only, so the gate
@@ -116,6 +136,19 @@ export interface ModelPhaseDeps {
 
 const DEFAULT_LIMIT = 200;
 
+/**
+ * How many items in a row may fail before a per-item phase stops trying.
+ *
+ * The number that separates "this page" from "this provider". A broken provider
+ * or a broken prompt fails the very next call too, so three is enough to tell
+ * them apart; an unusable page is surrounded by usable ones, so three is more
+ * than enough not to be tripped by one. It is the ceiling on what tolerance
+ * costs — at most this many wasted calls per phase per cycle — and it is
+ * deliberately small, because the thing being bought is the ability to get past
+ * one page, not the ability to grind through an outage.
+ */
+export const CONSECUTIVE_ITEM_FAILURE_LIMIT = 3;
+
 function empty(phase: ModelPhase, stopped: PhaseStop | null = null): PhaseOutcome {
   return {
     phase,
@@ -134,13 +167,24 @@ function stopFor(result: Extract<GatewayResult, { ok: false }>): PhaseStop {
   return result.reason === 'budget_exhausted' ? 'budget_exhausted' : 'model_unavailable';
 }
 
-interface ChatOutcome {
-  readonly ok: boolean;
-  readonly text: string;
-  readonly costMicroUsd: number;
-  readonly modelId: string;
-  readonly stop: PhaseStop | null;
-}
+/**
+ * A completion, or the code that explains its absence — never both, never
+ * neither.
+ *
+ * A union rather than one record with nullable halves, because the per-item
+ * loops now *branch* on the code instead of returning it verbatim: a shape where
+ * `ok: false` could carry `stop: null` has a path where a call failed and no
+ * caller can say why, and the honest handling of that is unwritable. The union
+ * deletes the path.
+ */
+type ChatOutcome =
+  | {
+      readonly ok: true;
+      readonly text: string;
+      readonly costMicroUsd: number;
+      readonly modelId: string;
+    }
+  | { readonly ok: false; readonly stop: PhaseStop };
 
 async function chat(deps: ModelPhaseDeps, phase: ModelPhase, prompt: Prompt): Promise<ChatOutcome> {
   const result = await deps.gateway.call({
@@ -151,18 +195,13 @@ async function chat(deps: ModelPhaseDeps, phase: ModelPhase, prompt: Prompt): Pr
     input: { kind: 'chat', system: prompt.system, user: prompt.user },
   });
 
-  if (!result.ok) {
-    return { ok: false, text: '', costMicroUsd: NO_SPEND, modelId: '', stop: stopFor(result) };
-  }
-  if (result.output.kind !== 'chat') {
-    return { ok: false, text: '', costMicroUsd: NO_SPEND, modelId: '', stop: 'bad_output' };
-  }
+  if (!result.ok) return { ok: false, stop: stopFor(result) };
+  if (result.output.kind !== 'chat') return { ok: false, stop: 'bad_output' };
   return {
     ok: true,
     text: result.output.text,
     costMicroUsd: result.metering.costMicroUsd ?? 0,
     modelId: result.metering.modelId,
-    stop: null,
   };
 }
 
@@ -526,22 +565,27 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
   let applied = 0;
   let logged = 0;
   let calls = 0;
+  /** Failures since the last page that worked. Reset by every summary written. */
+  let consecutiveFailures = 0;
+  /** The code the last failure reported, for the two stops that report one. */
+  let lastFailure: PhaseStop | null = null;
+
+  const outcome = (stopped: PhaseStop | null): PhaseOutcome => ({
+    phase,
+    items: pages.length,
+    applied,
+    queued: 0,
+    logged,
+    spentMicroUsd: deps.budget.spentMicroUsd(),
+    modelCalls: calls,
+    stopped,
+  });
 
   for (const page of pages) {
     // Checked **before** the call, not after: the cheapest place to stop is the
     // one where the next unit of work has not been paid for yet.
-    if (attempt.stop() !== null) {
-      return {
-        phase,
-        items: pages.length,
-        applied,
-        queued: 0,
-        logged,
-        spentMicroUsd: deps.budget.spentMicroUsd(),
-        modelCalls: calls,
-        stopped: 'out_of_time',
-      };
-    }
+    if (attempt.stop() !== null) return outcome('out_of_time');
+
     const prompt = buildSynopsisPrompt({
       title: page.title,
       text: page.text,
@@ -550,33 +594,35 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
     });
     const answer = await chat(deps, phase, prompt);
     if (!answer.ok) {
-      return {
-        phase,
-        items: pages.length,
-        applied,
-        queued: 0,
-        logged,
-        spentMicroUsd: deps.budget.spentMicroUsd(),
-        modelCalls: calls,
-        stopped: answer.stop,
-      };
+      // The cap is not the page's fault and no other page will fare better
+      // against it, so it stops the phase at once and under its own name — the
+      // cycle turns it into `budget_exhausted` rather than `phase_failed`, and
+      // burning two more calls to rediscover it would be spending money the
+      // budget has already refused.
+      if (answer.stop === 'budget_exhausted') return outcome('budget_exhausted');
+      logged += 1;
+      consecutiveFailures += 1;
+      lastFailure = answer.stop;
+      if (consecutiveFailures >= CONSECUTIVE_ITEM_FAILURE_LIMIT) return outcome(answer.stop);
+      continue;
     }
     calls += 1;
 
     const body = parseJsonObject(answer.text);
     const summary = body === null ? null : text(body, 'summary');
     if (summary === null) {
-      return {
-        phase,
-        items: pages.length,
-        applied,
-        queued: 0,
-        logged,
-        spentMicroUsd: deps.budget.spentMicroUsd(),
-        modelCalls: calls,
-        stopped: 'bad_output',
-      };
+      // The page is skipped, not marked: nothing is written for it, so
+      // `selectIngestedPages` offers it again next cycle. A page that is
+      // unusable because of its own size or shape will fail again and be skipped
+      // again for one call a cycle — the cost of not needing to know, here,
+      // which of the two it is.
+      logged += 1;
+      consecutiveFailures += 1;
+      lastFailure = 'bad_output';
+      if (consecutiveFailures >= CONSECUTIVE_ITEM_FAILURE_LIMIT) return outcome('bad_output');
+      continue;
     }
+    consecutiveFailures = 0;
 
     const written = await writeCanonicalSummary(deps.sql, {
       sourcePageId: page.pageId,
@@ -600,16 +646,15 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
     applied += 1;
   }
 
-  return {
-    phase,
-    items: pages.length,
-    applied,
-    queued: 0,
-    logged,
-    spentMicroUsd: deps.budget.spentMicroUsd(),
-    modelCalls: calls,
-    stopped: null,
-  };
+  // **A phase that wrote nothing while failing at something has not succeeded**,
+  // however few pages it was given. Returning `null` here would bank a
+  // checkpoint saying `synopsis` is paid for and put a cycle that summarised
+  // nothing on the run record as `complete` — indistinguishable from a brain
+  // with nothing left to summarise, which is the exact reading the "a refusal is
+  // carried out, never swallowed" rule exists to refuse. The consecutive bound
+  // catches this on a large brain; on a small one there are not three pages to
+  // fail, and this is what catches it.
+  return outcome(applied === 0 && lastFailure !== null ? lastFailure : null);
 }
 
 // ---------------------------------------------------------------------------

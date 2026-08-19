@@ -797,6 +797,18 @@ flat is the visible part; `stopped_phase` names the phase actually holding the
 run open. Fix that phase and the run completes, which clears the checkpoints and
 lets the next cycle run every phase again.
 
+**One item can no longer do that on its own.** `synopsis` calls the model once
+per page, and it used to return on the first page it could not summarise — so a
+single unusable page out of thousands held the whole chain above open. It now
+skips that page (nothing is written, so the next cycle offers it again) and keeps
+going. It stops and names a code only when **three items in a row** fail, or when
+it summarised nothing at all — a run of failures that long is the provider or the
+prompt rather than an item, and a phase that wrote nothing while failing at
+something has not succeeded. So `stopped_phase_code` on `synopsis` now means
+"this is systemic", not "one page was odd", and the ceiling on what the tolerance
+costs is three wasted calls per cycle. `transcribe` — the cycle's other per-item
+loop — still stops on its first bad item.
+
 **`out_of_time` is a clean stop, not a failure.** The cycle reads the deadline
 its own lease stamps, finishes the unit of work in flight, writes its run record
 and returns — where before it was *reaped*, which charged an attempt against a
