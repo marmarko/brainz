@@ -1075,15 +1075,10 @@ const ENTITY_NOUNS: Readonly<Record<EntityKind, readonly [string, string]>> = {
  * plan to somebody who had just bought it — on the page they had opened to find
  * out whether buying it had worked, which is the one place that lands worst.
  */
-function cycleSentence(
+function stopDetail(
   cycle: NonNullable<CoverageView['latestCycle']>,
   currentTier: string,
 ): string {
-  if (cycle.finishedAt === null) {
-    return `A cycle is running now. It started ${moment(new Date(cycle.startedAt))}.`;
-  }
-  const when = `Your last cycle finished ${moment(new Date(cycle.finishedAt))}.`;
-  if (cycle.dreamt) return `${when} It ran the whole pipeline.`;
   switch (cycle.stopReason) {
     case 'free_tier':
       // Past tense for the upgraded reader, and no word about the next cycle:
@@ -1091,26 +1086,82 @@ function cycleSentence(
       // no way to see the health of, which is the failure it exists to stop.
       // What it can state is the plan they are on.
       return currentTier === 'paid'
-        ? `${when} It ran the deterministic half only, because this account was on the free
+        ? `It ran the deterministic half only, because this account was on the free
 plan when that cycle ran. The half that turns documents into facts, people and companies is
 on your plan now.`
-        : `${when} It ran the deterministic half only: on the free plan, the half that turns
+        : `It ran the deterministic half only: on the free plan, the half that turns
 documents into facts, people and companies is on the paid plan. That is the plan working rather than
 something going wrong.`;
     case 'budget_exhausted':
-      return `${when} It stopped early because the spend budget for one cycle ran out. The next cycle
-picks up where this one left off.`;
+      return `It stopped early because the spend budget for one cycle ran out.`;
     case 'phase_failed':
-      return `${when} It stopped in the <code>${escapeHtml(cycle.stoppedPhase ?? 'unnamed')}</code>
+      return `It stopped in the <code>${escapeHtml(cycle.stoppedPhase ?? 'unnamed')}</code>
 phase, reporting <code>${escapeHtml(cycle.stoppedPhaseCode ?? 'no code')}</code>. Everything the
 phases before it produced is in the numbers below; nothing after it ran.`;
+    case 'out_of_time':
+      return `It ran out of the time one attempt is given, part way through. Nothing failed
+and no spend cap fired; there was more to do than fitted.`;
     case 'cancelled':
-      return `${when} It was cancelled before it got to the end.`;
+      return `It was cancelled before it got to the end.`;
     case 'complete':
-      return `${when} It completed without needing the model half.`;
+      return `It completed without needing the model half.`;
     default:
-      return when;
+      // An unrecognised code renders as itself rather than as a guess. A run
+      // written by a fleet newer than this page has a reason this file has no
+      // name for, and printing the code is strictly better than the silence
+      // that used to stand here — it is the string a user can quote.
+      return `It stopped, reporting <code>${escapeHtml(String(cycle.stopReason))}</code>.`;
   }
+}
+
+/**
+ * The consolidation line, from the run record and nothing else.
+ *
+ * **The (`finished_at`, `stop_reason`) PAIR is read, never `finished_at` alone,
+ * and that is the failure this closes.** The sentence used to open with `if
+ * (finishedAt === null) return 'A cycle is running now'`, on the assumption that
+ * an open run is a busy one. It never was: a cycle that stopped short banks its
+ * reason and leaves the run open, so `phase_failed at extract` — the frozen
+ * brain that sat at 5,608 pages and 167 facts, the incident rung 20 exists for —
+ * reported itself to its owner as *busy* for as long as it stayed broken. The
+ * page written to make a freeze visible said the opposite in exactly that case,
+ * and the whole `stop_reason` switch below it was unreachable in production.
+ *
+ * **A surface may state what it observes and must not assert what it cannot
+ * verify**, so the three shapes this row can take are three sentences:
+ *
+ *   * **open with a reason banked** — it stopped, and it says what stopped it.
+ *     Unambiguous, and the state that was being mis-reported;
+ *   * **open with nothing banked** — a cycle in flight and a cycle killed before
+ *     it could write are the SAME row here. Nothing distinguishes them, so the
+ *     page names both and picks neither rather than choosing the flattering one;
+ *   * **closed** — it finished, and the reason says how.
+ *
+ * Reading the pair is also what makes this correct across rung 22, which closes
+ * a run on every exit: the shapes move between branches as the writer changes,
+ * and rows written on both sides of that change still render as themselves. No
+ * branch here claims what a *next* cycle will do — that is a fact about a worker
+ * this page cannot see, and it is the class of promise the surface exists to
+ * stop making.
+ */
+function cycleSentence(
+  cycle: NonNullable<CoverageView['latestCycle']>,
+  currentTier: string,
+): string {
+  const opened = moment(new Date(cycle.startedAt));
+
+  if (cycle.finishedAt === null) {
+    if (cycle.stopReason === null) {
+      return `A cycle opened ${opened} and nothing has been recorded against it. A cycle that
+is still running and one that was killed before it could write look the same from here, so this page
+does not guess between them — either way the numbers below are from before it opened.`;
+    }
+    return `A cycle opened ${opened} and has not closed. ${stopDetail(cycle, currentTier)}`;
+  }
+
+  const when = `Your last cycle finished ${moment(new Date(cycle.finishedAt))}.`;
+  if (cycle.dreamt) return `${when} It ran the whole pipeline.`;
+  return `${when} ${stopDetail(cycle, currentTier)}`;
 }
 
 /**

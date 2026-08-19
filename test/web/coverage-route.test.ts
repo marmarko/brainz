@@ -387,9 +387,34 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
     expect(page.indexOf('has not consolidated yet')).toBeLessThan(page.indexOf('167'));
   });
 
-  test('a cycle in flight is named as in flight', async () => {
+  // -------------------------------------------------------------------------
+  // The four states of the consolidation line, one test each, and each asserts
+  // it renders as ITSELF and not as one of the other three.
+  //
+  // **The bug these were written against.** `cycleSentence` branched on
+  // `finished_at` alone and returned "A cycle is running now" for every open
+  // run. `finished_at IS NULL` was never a synonym for running: the writer
+  // banks a stop reason on a run it leaves open, so a brain frozen in `extract`
+  // — 5,608 pages at 167 facts, the incident rung 20 exists for — reported
+  // itself as busy for as long as it stayed broken. The page whose job is to
+  // make a freeze visible said the opposite in exactly that case, and the old
+  // test passed because its fixture invented a row shape (`phase_failed` with
+  // `finished_at` set) that the writer of the day never produced.
+  //
+  // **Both row shapes are pinned, on purpose.** A run that stopped short is
+  // written open by the writer this was found against, and closed by the one
+  // rung 22 is landing. The sentence must be right on rows from both sides of
+  // that change, which is why the code reads the (finished_at, stop_reason)
+  // PAIR and why the same stop appears twice below.
+  // -------------------------------------------------------------------------
+
+  test('a cycle with nothing recorded against it is not called running', async () => {
+    // The one row shape that genuinely cannot be resolved: an open run with no
+    // reason banked is a cycle in flight OR one killed before it could write,
+    // and nothing on this row separates them. The old copy picked the flattering
+    // one and stated it as fact.
     const cookie = await signedIn();
-    const running: CoverageView = {
+    const open: CoverageView = {
       ...VIEW,
       latestCycle: {
         tier: 'paid',
@@ -401,14 +426,52 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
         finishedAt: null,
       },
     };
-    const page = await (await app({ view: running })(get(COVERAGE, cookie))).text();
-    expect(page).toContain('running now');
+    const page = await (await app({ view: open })(get(COVERAGE, cookie))).text();
     expect(page).toContain('2026-08-16T08:55:00.000Z');
+    expect(page).toContain('nothing has been recorded against it');
+    // Says which two states it cannot tell apart rather than choosing one.
+    expect(page).toContain('look the same from here');
+    expect(page).not.toContain('running now');
+    // And it is not any of the other three states.
+    expect(page).not.toContain('has not closed');
+    expect(page).not.toContain('has not consolidated yet');
   });
 
-  test('a cycle that stopped in a phase names the phase and the code', async () => {
-    // `phase_failed at extract with model_unavailable` is a different sentence
-    // from `free_tier`, and the schema already refuses to let them blur.
+  test('a cycle frozen in a phase says it stopped, not that it is running', async () => {
+    // THE case. An open run carrying `phase_failed at extract` is the frozen
+    // brain, and it rendered as "A cycle is running now."
+    const cookie = await signedIn();
+    const frozen: CoverageView = {
+      ...VIEW,
+      latestCycle: {
+        tier: 'paid',
+        dreamt: false,
+        stopReason: 'phase_failed',
+        stoppedPhase: 'extract',
+        stoppedPhaseCode: 'model_unavailable',
+        startedAt: '2026-08-15T02:00:00.000Z',
+        finishedAt: null,
+      },
+      lastCompletedAt: '2026-08-10T00:05:00.000Z',
+      documentsSinceLastCycle: 1800,
+    };
+    const page = await (await app({ view: frozen })(get(COVERAGE, cookie))).text();
+    expect(page).toContain('has not closed');
+    expect(page).toContain('extract');
+    expect(page).toContain('model_unavailable');
+    // The number that turns "it stopped" into "and this much has piled up".
+    expect(page).toContain('1800');
+    // Not the state it used to be reported as, and not the other two.
+    expect(page).not.toContain('running now');
+    expect(page).not.toContain('nothing has been recorded against it');
+    expect(page).not.toContain('has not consolidated yet');
+  });
+
+  test('a cycle that stopped in a phase and closed still names the phase and the code', async () => {
+    // The same stop, written the way rung 22's writer writes it: closed, with
+    // the reason on the row. `phase_failed at extract with model_unavailable` is
+    // a different sentence from `free_tier`, and the schema refuses to let the
+    // two vocabularies blur.
     const cookie = await signedIn();
     const stopped: CoverageView = {
       ...VIEW,
@@ -425,10 +488,50 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
       documentsSinceLastCycle: 1800,
     };
     const page = await (await app({ view: stopped })(get(COVERAGE, cookie))).text();
+    expect(page).toContain('Your last cycle finished');
     expect(page).toContain('extract');
     expect(page).toContain('model_unavailable');
-    // The number that turns "it stopped" into "and this much has piled up".
     expect(page).toContain('1800');
+    expect(page).not.toContain('running now');
+    expect(page).not.toContain('has not closed');
+  });
+
+  test('a backlog behind a completed cycle reads as a backlog, not as a stopped cycle', async () => {
+    // "Consolidation is behind" is its own state: the cycle finished cleanly and
+    // documents have piled up since. It must not borrow the vocabulary of a
+    // cycle that stopped, or the two become one undifferentiated alarm.
+    const cookie = await signedIn();
+    const behind: CoverageView = {
+      ...VIEW,
+      latestCycle: {
+        tier: 'paid',
+        dreamt: true,
+        stopReason: 'complete',
+        stoppedPhase: null,
+        stoppedPhaseCode: null,
+        startedAt: '2026-08-15T02:00:00.000Z',
+        finishedAt: '2026-08-15T02:40:00.000Z',
+      },
+      lastCompletedAt: '2026-08-15T02:40:00.000Z',
+      documentsSinceLastCycle: 900,
+    };
+    const page = await (await app({ view: behind })(get(COVERAGE, cookie))).text();
+    expect(page).toContain('ran the whole pipeline');
+    expect(page).toContain('900');
+    expect(page).toContain('not in the numbers below');
+    expect(page).not.toContain('running now');
+    expect(page).not.toContain('has not closed');
+    expect(page).not.toContain('has not consolidated yet');
+  });
+
+  test('a brain with no cycle at all says so, and says nothing about a cycle', async () => {
+    // The fourth state, and the one with no run record to read at all.
+    const cookie = await signedIn();
+    const page = await (await app()(get(COVERAGE, cookie))).text();
+    expect(page).toContain('has not consolidated yet');
+    expect(page).not.toContain('running now');
+    expect(page).not.toContain('has not closed');
+    expect(page).not.toContain('nothing has been recorded against it');
   });
 
   test('the free tier is told its cold layer is the plan rather than a fault', async () => {

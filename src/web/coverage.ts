@@ -259,9 +259,17 @@ export interface CoverageSource {
 /**
  * The last consolidation cycle, as the run record states it.
  *
- * `finishedAt === null` means a cycle is running right now, which is a different
- * sentence from any finished state and is half of "honest when the brain is
- * thin": a small fact count during an active cycle is a snapshot, not a verdict.
+ * **`finishedAt === null` does not mean "running now", and reading it that way
+ * is what made this page lie about the one state it was built to expose.** A
+ * cycle that stops short banks its reason and leaves the run open, so an open
+ * run is any of: a cycle in flight, a cycle that stopped and said why, or a
+ * cycle killed before it could write anything. `stopReason` is what separates
+ * the second from the other two, and nothing here separates the first from the
+ * third — so `pages.ts` reads the pair and says so rather than choosing.
+ *
+ * The half of "honest when the brain is thin" this carries is unchanged: a small
+ * fact count under an unfinished cycle is a snapshot rather than a verdict, and
+ * that is true whichever of the three the open run turns out to be.
  */
 export interface CoverageCycle {
   readonly tier: 'free' | 'paid';
@@ -364,9 +372,11 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
     }));
 
   // The most recent run, open or finished. `run_id DESC` rather than
-  // `finished_at DESC` on purpose: an open run has no `finished_at` and is
-  // exactly the row a user needs to see, because "a cycle is running" is the one
-  // state in which a small number below is a snapshot rather than a verdict.
+  // `finished_at DESC` on purpose: an open run has no `finished_at` to order by
+  // and is exactly the row a user needs to see, because an unfinished cycle is
+  // the state in which a small number below is a snapshot rather than a verdict.
+  // Both columns of the stop are selected because the sentence branches on the
+  // PAIR — an open run is not the same claim as a running one. See `CoverageCycle`.
   const cycleRows = (await sql.unsafe(
     `SELECT tier, dreamt, stop_reason, stopped_phase, stopped_phase_code, started_at, finished_at
        FROM consolidation_run
