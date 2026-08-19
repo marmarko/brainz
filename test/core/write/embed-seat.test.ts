@@ -235,3 +235,62 @@ describe('a batch is bounded by what it weighs, not only by how many it holds', 
     expect(sent.some((text) => text.length > CHUNK_EMBED_MAX_CHARS)).toBe(true);
   });
 });
+
+/**
+ * **No character budget can be right, so the batch has to get smaller.**
+ *
+ * The provider's limit is in tokens and characters-per-token varies by more than
+ * a factor of two across one brain's own content: 69,676 encoded characters were
+ * accepted in one sample and 30,566 refused in another. A budget tuned on the
+ * first wedges on the second — which is what happened in production, where the
+ * first fix drained 9,285 chunks and then stopped dead on the remaining 358.
+ *
+ * The refusal is a bare 400 the transport reads no body from, so the pass cannot
+ * ask why. It can only try smaller, and that same walk absorbs a transient 429
+ * instead of turning it into a stalled backlog.
+ */
+describe('a refused batch is halved until it is accepted', () => {
+  test('a backlog whose natural batch is refused still drains completely', async () => {
+    for (let i = 0; i < 20; i += 1) await seedChunk(`a passage the provider will weigh ${i}`);
+    const before = await backlogSize(fixture.sql, ACTIVE_EMBEDDING_SEAT.column);
+    expect(before).toBeGreaterThanOrEqual(20);
+
+    // Small enough that the natural batch is refused and only a halved one lands.
+    const { gateway, transport } = createGateway({ refuseBatchesLargerThan: 4 });
+    const result = await runChunkEmbedBacklog({
+      sql: fixture.sql,
+      gateway,
+      tenantId: TENANT,
+      caller: CALLER,
+      budget: uncappedBudget(),
+    });
+
+    // The assertion that fails without the halving: the pass returns a failure
+    // and the backlog is untouched, every time, forever.
+    expect(result.failure).toBeUndefined();
+    expect(result.embedded).toBeGreaterThanOrEqual(before);
+    expect(await backlogSize(fixture.sql, ACTIVE_EMBEDDING_SEAT.column)).toBe(0);
+    // The refused attempts are legitimately large — that is the walk working, not
+    // a leak. What proves the halving is that it reached a size the provider
+    // accepts, and that it took more than one call to get there.
+    const sizes = transport.calls
+      .filter((call) => call.input.kind === 'embedding')
+      .map((call) => (call.input.kind === 'embedding' ? call.input.texts.length : 0));
+    expect(sizes.length).toBeGreaterThan(1);
+    expect(Math.min(...sizes)).toBeLessThanOrEqual(4);
+  });
+
+  test('a single text the provider always refuses is reported, not retried forever', async () => {
+    await seedChunk('the one the provider will never take');
+    const { gateway } = createGateway({ refuseBatchesLargerThan: 0 });
+    const result = await runChunkEmbedBacklog({
+      sql: fixture.sql,
+      gateway,
+      tenantId: TENANT,
+      caller: CALLER,
+      budget: uncappedBudget(),
+    });
+    // Halving stops at one. A real failure stays a real failure.
+    expect(result.failure).toBeDefined();
+  });
+});

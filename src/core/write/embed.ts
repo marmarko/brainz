@@ -83,11 +83,21 @@ export const CHUNK_EMBED_BATCH = 32;
  * not. The result was a wedge that could not clear itself: every run rebuilt the
  * identical oversized request and every run was refused.
  *
- * Measured against the live model rather than guessed: 69,676 encoded characters
- * were accepted and 73,808 were refused, so the cliff sits near 70k. The budget
- * below is well under it because the true limit is in tokens, and the character
- * count of a token varies with the text — a margin that looks generous on
- * English prose is not generous on anything else.
+ * **The budget is a first guess, not the guarantee.** The provider's limit is in
+ * TOKENS, and characters-per-token varies with the text by more than a factor of
+ * two: one sample of this brain's chunks was accepted at 69,676 encoded
+ * characters, while a later batch from the same brain was refused at 30,566. A
+ * character budget tuned on the first would wedge on the second, which is
+ * exactly what happened — the first fix drained 9,285 chunks and then stopped
+ * dead on the remainder.
+ *
+ * So this stays a coarse guard rather than the guarantee, and the halving below
+ * is what actually closes the failure. Tightening it to the densest content seen
+ * was tried and is worse: it roughly doubles the number of gateway calls for
+ * ordinary text, and each call reserves against the run's budget, so an import
+ * that used to finish began stopping on `budget_exhausted` instead. Paying one
+ * refused call on dense batches is cheaper than paying extra calls on every
+ * batch — and unlike a constant, the walk is right for text nobody has seen.
  */
 export const CHUNK_EMBED_MAX_CHARS = 48_000;
 
@@ -358,15 +368,35 @@ export async function runChunkEmbedBacklog(options: {
       chars = next;
       cut += 1;
     }
-    const pending = candidates.slice(0, cut);
-
-    const outcome = await embedTexts({
+    // **Halve and retry, because no character budget can be right.** The refusal
+    // is `input too big` on a token limit, and it arrives as a plain 400 that the
+    // transport does not read a body from — so the batch cannot ask why, only
+    // try smaller. Transients answer the same way: the same walk turns a 429
+    // `Capacity temporarily exceeded` into a completed pass instead of a wedge.
+    //
+    // Down to one item and no further. A single chunk the provider will not take
+    // is a real failure and is reported as one; what must not happen is the whole
+    // backlog stopping behind it every pass forever, which is the shape this
+    // whole area keeps producing.
+    let attempt = cut;
+    let outcome = await embedTexts({
       gateway: options.gateway,
       tenantId: options.tenantId,
       caller: options.caller,
       budget: options.budget,
-      texts: encoded.slice(0, cut),
+      texts: encoded.slice(0, attempt),
     });
+    while (!outcome.ok && attempt > 1) {
+      attempt = Math.floor(attempt / 2);
+      outcome = await embedTexts({
+        gateway: options.gateway,
+        tenantId: options.tenantId,
+        caller: options.caller,
+        budget: options.budget,
+        texts: encoded.slice(0, attempt),
+      });
+    }
+    const pending = candidates.slice(0, attempt);
 
     if (!outcome.ok) {
       return {

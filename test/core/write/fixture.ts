@@ -88,6 +88,16 @@ export interface EmbeddingTransportOptions {
    * because it counts calls rather than naming a stage.
    */
   readonly failRerank?: boolean;
+  /**
+   * Refuse any embedding batch holding more than this many texts.
+   *
+   * Models the provider's real refusal, which `failFromCall` cannot: the limit
+   * is on the SIZE of one request, so the same call succeeds or fails depending
+   * on how much went into it. A count stands in for the token budget because the
+   * property under test is "the batch gets smaller until it is accepted", not
+   * where the provider's own line sits.
+   */
+  readonly refuseBatchesLargerThan?: number;
 }
 
 export interface RecordingTransport extends ModelTransport {
@@ -151,6 +161,15 @@ export function createEmbeddingTransport(
 
       if (options.failFromCall !== undefined && calls.length >= options.failFromCall) {
         return Promise.reject(options.failWith ?? new TransportError('provider refused', 503));
+      }
+
+      if (
+        options.refuseBatchesLargerThan !== undefined &&
+        request.input.kind === 'embedding' &&
+        request.input.texts.length > options.refuseBatchesLargerThan
+      ) {
+        // The provider's own shape: HTTP 400, no readable reason.
+        return Promise.reject(new TransportError('input too big', 400));
       }
 
       if (request.input.kind === 'rerank') {
