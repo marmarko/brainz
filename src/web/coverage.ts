@@ -66,6 +66,26 @@
  * per origin. A count of one is a name — "1 person, from work:mail, first arrival
  * 14:32" is a fingerprint — and a cross-tab is where cells go to one.
  *
+ * **And the honest limit of that refusal, because an earlier draft of this
+ * paragraph forbade what the page does.** Not building the cross-tab keeps the
+ * cells from going to one on a brain with several sources. It does not, and
+ * cannot, keep them from going to one on a brain with **one** source: there,
+ * every whole-brain number this page prints — the histogram, the facts, the
+ * entities, the edges — *is* that source's number, standing a few lines under
+ * that source's label and its last-arrival instant. A reader recombines them by
+ * reading down the page. No narrowing removes that, because the only narrowing
+ * that would is rendering no derived numbers at all, which is the page.
+ *
+ * So the line this module actually holds is the one stated above — counts,
+ * codes and instants, never a name — and not a stronger claim about what those
+ * counts can be recombined into. What a single-source screenshot discloses is a
+ * count per type attached to an origin label the reader already has on the
+ * connectors panel: a shape, and the identity of nobody. That is a disclosure
+ * worth naming here rather than one worth denying, because the alternative — a
+ * page that withholds its derived numbers from exactly the users most likely to
+ * have one source, who are the new ones this page was built for — trades the
+ * whole purpose for an exposure the product does not have.
+ *
  * ===========================================================================
  * WHY EACH NUMBER IS AFFORDABLE, WHICH IS NOT THE SAME AS "SMALL"
  * ===========================================================================
