@@ -1,45 +1,35 @@
 /**
  * The cycle: estimate, then cheap, then expensive, checkpointing as it goes.
  *
- * **Where it stops is the interesting part.** Six exits, and they are not
+ * **Where it stops is the interesting part.** Four exits, and they are not
  * interchangeable — an operator reading a run record has to be able to tell them
- * apart — but **every one of them closes the run**, and that uniformity is not
- * tidiness. It is the fix for the incident this file's shape is owed to:
+ * apart, and the next cycle behaves differently for each:
  *
- *   `complete`          — everything ran. `dreamt: true`.
- *   `free_tier`         — R8's line. The deterministic phases ran and no model
- *                         was called.
- *   `budget_exhausted`  — the cap fired. U11's "consolidated but not dreamt".
+ *   `complete`          — everything ran. `dreamt: true`. The run closes and its
+ *                         checkpoints go with it.
+ *   `free_tier`         — R8's line. The deterministic phases ran, no model was
+ *                         called, and the run **closes**: nothing was left
+ *                         undone that a later cycle should skip.
+ *   `budget_exhausted`  — the cap fired. The run stays **open**, so the next
+ *                         cycle resumes into it and does not re-pay for the model
+ *                         phases that finished. This is U11's "consolidated but
+ *                         not dreamt".
  *   `phase_failed`      — a provider was unavailable, or answered with something
- *                         this code cannot read. A different name from the cap
- *                         because "we ran out of money" and "the provider was
- *                         down" want different responses.
+ *                         this code cannot read. Also stays open, for the same
+ *                         reason and with a different name, because "we ran out
+ *                         of money" and "the provider was down" want different
+ *                         responses.
+ *
  *   `out_of_time`       — the attempt's wall clock ran out with work left. The
- *                         job completes normally rather than being reaped, which
- *                         is the whole of what this reason buys.
+ *                         run stays **open** for the same reason and with the
+ *                         same effect as the two above: the next cycle resumes
+ *                         into it and does not re-pay for the model phases that
+ *                         finished. The job completes normally rather than being
+ *                         reaped, which is the whole of what this reason buys.
  *   `cancelled`         — the lease was lost or the worker is shutting down.
- *                         Named apart from the clock because "we were
+ *                         Same treatment, different name, because "we were
  *                         interrupted" and "this brain is long" want different
  *                         responses from whoever reads the run record.
- *
- * **Three of those used to leave the run open, and that is what froze a brain.**
- * The cap, the failed phase and the clock each left `finished_at` null so the
- * next cycle would resume into the same run and skip the model phases already
- * paid for. Then one page out of 5,608 drew a provider 500. The synopsis phase
- * stopped on it — correctly; a 500 is systemic and every other page would meet
- * it identically — the cycle stopped, the run stayed open, and `extract`'s
- * checkpoint stood in front of every later cycle. Every later cycle stopped the
- * same way, so the run never closed: 167 facts, flat for hours, with `extract`
- * called once in the whole of it.
- *
- * A cycle that reaches the bottom of this function has finished what was in
- * flight and can name what stopped it. Its pass is over, so it closes. The only
- * run left open is one whose cycle never got here at all — a process that died
- * mid-statement — and that absence, not a decision, is what `openRun` resumes
- * into, once. What closing costs is in the note on `finishRun`: nothing for the
- * two model phases whose selection already excludes finished work, and for the
- * other four exactly what a *successful* cycle costs, because their checkpoints
- * were being deleted on every `complete` already.
  *
  * **Three of those exits name the phase they happened in, on the row.**
  * `phase_failed`, `budget_exhausted` and `out_of_time` are all things a
@@ -90,6 +80,7 @@ import {
   completePhase,
   finishRun,
   openRun,
+  recordProgress,
   type ConsolidationTier,
   type StopReason,
 } from './checkpoint.ts';
@@ -523,19 +514,14 @@ export async function runConsolidationCycle(
     now: options.now,
   };
 
-  // **One exit, for every reason.** A cycle that got here has finished what was
-  // in flight, knows what stopped it and can say so — its pass is over, so its
-  // run closes and its checkpoints go with it.
-  //
-  // Three of the six reasons used to leave the run open instead, and that is the
-  // mechanism the whole rung is about: a run left open is adopted by the next
-  // cycle, and a model phase holding a checkpoint against an adopted run is
-  // skipped. One page drawing a provider 500 therefore stopped extraction for
-  // 5,608 others, on every cycle, forever. The resume signal is now an absence
-  // rather than a decision — a cycle killed with the process leaves `finished_at`
-  // null because nothing ran to set it — and that is the only state `openRun`
-  // adopts, at most once. See the note there.
-  await finishRun(deps.sql, run, record);
+  // A run that stopped short stays open, because that null `finished_at` is the
+  // resume signal. Closing it here would be the cycle forgiving itself and the
+  // next one paying for the phases this one already completed.
+  if (stopReason === 'complete' || stopReason === 'free_tier') {
+    await finishRun(deps.sql, run, record);
+  } else {
+    await recordProgress(deps.sql, run, record);
+  }
 
   return {
     runId: run.runId,
@@ -724,9 +710,8 @@ function attemptBudgetMsFor(context: JobContext): number | null {
  * an attempt that returns settles the tenant, writes its run record and leaves
  * the lane healthy, where a reaped one charges an attempt against a ladder that
  * dead-lettered a lane after five. The tenant then waits for its next scheduled
- * cycle like any other, and that cycle is a new pass: nothing is held open for
- * it, and the phases whose work a stop could have wasted — the two that call the
- * model once per item — re-select only what is still undone.
+ * cycle like any other, and that cycle resumes into the open run without
+ * re-paying for the model phases this one finished.
  *
  * There was briefly a re-enqueue here — a successful attempt asking the fleet to
  * run it again at once. It is gone with the machinery that made it necessary:

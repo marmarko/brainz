@@ -26,12 +26,10 @@
  *   2. **A model phase cut short does not re-pay for what it already did.** Its
  *      progress is durable in the content: the synopsis phase no longer
  *      re-selects a page it has summarised.
- *   3. **A completed model phase is skipped when the next cycle resumes into a
- *      run nobody ever closed.** That is KTD11's checkpoint, and since rung 22
- *      there is exactly one way to be in that state: a cycle that was killed and
- *      never wrote anything. A cycle that RETURNS closes its run whatever
- *      stopped it — see `run-closure.test.ts` for why that had to become true —
- *      so the checkpoint's subject is now the word KTD11 actually used.
+ *   3. **A completed model phase is skipped when the next cycle resumes into an
+ *      open run**, including a run left open by the clock. That is KTD11's
+ *      checkpoint, and `out_of_time` is a stop reason it has to work for like
+ *      any other.
  *   4. **`link_reconcile` costs round trips per pass, not per fact.** It is the
  *      one phase that refuses to stop on the clock — a half-built desired edge
  *      set makes the diff *delete* — so overrunning it is a reap rather than a
@@ -53,10 +51,10 @@
  *      everything behind it.
  *   6. **A per-item failure is the item's outcome, and never the phase's.** The
  *      phase completes when it did everything it could do, *including* when
- *      everything it could do was skip — because a cycle that stops at synopsis
- *      never reaches the phases behind it, and an earlier fix that still stopped
- *      on `applied === 0` put that back the moment the unreadable pages were all
- *      that was left. Section 6 pins the three
+ *      everything it could do was skip — because "the phase stopped" is what
+ *      holds the run open in front of every other phase, and an earlier fix that
+ *      still stopped on `applied === 0` put the freeze back the moment the
+ *      unreadable pages were all that was left. Section 6 pins the three
  *      properties that make that safe: the frozen run is closed by the next
  *      cycle and the stranded checkpoint goes with it; a page the model can
  *      never read is **never removed** — still live, still returned by search,
@@ -80,7 +78,7 @@ import { reconstructLivePages } from '../../src/core/export/reconstruct.ts';
 import {
   completePhase,
   openRun,
-  readLatestRun,
+  recordProgress,
 } from '../../src/worker/consolidate/checkpoint.ts';
 import { runConsolidationCycle, runDeterministicPhase } from '../../src/worker/consolidate/cycle.ts';
 import { createAttemptBudget } from '../../src/worker/consolidate/deadline.ts';
@@ -344,8 +342,9 @@ describe('a phase cut short does not re-pay for the pages it already summarised'
 
       // The provider goes away after two pages, which is the one thing that
       // still stops this phase part-way. An unreadable *answer* would not: that
-      // is one page's outcome, the phase skips it and completes. Section 6 is
-      // where that difference is the subject rather than the scaffolding.
+      // is one page's outcome, the phase skips it and completes, and this test
+      // needs a run left open to resume into. Section 6 is where that difference
+      // is the subject rather than the scaffolding.
       let synopsisCalls = 0;
       const cut = createGateway({
         chat: {
@@ -375,14 +374,7 @@ describe('a phase cut short does not re-pay for the pages it already summarised'
         { sql: tenant.sql, gateway: healthy.gateway, tenantId: TENANT, caller: CALLER },
         { trigger: 'time_ceiling', tier: 'paid', now },
       );
-
-      // **A new run, and the claim below does not care.** The first cycle
-      // returned, so it closed its run and took its checkpoints with it — this
-      // is a fresh pass over the corpus, not a resumption. That the phase still
-      // does not re-pay is the point: its progress is durable in the CONTENT,
-      // which is what makes it safe for a run to end wherever a cycle does.
-      expect(second.resumed).toBe(false);
-      expect(second.runId).not.toBe(first.runId);
+      expect(second.resumed).toBe(true);
 
       // The whole claim. Before the fix both numbers were wrong in the same
       // direction: the phase re-selected all six pages, so it made six calls and
@@ -396,26 +388,19 @@ describe('a phase cut short does not re-pay for the pages it already summarised'
   );
 });
 
-describe('a run no cycle ever closed is resumed without re-paying for it', () => {
+describe('a run left open by the clock is resumed without re-paying for it', () => {
   test(
-    'a model phase banked against it is skipped, not called again',
+    'a model phase banked before an out_of_time stop is skipped, not called again',
     async () => {
       await seedBrain(4);
       const now = new Date();
 
-      // **The state, and since rung 22 there are exactly two ways into it.** A
-      // process that died mid-cycle, which writes nothing at all; and — for the
-      // length of one rolling deploy — the previous fleet version, which wrote
-      // the reason and the spend and deliberately left `finished_at` null so the
-      // next cycle would resume. The second is built here because it is the
-      // harder one: the row names a phase, and a cycle that adopts it has to
-      // clear that attribution rather than leave a later success sitting under
-      // an earlier failure.
-      //
-      // Built directly rather than provoked, because provoking it means tuning a
-      // tick budget to land between two model phases — which tests the tuning
-      // rather than the resume, and re-tunes itself every time a phase changes
-      // how often it reads the clock.
+      // The state an attempt that stopped on its own clock leaves behind: a run
+      // with no `finished_at`, one model phase banked, and `out_of_time` on the
+      // record. Built directly rather than provoked, because provoking it means
+      // tuning a tick budget to land between two model phases — which tests the
+      // tuning rather than the resume, and re-tunes itself every time a phase
+      // changes how often it reads the clock.
       const opened = await openRun(tenant.sql, {
         trigger: 'time_ceiling',
         tier: 'paid',
@@ -427,17 +412,20 @@ describe('a run no cycle ever closed is resumed without re-paying for it', () =>
         spentMicroUsd: 9_000,
         now,
       });
-      // Written as the retired `recordProgress` wrote it — every column of the
-      // run record except `finished_at`. Raw SQL rather than a helper, because
-      // the code that produced this shape is gone and a helper kept alive to
-      // reproduce it in a test would be an exit somebody could take again.
-      await tenant.sql`
-        UPDATE consolidation_run
-           SET dreamt = false, stop_reason = 'out_of_time', spent_micro_usd = 9000,
-               model_calls = 4, phases_run = 7, wall_clock_ms = 840000,
-               stopped_phase = 'synopsis', stopped_phase_code = 'out_of_time'
-         WHERE run_id = ${opened.run.runId}::bigint
-      `;
+      await recordProgress(tenant.sql, opened.run, {
+        dreamt: false,
+        stopReason: 'out_of_time',
+        spentMicroUsd: 9_000,
+        modelCalls: 4,
+        phasesRun: 7,
+        wallClockMs: 840_000,
+        // The phase the clock caught, as rung 20 records it. Carried here so the
+        // resumed cycle below is resuming a row that names something — which is
+        // the state a real interrupted attempt leaves, and the state whose
+        // attribution the completing cycle has to clear.
+        stoppedPhase: { phase: 'synopsis', code: 'out_of_time' },
+        now,
+      });
 
       const { gateway, transport } = createGateway({ chat: SCRIPT });
       const next = await runConsolidationCycle(
@@ -445,9 +433,10 @@ describe('a run no cycle ever closed is resumed without re-paying for it', () =>
         { trigger: 'time_ceiling', tier: 'paid', now },
       );
 
-      // **The claim, and it is KTD11's sentence.** The same run, the paid phase
-      // skipped by name, and not one call to the provider for work somebody has
-      // already been billed for.
+      // **The claim.** `out_of_time` is a stop reason the checkpoint has to work
+      // for exactly as `budget_exhausted` and `phase_failed` always did: the same
+      // run, the paid phase skipped by name, and not one call to the provider for
+      // work somebody has already been billed for.
       expect(next.runId).toBe(opened.run.runId);
       expect(next.resumed).toBe(true);
       const extract = next.phases.find((record) => record.phase === 'extract');
@@ -458,20 +447,6 @@ describe('a run no cycle ever closed is resumed without re-paying for it', () =>
       // And the spend it already carried stays on the run's total, or the tenant's
       // bill would reset every time an attempt did.
       expect(next.spentMicroUsd).toBeGreaterThanOrEqual(9_000);
-
-      // **The free ride is taken once.** The adopting cycle closes the run it
-      // adopted — that is rung 22's whole subject — and the attribution the
-      // stopped attempt left is cleared with it, so the row does not name a
-      // phase that stopped nothing.
-      expect(await countRows(tenant.sql, 'consolidation_run', 'finished_at IS NULL')).toBe(0);
-      expect(await countRows(tenant.sql, 'consolidation_checkpoint')).toBe(0);
-      const closed = (await tenant.sql`
-        SELECT stop_reason, stopped_phase, resumed_at
-          FROM consolidation_run WHERE run_id = ${opened.run.runId}::bigint
-      `) as Array<{ stop_reason: string; stopped_phase: string | null; resumed_at: Date | null }>;
-      expect(closed[0]?.stop_reason).toBe('complete');
-      expect(closed[0]?.stopped_phase).toBeNull();
-      expect(closed[0]?.resumed_at).not.toBeNull();
 
       // The free tier, by contrast, ran again from the top. That is the design
       // and it is what the first test in this file measures the cost of.
@@ -598,17 +573,11 @@ describe('reconciliation costs round trips per pass rather than per fact', () =>
  *   1. the synopsis phase calls the model once per page and returned on the
  *      first answer it could not read;
  *   2. a model phase that stops stops the cycle, at `phase_failed`;
- *   3. a cycle that stopped short left its run **open**, because that null
- *      `finished_at` was what the next cycle resumed into;
+ *   3. a cycle that stops short leaves its run **open**, because that null
+ *      `finished_at` is what the next cycle resumes into;
  *   4. a model phase with a checkpoint against an open run is skipped on every
  *      resume — so `extract`, banked by an earlier attempt of the same run,
  *      never ran again and the fact count could not move.
- *
- * Link 3 is gone since rung 22 — a cycle that returns closes its run, whatever
- * stopped it — so this test now asserts more than it was written to. Both fixes
- * stay: this one is about the cycle finishing its WORK, and rung 22 is about the
- * cycle ENDING. A brain that stops at synopsis every night still never reaches
- * contradiction or salience refinement, however cleanly its runs close.
  *
  * The brain this was measured on had 5,608 pages and 167 facts, flat for hours,
  * with `extract` holding a checkpoint at exactly its batch bound. Nothing was
@@ -684,8 +653,7 @@ describe('a page the model cannot summarise does not stop the cycle', () => {
       //
       // The phase did everything it could do. That it could do nothing is a fact
       // about the corpus, and it is reported as a count rather than as a stop,
-      // because a stop is what keeps the cycle from reaching the phases behind
-      // this one.
+      // because a stop is what holds the run open in front of every other phase.
       const PAGES = 3;
       await seedBrain(PAGES);
 
@@ -774,17 +742,16 @@ describe('a run frozen by a page the model cannot read is closed by the next cyc
         spentMicroUsd: 9_000,
         now,
       });
-      // The row exactly as the fleet version that produced it wrote it: every
-      // column of the record except `finished_at`. Raw SQL because the code that
-      // wrote this shape is retired, and a helper kept alive to reproduce it
-      // would be an exit somebody could take again.
-      await tenant.sql`
-        UPDATE consolidation_run
-           SET dreamt = false, stop_reason = 'phase_failed', spent_micro_usd = 9000,
-               model_calls = 15, phases_run = 9, wall_clock_ms = 120000,
-               stopped_phase = 'synopsis', stopped_phase_code = 'bad_output'
-         WHERE run_id = ${opened.run.runId}::bigint
-      `;
+      await recordProgress(tenant.sql, opened.run, {
+        dreamt: false,
+        stopReason: 'phase_failed',
+        spentMicroUsd: 9_000,
+        modelCalls: 15,
+        phasesRun: 9,
+        wallClockMs: 120_000,
+        stoppedPhase: { phase: 'synopsis', code: 'bad_output' },
+        now,
+      });
 
       const { gateway, transport } = createGateway({
         chat: {
@@ -966,18 +933,12 @@ describe('a page the model can never read is still the user\'s page', () => {
  *
  * This is what keeps "the phase completes even when all it could do was skip"
  * from meaning "a total outage reads as a clean cycle". A cycle that never
- * called a working provider must not bank a checkpoint saying the phase is paid
- * for, and must not report `complete` — an outage has to be legible as one on
- * the run record, or nobody chases the provider.
- *
- * What it must NOT do is stay open. Rung 22 separated those two: the run closes
- * and the stop reason and the phase that reported it are what say the cycle did
- * not do its job. Holding the row open said the same thing far less clearly and
- * stranded the next cycle's extraction to say it.
+ * called a working provider must not close its run and bank a checkpoint saying
+ * the phase is paid for.
  */
 describe('a provider refusing everything stops the phase rather than reading as skips', () => {
   test(
-    'a dead provider stops on the first call, blames no page, and closes the run anyway',
+    'a dead provider stops on the first call, blames no page, and holds the run open',
     async () => {
       const PAGES = 6;
       await seedBrain(PAGES);
@@ -1003,18 +964,9 @@ describe('a provider refusing everything stops the phase rather than reading as 
       expect(result.stopReason).toBe('phase_failed');
       expect(result.stoppedPhase).toEqual({ phase: 'synopsis', code: 'model_unavailable' });
 
-      // **And the run closes anyway**, which is the difference rung 22 makes.
-      // The outage is real and the cycle is right to stop, but "there is work
-      // still owed" is not a reason to leave a run open: it was that null
-      // `finished_at` — under a provider failing on exactly one page — that
-      // stranded `extract`'s checkpoint and pinned a brain at 167 facts. The
-      // work is still owed; the next cycle is a new pass at it, and
-      // `run-closure.test.ts` is where three of those in a row are counted.
-      expect(await countRows(tenant.sql, 'consolidation_run', 'finished_at IS NULL')).toBe(0);
-      expect(await countRows(tenant.sql, 'consolidation_checkpoint')).toBe(0);
-      const record = await readLatestRun(tenant.sql);
-      expect(record?.stopReason).toBe('phase_failed');
-      expect(record?.stoppedPhase).toEqual({ phase: 'synopsis', code: 'model_unavailable' });
+      // The run stays open, which is the difference that matters: an outage is
+      // work still owed, and the next cycle resumes into it.
+      expect(await countRows(tenant.sql, 'consolidation_run', 'finished_at IS NULL')).toBe(1);
 
       // And no page is answerable for it. Not retired — nothing is, ever — and
       // not even counted, because a counter that crept during an outage would be
