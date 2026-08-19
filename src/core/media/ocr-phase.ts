@@ -152,6 +152,10 @@ function outcomeOf(
     applied: progress.applied,
     queued: 0,
     logged: progress.logged,
+    // This phase retires nothing. An attachment it cannot read stays queued —
+    // `ocr_text` is left NULL on purpose so the item comes back — and the one
+    // thing R23 promised never to do is retire a payload nobody ever read.
+    quarantined: 0,
     // The budget's own figure, not the chat calls' sum: the transcript's page
     // pays for its embedding out of this same phase budget, and reporting only
     // the vision calls would under-report what the phase spent.

@@ -760,7 +760,7 @@ diagnosis nobody can perform. Everything below is also on
 | `free_tier` | the deterministic phases ran and no model was called | nothing — this is what the free tier is |
 | `out_of_time` | the attempt's wall clock ran out with work left | nothing on its own; the same tenant repeating it is the alert — see below |
 | `budget_exhausted` | the tenant's spend cap stopped the model phases | the user's cap, or the tier; waiting does not fix it |
-| `phase_failed` | a provider was unavailable or answered unreadably | read `stopped_phase_code` before doing anything — the three codes it covers want three different responses |
+| `phase_failed` | a provider was unavailable, refused the request, or answered unreadably | read `stopped_phase_code` before doing anything — the four codes it covers want four different responses |
 | `cancelled` | the worker lost its lease or was shutting down | ordinary during a deploy |
 
 ### Which phase, and what it reported
@@ -781,7 +781,8 @@ cycle, a lost lease, or the clock read *between* two phases.
 
 | `stopped_phase_code` | What it means | What to do |
 |---|---|---|
-| `model_unavailable` | the gateway could not complete the call | usually the provider, and usually transient. Repeating on the same phase every cycle is not transient — suspect an input that phase cannot get past |
+| `model_unavailable` | the gateway could not complete the call: a rate limit, a 5xx, a dropped connection, a key that would not resolve | usually the provider, and usually transient. Waiting is the remedy. Nothing is ever retired on this code, however long it lasts |
+| `input_rejected` | the provider read the request and refused it — a 400/413/422-class status | the request, not the provider. Waiting does not fix it. On `synopsis` this is also what retires a page; see below |
 | `bad_output` | the model answered with something this code cannot read | a prompt or an input problem, not a provider one. Waiting does not fix it |
 | `payload_unavailable` | `transcribe` only: the stored object was not there | object storage or the prefix credential; the attachment is deliberately not marked done |
 | `budget_exhausted` | this phase asked for money the cap would not give | matches `stop_reason`; the phase named is the first one to want it, not the expensive one |
@@ -808,6 +809,50 @@ something has not succeeded. So `stopped_phase_code` on `synopsis` now means
 "this is systemic", not "one page was odd", and the ceiling on what the tolerance
 costs is three wasted calls per cycle. `transcribe` — the cycle's other per-item
 loop — still stops on its first bad item.
+
+**Skipping alone only moved the freeze, so a page can also leave.** The candidate
+query excludes a page once a summary exists for it, and a skipped page writes
+nothing — so every usable page leaves the set and every unusable one stays, until
+the unusable ones are all that is left, adjacent at the head of a fixed ordering,
+tripping the three-in-a-row bound on the first three calls of every cycle. That
+is the original freeze arriving a few cycles later. So `synopsis` now retires a
+page that has **durably** refused twice, by setting `page.quarantined_at` — which
+the candidate query has always honoured — with `page.quarantine_reason` recording
+which code, and `page.consolidation_refusals` counting the evidence.
+
+*Durable* is doing all the work in that sentence, and it is deliberately narrow:
+only `input_rejected` (a 400/413/422-class status — the provider refusing the
+request itself) and an answer that could not be parsed at all. **A rate limit, a
+5xx, a timeout or a dropped connection increments nothing**, however many pages
+it touches or how long it lasts, because retiring a good page is silent where
+this freeze is loud.
+
+Read what it has taken, and from where:
+
+```sql
+SELECT quarantine_reason, count(*)
+  FROM page
+ WHERE quarantined_at IS NOT NULL AND quarantine_reason IS NOT NULL
+ GROUP BY quarantine_reason;
+```
+
+The fleet's `cycle` log line carries the per-cycle count as `quarantined`. A
+non-zero count repeating cycle after cycle is the shape of a misclassification
+(a broken prompt template, a seat whose output ceiling is too tight) rather than
+of bad pages — three per cycle is the ceiling the three-in-a-row bound imposes,
+so it creeps rather than sweeps, and every such cycle also reports `phase_failed`.
+
+**Undoing one is a single statement, and it must clear the counter too:**
+
+```sql
+UPDATE page
+   SET quarantined_at = NULL, quarantine_reason = NULL, consolidation_refusals = 0
+ WHERE page_id = <id>;
+```
+
+Leaving `consolidation_refusals` set would put the page one durable refusal from
+being retired again, so the decision would survive exactly one cycle and look as
+though it had not been applied.
 
 **`out_of_time` is a clean stop, not a failure.** The cycle reads the deadline
 its own lease stamps, finishes the unit of work in flight, writes its run record

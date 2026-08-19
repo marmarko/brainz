@@ -106,6 +106,18 @@ export const FREE_TIER_PHASES: readonly CyclePhase[] = DETERMINISTIC_PHASES;
  * already-summarised predicate: the next attempt simply does not select what
  * this one finished.
  *
+ * `input_rejected` is the provider refusing the **request** rather than the
+ * connection: a 400/413/422-class status, which says the thing we sent is not
+ * something it will ever accept. It was `model_unavailable` until rung 21, and
+ * collapsing the two cost more than a misleading word. The two want opposite
+ * responses — `model_unavailable` means wait, `input_rejected` means the input
+ * has to change or go — and `runSynopsisPhase` is now allowed to retire a page
+ * that earns the second one. A phase that cannot tell them apart cannot be
+ * trusted with that decision, which is why this member had to exist before the
+ * quarantine did. 429, 408, every 5xx and a status-less network failure stay
+ * `model_unavailable`: those are the provider having a bad minute, and no page
+ * is answerable for one.
+ *
  * **`cancelled` is deliberately not a member.** A lost lease is something the
  * *run* suffered, not something a phase reported, and admitting it here would
  * make the column mean two things at once.
@@ -113,6 +125,7 @@ export const FREE_TIER_PHASES: readonly CyclePhase[] = DETERMINISTIC_PHASES;
 export const PHASE_STOPS = [
   'budget_exhausted',
   'model_unavailable',
+  'input_rejected',
   'bad_output',
   'payload_unavailable',
   'out_of_time',

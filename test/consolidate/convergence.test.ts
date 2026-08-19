@@ -15,7 +15,7 @@
  * 28,799 of the pass's 30,850 round trips, against the other four deterministic
  * phases' combined 400ms.
  *
- * So there are five things to pin, and they are the five sections below:
+ * So there are six things to pin, and they are the six sections below:
  *
  *   1. **The deterministic prefix costs round trips per batch, not per page**,
  *      and it finishes in one attempt. This is the claim that makes redoing the
@@ -49,11 +49,23 @@
  *      looked broken was one page's worth of broken. That is the same shape as
  *      the embed batch that wedged ingest: one un-processable item stopping
  *      everything behind it.
+ *   6. **And the skip alone was not enough.** Section 5's tolerance defers the
+ *      freeze rather than removing it: a skipped page writes nothing, so
+ *      `selectIngestedPages(unsummarised)` offers it again — every good page
+ *      leaves the candidate set and every unusable one stays, until the
+ *      unusable ones are all that is left, adjacent at the head of a fixed
+ *      ordering, tripping the consecutive bound at the first three calls of
+ *      every cycle. The terminal state is the freeze it was meant to fix. So a
+ *      page the model can *never* read has to LEAVE the set, and section 6 is
+ *      the pair of properties that makes that safe: the set shrinks under
+ *      unreadable pages, and a page failing on a transient is still a candidate
+ *      next cycle.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type { SQL } from 'bun';
 
+import { TransportError } from '../../src/ai/gateway.ts';
 import {
   completePhase,
   openRun,
@@ -65,6 +77,7 @@ import { reconcileAllEdges } from '../../src/worker/consolidate/deterministic.ts
 import { NO_SPEND } from '../../src/worker/consolidate/estimate.ts';
 import {
   CONSECUTIVE_ITEM_FAILURE_LIMIT,
+  QUARANTINE_AFTER_REFUSALS,
   runSynopsisPhase,
 } from '../../src/worker/consolidate/model-phases.ts';
 import { DETERMINISTIC_PHASES } from '../../src/worker/consolidate/phases.ts';
@@ -700,6 +713,313 @@ describe('a page the model cannot summarise does not stop the cycle', () => {
       expect(transport.callsFor('synopsis').length).toBe(PAGES);
       expect(outcome.applied).toBe(0);
       expect(outcome.stopped).toBe('bad_output');
+    },
+    SETUP_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 6. The link the skip did not break: a page that can never be read must leave.
+// ---------------------------------------------------------------------------
+
+/**
+ * The candidate set shrinks under unreadable pages, so the phase can finish.
+ *
+ * **Why section 5's skip was not the fix.** `selectIngestedPages(unsummarised)`
+ * excludes a page only once a summary row exists for it. A skipped page writes
+ * nothing, so every *good* page leaves the candidate set and every unusable one
+ * stays. The set converges monotonically onto the unusable pages; the ordering
+ * (`salience DESC NULLS LAST, page_id`) is a fixed key, so they end up adjacent
+ * at the head; three adjacent failures trip the consecutive bound at calls one
+ * to three of every cycle with `applied === 0`; and the terminal state is
+ * byte-identical to the freeze the skip was written to fix.
+ *
+ * So this asserts the property the skip could not: **the run CLOSES.** That is
+ * the only state that clears `extract`'s checkpoint, which is the only thing
+ * that lets the fact count move.
+ */
+describe('a page the model can never read leaves the candidate set', () => {
+  test(
+    'unreadable pages plus good ones converge: every good page summarised, the run closed',
+    async () => {
+      const PAGES = 8;
+      // Interleaved rather than contiguous, so the run is not trivially the
+      // shape where the poison sorts last and never blocks anything.
+      const POISON = new Set(['Thread 1', 'Thread 3', 'Thread 5']);
+      const GOOD = PAGES - POISON.size;
+      await seedBrain(PAGES);
+
+      // **A durable refusal, not a flaky one.** 413 is the provider saying the
+      // request itself is unacceptable — the same page will be refused the same
+      // way forever, which is the only evidence that licenses removing a page
+      // from the set. The gateway keeps the status and discards everything else.
+      const { gateway } = createGateway({
+        chat: {
+          ...SCRIPT,
+          synopsis: (request) => {
+            if (request.input.kind !== 'chat') return JSON.stringify({ summary: 'A thread.' });
+            for (const title of POISON) {
+              if (request.input.user.includes(title)) {
+                throw new TransportError('request payload too large', 413);
+              }
+            }
+            return JSON.stringify({ summary: 'A thread about a hire.' });
+          },
+        },
+      });
+
+      // One instant for every cycle: salience decays with age and orders the
+      // candidate set, so a moving `now` would reshuffle the queue between
+      // cycles and make "the set shrank" unanswerable.
+      const now = new Date();
+
+      // **A bound with an argument behind it, not a guess.** Every cycle makes
+      // at least one unit of progress on the set: the first candidate is either
+      // a good page (summarised, leaves) or an unreadable one (earns a strike).
+      // So the work is bounded by the good pages plus the strikes the
+      // unreadable ones must accumulate, and one more cycle to find nothing
+      // left to do.
+      //
+      // **Run to the bound rather than stopping at the first `complete`.** The
+      // first cycle of this shape completes on any version of the code — five
+      // good pages are summarised and the three unreadable ones are scattered
+      // among them, so the consecutive bound never trips. The freeze arrives on
+      // the cycle *after*, when the unreadable pages are all that is left and
+      // are adjacent. What converges is the steady state, so the steady state is
+      // what gets asserted.
+      const MAX_CYCLES = GOOD + POISON.size * QUARANTINE_AFTER_REFUSALS + 2;
+      const reasons: string[] = [];
+      for (let cycle = 0; cycle < MAX_CYCLES; cycle++) {
+        const result = await runConsolidationCycle(
+          { sql: tenant.sql, gateway, tenantId: TENANT, caller: CALLER },
+          { trigger: 'time_ceiling', tier: 'paid', now },
+        );
+        reasons.push(result.stopReason);
+      }
+
+      // **The assertion the previous attempt could not make.** With the skip
+      // alone this reads `phase_failed`: every cycle from the second on stopped
+      // in `synopsis` at call three with nothing applied, so the run never
+      // closed and `extract`'s checkpoint stood in front of every resume.
+      expect(reasons.at(-1)).toBe('complete');
+
+      // Every good page is summarised, and the unreadable ones are the only
+      // thing missing.
+      expect(await summaryPages()).toBe(GOOD);
+
+      // The unreadable pages left the set the one way `selectIngestedPages`
+      // already honours — and each one says under which code, so an operator can
+      // see how many pages this has taken and why without reading any of them.
+      expect(
+        await countRows(tenant.sql, 'page', "quarantined_at IS NOT NULL AND quarantine_reason = 'input_rejected'"),
+      ).toBe(POISON.size);
+
+      // And nothing else was touched. Every good page is still live, so "the set
+      // shrank" cannot be satisfied by a phase that retired the corpus.
+      expect(
+        await countRows(tenant.sql, 'page', "derivation = 'ingested' AND quarantined_at IS NULL"),
+      ).toBe(GOOD);
+
+      // Links 3 and 4 of the original chain, which are the ones that starved the
+      // brain: a closed run has no checkpoints, so the next cycle runs `extract`
+      // again rather than skipping it forever.
+      expect(await countRows(tenant.sql, 'consolidation_run', 'finished_at IS NULL')).toBe(0);
+      expect(await countRows(tenant.sql, 'consolidation_checkpoint')).toBe(0);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+});
+
+/**
+ * The half that protects the user, and the one a green "the freeze lifts" test
+ * would never have caught.
+ *
+ * **Quarantining on a transient is a worse bug than the freeze**, and the
+ * asymmetry is the entire reason the threshold and the status check exist. The
+ * freeze is loud: it is on the run record, in the cycle log, and in a fact count
+ * that visibly stops moving. A page dropped from consolidation because the
+ * provider had a bad minute is silent — the cycle completes, the fact count
+ * grows, and the only symptom is that the brain has quietly stopped reading
+ * something its owner still has.
+ *
+ * So the assertion is the negative one: however many times a transient recurs,
+ * it moves no counter and retires nothing, and the page is still there to be
+ * summarised the moment the provider comes back.
+ */
+describe('a page that failed on a transient is still a candidate next cycle', () => {
+  test(
+    'a rate-limited page is never retired, however many cycles it fails in',
+    async () => {
+      const PAGES = 4;
+      const FLAKY = 'Thread 2';
+      await seedBrain(PAGES);
+      const now = new Date();
+
+      // 429 is a 4xx and is emphatically not durable — it is the fleet being
+      // told to slow down. A rule that read "the provider refused, so the page
+      // is bad" would retire a page on every busy hour, which is how a
+      // well-meaning quarantine turns one rate limit into permanent data loss.
+      let outage = true;
+      const { gateway } = createGateway({
+        chat: {
+          ...SCRIPT,
+          synopsis: (request) => {
+            if (
+              outage &&
+              request.input.kind === 'chat' &&
+              request.input.user.includes(FLAKY)
+            ) {
+              throw new TransportError('slow down', 429);
+            }
+            return JSON.stringify({ summary: 'A thread about a hire.' });
+          },
+        },
+      });
+
+      // More cycles than the threshold, by a clear margin: if a transient
+      // counted at all, this page would have been retired several times over.
+      const CYCLES = QUARANTINE_AFTER_REFUSALS + 3;
+      for (let cycle = 0; cycle < CYCLES; cycle++) {
+        await runConsolidationCycle(
+          { sql: tenant.sql, gateway, tenantId: TENANT, caller: CALLER },
+          { trigger: 'time_ceiling', tier: 'paid', now },
+        );
+      }
+
+      // **Nothing moved.** Not the quarantine, and not the counter behind it —
+      // a counter that crept during an outage would be a page one durable
+      // refusal from retirement for reasons that were never its own.
+      expect(
+        await countRows(tenant.sql, 'page', 'quarantined_at IS NOT NULL'),
+      ).toBe(0);
+      expect(
+        await countRows(tenant.sql, 'page', 'consolidation_refusals > 0'),
+      ).toBe(0);
+      expect(await summaryPages()).toBe(PAGES - 1);
+
+      // And the page is still a candidate, which is the whole claim: the
+      // provider comes back and the brain reads it, with no operator involved.
+      outage = false;
+      await runConsolidationCycle(
+        { sql: tenant.sql, gateway, tenantId: TENANT, caller: CALLER },
+        { trigger: 'time_ceiling', tier: 'paid', now },
+      );
+      expect(await summaryPages()).toBe(PAGES);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
+    'a provider that is simply unreachable retires nothing either',
+    async () => {
+      // The status-less shape: a socket that died, a DNS failure, a gateway that
+      // never answered. `providerStatus` is null, which proves nothing about the
+      // request, so it must count for nothing. This is the case a rule written
+      // as "not a success, therefore the page" would sweep in wholesale — and it
+      // is the case that hits EVERY page at once, so getting it wrong retires
+      // the corpus rather than a page.
+      const PAGES = 3;
+      await seedBrain(PAGES);
+      const now = new Date();
+
+      const { gateway } = createGateway({
+        chat: SCRIPT,
+        failOn: 'synopsis',
+        failWith: new Error('socket hang up'),
+      });
+
+      for (let cycle = 0; cycle < QUARANTINE_AFTER_REFUSALS + 2; cycle++) {
+        await runConsolidationCycle(
+          { sql: tenant.sql, gateway, tenantId: TENANT, caller: CALLER },
+          { trigger: 'time_ceiling', tier: 'paid', now },
+        );
+      }
+
+      expect(await countRows(tenant.sql, 'page', 'quarantined_at IS NOT NULL')).toBe(0);
+      expect(await countRows(tenant.sql, 'page', 'consolidation_refusals > 0')).toBe(0);
+      expect(await summaryPages()).toBe(0);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+});
+
+/**
+ * A page is retired at the threshold and not one refusal before it.
+ *
+ * Asserted against the phase directly rather than through the cycle, because
+ * the claim is about *when* — and a cycle test can only observe the state after
+ * a whole pass, which is exactly the resolution the claim is made at.
+ */
+describe('a durable refusal is evidence, not a verdict', () => {
+  test(
+    'the page survives every refusal before the threshold and leaves on it',
+    async () => {
+      const POISON = 'Thread 0';
+      await seedBrain(2);
+      const now = new Date();
+
+      const { gateway } = createGateway({
+        chat: {
+          ...SCRIPT,
+          synopsis: (request) =>
+            request.input.kind === 'chat' && request.input.user.includes(POISON)
+              ? // Reachable, billed, and unreadable: the durable case that needs
+                // the threshold most, since one badly sampled answer and a page
+                // the model can never parse look identical in a single exchange.
+                'I am afraid I cannot summarise that.'
+              : JSON.stringify({ summary: 'A thread about a hire.' }),
+        },
+      });
+      const run = await openRun(tenant.sql, {
+        trigger: 'time_ceiling',
+        tier: 'paid',
+        now,
+        estimateMicroUsd: NO_SPEND,
+      });
+
+      const runPhase = () =>
+        runSynopsisPhase({
+          sql: tenant.sql,
+          gateway,
+          tenantId: TENANT,
+          caller: CALLER,
+          runId: run.run.runId,
+          now,
+          budget: uncappedBudget('synopsis'),
+        });
+
+      // **More than one, or the loop below is vacuous and the claim with it.**
+      // One phase run offers a page to the model exactly once, so a threshold
+      // above one is precisely what makes retirement span independent attempts
+      // — separate cycles, separately sampled answers. At one, a single bad
+      // sample would be a verdict.
+      expect(QUARANTINE_AFTER_REFUSALS).toBeGreaterThan(1);
+
+      // Every pass before the last one leaves the page in the set.
+      for (let strike = 1; strike < QUARANTINE_AFTER_REFUSALS; strike++) {
+        const outcome = await runPhase();
+        expect(outcome.quarantined).toBe(0);
+        expect(await countRows(tenant.sql, 'page', 'quarantined_at IS NOT NULL')).toBe(0);
+      }
+
+      const last = await runPhase();
+      expect(last.quarantined).toBe(1);
+      expect(
+        await countRows(tenant.sql, 'page', "quarantined_at IS NOT NULL AND quarantine_reason = 'bad_output'"),
+      ).toBe(1);
+
+      // And the reversal an operator performs when the judgement was wrong has
+      // to clear the counter too — the rung's header spells the statement out.
+      // Left set, the page would sit one refusal from instant re-quarantine and
+      // the operator's decision would survive exactly one cycle.
+      await tenant.sql`
+        UPDATE page
+           SET quarantined_at = NULL, quarantine_reason = NULL, consolidation_refusals = 0
+         WHERE quarantined_at IS NOT NULL
+      `;
+      const restored = await runPhase();
+      expect(restored.quarantined).toBe(0);
+      expect(await countRows(tenant.sql, 'page', 'quarantined_at IS NOT NULL')).toBe(0);
     },
     SETUP_TIMEOUT_MS,
   );
