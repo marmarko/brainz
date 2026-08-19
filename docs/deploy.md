@@ -740,16 +740,19 @@ arriving, search keeps working on them, and the things a cycle *produces* —
 facts, entity cards, clusters, briefings — simply stop growing. The number that
 shows it is the ratio in this heading, and nothing alerts on a ratio.
 
-The cycle writes one line per attempt to container stdout, so `wrangler tail`
-has it:
+The cycle writes one line per attempt to container stdout:
 
 ```json
 {"event":"cycle","tenant":"t-…","stop_reason":"out_of_time",
- "more_to_do":true,"wall_clock_ms":842000,
- "model_calls":83,"spent_micro_usd":91200}
+ "more_to_do":true,"stopped_phase":"synopsis","stopped_phase_code":"out_of_time",
+ "wall_clock_ms":842000,"model_calls":83,"spent_micro_usd":91200}
 ```
 
-`stop_reason` is the whole diagnosis:
+**Do not plan on reading that line.** `wrangler tail` captures the *Worker*, not
+the container, and `containers ssh` is interactive-only — so on this deploy the
+cycle log is effectively unreachable, and a diagnosis that depends on it is a
+diagnosis nobody can perform. Everything below is also on
+`consolidation_run` in the tenant's own database, which is where to read it.
 
 | `stop_reason` | What it means | What to do |
 |---|---|---|
@@ -757,8 +760,42 @@ has it:
 | `free_tier` | the deterministic phases ran and no model was called | nothing — this is what the free tier is |
 | `out_of_time` | the attempt's wall clock ran out with work left | nothing on its own; the same tenant repeating it is the alert — see below |
 | `budget_exhausted` | the tenant's spend cap stopped the model phases | the user's cap, or the tier; waiting does not fix it |
-| `phase_failed` | a provider was unavailable or answered unreadably | usually nobody's; the next cycle resumes into the same run |
+| `phase_failed` | a provider was unavailable or answered unreadably | read `stopped_phase_code` before doing anything — the three codes it covers want three different responses |
 | `cancelled` | the worker lost its lease or was shutting down | ordinary during a deploy |
+
+### Which phase, and what it reported
+
+`stop_reason` is not the whole diagnosis, and treating it as one cost hours on a
+brain that sat at `phase_failed` with a flat fact count. Three of the six reasons
+are things a *particular phase* did, and `consolidation_run` records which:
+
+```sql
+SELECT stop_reason, stopped_phase, stopped_phase_code, phases_run, model_calls,
+       dreamt, finished_at
+  FROM consolidation_run ORDER BY run_id DESC LIMIT 1;
+```
+
+`stopped_phase` is one of the twelve `CYCLE_PHASES`; `stopped_phase_code` is what
+that phase reported. Both are NULL when no phase is answerable — a completed
+cycle, a lost lease, or the clock read *between* two phases.
+
+| `stopped_phase_code` | What it means | What to do |
+|---|---|---|
+| `model_unavailable` | the gateway could not complete the call | usually the provider, and usually transient. Repeating on the same phase every cycle is not transient — suspect an input that phase cannot get past |
+| `bad_output` | the model answered with something this code cannot read | a prompt or an input problem, not a provider one. Waiting does not fix it |
+| `payload_unavailable` | `transcribe` only: the stored object was not there | object storage or the prefix credential; the attachment is deliberately not marked done |
+| `budget_exhausted` | this phase asked for money the cap would not give | matches `stop_reason`; the phase named is the first one to want it, not the expensive one |
+| `out_of_time` | the attempt's clock ran out inside this phase | matches `stop_reason`; see the phase-cost table below |
+
+**A cycle stuck on one phase freezes every phase behind it, and that is the
+symptom to recognise.** A run that stops short stays open so the next cycle can
+resume into it without re-paying — and a model phase with a checkpoint against
+that open run is *skipped* on every attempt until the run closes. So a brain
+whose `synopsis` fails every cycle stops extracting facts entirely, even though
+extraction is working perfectly and ran to completion once. The fact count going
+flat is the visible part; `stopped_phase` names the phase actually holding the
+run open. Fix that phase and the run completes, which clears the checkpoints and
+lets the next cycle run every phase again.
 
 **`out_of_time` is a clean stop, not a failure.** The cycle reads the deadline
 its own lease stamps, finishes the unit of work in flight, writes its run record
