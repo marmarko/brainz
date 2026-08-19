@@ -401,7 +401,7 @@ export async function runConsolidationCycle(
         skipped: null,
         items: outcome.items,
         spentMicroUsd: NO_SPEND,
-        stopped: outcome.done ? null : (stop as string),
+        stopped: outcome.done ? null : stop,
       });
       continue;
     }

@@ -196,6 +196,14 @@ export async function startWorkerFleet(
           event: 'cycle',
           tenant: tenantId,
           stop_reason: result.stopReason,
+          // The two that separate "this brain is long" from "this brain is
+          // stuck". A fleet emitting `out_of_time` every hour with `advanced`
+          // true is converging on something big; the same line with `advanced`
+          // false is a cycle that cannot get past a phase, which no amount of
+          // waiting fixes and which nothing else in this log would show.
+          more_to_do: result.moreToDo,
+          advanced: result.advanced,
+          wall_clock_ms: result.wallClockMs,
           model_calls: result.modelCalls,
           spent_micro_usd: result.spentMicroUsd,
         })}\n`,

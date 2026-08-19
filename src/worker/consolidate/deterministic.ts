@@ -786,7 +786,17 @@ export async function clusterByEmbedding(
   options: {
     readonly runId: string | null;
     readonly threshold?: number;
-    /** A ceiling on seeds considered per call. Absent means the whole corpus. */
+    /**
+     * A ceiling on seeds considered per call. Absent means the whole corpus,
+     * which is the cycle's caller and the correction to a real bug: the old
+     * default of 2,000 meant 14,913 of one brain's 16,913 chunks could never be
+     * a seed, so cluster coverage was permanently capped at the oldest 2,000
+     * however many cycles ran.
+     *
+     * A call that hits this ceiling reports `done: false` with a cursor — it
+     * stopped, and there is more — which is the same shape as running out of
+     * time and is honest for both.
+     */
     readonly limit?: number;
     /** Resume point from a previous attempt. Null rebuilds from scratch. */
     readonly cursor?: string | null;

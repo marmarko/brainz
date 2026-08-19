@@ -731,6 +731,63 @@ source was never connected. It is an ordinary answer, not a failure.
 The same facts reach the user in their own words on `/dashboard`, so a support
 reply can usually be "look at the panel" rather than a screenshot of this JSON.
 
+## "The brain has 5,000 pages and 160 facts": why consolidation is not finishing
+
+Ingestion and consolidation fail independently, and they fail in opposite
+directions. Ingestion stopping is loud — a connector lane goes `dead` and the
+section above is about reading it. Consolidation stopping is silent: pages keep
+arriving, search keeps working on them, and the things a cycle *produces* —
+facts, entity cards, clusters, briefings — simply stop growing. The number that
+shows it is the ratio in this heading, and nothing alerts on a ratio.
+
+The cycle writes one line per attempt to container stdout, so `wrangler tail`
+has it:
+
+```json
+{"event":"cycle","tenant":"t-…","stop_reason":"out_of_time",
+ "more_to_do":true,"advanced":true,"wall_clock_ms":842000,
+ "model_calls":83,"spent_micro_usd":91200}
+```
+
+`stop_reason` is the whole diagnosis, and the six values split three ways:
+
+| `stop_reason` | What it means | What to do |
+|---|---|---|
+| `complete` | every phase ran | nothing |
+| `free_tier` | the deterministic phases ran and no model was called | nothing — this is what the free tier is |
+| `out_of_time` | the attempt's wall clock ran out with work left | **nothing, if `advanced` is true** — see below |
+| `budget_exhausted` | the tenant's spend cap stopped the model phases | the user's cap, or the tier; waiting does not fix it |
+| `phase_failed` | a provider was unavailable or answered unreadably | usually nobody's; the next cycle resumes into the same run |
+| `cancelled` | the worker lost its lease or was shutting down | ordinary during a deploy |
+
+**`out_of_time` with `advanced: true` is a working system, not an incident.** A
+brain larger than one fifteen-minute attempt is consolidated over several: each
+attempt banks where it got to, the job completes normally rather than failing,
+and the tenant is settled as due again immediately instead of at its next
+24-hour ceiling. Expect a run of these lines minutes apart, `model_calls`
+accumulating, ending in one `complete`. Each is a **fresh job with a fresh
+attempt ladder**, so a brain that needs ten attempts is not being walked toward a
+dead letter.
+
+**`out_of_time` with `advanced: false` is the one that needs a human.** It means
+an attempt banked nothing the next one can skip, so re-running it would produce
+the same line for ever — which is why the fleet does *not* re-run it and lets the
+tenant wait for its ceiling instead. The cause is a single phase that does not
+fit one attempt and cannot hand over a position: today that is `dedup`,
+`link_reconcile` or `entity_merge`, each of which computes over the whole fact or
+entity set and therefore restarts rather than resumes. Measured, those three cost
+under 400ms together on a 5,608-page brain, so reaching this state means
+something else — a fact table orders of magnitude larger than that brain's, or a
+tenant database that has become very slow. Read `wall_clock_ms` before assuming
+which.
+
+**A `consolidate` lane that reached `dead` is the older failure and needs the
+same treatment as a connector.** It is what happened before a cycle could stop
+itself: five reaped attempts, `failure_code: attempt_timed_out`, and then a lane
+that nothing polls — the cadence counts a dead-lettered lane as one already
+standing. Clearing it is an operator action; the section above is the shape of
+it.
+
 ## Tearing it down
 
 **`wrangler delete` removes the Worker and leaves the container application and
