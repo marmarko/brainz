@@ -512,7 +512,7 @@ export async function runConsolidationCycle(
  * brain, and a check that only fires at a phase boundary would never fire inside
  * the phase that is the reason there is a boundary problem.
  */
-async function runDeterministicPhase(
+export async function runDeterministicPhase(
   sql: SQL,
   phase: CyclePhase,
   options: {
@@ -538,10 +538,23 @@ async function runDeterministicPhase(
       // a *fix point* over the whole edge set: running it against a fact set the
       // next attempt is still retiring from would remove edges that attempt is
       // about to re-derive, and re-add them, once per attempt.
-      if (result.done && result.factsInvalidated > 0) {
-        await reconcileAllEdges(sql, { taxonomyVersion: 1, budget });
+      if (!result.done || result.factsInvalidated === 0) {
+        return { items: result.staled, done: result.done, cursor: result.cursor };
       }
-      return { items: result.staled, done: result.done, cursor: result.cursor };
+
+      const again = await reconcileAllEdges(sql, { taxonomyVersion: 1, budget });
+      if (!again.done) {
+        // **A phase is not complete while work it triggered is unfinished.**
+        // `reconcileAllEdges` reports a restart when it yields, and dropping
+        // that on the floor here banked staleness as *done* over an edge set
+        // nothing had reconciled — after which every later attempt skipped the
+        // phase and the retired fact's edge stood for the life of the run. The
+        // walk itself is over, so there is no position to hand on; the phase
+        // says so and restarts, which is cheap because a page already marked
+        // stale is not selected again.
+        return { items: result.staled, done: false, cursor: null };
+      }
+      return { items: result.staled, done: true, cursor: null };
     }
     case 'entity_merge': {
       const result = await mergeEntitiesByRule(sql, { budget });
