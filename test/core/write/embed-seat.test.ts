@@ -22,6 +22,7 @@ import {
   EmbeddingWidthError,
   CHUNK_EMBED_MAX_CHARS,
   backlogSize,
+  embedAllTexts,
   pendingChunkEmbeddings,
   runChunkEmbedBacklog,
   vectorLiteral,
@@ -292,5 +293,71 @@ describe('a refused batch is halved until it is accepted', () => {
     });
     // Halving stops at one. A real failure stays a real failure.
     expect(result.failure).toBeDefined();
+  });
+});
+
+/**
+ * **The other unbounded request, closed before it cost anything.**
+ *
+ * The chunk backlog built a request sized by how many chunks it selected and
+ * was refused; the write path built one sized by however many facts a document
+ * happened to state, and was not refused only because facts are short. "Not
+ * refused yet" is exactly what the batch of thirty-two also was, on the morning
+ * of the day it stopped three connectors for ten hours.
+ *
+ * All-or-nothing here, unlike the backlog: an unembedded chunk simply waits in
+ * the backlog, but a fact with no vector is a row the database refuses, so a
+ * partial answer would write half a document's claims and drop the rest with no
+ * error. That is why the failure case asserts nothing was returned rather than
+ * asserting a smaller set came back.
+ */
+describe('a document with many facts never becomes one oversized request', () => {
+  test('the texts are split, and every vector still comes back in order', async () => {
+    const texts = Array.from({ length: 40 }, (_, i) => `${'f'.repeat(4_000)} ${i}`);
+    const { gateway, transport } = createGateway();
+    const outcome = await embedAllTexts({
+      gateway,
+      tenantId: TENANT,
+      caller: CALLER,
+      budget: uncappedBudget(),
+      texts,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    // Every text answered, none dropped — the property a partial result breaks.
+    expect(outcome.vectors.length).toBe(texts.length);
+    const sizes = transport.calls
+      .filter((call) => call.input.kind === 'embedding')
+      .map((call) => (call.input.kind === 'embedding' ? call.input.texts.length : 0));
+    expect(sizes.length).toBeGreaterThan(1);
+  });
+
+  test('a refused batch halves here too, rather than failing the document', async () => {
+    const texts = Array.from({ length: 12 }, (_, i) => `a fact worth stating ${i}`);
+    const { gateway } = createGateway({ refuseBatchesLargerThan: 3 });
+    const outcome = await embedAllTexts({
+      gateway,
+      tenantId: TENANT,
+      caller: CALLER,
+      budget: uncappedBudget(),
+      texts,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.vectors.length).toBe(texts.length);
+  });
+
+  test('a text the provider will never take fails the whole call, not half of it', async () => {
+    const { gateway } = createGateway({ refuseBatchesLargerThan: 0 });
+    const outcome = await embedAllTexts({
+      gateway,
+      tenantId: TENANT,
+      caller: CALLER,
+      budget: uncappedBudget(),
+      texts: ['one', 'two', 'three'],
+    });
+    expect(outcome.ok).toBe(false);
   });
 });

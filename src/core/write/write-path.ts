@@ -46,7 +46,7 @@ import type { CallerIdentity } from '../../control/secrets.ts';
 import { seatColumnSql, type EmbeddingSeat } from '../../schema/embedding-seat.ts';
 import { CHUNKER_VERSION, chunkDocument, type Chunk } from './chunker.ts';
 import { classifyStatement, type DedupVerdict, type WriteStatus } from './dedup.ts';
-import { embedTexts, knownEmbeddingModelFor, vectorLiteral } from './embed.ts';
+import { embedAllTexts, embedTexts, knownEmbeddingModelFor, vectorLiteral } from './embed.ts';
 import { extractFacts, extractFromStatement, type ExtractedFact } from './extract.ts';
 import { NORMALIZER_VERSION } from './normalize.ts';
 import { textArrayLiteral } from './pg-values.ts';
@@ -522,7 +522,10 @@ export async function ingestDocument(
   const facts = quarantined ? [] : extractFacts(chunks);
 
   phases.enter('embed_facts');
-  const embedded = await embedTexts({
+  // `embedAllTexts`, not `embedTexts`: a document's fact set is unbounded, and
+  // one request sized by however many facts a document happens to state is the
+  // exact shape that refused the chunk backlog and stopped every connector.
+  const embedded = await embedAllTexts({
     gateway: ctx.gateway,
     tenantId: ctx.tenantId,
     caller: ctx.caller,

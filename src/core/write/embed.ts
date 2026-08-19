@@ -235,6 +235,70 @@ export type EmbedOutcome =
  * row the database refuses, correctly), and the backfill leaves the chunk in
  * the backlog for the next pass.
  */
+/**
+ * Every text, in one answer, without ever building a request the provider will
+ * refuse.
+ *
+ * **The failure this closes.** The write path embedded a document's whole fact
+ * set in a single `embedTexts` call with no bound of any kind. That is the same
+ * defect the chunk backlog had — a request sized by how many items happen to
+ * exist rather than by what the provider will take — and it wedged three
+ * connectors for ten hours when the backlog hit it. Facts are short, so this
+ * path had not hit it yet; "had not hit it yet" is what the batch of 32 also
+ * was.
+ *
+ * All-or-nothing, unlike the backlog's pass. The backlog may bank part of its
+ * work and leave the rest for the next run, because an unembedded chunk simply
+ * stays in the backlog. A fact with no vector is a row the database refuses, so
+ * a caller here needs every vector or none — a partial answer would write half a
+ * document's claims and drop the other half silently.
+ *
+ * Batching and halving are the backlog's, for the reason given at
+ * {@link CHUNK_EMBED_MAX_CHARS}: the provider's limit is in tokens, no character
+ * budget is correct for text nobody has seen, and the only reliable move on a
+ * refusal is to try smaller.
+ */
+export async function embedAllTexts(request: EmbedRequest): Promise<EmbedOutcome> {
+  // Preserved rather than special-cased: the empty call is the one that answers
+  // `modelId: null`, and a document that stated no facts depends on it.
+  if (request.texts.length <= 1) return embedTexts(request);
+
+  const vectors: (readonly number[])[] = [];
+  let modelId: string | null = null;
+  let index = 0;
+
+  while (index < request.texts.length) {
+    let cut = index;
+    let chars = 0;
+    while (cut < request.texts.length) {
+      const next = chars + (request.texts[cut] as string).length;
+      // The first text of a batch always goes, whatever it weighs — the same
+      // rule the backlog uses, and for the same reason: a text over the budget
+      // must still be attempted rather than becoming a document that can never
+      // be written.
+      if (cut > index && next > CHUNK_EMBED_MAX_CHARS) break;
+      chars = next;
+      cut += 1;
+    }
+
+    let end = cut;
+    let outcome = await embedTexts({ ...request, texts: request.texts.slice(index, end) });
+    while (!outcome.ok && end - index > 1) {
+      end = index + Math.floor((end - index) / 2);
+      outcome = await embedTexts({ ...request, texts: request.texts.slice(index, end) });
+    }
+    if (!outcome.ok) return outcome;
+
+    vectors.push(...outcome.vectors);
+    // The last non-null wins; every batch went to the same op on the same
+    // profile, so they cannot disagree about which model answered.
+    modelId = outcome.modelId ?? modelId;
+    index = end;
+  }
+
+  return { ok: true, vectors, modelId };
+}
+
 export async function embedTexts(request: EmbedRequest): Promise<EmbedOutcome> {
   if (request.texts.length === 0) {
     return { ok: true, vectors: [], modelId: null };
