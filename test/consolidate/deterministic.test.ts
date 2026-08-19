@@ -13,6 +13,8 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
+import { resolveOrCreateEntity } from '../../src/core/write/links.ts';
+import { slugify } from '../../src/core/write/normalize.ts';
 import {
   clusterByEmbedding,
   collapseDuplicateFacts,
@@ -208,6 +210,153 @@ describe('link reconciliation', () => {
       const result = await reconcileAllEdges(sql, { taxonomyVersion: 1 });
       expect(result.removed).toBe(1);
       expect(await countRows(sql, 'entity_edge', 'deleted_at IS NULL')).toBe(0);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  /**
+   * The two shapes that separate "resolve every endpoint one at a time" from
+   * "resolve the whole pass as a set".
+   *
+   * The phase's cost is now per pass rather than per fact, which is what makes it
+   * fit an attempt at all. The price of that is a resolver that answers about a
+   * *snapshot* instead of about the state its own previous answer left behind, so
+   * these are the two places the fold could have changed identity — and identity
+   * is the one thing batching was not allowed to touch.
+   */
+  test(
+    'two spellings that share one address resolve to one entity',
+    async () => {
+      const { sql } = tenant;
+      // `Kettle Works` and `Kettle-Works` are two normalize keys and one slug.
+      // Resolved one at a time, the first creates the entity and the second finds
+      // it *through the slug namespace* — that is the read path's second rung
+      // doing its job. Resolved as a set against one snapshot, both miss, and a
+      // fold that keyed only on the normalize key would create two rows no
+      // rule-based merge could ever collapse: their canonical names differ, so
+      // `entity_merge` groups them apart, and the graph carries one company as
+      // two forever.
+      for (const [subject, company] of [
+        ['Dana Ilves', 'Kettle Works'],
+        ['Femi Adeyemi', 'Kettle-Works'],
+      ]) {
+        await seedFact(sql, {
+          statement: `${subject} joined ${company}.`,
+          origins: ['personal:mail'],
+          confidence: 0.8,
+        });
+      }
+
+      const result = await reconcileAllEdges(sql, { taxonomyVersion: 1 });
+      expect(result.added).toBe(2);
+
+      const companies = (await sql`
+        SELECT entity_id::text AS entity_id FROM entity
+         WHERE entity_type = 'organization' AND deleted_at IS NULL
+      `) as Array<{ entity_id: string }>;
+      expect(companies.length).toBe(1);
+
+      // Both spellings are recall vocabulary on the one row, and the address
+      // resolves to it — which is the whole of what the sequential fold produced.
+      const aliases = (await sql`
+        SELECT alias FROM entity_alias
+         WHERE entity_id = ${companies[0]?.entity_id ?? ''}::bigint ORDER BY alias
+      `) as Array<{ alias: string }>;
+      expect(aliases.map((row) => row.alias)).toEqual(['kettle works', 'kettle-works']);
+
+      const address = (await sql`
+        SELECT entity_id::text AS entity_id FROM entity_slug
+         WHERE slug = ${slugify('Kettle Works')} AND kind = 'canonical'
+      `) as Array<{ entity_id: string }>;
+      expect(address[0]?.entity_id).toBe(companies[0]?.entity_id ?? '');
+
+      // And both edges point at it, so the graph answers "who works at Kettle
+      // Works" with two people rather than one each from two rows.
+      const employers = (await sql`
+        SELECT count(*)::int AS n FROM entity_edge
+         WHERE deleted_at IS NULL AND object_entity_id = ${companies[0]?.entity_id ?? ''}::bigint
+      `) as Array<{ n: number }>;
+      expect(employers[0]?.n).toBe(2);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
+    'an entity mentioned under a second credential widens once, and the edges follow it',
+    async () => {
+      const { sql } = tenant;
+      // The entity as an earlier write left it: narrow, one credential.
+      await resolveOrCreateEntity(sql, {
+        name: 'Kettle Works',
+        type: 'organization',
+        origins: ['personal:mail'],
+        taxonomyVersion: 1,
+      });
+
+      // Two facts, one per credential, and the second is the one that widens.
+      // R15 makes widening a successor row and a tombstone, so the order matters:
+      // an edge derived from the first fact was resolved against the row the
+      // second fact is about to kill.
+      await seedFact(sql, {
+        statement: 'Dana Ilves joined Kettle Works.',
+        origins: ['personal:mail'],
+        confidence: 0.8,
+      });
+      await seedFact(sql, {
+        statement: 'Femi Adeyemi joined Kettle Works.',
+        origins: ['work:slack'],
+        confidence: 0.8,
+      });
+
+      const result = await reconcileAllEdges(sql, { taxonomyVersion: 1 });
+      expect(result.added).toBe(2);
+
+      // **Once**, however many facts mention it. A second widen would be written
+      // from a row this pass had already tombstoned.
+      expect(await countRows(sql, 'entity', 'deleted_at IS NOT NULL')).toBe(1);
+      const survivor = (await sql`
+        SELECT entity_id::text AS entity_id, origin_contexts FROM entity
+         WHERE canonical_name = 'Kettle Works' AND deleted_at IS NULL
+      `) as Array<{ entity_id: string; origin_contexts: string[] }>;
+      expect(survivor.length).toBe(1);
+      expect([...(survivor[0]?.origin_contexts ?? [])].sort()).toEqual([
+        'personal:mail',
+        'work:slack',
+      ]);
+
+      // **The claim this test exists for.** Every live edge names a live entity.
+      // Resolving endpoint by endpoint, the edge implied by the *first* fact kept
+      // the id of the predecessor — so the pass inserted a live edge into a
+      // tombstoned row: a graph walk arriving somewhere nothing else can reach,
+      // with no constraint violated and nothing logged.
+      const orphaned = (await sql`
+        SELECT count(*)::int AS n
+          FROM entity_edge e
+          JOIN entity s ON s.entity_id = e.subject_entity_id
+          JOIN entity o ON o.entity_id = e.object_entity_id
+         WHERE e.deleted_at IS NULL
+           AND (s.deleted_at IS NOT NULL OR o.deleted_at IS NOT NULL)
+      `) as Array<{ n: number }>;
+      expect(orphaned[0]?.n).toBe(0);
+
+      // The spelling this pass planted is on the survivor. On the predecessor it
+      // would be invisible to the resolution ladder, which filters tombstones —
+      // so the next pass would not find the entity by name and would create it
+      // again.
+      const aliased = (await sql`
+        SELECT count(*)::int AS n FROM entity_alias
+         WHERE entity_id = ${survivor[0]?.entity_id ?? ''}::bigint AND alias = 'kettle works'
+      `) as Array<{ n: number }>;
+      expect(aliased[0]?.n).toBe(1);
+
+      // Monotone: the union is now correct, so a second pass widens nothing and
+      // changes nothing. That is what makes leaving widening un-batched
+      // affordable — it is bounded by entities whose origins actually grow, and
+      // in steady state that is none of them.
+      const again = await reconcileAllEdges(sql, { taxonomyVersion: 1 });
+      expect(again.added).toBe(0);
+      expect(again.removed).toBe(0);
+      expect(await countRows(sql, 'entity', 'deleted_at IS NOT NULL')).toBe(1);
     },
     SETUP_TIMEOUT_MS,
   );

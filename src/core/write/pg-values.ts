@@ -26,3 +26,18 @@ export function textArrayLiteral(values: readonly string[]): string {
   const escaped = values.map((value) => `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
   return `{${escaped.join(',')}}`;
 }
+
+/**
+ * `{1,2}` — the same literal form for `bigint[]` and `float8[]`, which the
+ * batched writes bind to drive an `unnest`.
+ *
+ * **The absence of escaping is the thing to check when editing.** Every value
+ * passed here is either a row id this process read out of the database (digits)
+ * or a number the caller computed; neither can carry a quote and neither is user
+ * text. Hand it anything derived from a document and it needs
+ * {@link textArrayLiteral}'s treatment instead — a name that ended its own
+ * element early is how a batched write silently writes the wrong row.
+ */
+export function numericArrayLiteral(values: readonly (string | number)[]): string {
+  return `{${values.join(',')}}`;
+}

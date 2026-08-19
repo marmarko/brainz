@@ -15,7 +15,7 @@
  * 28,799 of the pass's 30,850 round trips, against the other four deterministic
  * phases' combined 400ms.
  *
- * So there are three things to pin, and they are the three tests below:
+ * So there are four things to pin, and they are the four tests below:
  *
  *   1. **The deterministic prefix costs round trips per batch, not per page**,
  *      and it finishes in one attempt. This is the claim that makes redoing the
@@ -30,6 +30,13 @@
  *      open run**, including a run left open by the clock. That is KTD11's
  *      checkpoint, and `out_of_time` is a stop reason it has to work for like
  *      any other.
+ *   4. **`link_reconcile` costs round trips per pass, not per fact.** It is the
+ *      one phase that refuses to stop on the clock — a half-built desired edge
+ *      set makes the diff *delete* — so overrunning it is a reap rather than a
+ *      stop, and the only defence is for it to be cheap. It was 8.42 round trips
+ *      per live fact, which is four whole attempts on the brain that
+ *      dead-lettered. The corpus doubles inside that test and the statement
+ *      count does not move.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
@@ -42,6 +49,7 @@ import {
 } from '../../src/worker/consolidate/checkpoint.ts';
 import { runConsolidationCycle, runDeterministicPhase } from '../../src/worker/consolidate/cycle.ts';
 import { createAttemptBudget } from '../../src/worker/consolidate/deadline.ts';
+import { reconcileAllEdges } from '../../src/worker/consolidate/deterministic.ts';
 import { NO_SPEND } from '../../src/worker/consolidate/estimate.ts';
 import { DETERMINISTIC_PHASES } from '../../src/worker/consolidate/phases.ts';
 import {
@@ -75,9 +83,9 @@ afterEach(async () => {
  * pages would collapse to one cluster and stop exercising the seed walk that is
  * half of what this suite measures.
  */
-async function seedBrain(pages: number): Promise<void> {
+async function seedBrain(pages: number, from = 0): Promise<void> {
   const { sql } = tenant;
-  for (let index = 0; index < pages; index++) {
+  for (let index = from; index < from + pages; index++) {
     const subject = `Person${index}`;
     const company = `Company${index % 7}`;
     const body = `${subject} joined ${company}. ${company} is based in City${index % 5}.`;
@@ -222,16 +230,16 @@ describe('the deterministic prefix fits one attempt at the current phase costs',
       expect(cost.get('staleness')).toBeLessThanOrEqual(2 * BATCHES + 2);
       expect(cost.get('entity_merge')).toBeLessThanOrEqual(PAGES + 1);
 
-      // **Reconciliation is the one phase whose cost is per *fact*, and it is
-      // the next thing to attack if this ever stops fitting.** Every implied
-      // edge resolves its two entities, and each resolution is its own round
-      // trip. Measured on the brain that dead-lettered: 1,074 round trips and
-      // 214ms — about 39 seconds at that fleet's 36ms latency, which fits a
-      // fifteen-minute attempt with room and is why it was never the problem.
-      // The bound here is stated per fact rather than per page, so a corpus that
-      // states more claims per page does not silently relax it.
+      // **Reconciliation was the one phase whose cost was per *fact*.** Every
+      // implied edge resolved its two entities and each resolution was its own
+      // round trip, which measured 8.42 round trips per live fact cold. It now
+      // resolves the whole pass's names in batches, so the bound below is stated
+      // per fact only so that a corpus stating more claims per page cannot
+      // silently relax it — the cost no longer tracks the fact count at all. The
+      // rate itself is pinned in its own test at the bottom of this file, which
+      // is where the arithmetic back to a 5,608-page brain is written out.
       const facts = await countRows(tenant.sql, 'fact', 'superseded_by IS NULL');
-      expect(cost.get('link_reconcile')).toBeLessThan(facts * 12);
+      expect(cost.get('link_reconcile')).toBeLessThanOrEqual(facts / 4);
 
       // **The whole prefix, end to end, through the cycle the fleet runs.** One
       // attempt, one run, six phases, no clock stop — and this is the *second*
@@ -393,6 +401,108 @@ describe('a run left open by the clock is resumed without re-paying for it', () 
         (record) => record.tier === 'deterministic' && record.ran,
       );
       expect(redone.length).toBe(6);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 4. The phase that could not yield, and therefore had to become cheap.
+// ---------------------------------------------------------------------------
+
+/**
+ * `link_reconcile` costs round trips per *pass*, not per fact.
+ *
+ * **Why this phase and not another.** Every other phase here consults the budget
+ * between units of work and returns `done: false`, which is a clean
+ * `out_of_time`: a run record, no attempt charged, the next attempt resumes by
+ * repetition. `reconcileAllEdges` cannot do that — an edge missing from a
+ * half-built desired set is an edge the diff *deletes* — so it yields only to a
+ * lost lease. A phase that will not stop on the clock is a phase that gets
+ * **reaped** when it overruns, and a reap charges an attempt against a ladder
+ * that dead-letters after five. Being expensive is a different kind of problem
+ * here than it is anywhere else in the file.
+ *
+ * **The arithmetic, which is the whole reason for the bound below.** A 14-minute
+ * attempt at the incident fleet's 36ms worker-to-database latency buys about
+ * 23,300 sequential round trips for the entire deterministic prefix. The brain
+ * that dead-lettered is 5,608 pages ≈ 11,200 facts once extraction actually
+ * runs:
+ *
+ *   * At the shape this test was written against — two `resolveOrCreateEntity`
+ *     calls per implied edge, each of them two to six round trips, plus a probe
+ *     loop per new slug — it measured **8.42 round trips per live fact cold** and
+ *     4.01 warm. 11,200 facts × 8.42 ≈ 94,000 round trips: four whole attempts
+ *     for one phase, before any other phase ran. The reassuring "214ms, never the
+ *     problem" figure recorded in the code was taken on a brain with 160 facts,
+ *     *because* extraction had dead-lettered — so it could not support the
+ *     conclusion drawn from it.
+ *   * The ceiling asserted here is **one round trip per four live facts**. At
+ *     11,200 facts that is 2,800 round trips ≈ 101 seconds, about an eighth of
+ *     the attempt, which leaves the prefix's other five phases their share.
+ *
+ * **Counted, never timed.** Same reason as the first test in this file: on
+ * localhost the 8.42-per-fact version is also fast, which is exactly how this was
+ * missed.
+ */
+describe('reconciliation costs round trips per pass rather than per fact', () => {
+  test(
+    'doubling the corpus does not double the statements',
+    async () => {
+      const PAGES = 120;
+      await seedBrain(PAGES);
+
+      /** The denominator: what `LIVE_FACT` means, spelled out. */
+      const liveFacts = (): Promise<number> =>
+        countRows(
+          tenant.sql,
+          'fact',
+          'deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL',
+        );
+
+      // **Cold**: no entity exists yet, so this pass creates every one of them,
+      // allocates every slug and inserts every edge. It is the expensive
+      // direction and the one the incident brain would have taken.
+      const cold = { statements: 0 };
+      const first = await reconcileAllEdges(countingSql(tenant.sql, cold), {
+        taxonomyVersion: 1,
+      });
+      expect(first.done).toBe(true);
+      expect(first.added).toBeGreaterThan(0);
+      const factsAtFirst = await liveFacts();
+      expect(cold.statements).toBeLessThanOrEqual(factsAtFirst / 4);
+
+      // **Warm**: the nightly shape. Every entity resolves, every edge is already
+      // present, and the pass still has to prove that by recomputing the desired
+      // set from every live fact.
+      const warm = { statements: 0 };
+      const second = await reconcileAllEdges(countingSql(tenant.sql, warm), {
+        taxonomyVersion: 1,
+      });
+      expect(second.done).toBe(true);
+      expect(second.removed).toBe(0);
+      expect(second.added).toBe(0);
+      expect(warm.statements).toBeLessThanOrEqual(factsAtFirst / 4);
+
+      // **A rate rather than a constant.** A bound stated per fact is satisfied
+      // by any fixed cost at one corpus size, so the corpus doubles and the
+      // *marginal* cost is what gets asserted. Everything a second 120 pages adds
+      // is a longer array inside statements that were being issued anyway: one
+      // more batch of names to resolve, one more batch of entities to create, one
+      // more batch of edges to insert. The ceiling is per batch group, not per
+      // fact, so it does not move with the corpus.
+      await seedBrain(PAGES, PAGES);
+      const grown = { statements: 0 };
+      const third = await reconcileAllEdges(countingSql(tenant.sql, grown), {
+        taxonomyVersion: 1,
+      });
+      expect(third.done).toBe(true);
+      const factsAtThird = await liveFacts();
+      expect(factsAtThird).toBeGreaterThanOrEqual(2 * factsAtFirst);
+      expect(grown.statements).toBeLessThanOrEqual(factsAtThird / 4);
+      // 240 more live facts for at most a handful more statements. At the rate
+      // this phase used to run, the same 240 facts cost about 2,000.
+      expect(grown.statements - warm.statements).toBeLessThanOrEqual(8);
     },
     SETUP_TIMEOUT_MS,
   );

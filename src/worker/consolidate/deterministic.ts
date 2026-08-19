@@ -47,10 +47,14 @@
  *   to the clock — stopping it on the clock would buy nothing and cost the
  *   whole pass.
  *
- * That is affordable exactly because these are the cheap ones: measured on a
- * 5,608-page brain, dedup, link reconciliation, staleness and entity merge
- * together cost under 400ms of database work, while salience and clustering cost
- * 28,799 of the pass's 30,850 round trips.
+ * That is affordable only because none of these costs round trips per row, and
+ * `link_reconcile` is the one that had to be *made* that way rather than being
+ * born it. It is not the cheap phase this header used to call it: the 214ms it
+ * was measured at was measured on a brain holding 160 facts, because extraction
+ * had dead-lettered, so it said nothing about the 11,200-fact brain it was
+ * quoted about. Counted instead of timed, it cost 8.42 round trips per live fact
+ * — and being the phase that refuses the clock, overrunning is a reap rather
+ * than a stop. See {@link reconcileAllEdges}.
  *
  * **Round trips, not rows, were the wall.** Salience issued `1 + 2N` sequential
  * statements — a per-page fact query and a per-page UPDATE — which is 11,217 on
@@ -59,7 +63,10 @@
  * statements per {@link SALIENCE_BATCH} pages. Clustering paid a whole
  * transaction (`BEGIN`, two `SET LOCAL`, `COMMIT`) per seed and one INSERT per
  * member; it now amortizes the transaction over a batch of seeds and writes each
- * cluster with its members in one statement.
+ * cluster with its members in one statement. Reconciliation resolved both
+ * endpoints of every implied edge one call at a time and diffed one edge per
+ * statement; it now resolves the pass's whole name set together and diffs
+ * set-wise.
  *
  * **Nothing here collapses across credentials.** R15 makes `origin_contexts`
  * immutable, so a row cannot absorb a second credential's attestation — and
@@ -73,9 +80,13 @@ import type { SQL } from 'bun';
 import { RECENCY_HALF_LIFE_DAYS, SOURCE_TYPE_PRIOR } from '../../core/search/boosts.ts';
 import type { SourceType } from '../../core/search/types.ts';
 import { extractFromStatement } from '../../core/write/extract.ts';
-import { impliedEdges, resolveOrCreateEntity } from '../../core/write/links.ts';
+import {
+  impliedEdges,
+  resolveOrCreateEntities,
+  type EntityType,
+} from '../../core/write/links.ts';
 import { normalize } from '../../core/write/normalize.ts';
-import { textArrayLiteral } from '../../core/write/pg-values.ts';
+import { numericArrayLiteral, textArrayLiteral } from '../../core/write/pg-values.ts';
 import { ACTIVE_EMBEDDING_SEAT, seatColumnSql } from '../../schema/embedding-seat.ts';
 import { candidatePoolFor, withVectorScan } from '../../schema/vector-query.ts';
 import { unboundedAttempt, type AttemptBudget } from './deadline.ts';
@@ -112,17 +123,11 @@ const RESTARTS: PhaseProgress = Object.freeze({ done: false });
  */
 const CURSOR_START = '0';
 
-/**
- * A `bigint[]` / `float8[]` literal, for the batched writes below.
- *
- * `textArrayLiteral`'s escaping is deliberately absent, and its absence is the
- * thing to check when editing: every value passed here is either a row id this
- * process just read out of the database (digits) or a number this file computed
- * and clamped to [0, 1]. Neither can carry a quote, and neither is user text.
- * Hand it anything from a document and the escaping has to come back.
- */
-function numericArrayLiteral(values: readonly (string | number)[]): string {
-  return `{${values.join(',')}}`;
+/** `xs` in runs of at most `size`, for the batched writes below. */
+function chunked<T>(xs: readonly T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let index = 0; index < xs.length; index += size) out.push(xs.slice(index, index + size));
+  return out;
 }
 
 /**
@@ -233,6 +238,22 @@ function edgeKey(subjectId: string, edgeType: string, objectId: string): string 
   return `${subject}|${edgeType}|${object}`;
 }
 
+/** One edge the live facts assert, with the endpoints this pass settled on. */
+interface DesiredEdge {
+  readonly subjectId: string;
+  readonly objectId: string;
+  readonly edgeType: string;
+  readonly confidence: number;
+  readonly origins: readonly string[];
+}
+
+/**
+ * Edges per statement in the diff below. Same trade as {@link SALIENCE_BATCH}:
+ * large enough that the write is per pass rather than per edge, small enough
+ * that one array literal stays a comfortable bind.
+ */
+export const RECONCILE_EDGE_BATCH = 500;
+
 /**
  * Bring the whole edge set into agreement with the live facts.
  *
@@ -247,51 +268,110 @@ function edgeKey(subjectId: string, edgeType: string, objectId: string): string 
  * its origins, which under R15's immutability means a successor row and a rewrite
  * of its live edges — so reading the live edges before that happens would diff
  * against rows that no longer exist.
+ *
+ * **This phase yields to a lost lease and never to the clock, and the reason has
+ * changed.** It was "affordable because it is small: 214ms on a 5,608-page
+ * brain" — a measurement taken on a brain holding 160 facts *because* extraction
+ * had dead-lettered, and therefore evidence for nothing about the brain it was
+ * quoted about. Counted rather than timed, the old shape cost **8.42 round trips
+ * per live fact** cold and 4.01 warm: two `resolveOrCreateEntity` calls per
+ * implied edge, each two to six statements, plus a probe loop per new slug, plus
+ * one statement per diffed edge. On 11,200 facts that is ~94,000 sequential round
+ * trips, and a 14-minute attempt at the incident fleet's 36ms latency buys about
+ * 23,300 for the *whole* prefix. A phase that cannot stop on the clock does not
+ * overrun politely — it is reaped, and a reap charges an attempt against a ladder
+ * that dead-letters after five.
+ *
+ * So it was made cheap rather than stoppable, which is what salience's fix was
+ * too. The names of every endpoint the pass needs are knowable before any of them
+ * is resolved, so they are resolved as a set
+ * (`write/links.ts:resolveOrCreateEntities`); the diff's removals and insertions
+ * are set-based writes. What is left is a handful of statements per pass plus one
+ * per {@link RECONCILE_EDGE_BATCH}, and the per-fact term is gone — which is the
+ * property `test/consolidate/convergence.test.ts` asserts, by doubling the corpus
+ * and watching the statement count stand still.
  */
 export async function reconcileAllEdges(
   sql: SQL,
   options: { readonly taxonomyVersion: number; readonly budget?: AttemptBudget },
 ): Promise<ReconcileResult & PhaseProgress> {
   const budget = options.budget ?? unboundedAttempt();
+  const nothingDone = { added: 0, removed: 0, kept: 0, ...RESTARTS };
   const facts = (await sql.unsafe(`
     SELECT statement, origin_contexts FROM fact WHERE ${LIVE_FACT} ORDER BY fact_id
   `)) as Array<{ statement: string; origin_contexts: string[] }>;
 
-  const desired = new Map<string, { subjectId: string; objectId: string; edgeType: string; confidence: number; origins: string[] }>();
+  // The projection, computed entirely in memory. Every name the pass will need
+  // is knowable here, which is what makes resolving them as a set possible at
+  // all — and the endpoints are carried by normalize key rather than by entity
+  // id because the ids do not exist yet.
+  const endpoints: Array<{
+    readonly name: string;
+    readonly type: EntityType;
+    readonly origins: readonly string[];
+    readonly taxonomyVersion: number;
+  }> = [];
+  const projected: Array<{
+    readonly subject: string;
+    readonly object: string;
+    readonly edgeType: string;
+    readonly confidence: number;
+  }> = [];
 
   for (const fact of facts) {
     // **The desired set has to be complete before anything is diffed against
     // it**, so this phase cannot bank a partial position: an edge missing from a
     // half-built desired set is an edge the diff below would *delete*. It
     // therefore yields to a lost lease and not to the clock — abandoning it on
-    // the clock would make it the phase the cycle can never get past. Affordable
-    // because it is small: 214ms and 1,074 round trips on a 5,608-page brain,
-    // against the 28,799 round trips salience and clustering used to cost.
-    if (budget.cancelled() !== null) return { added: 0, removed: 0, kept: 0, ...RESTARTS };
+    // the clock would make it the phase the cycle can never get past.
+    if (budget.cancelled() !== null) return nothingDone;
     const extracted = extractFromStatement(fact.statement);
     if (extracted === null) continue;
     for (const implied of impliedEdges([extracted])) {
-      const subject = await resolveOrCreateEntity(sql, {
-        name: implied.subject.name,
-        type: implied.subject.type,
-        origins: fact.origin_contexts,
-        taxonomyVersion: options.taxonomyVersion,
-      });
-      const object = await resolveOrCreateEntity(sql, {
-        name: implied.object.name,
-        type: implied.object.type,
-        origins: fact.origin_contexts,
-        taxonomyVersion: options.taxonomyVersion,
-      });
-      if (subject.entityId === object.entityId) continue;
-      desired.set(edgeKey(subject.entityId, implied.edgeType, object.entityId), {
-        subjectId: subject.entityId,
-        objectId: object.entityId,
+      for (const end of [implied.subject, implied.object]) {
+        endpoints.push({
+          name: end.name,
+          type: end.type,
+          origins: fact.origin_contexts,
+          taxonomyVersion: options.taxonomyVersion,
+        });
+      }
+      projected.push({
+        subject: normalize(implied.subject.name),
+        object: normalize(implied.object.name),
         edgeType: implied.edgeType,
         confidence: implied.confidence,
-        origins: [...new Set([...subject.originContexts, ...object.originContexts])].sort(),
       });
     }
+  }
+
+  // Checked once more, unconditionally, because the loop above is skipped
+  // entirely on a brain whose facts state no edges — and a dispossessed pass that
+  // reached the diff with an empty desired set would tombstone every rule-derived
+  // edge the brain has, with an unfenced write, on its way out.
+  if (budget.cancelled() !== null) return nothingDone;
+
+  const entities = await resolveOrCreateEntities(sql, endpoints);
+
+  const desired = new Map<string, DesiredEdge>();
+  for (const edge of projected) {
+    const subject = entities.get(edge.subject);
+    const object = entities.get(edge.object);
+    // Unreachable: a name that resolves to nothing throws inside the resolver,
+    // exactly as it did when the endpoints were resolved one at a time.
+    if (subject === undefined || object === undefined) continue;
+    if (subject.entityId === object.entityId) continue;
+    // **The origins come from the entity rows the pass settled on**, which is
+    // also the repair of a bug the sequential shape carried: an endpoint widened
+    // by a later fact left every edge derived from an earlier one pointing at the
+    // predecessor this pass had already tombstoned.
+    desired.set(edgeKey(subject.entityId, edge.edgeType, object.entityId), {
+      subjectId: subject.entityId,
+      objectId: object.entityId,
+      edgeType: edge.edgeType,
+      confidence: edge.confidence,
+      origins: [...new Set([...subject.originContexts, ...object.originContexts])].sort(),
+    });
   }
 
   // **Only edges this projection could itself have produced are candidates for
@@ -307,9 +387,9 @@ export async function reconcileAllEdges(
       FROM entity_edge WHERE deleted_at IS NULL AND derivation = 'rule_derived'
   `) as Array<{ edge_id: string; subject_entity_id: string; edge_type: string; object_entity_id: string }>;
 
-  let removed = 0;
   let kept = 0;
   const present = new Set<string>();
+  const doomed: string[] = [];
   for (const edge of live) {
     const key = edgeKey(edge.subject_entity_id, edge.edge_type, edge.object_entity_id);
     if (desired.has(key)) {
@@ -317,29 +397,67 @@ export async function reconcileAllEdges(
       kept += 1;
       continue;
     }
-    await sql`UPDATE entity_edge SET deleted_at = now() WHERE edge_id = ${edge.edge_id}::bigint`;
-    removed += 1;
+    doomed.push(edge.edge_id);
+  }
+
+  let removed = 0;
+  for (const chunk of chunked(doomed, RECONCILE_EDGE_BATCH)) {
+    const gone = (await sql.unsafe(
+      `UPDATE entity_edge SET deleted_at = now()
+        WHERE edge_id = ANY($1::bigint[]) AND deleted_at IS NULL
+       RETURNING edge_id`,
+      [numericArrayLiteral(chunk)],
+    )) as unknown[];
+    removed += gone.length;
+  }
+
+  // Grouped by origin set so each statement binds one `text[]` literal rather
+  // than a literal per row — and there are as many groups as the brain has
+  // distinct credential unions, which is a property of the connectors somebody
+  // installed rather than of how many facts they wrote.
+  const groups = new Map<string, { origins: readonly string[]; edges: DesiredEdge[] }>();
+  for (const [key, edge] of desired) {
+    if (present.has(key)) continue;
+    const group = groups.get(originKey(edge.origins)) ?? { origins: edge.origins, edges: [] };
+    group.edges.push(edge);
+    groups.set(originKey(edge.origins), group);
   }
 
   let added = 0;
-  for (const [key, edge] of desired) {
-    if (present.has(key)) continue;
-    const [subject, object] = orient(edge.subjectId, edge.objectId, edge.edgeType);
-    const inserted = (await sql`
-      INSERT INTO entity_edge (subject_entity_id, edge_type, object_entity_id, origin_contexts, confidence)
-      SELECT ${subject}::bigint, ${edge.edgeType}, ${object}::bigint,
-             ${textArrayLiteral(edge.origins)}::text[], ${edge.confidence}
-       WHERE NOT EXISTS (
-         SELECT 1 FROM entity_edge
-          WHERE deleted_at IS NULL
-            AND subject_entity_id = ${subject}::bigint
-            AND edge_type = ${edge.edgeType}
-            AND object_entity_id = ${object}::bigint
-       )
-      RETURNING edge_id
-    `) as unknown[];
-    if (inserted.length > 0) added += 1;
-    else kept += 1;
+  for (const { origins, edges } of groups.values()) {
+    for (const chunk of chunked(edges, RECONCILE_EDGE_BATCH)) {
+      const oriented = chunk.map((edge) => {
+        const [subject, object] = orient(edge.subjectId, edge.objectId, edge.edgeType);
+        return { subject, object, edgeType: edge.edgeType, confidence: edge.confidence };
+      });
+      // `WHERE NOT EXISTS` rather than `ON CONFLICT`, unchanged: the unique index
+      // it races is partial over live rows, and the row already there may be one
+      // this pass just tombstoned. What each surviving row costs is a `kept`
+      // rather than an `added`, which is why the count comes from `RETURNING`.
+      const inserted = (await sql.unsafe(
+        `INSERT INTO entity_edge (subject_entity_id, edge_type, object_entity_id, origin_contexts, confidence)
+         SELECT u.subject, u.edge_type, u.object, $5::text[], u.confidence
+           FROM unnest($1::bigint[], $2::text[], $3::bigint[], $4::float8[])
+                AS u(subject, edge_type, object, confidence)
+          WHERE NOT EXISTS (
+            SELECT 1 FROM entity_edge e
+             WHERE e.deleted_at IS NULL
+               AND e.subject_entity_id = u.subject
+               AND e.edge_type = u.edge_type
+               AND e.object_entity_id = u.object
+          )
+         RETURNING edge_id`,
+        [
+          numericArrayLiteral(oriented.map((edge) => edge.subject)),
+          textArrayLiteral(oriented.map((edge) => edge.edgeType)),
+          numericArrayLiteral(oriented.map((edge) => edge.object)),
+          numericArrayLiteral(oriented.map((edge) => edge.confidence)),
+          textArrayLiteral([...origins]),
+        ],
+      )) as unknown[];
+      added += inserted.length;
+      kept += chunk.length - inserted.length;
+    }
   }
 
   return { added, removed, kept, ...FINISHED };

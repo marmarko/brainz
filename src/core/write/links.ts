@@ -36,7 +36,7 @@ import type { SQL } from 'bun';
 
 import { extractFromStatement, type ExtractedFact, type Predicate } from './extract.ts';
 import { normalize, slugify } from './normalize.ts';
-import { textArrayLiteral } from './pg-values.ts';
+import { numericArrayLiteral, textArrayLiteral } from './pg-values.ts';
 
 /** `entity_type_is_known` in the schema. Repeating the closed set is the point:
  * a type outside it fails at commit, at the end of an otherwise good write. */
@@ -146,6 +146,95 @@ function toEntity(row: RawEntity): EntityRow {
 }
 
 /**
+ * Names per statement in every batched read and write below.
+ *
+ * Large enough that a whole consolidation pass over a 5,608-page brain is a
+ * couple of dozen statements rather than tens of thousands; small enough that
+ * one batch's array literal stays a comfortable parameter and a name list built
+ * from a corpus cannot grow into a megabyte-long bind.
+ */
+export const ENTITY_BATCH = 500;
+
+/** `xs` in runs of at most {@link ENTITY_BATCH}. */
+function batched<T>(xs: readonly T[], size = ENTITY_BATCH): T[][] {
+  const out: T[][] = [];
+  for (let index = 0; index < xs.length; index += size) out.push(xs.slice(index, index + size));
+  return out;
+}
+
+/**
+ * Alias first, then the slug namespace, for a whole set of names at once.
+ *
+ * **One ladder, expressed once.** This is the read path's resolution order —
+ * alias, then the slug namespace in which a redirect resolves exactly as a
+ * canonical slug does — and both the singular {@link findEntityByName} and the
+ * batched {@link resolveOrCreateEntities} go through it. A second copy written
+ * for the batched caller would be the failure this module's header names about
+ * the normalizer, one layer up: two ladders that agree today, disagree after one
+ * edit, and disagree *silently*, because a name that resolves one way on the
+ * write path and another way in consolidation does not throw. It forks the
+ * entity.
+ *
+ * Keyed by {@link normalize}, which is what the caller has to key its own
+ * bookkeeping by anyway. A name whose key is empty is not asked about.
+ */
+export async function findEntitiesByName(
+  db: SQL,
+  names: readonly string[],
+): Promise<Map<string, EntityRow>> {
+  const wanted = new Map<string, string>();
+  for (const name of names) {
+    const key = normalize(name);
+    // Same key implies the same slug — `slugify` is a function of `normalize` —
+    // so the first spelling seen may stand for every later one.
+    if (key.length > 0 && !wanted.has(key)) wanted.set(key, slugify(name));
+  }
+
+  const found = new Map<string, EntityRow>();
+  for (const chunk of batched([...wanted])) {
+    // `DISTINCT ON (key) ... ORDER BY key, entity_id` is the batched spelling of
+    // the singular lookup's `ORDER BY e.entity_id LIMIT 1`: two people really are
+    // called Mike, aliases are deliberately not unique across entities, and the
+    // tie has to break the same way for both callers or they fork the entity.
+    const rows = (await db.unsafe(
+      `WITH wanted AS (
+         SELECT * FROM unnest($1::text[], $2::text[]) AS w(key, slug)
+       ),
+       by_alias AS (
+         SELECT DISTINCT ON (w.key)
+                w.key AS key, e.entity_id::text AS entity_id, e.canonical_name, e.origin_contexts
+           FROM wanted w
+           JOIN entity_alias a ON lower(a.alias) = w.key
+           JOIN entity e ON e.entity_id = a.entity_id
+          WHERE e.deleted_at IS NULL
+          ORDER BY w.key, e.entity_id
+       ),
+       by_slug AS (
+         SELECT w.key AS key, e.entity_id::text AS entity_id, e.canonical_name, e.origin_contexts
+           FROM wanted w
+           JOIN entity_slug s ON s.slug = w.slug
+           JOIN entity e ON e.entity_id = s.entity_id
+          WHERE e.deleted_at IS NULL
+       )
+       SELECT w.key,
+              coalesce(a.entity_id, s.entity_id) AS entity_id,
+              coalesce(a.canonical_name, s.canonical_name) AS canonical_name,
+              coalesce(a.origin_contexts, s.origin_contexts) AS origin_contexts
+         FROM wanted w
+         LEFT JOIN by_alias a ON a.key = w.key
+         LEFT JOIN by_slug s ON s.key = w.key
+        WHERE a.entity_id IS NOT NULL OR s.entity_id IS NOT NULL`,
+      [
+        textArrayLiteral(chunk.map(([key]) => key)),
+        textArrayLiteral(chunk.map(([, slug]) => slug)),
+      ],
+    )) as Array<RawEntity & { key: string }>;
+    for (const row of rows) found.set(row.key, toEntity(row));
+  }
+  return found;
+}
+
+/**
  * Alias first, then the slug namespace — the read path's ladder, applied on the
  * write side so that both sides resolve a name the same way. A redirect
  * resolves here exactly as a canonical slug does, which is the whole reason
@@ -154,40 +243,7 @@ function toEntity(row: RawEntity): EntityRow {
 export async function findEntityByName(db: SQL, name: string): Promise<EntityRow | null> {
   const key = normalize(name);
   if (key.length === 0) return null;
-
-  const byAlias = (await db`
-    SELECT e.entity_id::text AS entity_id, e.canonical_name, e.origin_contexts
-      FROM entity_alias a
-      JOIN entity e ON e.entity_id = a.entity_id
-     WHERE lower(a.alias) = ${key}
-       AND e.deleted_at IS NULL
-     ORDER BY e.entity_id
-     LIMIT 1
-  `) as RawEntity[];
-  if (byAlias[0] !== undefined) return toEntity(byAlias[0]);
-
-  const bySlug = (await db`
-    SELECT e.entity_id::text AS entity_id, e.canonical_name, e.origin_contexts
-      FROM entity_slug s
-      JOIN entity e ON e.entity_id = s.entity_id
-     WHERE s.slug = ${slugify(name)}
-       AND e.deleted_at IS NULL
-     LIMIT 1
-  `) as RawEntity[];
-  return bySlug[0] === undefined ? null : toEntity(bySlug[0]);
-}
-
-/** A free slug in the addressing namespace, derived from the name. */
-async function availableSlug(db: SQL, name: string): Promise<string> {
-  const base = slugify(name);
-  for (let attempt = 0; attempt < 64; attempt += 1) {
-    const candidate = attempt === 0 ? base : `${base.slice(0, 120)}-${attempt + 1}`;
-    const taken = (await db`SELECT 1 AS taken FROM entity_slug WHERE slug = ${candidate}`) as Array<{
-      taken: number;
-    }>;
-    if (taken.length === 0) return candidate;
-  }
-  throw new Error(`no free slug for '${name}' after 64 attempts`);
+  return (await findEntitiesByName(db, [name])).get(key) ?? null;
 }
 
 function union(left: readonly string[], right: readonly string[]): string[] {
@@ -269,12 +325,323 @@ export interface ResolveEntityRequest {
   readonly taxonomyVersion: number;
 }
 
+/** One spelling, folded across every request in the batch that used it. */
+interface WantedName {
+  readonly key: string;
+  /** The first spelling seen — what a created row's `canonical_name` becomes. */
+  readonly name: string;
+  readonly type: EntityType;
+  readonly slug: string;
+  readonly taxonomyVersion: number;
+  /** Every origin any request for this spelling carried. The widening target. */
+  readonly origins: Set<string>;
+  /** The first request's origins — what the alias row is stamped with. */
+  readonly aliasOrigins: readonly string[];
+}
+
+/**
+ * The entities a whole set of names refers to, creating what the brain has not
+ * seen, in a number of statements that does not grow with the set.
+ *
+ * **This exists because a phase that cannot yield had to become cheap.**
+ * Consolidation's `link_reconcile` resolves both endpoints of every implied
+ * edge, and resolving them one at a time cost 8.42 round trips per live fact —
+ * about 94,000 on a 5,608-page brain, four times what a 14-minute attempt buys
+ * at the incident fleet's latency. It is the one phase that cannot stop on the
+ * clock (an edge missing from a half-built desired set is an edge the diff
+ * deletes), so overrunning it is not a slow phase but a *reaped* attempt against
+ * a ladder that dead-letters after five. The fix is the one salience took: batch
+ * the work, do not checkpoint it.
+ *
+ * **Every path still leaves the same three things true** — the entity exists,
+ * its origin union covers every write that mentioned it, and the normalized
+ * surface form is in its alias vocabulary — and the order below is what keeps
+ * them true together:
+ *
+ *   1. **Resolve** every name through the one ladder.
+ *   2. **Widen** each found entity ONCE, to the union of every origin this batch
+ *      needs, remapping the spellings that landed on it to the successor. R15
+ *      makes widening a new row and a tombstone, so a batch that widened the same
+ *      entity twice would write the second successor from a row it had just
+ *      killed.
+ *   3. **Create** what is left, with the full union up front rather than the
+ *      first mention's origins and a widen per mention afterwards. Same end
+ *      state, without the intermediate tombstones.
+ *   4. **Slugs**, then **aliases** — aliases last, and after the remap, because
+ *      an alias planted on a tombstoned predecessor is a spelling that silently
+ *      stops resolving (`deleted_at IS NULL` is in the ladder) and gets the
+ *      entity re-created on the next pass.
+ *
+ * **Creation folds by slug, not by key**, which is the one place batching could
+ * have changed identity. `Acme, Inc.` and `Acme Inc` are two normalize keys and
+ * one slug: resolved one at a time, the first creates the entity and the second
+ * *finds* it through the slug namespace. Resolved as a set against one snapshot,
+ * both miss and both would create — two entities that no rule-based merge would
+ * ever collapse, because their canonical names differ. So the unresolved names
+ * are folded by slug and the leader's entity stands for the group, which is
+ * exactly what the sequential fold produced.
+ */
+export async function resolveOrCreateEntities(
+  db: SQL,
+  requests: readonly ResolveEntityRequest[],
+): Promise<Map<string, EntityRow>> {
+  const wanted = new Map<string, WantedName>();
+  for (const request of requests) {
+    const key = normalize(request.name);
+    if (key.length === 0) throw new Error('an entity needs a name');
+    const seen = wanted.get(key);
+    if (seen !== undefined) {
+      for (const origin of request.origins) seen.origins.add(origin);
+      continue;
+    }
+    wanted.set(key, {
+      key,
+      name: request.name,
+      type: request.type,
+      slug: slugify(request.name),
+      taxonomyVersion: request.taxonomyVersion,
+      origins: new Set(request.origins),
+      aliasOrigins: [...new Set(request.origins)].sort(),
+    });
+  }
+  if (wanted.size === 0) return new Map();
+
+  const resolved = new Map<string, EntityRow>(
+    await findEntitiesByName(db, [...wanted.values()].map((name) => name.name)),
+  );
+
+  // ------------------------------------------------------------------
+  // 2. Widen, once per entity.
+  // ------------------------------------------------------------------
+
+  const perEntity = new Map<string, { entity: EntityRow; keys: string[]; origins: Set<string> }>();
+  for (const [key, entity] of resolved) {
+    const name = wanted.get(key);
+    if (name === undefined) continue;
+    const group = perEntity.get(entity.entityId) ?? { entity, keys: [], origins: new Set<string>() };
+    group.keys.push(key);
+    for (const origin of name.origins) group.origins.add(origin);
+    perEntity.set(entity.entityId, group);
+  }
+
+  for (const group of perEntity.values()) {
+    const missing = [...group.origins].filter(
+      (origin) => !group.entity.originContexts.includes(origin),
+    );
+    // Not batched, and it does not need to be: this fires once per entity whose
+    // origin set genuinely grows, it is monotone (the next pass finds the union
+    // already there), and in steady state it fires for nothing at all — the
+    // write path widens as it ingests, so consolidation is re-deriving a union
+    // that is already correct. It is bounded by entities, never by facts.
+    if (missing.length === 0) continue;
+    const successor = await widenEntityOrigins(db, group.entity, missing);
+    for (const key of group.keys) resolved.set(key, successor);
+  }
+
+  // ------------------------------------------------------------------
+  // 3. Create what is left, folded by slug.
+  // ------------------------------------------------------------------
+
+  const leaders: WantedName[] = [];
+  const bySlug = new Map<string, WantedName>();
+  const followers = new Map<string, string[]>();
+  for (const name of wanted.values()) {
+    if (resolved.has(name.key)) continue;
+    const leader = bySlug.get(name.slug);
+    if (leader === undefined) {
+      bySlug.set(name.slug, name);
+      followers.set(name.slug, []);
+      leaders.push(name);
+      continue;
+    }
+    followers.get(leader.slug)?.push(name.key);
+    for (const origin of name.origins) leader.origins.add(origin);
+  }
+
+  const born: Array<{ leader: WantedName; entity: EntityRow }> = [];
+  for (const group of groupByOrigins(leaders)) {
+    for (const chunk of batched(group.members)) {
+      const rows = (await db.unsafe(
+        `INSERT INTO entity (canonical_name, entity_type, taxonomy_version, origin_contexts)
+         SELECT u.name, u.type, $3::int, $4::text[]
+           FROM unnest($1::text[], $2::text[]) AS u(name, type)
+         RETURNING entity_id::text AS entity_id, canonical_name, origin_contexts`,
+        [
+          textArrayLiteral(chunk.map((member) => member.name)),
+          textArrayLiteral(chunk.map((member) => member.type)),
+          group.taxonomyVersion,
+          textArrayLiteral(group.origins),
+        ],
+      )) as RawEntity[];
+      // Correlated by `canonical_name` rather than by the order rows come back
+      // in, which nothing promises. It is a key here because two spellings that
+      // produce the same name produce the same normalize key, and this list holds
+      // one member per key.
+      const byName = new Map(chunk.map((member) => [member.name, member]));
+      for (const row of rows) {
+        const leader = byName.get(row.canonical_name);
+        if (leader === undefined) continue;
+        born.push({ leader, entity: toEntity(row) });
+      }
+    }
+  }
+  for (const { leader, entity } of born) {
+    resolved.set(leader.key, entity);
+    for (const key of followers.get(leader.slug) ?? []) resolved.set(key, entity);
+  }
+  if (born.length !== leaders.length) {
+    const missed = leaders.find((leader) => !resolved.has(leader.key));
+    throw new Error(`could not create entity '${missed?.name ?? ''}'`);
+  }
+
+  await allocateSlugs(db, born);
+  await plantAliases(db, wanted, resolved);
+  return resolved;
+}
+
+/**
+ * Groups by origin set, so each write binds one `text[]` literal for the lot
+ * rather than one per row — and the group carries the values it was keyed on, so
+ * the bind reads them from the group rather than from some member of it.
+ *
+ * There are as many groups as there are distinct credential unions among these
+ * names, which is a property of how many connectors somebody installed rather
+ * than of how many names the corpus mentions.
+ */
+interface OriginGroup {
+  readonly origins: readonly string[];
+  /** Keyed on too: it is a column of the same INSERT, so a batch that mixed two
+   * versions would have to bind one of them wrongly. */
+  readonly taxonomyVersion: number;
+  readonly members: WantedName[];
+}
+
+function groupByOrigins(names: readonly WantedName[]): OriginGroup[] {
+  const groups = new Map<string, OriginGroup>();
+  for (const name of names) {
+    const origins = [...name.origins].sort();
+    const key = JSON.stringify([origins, name.taxonomyVersion]);
+    const group = groups.get(key) ?? {
+      origins,
+      taxonomyVersion: name.taxonomyVersion,
+      members: [],
+    };
+    group.members.push(name);
+    groups.set(key, group);
+  }
+  return [...groups.values()];
+}
+
+/**
+ * A canonical slug for every entity just created.
+ *
+ * **The probe loop was a per-name round-trip multiplier.** Asking `is this slug
+ * taken` before every insert is one statement per new entity on top of the
+ * insert itself, and the answer is one the database can give by refusing. So
+ * the whole round is offered at once and the namespace's own primary key
+ * arbitrates: `ON CONFLICT (slug) DO NOTHING` settles collisions with rows that
+ * already exist *and* between two candidates inside the same statement, and
+ * `RETURNING` says who won. The losers try the next suffix, so a round is one
+ * statement rather than one per name and the common case is a single round.
+ *
+ * The candidate shape (`base`, then `base-2` … `base-64`) is the shape it always
+ * was. A collision is rarer than it looks: a slug taken by a *live* entity is
+ * resolved through the slug namespace long before anything reaches here, so what
+ * remains are the addresses of tombstoned rows, which keep their slugs on
+ * purpose.
+ */
+async function allocateSlugs(
+  db: SQL,
+  born: ReadonlyArray<{ leader: WantedName; entity: EntityRow }>,
+): Promise<void> {
+  let pending = [...born];
+  for (let attempt = 0; attempt < 64 && pending.length > 0; attempt += 1) {
+    const candidate = (leader: WantedName): string =>
+      attempt === 0 ? leader.slug : `${leader.slug.slice(0, 120)}-${attempt + 1}`;
+
+    const stillPending: typeof pending = [];
+    for (const chunk of batched(pending)) {
+      const rows = (await db.unsafe(
+        `INSERT INTO entity_slug (slug, entity_id, kind)
+         SELECT u.slug, u.entity_id, 'canonical'
+           FROM unnest($1::text[], $2::bigint[]) AS u(slug, entity_id)
+         ON CONFLICT (slug) DO NOTHING
+         RETURNING entity_id::text AS entity_id`,
+        [
+          textArrayLiteral(chunk.map((row) => candidate(row.leader))),
+          numericArrayLiteral(chunk.map((row) => row.entity.entityId)),
+        ],
+      )) as Array<{ entity_id: string }>;
+      const addressed = new Set(rows.map((row) => row.entity_id));
+      for (const row of chunk) if (!addressed.has(row.entity.entityId)) stillPending.push(row);
+    }
+    pending = stillPending;
+  }
+  const stuck = pending[0];
+  if (stuck !== undefined) {
+    throw new Error(`no free slug for '${stuck.leader.name}' after 64 attempts`);
+  }
+}
+
+/**
+ * The normalized surface form of every spelling in the batch, on the entity it
+ * resolved to.
+ *
+ * **The origins of the write that planted the spelling, not the entity's.** An
+ * entity accumulates origins as more of the brain mentions it; an alias is one
+ * string from one write, and R15 fences on where a row came from. Stamped at
+ * insert because it is immutable afterwards, and because the read
+ * (`mcp/reads.ts:entityCard`) has nothing else to fence on.
+ *
+ * `ON CONFLICT DO NOTHING` means a spelling first seen at one origin keeps that
+ * origin when a second origin restates it. That under-shows — a grant holding
+ * only the second origin will not see a name it could legitimately have been
+ * told — and it is the fail-closed direction, which is the one to be wrong in.
+ */
+async function plantAliases(
+  db: SQL,
+  wanted: ReadonlyMap<string, WantedName>,
+  resolved: ReadonlyMap<string, EntityRow>,
+): Promise<void> {
+  const groups = new Map<
+    string,
+    { origins: readonly string[]; rows: Array<{ entityId: string; alias: string }> }
+  >();
+  for (const name of wanted.values()) {
+    const entity = resolved.get(name.key);
+    if (entity === undefined) continue;
+    const key = JSON.stringify(name.aliasOrigins);
+    const group = groups.get(key) ?? { origins: name.aliasOrigins, rows: [] };
+    group.rows.push({ entityId: entity.entityId, alias: name.key });
+    groups.set(key, group);
+  }
+
+  for (const { origins, rows } of groups.values()) {
+    for (const chunk of batched(rows)) {
+      await db.unsafe(
+        `INSERT INTO entity_alias (entity_id, alias, alias_source, confidence, origin_contexts)
+         SELECT u.entity_id, u.alias, 'inferred', $3::real, $4::text[]
+           FROM unnest($1::bigint[], $2::text[]) AS u(entity_id, alias)
+         ON CONFLICT (entity_id, alias) DO NOTHING`,
+        [
+          numericArrayLiteral(chunk.map((row) => row.entityId)),
+          textArrayLiteral(chunk.map((row) => row.alias)),
+          INFERRED_ALIAS_CONFIDENCE,
+          textArrayLiteral([...origins]),
+        ],
+      );
+    }
+  }
+}
+
 /**
  * The entity a name refers to, creating it if the brain has not seen it.
  *
  * Every path leaves the same three things true: the entity exists, its origin
  * union covers the write that mentioned it, and the normalized surface form is
- * in its alias vocabulary.
+ * in its alias vocabulary. A batch of one, so that the write path and
+ * consolidation cannot disagree about what a name resolves to — see
+ * {@link resolveOrCreateEntities}.
  */
 export async function resolveOrCreateEntity(
   db: SQL,
@@ -282,53 +649,9 @@ export async function resolveOrCreateEntity(
 ): Promise<EntityRow> {
   const key = normalize(request.name);
   if (key.length === 0) throw new Error('an entity needs a name');
-
-  const found = await findEntityByName(db, request.name);
-  if (found !== null) {
-    const missing = request.origins.filter((origin) => !found.originContexts.includes(origin));
-    const current = missing.length === 0 ? found : await widenEntityOrigins(db, found, missing);
-    // **The origins of the write that planted the spelling, not the entity's.**
-    // An entity accumulates origins as more of the brain mentions it; an alias is
-    // one string from one write, and R15 fences on where a row came from. Stamped
-    // at insert because it is immutable afterwards, and because the read
-    // (`mcp/reads.ts:entityCard`) has nothing else to fence on.
-    //
-    // `ON CONFLICT DO NOTHING` means a spelling first seen at one origin keeps
-    // that origin when a second origin restates it. That under-shows — a grant
-    // holding only the second origin will not see a name it could legitimately
-    // have been told — and it is the fail-closed direction, which is the one to
-    // be wrong in.
-    await db`
-      INSERT INTO entity_alias (entity_id, alias, alias_source, confidence, origin_contexts)
-      VALUES (${current.entityId}::bigint, ${key}, 'inferred', ${INFERRED_ALIAS_CONFIDENCE},
-              ${textArrayLiteral([...new Set(request.origins)].sort())}::text[])
-      ON CONFLICT (entity_id, alias) DO NOTHING
-    `;
-    return current;
-  }
-
-  const created = (await db`
-    INSERT INTO entity (canonical_name, entity_type, taxonomy_version, origin_contexts)
-    VALUES (${request.name}, ${request.type}, ${request.taxonomyVersion},
-            ${textArrayLiteral([...new Set(request.origins)].sort())}::text[])
-    RETURNING entity_id::text AS entity_id, canonical_name, origin_contexts
-  `) as RawEntity[];
-
-  const entity = created[0];
+  const entity = (await resolveOrCreateEntities(db, [request])).get(key);
   if (entity === undefined) throw new Error(`could not create entity '${request.name}'`);
-
-  await db`
-    INSERT INTO entity_slug (slug, entity_id, kind)
-    VALUES (${await availableSlug(db, request.name)}, ${entity.entity_id}::bigint, 'canonical')
-  `;
-  await db`
-    INSERT INTO entity_alias (entity_id, alias, alias_source, confidence, origin_contexts)
-    VALUES (${entity.entity_id}::bigint, ${key}, 'inferred', ${INFERRED_ALIAS_CONFIDENCE},
-            ${textArrayLiteral([...new Set(request.origins)].sort())}::text[])
-    ON CONFLICT (entity_id, alias) DO NOTHING
-  `;
-
-  return toEntity(entity);
+  return entity;
 }
 
 interface ResolvedEdge {

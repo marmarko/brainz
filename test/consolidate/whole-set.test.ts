@@ -18,7 +18,13 @@
  *   fact and then diffs the live edges against it, so an edge missing from a
  *   half-built desired set is an edge the diff *deletes*. Stopping it on the
  *   clock would throw the pass away, so it yields to a lost lease and to nothing
- *   else. Affordable because it is small: 214ms on a 5,608-page brain.
+ *   else. Affordable because it is a near-constant number of statements per
+ *   pass, which it had to be *made*: a phase that will not stop on the clock is
+ *   not a phase that overruns politely, it is one that gets reaped. It was
+ *   "small: 214ms on a 5,608-page brain", measured on a brain whose extraction
+ *   had dead-lettered — 160 facts. Counted rather than timed it was 8.42 round
+ *   trips per live fact, and the rate is pinned in
+ *   `test/consolidate/convergence.test.ts`.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';

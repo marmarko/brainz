@@ -775,11 +775,18 @@ the top every attempt — because at current phase costs it is seconds:
 | phase | shape of its cost | measured |
 |---|---|---|
 | `dedup` | one read, plus one write per collapse | — |
-| `link_reconcile` | one entity resolution per implied edge, so per **fact** | 1,074 round trips / 214ms on a 5,608-page brain |
+| `link_reconcile` | one batched name resolution per **500 names** + one diff write per **500 edges**, so per **pass** | 7 cold / 4 warm on a 240-fact fixture, down from 8.42 per live fact |
 | `staleness` | one read per batch of superseded pages | — |
 | `entity_merge` | one read, plus a few writes per merge | — |
 | `salience` | one read + one write per **500 pages** | 24 round trips on that brain, down from 11,217 |
 | `cluster` | one probe per unassigned chunk, one transaction per 100 seeds | down from five round trips per seed |
+
+`link_reconcile` is the row to watch, because it is the one phase that does not
+stop on the clock: its desired edge set has to be complete before anything is
+diffed against it, so a half-finished pass would *delete* edges rather than
+resume them. It therefore cannot report `out_of_time` at all — if it grows past
+the attempt it gets reaped, which charges an attempt. A brain whose lane
+dead-letters with no `out_of_time` line before it is the shape to suspect.
 
 So a tenant stuck on `out_of_time` is one whose numbers have outgrown that table
 — a fact set orders of magnitude larger, or a tenant database that has become
