@@ -354,6 +354,15 @@ export interface IndexState {
    * this origin and every successful one writes exactly one fact, while the page
    * beside it is an implementation detail of the write path that has been
    * nullable in the response shape from the start.
+   *
+   * **This counts inside the fence, which is only sound because a grant always
+   * contains the origin it writes to.** `grant-scope.ts` refuses a credential
+   * whose `writeOrigin` sits outside its own origins, at mint and again at
+   * verify — "a grant that writes where it cannot read plants rows it can never
+   * see" — and `expandGrant` floors every class wildcard with that class's agent
+   * origin. Were that ever relaxed, a user's own captures would fall outside the
+   * subset fence, this would read zero forever, and {@link setupHint} would ask
+   * a user who HAS captured to start capturing, with no action able to stop it.
    */
   readonly capturedByAgent: number;
 }
