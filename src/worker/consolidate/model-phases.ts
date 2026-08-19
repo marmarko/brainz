@@ -565,7 +565,13 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
   let applied = 0;
   let logged = 0;
   let calls = 0;
-  /** Failures since the last page that worked. Reset by every summary written. */
+  /**
+   * Failures since the last page the model answered readably.
+   *
+   * Reset on the parse, not on the write: a summary the seam then refuses is the
+   * model working and this code declining the result, which says nothing about
+   * whether the provider is up.
+   */
   let consecutiveFailures = 0;
   /** The code the last failure reported, for the two stops that report one. */
   let lastFailure: PhaseStop | null = null;

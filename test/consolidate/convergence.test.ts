@@ -137,7 +137,13 @@ const SCRIPT = {
   salience: () => JSON.stringify({ scores: [] }),
 };
 
-/** How many canonical summary **rows** exist. One per model call ever made. */
+/**
+ * How many canonical summary **rows** exist.
+ *
+ * One per page the phase summarised — *not* one per model call, since a call
+ * whose answer could not be read writes nothing and the page is offered again.
+ * The gap between this and `callsFor('synopsis')` is what section 5 measures.
+ */
 function summaryPages(): Promise<number> {
   return countRows(tenant.sql, 'page', "external_ref LIKE 'summary:%' AND deleted_at IS NULL");
 }
