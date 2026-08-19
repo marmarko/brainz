@@ -1067,8 +1067,18 @@ const ENTITY_NOUNS: Readonly<Record<EntityKind, readonly [string, string]>> = {
  *
  * The raw codes are rendered beside the sentence rather than replaced by it:
  * they are what a user can quote when they ask for help.
+ *
+ * **`currentTier` is the reader's plan and the run record's tier is not.**
+ * `stop_reason = 'free_tier'` says what the cycle did when it ran, and a user
+ * who upgraded ten minutes ago has a paid subscription sitting over a newest run
+ * that still says it. Reading the run's tier as the reader's pitched the paid
+ * plan to somebody who had just bought it — on the page they had opened to find
+ * out whether buying it had worked, which is the one place that lands worst.
  */
-function cycleSentence(cycle: NonNullable<CoverageView['latestCycle']>): string {
+function cycleSentence(
+  cycle: NonNullable<CoverageView['latestCycle']>,
+  currentTier: string,
+): string {
   if (cycle.finishedAt === null) {
     return `A cycle is running now. It started ${moment(new Date(cycle.startedAt))}.`;
   }
@@ -1076,7 +1086,15 @@ function cycleSentence(cycle: NonNullable<CoverageView['latestCycle']>): string 
   if (cycle.dreamt) return `${when} It ran the whole pipeline.`;
   switch (cycle.stopReason) {
     case 'free_tier':
-      return `${when} It ran the deterministic half only: on the free plan, the half that turns
+      // Past tense for the upgraded reader, and no word about the next cycle:
+      // "the next one will run it" is a promise about a pipeline this page has
+      // no way to see the health of, which is the failure it exists to stop.
+      // What it can state is the plan they are on.
+      return currentTier === 'paid'
+        ? `${when} It ran the deterministic half only, because this account was on the free
+plan when that cycle ran. The half that turns documents into facts, people and companies is
+on your plan now.`
+        : `${when} It ran the deterministic half only: on the free plan, the half that turns
 documents into facts, people and companies is on the paid plan. That is the plan working rather than
 something going wrong.`;
     case 'budget_exhausted':
@@ -1233,7 +1251,7 @@ ${sources}
 biggest table it has, and this is a page load. If a source has stopped arriving, the connected
 accounts panel on your dashboard is where the reason is.</p>
 <h2>Consolidation</h2>
-${view.latestCycle === null ? cold : `<p>${cycleSentence(view.latestCycle)}</p>`}${behind}${derived}
+${view.latestCycle === null ? cold : `<p>${cycleSentence(view.latestCycle, page.tier)}</p>`}${behind}${derived}
 ${back}`,
   );
 }

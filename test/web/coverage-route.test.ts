@@ -197,7 +197,16 @@ function post(path: string, fields: unknown): Request {
   });
 }
 
-async function signedIn(options: { readonly withBrain?: boolean } = {}): Promise<string> {
+/**
+ * `tier: 'paid'` writes the subscription row a real upgrade writes, rather than
+ * granting the tenant `internal`. The distinction matters for the state this
+ * page kept getting wrong: a user who upgraded ten minutes ago has a paid
+ * subscription and a run record whose newest row still says `free_tier`, and
+ * that is the pair the sentence has to read correctly.
+ */
+async function signedIn(
+  options: { readonly withBrain?: boolean; readonly tier?: 'free' | 'paid' } = {},
+): Promise<string> {
   const handle = app();
   const created = await handle(
     post('/api/signup', {
@@ -215,6 +224,18 @@ async function signedIn(options: { readonly withBrain?: boolean } = {}): Promise
   } else {
     await seedTenant(controlSql, TENANT);
     await attachBrain(sql, { accountId: body.account_id, tenantId: TENANT, ftsLanguage: 'simple', now: AT });
+  }
+  if (options.tier === 'paid') {
+    // The vendor ids are not decoration: `paid_subscriptions_name_a_vendor_object`
+    // refuses a paid row with nothing behind it, precisely so a comp cannot be
+    // mistaken for a subscription. A fixture that worked around the CHECK would
+    // be testing a row the product cannot hold.
+    await sql`UPDATE account.subscription
+                 SET tier = 'paid',
+                     status = 'active',
+                     stripe_customer_id = 'cus_fixture',
+                     stripe_subscription_id = 'sub_fixture'
+               WHERE account_id = ${body.account_id}::account.account_id`;
   }
   return `${SESSION_COOKIE}=${token}`;
 }
@@ -427,8 +448,38 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
       documentsSinceLastCycle: 4,
     };
     const page = await (await app({ view: free })(get(COVERAGE, cookie))).text();
-    expect(page).toContain('paid plan');
+    expect(page).toContain('is on the paid plan');
     expect(page).not.toContain('failed');
+    // The other half of the pair below: a free user is not told they have
+    // already bought the thing they are being told about.
+    expect(page).not.toContain('on your plan now');
+  });
+
+  test('a cycle that ran before an upgrade does not tell a paid user they are on the free plan', async () => {
+    // `stop_reason` is what the run did when it ran, and the tier on the run
+    // record is the tier at that moment. A user who upgraded ten minutes ago has
+    // a paid subscription sitting over a newest run that says `free_tier`, and
+    // the sentence was reading the run's tier as the reader's — pitching the
+    // paid plan to somebody who had just bought it, on the page they opened to
+    // find out whether buying it had worked.
+    const cookie = await signedIn({ tier: 'paid' });
+    const beforeUpgrade: CoverageView = {
+      ...VIEW,
+      latestCycle: {
+        tier: 'free',
+        dreamt: false,
+        stopReason: 'free_tier',
+        stoppedPhase: null,
+        stoppedPhaseCode: null,
+        startedAt: '2026-08-15T02:00:00.000Z',
+        finishedAt: '2026-08-15T02:01:00.000Z',
+      },
+      lastCompletedAt: '2026-08-15T02:01:00.000Z',
+    };
+    const page = await (await app({ view: beforeUpgrade })(get(COVERAGE, cookie))).text();
+    expect(page).not.toContain('is on the paid plan');
+    expect(page).toContain('when that cycle ran');
+    expect(page).toContain('on your plan now');
   });
 
   test('counts that are structurally zero for the tier are absent, not zero', async () => {
