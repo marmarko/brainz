@@ -40,18 +40,25 @@ const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
 
 /**
- * The one refusal for every "this brain has no such record", and its one fix.
+ * The fix a scope refusal carries: nothing the caller can pass will widen it.
  *
- * A function rather than three literals because the three sites must not drift:
- * an id that does not parse and an id that names no live row are the same fact
- * to a caller (see `recallById`), so two different sentences here would
- * re-introduce the distinction the codes just stopped making.
+ * Worth saying rather than leaving implied — the ordinary agent response to a
+ * refusal is to retry with different arguments, and here there are none that
+ * work. The move is to stop asking and tell the user.
  */
 const OUTSIDE_THIS_CONNECTION =
   'This connection is scoped to part of the brain and that record sits outside it. No parameter ' +
   'widens it — read what this connection can reach with `recall`, or ask the user to reconnect ' +
   'with the origins they want this agent to see.';
 
+/**
+ * The one refusal for every "this brain has no such record", and its one fix.
+ *
+ * One function rather than three literals because the three sites must not
+ * drift: an id that does not parse and an id that names no live row are the same
+ * fact to a caller (see `recallById`), so two different sentences here would
+ * re-introduce the distinction the codes just stopped making.
+ */
 const NO_SUCH_RECORD_FIX =
   'Ids are minted by this brain and are only valid inside it. Run `recall` or `search` and pass ' +
   "a result's `id` field back verbatim, rather than composing one or reusing one from elsewhere.";
