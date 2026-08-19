@@ -431,16 +431,25 @@ describe('a continuation that got stuck stops being treated as one', () => {
       const bankedPhases = (await banked()).map((row) => row.phase);
       expect(bankedPhases.length).toBeGreaterThan(0);
 
-      // Two days later. The run is still open and still says `out_of_time`, but
-      // "nothing has changed since" — the entire argument for skipping the free
-      // work — is no longer a claim anyone can make about this brain.
+      // Two days later. "Nothing has changed since" — the entire argument for
+      // skipping the free work — is no longer a claim anyone can make about this
+      // brain, so the stalled run is **closed** and the work carries on in a
+      // fresh one. Closed rather than merely distrusted: a run left open past the
+      // horizon has no way back inside it, and would re-run its whole free tier
+      // on every attempt for as long as it stayed open. See
+      // `test/consolidate/livelock.test.ts`.
       const later = new Date(started.getTime() + 2 * 24 * 60 * 60 * 1000);
       const second = await runConsolidationCycle(deps, {
         trigger: 'time_ceiling',
         tier: 'paid',
         now: later,
       });
-      expect(second.runId).toBe(first.runId);
+      expect(second.runId).not.toBe(first.runId);
+      const swept = (await tenant.sql`
+        SELECT stop_reason, finished_at FROM consolidation_run WHERE run_id = ${first.runId}::bigint
+      `) as Array<{ stop_reason: string | null; finished_at: Date | null }>;
+      expect(swept[0]?.stop_reason).toBe('abandoned');
+      expect(swept[0]?.finished_at).not.toBeNull();
 
       const rerun = second.phases.filter(
         (record) => record.tier === 'deterministic' && record.ran,

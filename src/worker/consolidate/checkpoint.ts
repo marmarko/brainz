@@ -53,7 +53,18 @@ export type StopReason =
    * to run the same cycle again immediately rather than to wait for a provider
    * or for a spend window. See `deadline.ts`.
    */
-  | 'out_of_time';
+  | 'out_of_time'
+  /**
+   * The run was open for longer than a continuation is, and was closed so a
+   * fresh one could start.
+   *
+   * Never a *cycle's* stop reason — no attempt reports it about itself. It is
+   * written by {@link openRun} onto a run some earlier process left open and
+   * then never came back to, and it is on the closed row so an operator counting
+   * cycles can tell "we swept this" from "this finished". See the horizon in
+   * `cycle.ts`.
+   */
+  | 'abandoned';
 
 export interface CycleRun {
   readonly runId: string;
@@ -127,6 +138,19 @@ export async function openRun(
     readonly tier: ConsolidationTier;
     readonly now: Date;
     readonly estimateMicroUsd: number;
+    /**
+     * How old an open run may be and still be **adopted** rather than swept.
+     *
+     * The cycle's continuation horizon, applied where adopting is decided —
+     * because "is this run still a continuation" and "do we adopt it" are one
+     * question with one answer, and answering them in two places is how the
+     * horizon came to be a state a run could enter and never leave.
+     *
+     * Absent means no sweep: every open run is adoptable, which is what a caller
+     * outside the cycle wants and what this function did before the horizon
+     * existed.
+     */
+    readonly horizonMs?: number;
   },
 ): Promise<OpenedRun> {
   const open = (await sql`
@@ -138,7 +162,32 @@ export async function openRun(
   `) as RunRow[];
 
   const existing = open[0];
-  if (existing !== undefined) {
+  const staleRun =
+    existing !== undefined &&
+    options.horizonMs !== undefined &&
+    options.now.getTime() - existing.started_at.getTime() >= options.horizonMs;
+
+  if (staleRun && existing !== undefined) {
+    // **Closed, not ignored.** Leaving it open and merely distrusting its
+    // checkpoints is the absorbing version: nothing advances `started_at`, so
+    // the run is past the horizon for ever and its whole deterministic tier
+    // restarts on every attempt from here to the heat death of the lane. Closing
+    // it is what makes the horizon terminate — the fresh run below gets a fresh
+    // `started_at` and re-runs the free work *once*, which is what the horizon
+    // was asking for.
+    //
+    // Spend, model calls, phases and wall clock are left exactly as the last
+    // attempt recorded them. This is a sweep, not a settlement, and a sweep that
+    // zeroed a real invoice would be losing the only record of it.
+    await sql`
+      UPDATE consolidation_run
+         SET stop_reason = 'abandoned', finished_at = ${options.now}
+       WHERE run_id = ${existing.run_id}::bigint
+    `;
+    await sql`DELETE FROM consolidation_checkpoint WHERE run_id = ${existing.run_id}::bigint`;
+  }
+
+  if (existing !== undefined && !staleRun) {
     const banked = (await sql`
       SELECT phase, completed, phase_cursor, items,
              spent_micro_usd::bigint AS spent

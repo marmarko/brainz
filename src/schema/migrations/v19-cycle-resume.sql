@@ -53,6 +53,29 @@
 -- to widen a CHECK: the constraint is absent for the length of one transaction
 -- and comes back strictly more permissive, so the previous fleet version — which
 -- writes only the four older values — is never refused.
+--
+-- ---------------------------------------------------------------------------
+-- **And `abandoned`, which is what stops the resume from being a trap.**
+--
+-- The free work banked against a run is honoured only while that run is being
+-- *continued* — attempts seconds apart over a brain nothing has ingested into.
+-- Past one ceiling period the argument for skipping it ("nothing has changed
+-- since") is no longer one anybody can make, so the checkpoints stop counting.
+--
+-- Written that way alone, the horizon absorbs: `started_at` never moves, nothing
+-- but a completed cycle sets `finished_at`, and there is no sweep. A run that
+-- crossed it therefore never left it — no deterministic checkpoint honoured
+-- again, ever, the whole tier restarting from zero on every attempt for as long
+-- as the run stayed open, which on a brain whose free tier outlives one attempt
+-- is precisely the non-terminating loop this rung was cut to end.
+--
+-- Crossing the horizon now *closes* the run. The next cycle opens a fresh one,
+-- which gets a fresh `started_at` and legitimately re-runs the free work — which
+-- is what the horizon wanted — instead of an un-closeable run that re-runs it
+-- for ever. `abandoned` is the label on the closed row: it did not complete, it
+-- did not fail, and nobody spent anything discovering that. Its spend and its
+-- counters are left exactly as the last attempt recorded them, because the
+-- tenant's bill is not a thing a sweep gets to rewrite.
 -- ===========================================================================
 
 ALTER TABLE consolidation_checkpoint
@@ -75,5 +98,5 @@ ALTER TABLE consolidation_run
   ADD CONSTRAINT consolidation_run_stop_reason_is_known CHECK (
     stop_reason IS NULL
     OR stop_reason IN ('complete', 'free_tier', 'budget_exhausted', 'phase_failed', 'cancelled',
-                       'out_of_time')
+                       'out_of_time', 'abandoned')
   );

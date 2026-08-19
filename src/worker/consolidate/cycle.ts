@@ -30,6 +30,11 @@
  *                         interrupted" and "this brain is bigger than one
  *                         attempt" want different responses.
  *
+ * A fifth reason, `abandoned`, is never a cycle's own: it is written by
+ * {@link openRun} onto a run that was left open for longer than a continuation
+ * lasts, so that the work can carry on in a fresh one. See
+ * {@link CONTINUATION_HORIZON_MS}.
+ *
  * **A checkpoint's subject is money for the model tier and position for the
  * deterministic one**, and the difference is what makes both true at once. The
  * original asymmetry — only model phases skipped — was the right reading of
@@ -140,6 +145,18 @@ export interface CycleOptions {
   /** Injected so a test can assert on a duration without sleeping. */
   readonly clock?: () => number;
   /**
+   * The keyset batch the walking deterministic phases take per read/write pair.
+   *
+   * Absent leaves every phase at its own tuned constant, which is what the fleet
+   * wants: those numbers were measured against a real brain, and a cycle that
+   * second-guessed them would be a second tuning nobody took. It is expressible
+   * because the property the whole resume mechanism exists for — an attempt
+   * interrupted mid-walk hands the next one its position — is only reachable
+   * over more rows than one batch, and a suite that had to seed five hundred
+   * pages to reach it is a suite that stops being run.
+   */
+  readonly batch?: number;
+  /**
    * The attempt's wall-clock budget. Absent means unbudgeted, which is what
    * every caller that is not a job wants.
    *
@@ -213,7 +230,7 @@ function profileOf(deps: CycleDeps): NamedProfile {
 const DEFAULT_LIMIT = 200;
 
 /**
- * How old an open run may be and still have its free work treated as current.
+ * How old an open run may be and still be a continuation.
  *
  * The deterministic tier's checkpoints are honoured while a run is being
  * *continued* — attempts seconds apart, working the same brain down. They are
@@ -223,11 +240,22 @@ const DEFAULT_LIMIT = 200;
  *
  * One ceiling period, derived rather than typed: past that the tenant would have
  * been given a fresh cycle anyway, so a run still open beyond it is not a
- * continuation in any sense the scheduler recognises. Without this bound, a run
- * that stalls at a whole-set phase it cannot fit would go on skipping dedup and
- * staleness on every daily cycle for as long as it stayed open — which is the
- * exact silent-free-tier failure the original checkpoint asymmetry was
- * protecting against, arriving through the door the fix opened.
+ * continuation in any sense the scheduler recognises.
+ *
+ * **It closes the run, and the first version of it did not — which made it a
+ * trap rather than a bound.** Distrusting the checkpoints of a run left open is
+ * only half a decision: `started_at` never advances, nothing but a completed
+ * cycle sets `finished_at`, and there is no abandonment sweep anywhere. So a run
+ * that crossed the horizon could not leave it. Every later attempt restarted the
+ * whole deterministic tier from zero, which on a brain whose free tier outlives
+ * one attempt means the tier is never finished, the model tier is never reached,
+ * and the cycle never completes — the original dead-lane failure, reintroduced
+ * by the bound that was written to prevent a different one.
+ *
+ * Handed to {@link openRun}, because "is this still a continuation" and "do we
+ * adopt it" are one question. Past the horizon the run is closed as `abandoned`
+ * and a fresh one opens: fresh `started_at`, so the free work is re-run *once*
+ * — which is what the horizon wanted — rather than for ever.
  */
 const CONTINUATION_HORIZON_MS = ALPHA_CEILING_MS;
 
@@ -255,6 +283,7 @@ export async function runConsolidationCycle(
     tier: options.tier,
     now: options.now,
     estimateMicroUsd: options.tier === 'free' ? 0 : estimate.totalMicroUsd,
+    horizonMs: CONTINUATION_HORIZON_MS,
   });
   const run = opened.run;
 
@@ -273,9 +302,13 @@ export async function runConsolidationCycle(
   // current and skipping it is thrift. A run resumed after a provider outage may
   // be hours old over a brain that has ingested since, and skipping its free
   // work would be the free tier quietly stopping. See the header.
+  // The age half of this test is gone, and its absence is the point: `openRun`
+  // does not hand back a run older than the horizon, so a run that reaches here
+  // is inside it by construction. Keeping the clause as a belt would be keeping
+  // the branch that made the horizon absorbing, in a place where it now can
+  // never be true — dead code that reads as the live rule.
   const continuingOnTheClock =
-    (opened.previousStop === 'out_of_time' || opened.previousStop === 'cancelled') &&
-    options.now.getTime() - run.startedAt.getTime() < CONTINUATION_HORIZON_MS;
+    opened.previousStop === 'out_of_time' || opened.previousStop === 'cancelled';
   const bankedFor = (phase: CyclePhase): PhaseCheckpoint | undefined => {
     const banked = opened.banked.get(phase);
     if (banked === undefined) return undefined;
@@ -376,6 +409,7 @@ export async function runConsolidationCycle(
         now: options.now,
         cursor: banked?.cursor ?? null,
         attempt,
+        ...(options.batch === undefined ? {} : { batch: options.batch }),
       });
       // Items are banked **cumulatively over the run** and reported per attempt.
       // A phase resumed three times has done the sum of what its three attempts
@@ -571,15 +605,8 @@ export async function runDeterministicPhase(
     readonly cursor: string | null;
     readonly attempt: AttemptBudget;
     /**
-     * The keyset batch the walking phases take per read/write pair.
-     *
-     * The cycle never sets it: every phase's tuned constant is the right number
-     * against a real brain, and a cycle that second-guessed them would be a
-     * second tuning nobody measured. It is a parameter because the property the
-     * arms below have to hold — that an attempt interrupted mid-walk hands the
-     * next one its position — is only reachable over more rows than one batch,
-     * and a suite that had to seed five hundred superseded pages to reach it
-     * would be a suite that stopped being run.
+     * The keyset batch the walking phases take per read/write pair. Absent
+     * leaves each phase at its own tuned constant; see {@link CycleOptions}.
      */
     readonly batch?: number;
   },
