@@ -19,7 +19,7 @@ import { recall as rankedRead } from '../../core/search/read.ts';
 import { formatId, recordUrl } from '../ids.ts';
 import { parseId } from '../ids.ts';
 import { demarcateIfExternal } from '../demarcation.ts';
-import { degradedBriefing, degradedSearch } from '../envelope.ts';
+import { degradedBriefing, degradedNotice, degradedSearch, setupHint } from '../envelope.ts';
 import { entityCard, fetchRecord } from '../reads.ts';
 import {
   intArg,
@@ -130,6 +130,12 @@ export const recall: Handler = async (ctx, args) => {
 
   const state = await ctx.indexState();
   const degraded = degradedSearch(state, response.degraded);
+  // The two advisory lanes, filled from the same state and by the same rules on
+  // every read that pays for it. Both are empty on a healthy brain, which is the
+  // property `test/mcp/thin-brain.test.ts` pins: a `notice` on a read with
+  // nothing wrong with it is how a connector gets turned off.
+  const notice = degradedNotice(degraded);
+  const setup = setupHint(state, ctx.webAppBaseUrl);
   const top = response.results[0];
 
   return {
@@ -144,15 +150,8 @@ export const recall: Handler = async (ctx, args) => {
     },
     degraded,
     ...(degraded === null ? {} : { resultClass: 'degraded' as const }),
-    ...(state.pages === 0 && state.chunks === 0
-      ? {
-          setup: {
-            kind: 'first_memory' as const,
-            detail:
-              'This brain has nothing in it yet. Store the first thing this person tells you about themselves with `remember`.',
-          },
-        }
-      : {}),
+    ...(notice.length === 0 ? {} : { notice }),
+    ...(setup === null ? {} : { setup }),
     ...(top === undefined ? {} : { rank1Score: top.score }),
   };
 };
@@ -377,24 +376,37 @@ export const briefing: Handler = async (ctx, args) => {
       ctx.nonce,
     );
 
-  const degraded = degradedBriefing(await ctx.indexState(), {
+  const state = await ctx.indexState();
+  const degraded = degradedBriefing(state, {
     materialized: bundle.coverage === 'materialized',
   });
 
-  // The advisory lane, and both of its tenants. Each carries its own dismissal
-  // because each is bounded by its own rule — a shared sentence would describe
-  // one of them wrongly, and this is the lane whose whole justification is that
-  // the reader can trust what it says about how often it will say it again.
+  // The advisory lane, and all three of its tenants. The first two each carry
+  // their own dismissal because each is bounded by its own rule — a shared
+  // sentence would describe one of them wrongly, and this is the lane whose
+  // whole justification is that the reader can trust what it says about how
+  // often it will say it again.
+  //
+  // **The degradation goes last, and the order is the whole of the decision.**
+  // The two bounded advisories *bank themselves as shown* when they fire
+  // (`advanceBriefingCursor`), so a line that displaced one would not delay it —
+  // it would consume it, and the user would never see that reminder again.
+  // The degradation lane has no such bookkeeping and `degraded` carries its
+  // machine-readable half regardless, so it is the one that can afford to yield
+  // when a rare brain owes all three.
   const notice = [
     ...(bundle.prompt === null ? [] : [`${bundle.prompt.text} ${bundle.prompt.dismissal}`]),
     ...(bundle.backup === null ? [] : [`${bundle.backup.text} ${bundle.backup.dismissal}`]),
+    ...degradedNotice(degraded),
   ];
+  const setup = setupHint(state, ctx.webAppBaseUrl);
 
   return {
     ok: true,
     ...(degraded === null ? {} : { resultClass: 'degraded' as const }),
     degraded,
     ...(notice.length === 0 ? {} : { notice }),
+    ...(setup === null ? {} : { setup }),
     content: {
       coverage: bundle.coverage,
       tier: bundle.tier,

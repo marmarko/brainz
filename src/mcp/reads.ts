@@ -61,28 +61,87 @@ export type RecordOutcome =
  * work-scoped connector telling a user their personal brain is empty would be a
  * cross-origin inference wearing a status message.
  */
-export async function indexState(sql: SQL, grant: Grant): Promise<IndexState> {
+export async function indexState(
+  sql: SQL,
+  grant: Grant,
+  writeOrigin: string,
+): Promise<IndexState> {
   const grantLiteral = textArrayLiteral(grant);
+  // **Seven counters, four scans, one round trip — and the shape is why.** This
+  // statement is on the critical path of every ranked read, so each counter that
+  // arrives as its own scalar subquery is another pass over a table that was
+  // already being passed over. Grouping by table and separating the variants
+  // with `FILTER` keeps the widened state at the scan count the four-counter
+  // version already paid. It stays one statement for the reason it always was:
+  // `entity` publishes a warm-p99 promise and never calls this at all, so the
+  // cost that matters is the one `recall` pays, once, memoised per request.
   const rows = (await sql.unsafe(
-    `SELECT
-       (SELECT count(*) FROM page  WHERE deleted_at IS NULL AND quarantined_at IS NULL AND origin_context = ANY($1::text[]))::int AS pages,
-       (SELECT count(*) FROM chunk WHERE deleted_at IS NULL AND quarantined_at IS NULL AND origin_context = ANY($1::text[]))::int AS chunks,
+    `WITH pages AS (
+       SELECT count(*)::int AS live
+         FROM page
+        WHERE deleted_at IS NULL AND quarantined_at IS NULL AND origin_context = ANY($1::text[])
+     ),
+     chunks AS (
        -- The active seat's column, not the literal \`embedding\`: "how many
        -- chunks are still unembedded" is a question about a *space*, and asking
        -- it of the wrong column answers zero on the day a seat moves — a
        -- caller told its brain is fully indexed while the arm it will be read
        -- with scans an empty column.
-       (SELECT count(*) FROM chunk WHERE deleted_at IS NULL AND quarantined_at IS NULL AND ${seatColumnSql(ACTIVE_EMBEDDING_SEAT.column)} IS NULL AND origin_context = ANY($1::text[]))::int AS pending,
-       (SELECT count(*) FROM ingest_log WHERE outcome = 'running' AND origin_context = ANY($1::text[]))::int AS running`,
-    [grantLiteral],
-  )) as Array<{ pages: number; chunks: number; pending: number; running: number }>;
+       SELECT count(*)::int AS live,
+              count(*) FILTER (WHERE ${seatColumnSql(ACTIVE_EMBEDDING_SEAT.column)} IS NULL)::int AS pending
+         FROM chunk
+        WHERE deleted_at IS NULL AND quarantined_at IS NULL AND origin_context = ANY($1::text[])
+     ),
+     facts AS (
+       -- Subset, per this module's second fence rule: a statement is a synthesis
+       -- of every contributing origin, so a grant holding only some of them must
+       -- not count it. \`superseded_by IS NULL\` is the other half — consolidation
+       -- supersedes rather than rewrites, and counting the superseded rows would
+       -- report a layer several times larger than the one a read can answer from.
+       SELECT count(*)::int AS live,
+              count(*) FILTER (WHERE $2 = ANY(origin_contexts))::int AS by_agent
+         FROM fact
+        WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL
+          AND origin_contexts <@ $1::text[]
+     ),
+     ingests AS (
+       SELECT count(*)::int AS runs,
+              count(*) FILTER (WHERE outcome = 'running')::int AS running
+         FROM ingest_log
+        WHERE origin_context = ANY($1::text[])
+     )
+     SELECT pages.live AS pages, chunks.live AS chunks, chunks.pending AS pending,
+            ingests.running AS running, ingests.runs AS runs,
+            facts.live AS facts, facts.by_agent AS captured
+       FROM pages, chunks, facts, ingests`,
+    [grantLiteral, writeOrigin],
+  )) as Array<{
+    pages: number;
+    chunks: number;
+    pending: number;
+    running: number;
+    runs: number;
+    facts: number;
+    captured: number;
+  }>;
 
-  const row = rows[0] ?? { pages: 0, chunks: 0, pending: 0, running: 0 };
+  const row = rows[0] ?? {
+    pages: 0,
+    chunks: 0,
+    pending: 0,
+    running: 0,
+    runs: 0,
+    facts: 0,
+    captured: 0,
+  };
   return {
     pages: row.pages,
     chunks: row.chunks,
     chunksPendingEmbedding: row.pending,
     importInProgress: row.running > 0,
+    facts: row.facts,
+    ingestRuns: row.runs,
+    capturedByAgent: row.captured,
   };
 }
 

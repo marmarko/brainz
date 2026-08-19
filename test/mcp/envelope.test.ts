@@ -23,6 +23,8 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  CONSOLIDATION_CORPUS_FLOOR,
+  CONSOLIDATION_DOCUMENTS_PER_FACT,
   ENVELOPE_KEYS,
   META_KEYS,
   MAX_NEXT,
@@ -30,8 +32,12 @@ import {
   MCP_PROTOCOL_VERSION,
   MEMORY_VERBS_VERSION,
   buildEnvelope,
+  degradedBriefing,
+  degradedNotice,
   degradedSearch,
   envelopeViolations,
+  setupHint,
+  type IndexState,
 } from '../../src/mcp/envelope.ts';
 import { advertisedTools, toolByName } from '../../src/mcp/tools/index.ts';
 
@@ -170,9 +176,41 @@ describe('referential integrity on next[]', () => {
   });
 });
 
+/**
+ * A brain with nothing wrong with it, as the baseline every case below varies
+ * from one field at a time.
+ *
+ * Deliberately ABOVE {@link CONSOLIDATION_CORPUS_FLOOR} with facts to match: a
+ * baseline under the floor would satisfy the healthy-silence assertion by being
+ * too small for the consolidation ratio to have an opinion, which is the shape
+ * of green that proves nothing.
+ */
+const HEALTHY: IndexState = {
+  pages: 600,
+  chunks: 900,
+  chunksPendingEmbedding: 0,
+  importInProgress: false,
+  facts: 120,
+  ingestRuns: 3,
+  capturedByAgent: 4,
+};
+
+/** A tenant before its first write: no corpus, no source, no capture. */
+const EMPTY: IndexState = {
+  pages: 0,
+  chunks: 0,
+  chunksPendingEmbedding: 0,
+  importInProgress: false,
+  facts: 0,
+  ingestRuns: 0,
+  capturedByAgent: 0,
+};
+
+const WEB_APP = 'https://app.brainz.test';
+
 describe('search_degraded', () => {
   test('a tenant with nothing indexed gets a named shape, not an empty success', () => {
-    const degraded = degradedSearch({ pages: 0, chunks: 0, chunksPendingEmbedding: 0, importInProgress: false });
+    const degraded = degradedSearch(EMPTY);
     expect(degraded).not.toBeNull();
     expect(degraded?.kind).toBe('search_degraded');
     expect(degraded?.reasons).toContain('no_content_yet');
@@ -180,8 +218,7 @@ describe('search_degraded', () => {
 
   test('a tenant mid-first-import says so, and names the backlog as the reason', () => {
     const degraded = degradedSearch({
-      pages: 40,
-      chunks: 900,
+      ...HEALTHY,
       chunksPendingEmbedding: 400,
       importInProgress: true,
     });
@@ -192,25 +229,17 @@ describe('search_degraded', () => {
 
   test('a fully indexed tenant is not degraded', () => {
     expect(
-      degradedSearch({ pages: 40, chunks: 900, chunksPendingEmbedding: 0, importInProgress: false }),
+      degradedSearch(HEALTHY),
     ).toBeNull();
   });
 
   test('a read that lost its vector arm reports the arm, not an empty result set', () => {
-    const degraded = degradedSearch(
-      { pages: 40, chunks: 900, chunksPendingEmbedding: 0, importInProgress: false },
-      ['embedding_unavailable'],
-    );
+    const degraded = degradedSearch(HEALTHY, ['embedding_unavailable']);
     expect(degraded?.reasons).toContain('embedding_unavailable');
   });
 
   test('the degraded detail is content-free', () => {
-    const degraded = degradedSearch({
-      pages: 0,
-      chunks: 0,
-      chunksPendingEmbedding: 0,
-      importInProgress: false,
-    });
+    const degraded = degradedSearch(EMPTY);
     // Counts and state names only: this string reaches logs and support tickets.
     expect(degraded?.detail).not.toMatch(/[A-Z][a-z]+ [A-Z][a-z]+/);
   });
@@ -225,10 +254,7 @@ describe('search_degraded', () => {
     // read's spend ceiling and Postgres's tsquery parser in the same call —
     // gets both sentences in one `detail`. One of them is always false, the
     // reader cannot tell which, and only the graph arm actually ran.
-    const degraded = degradedSearch(
-      { pages: 40, chunks: 900, chunksPendingEmbedding: 0, importInProgress: false },
-      ['embedding_unavailable', 'query_too_complex'],
-    );
+    const degraded = degradedSearch(HEALTHY, ['embedding_unavailable', 'query_too_complex']);
 
     expect(degraded?.reasons).toContain('embedding_unavailable');
     expect(degraded?.reasons).toContain('query_too_complex');
@@ -248,16 +274,223 @@ describe('search_degraded', () => {
   test('one arm down still names the arms that answered', () => {
     // The half that keeps the fix from being "delete the sentences". Each
     // reason on its own keeps saying which arms carried the result.
-    const noVector = degradedSearch(
-      { pages: 40, chunks: 900, chunksPendingEmbedding: 0, importInProgress: false },
-      ['embedding_unavailable'],
-    );
+    const noVector = degradedSearch(HEALTHY, ['embedding_unavailable']);
     expect(noVector?.detail).toContain('came from text and graph matching only');
 
-    const noText = degradedSearch(
-      { pages: 40, chunks: 900, chunksPendingEmbedding: 0, importInProgress: false },
-      ['query_too_complex'],
-    );
+    const noText = degradedSearch(HEALTHY, ['query_too_complex']);
     expect(noText?.detail).toContain('came from meaning and graph matching only');
+  });
+});
+
+describe('consolidation_behind — a corpus that is indexed but not yet worked out', () => {
+  test('a large corpus with almost no facts is degraded, and says which kind of behind', () => {
+    // The measured state of a real brain: the documents are all there and all
+    // embedded, and the layer built from them is not. Nothing else in the
+    // closed set describes it — `no_content_yet` is false, `embedding_backlog`
+    // is false, and the read comes back a clean success over raw passages.
+    const degraded = degradedSearch({ ...HEALTHY, pages: 5608, chunks: 16_913, facts: 167 });
+    expect(degraded?.reasons).toContain('consolidation_behind');
+    expect(degraded?.reasons).not.toContain('no_content_yet');
+    expect(degraded?.reasons).not.toContain('embedding_backlog');
+  });
+
+  test('a brain under the corpus floor is new, not behind', () => {
+    // The floor is what keeps the ratio from calling every brand-new brain
+    // behind. Three documents and no facts yet is the first minute of an
+    // import, and `import_in_progress` is the reason that describes it.
+    const degraded = degradedSearch({
+      ...HEALTHY,
+      pages: CONSOLIDATION_CORPUS_FLOOR - 1,
+      chunks: 40,
+      facts: 0,
+    });
+    expect(degraded).toBeNull();
+  });
+
+  test('a corpus whose facts keep pace is not behind', () => {
+    const atTheLine = {
+      ...HEALTHY,
+      pages: CONSOLIDATION_CORPUS_FLOOR * 4,
+      facts: (CONSOLIDATION_CORPUS_FLOOR * 4) / CONSOLIDATION_DOCUMENTS_PER_FACT,
+    };
+    expect(degradedSearch(atTheLine)).toBeNull();
+    // One fact short of the line is behind, which is what makes the line a line.
+    expect(degradedSearch({ ...atTheLine, facts: atTheLine.facts - 1 })?.reasons).toContain(
+      'consolidation_behind',
+    );
+  });
+
+  test('the detail carries counts and state names only', () => {
+    const degraded = degradedSearch({ ...HEALTHY, pages: 5608, chunks: 16_913, facts: 167 });
+    expect(degraded?.detail).toContain('167');
+    expect(degraded?.detail).not.toMatch(/[A-Z][a-z]+ [A-Z][a-z]+/);
+  });
+
+  test('a briefing over a layer that never ran says pending, and does not also say behind', () => {
+    // Both are true of a cold brain and they are the same news to a reader.
+    // `consolidation_pending` is the stronger claim, so the detail states it
+    // once rather than stacking a ratio sentence behind it.
+    const degraded = degradedBriefing(
+      { ...HEALTHY, pages: 5608, chunks: 16_913, facts: 167 },
+      { materialized: false },
+    );
+    expect(degraded?.reasons).toContain('consolidation_pending');
+    expect(degraded?.detail).toContain('consolidation has not run over it yet');
+    expect(degraded?.detail).not.toContain('turned into facts');
+    // Both reasons are still on the wire — the collapse is in the sentence, not
+    // in the machine-readable half, which stays additive the way the set says.
+    expect(degraded?.reasons).toContain('consolidation_behind');
+  });
+
+  test('and the notice collapses the same way, so the promise stays true', () => {
+    // The line for "behind" says the layer sharpens as consolidation catches
+    // up. On a brain whose layer has never completed — the permanent state of a
+    // free-tier one — that is a promise the product does not keep, so the
+    // stronger reason silences it rather than sitting beside it.
+    const notice = degradedNotice(
+      degradedBriefing(
+        { ...HEALTHY, pages: 5608, chunks: 16_913, facts: 167 },
+        { materialized: false },
+      ),
+    );
+    expect(notice).toEqual([]);
+  });
+});
+
+describe('the notice a user actually hears', () => {
+  /**
+   * THE ASSERTION THAT STOPS THIS BECOMING A NAG.
+   *
+   * A healthy brain says nothing in either advisory lane. This is the test a
+   * future edit breaks first — every new sentence anyone is tempted to add to
+   * the envelope has to get past it, and "quiet by default" is a property only
+   * for as long as something fails when it stops being true.
+   */
+  test('A HEALTHY BRAIN CARRIES NEITHER A NOTICE NOR A SETUP HINT', () => {
+    const degraded = degradedSearch(HEALTHY);
+    expect(degraded).toBeNull();
+    expect(degradedNotice(degraded)).toEqual([]);
+    expect(setupHint(HEALTHY, WEB_APP)).toBeNull();
+  });
+
+  test('a consolidation-behind read carries one sentence a person can hear', () => {
+    const degraded = degradedSearch({ ...HEALTHY, pages: 5608, chunks: 16_913, facts: 167 });
+    const notice = degradedNotice(degraded);
+    expect(notice).toHaveLength(1);
+    expect(notice[0]).toMatch(/consolidat/i);
+    // Prose, not a code: the whole point is that the model relays it.
+    expect(notice[0]).not.toContain('consolidation_behind');
+  });
+
+  test('several reasons at once still produce one line, never one per cause', () => {
+    // The lane is two entries wide and `briefing` already owns both on a brain
+    // that owes an upgrade prompt and a backup reminder. A degradation that
+    // spent the whole lane on itself would push a bounded, scheduled notice out
+    // of a response that had already banked it as shown.
+    const notice = degradedNotice(
+      degradedSearch({ ...HEALTHY, pages: 5608, facts: 4, chunksPendingEmbedding: 900, importInProgress: true }, [
+        'embedding_unavailable',
+        'rerank_unavailable',
+      ]),
+    );
+    expect(notice).toHaveLength(1);
+  });
+
+  test('the widest cause wins, because it is the one that explains the thinness', () => {
+    const stillImporting = degradedNotice(
+      degradedSearch({ ...HEALTHY, pages: 5608, facts: 4, importInProgress: true }),
+    );
+    expect(stillImporting[0]).toMatch(/import/i);
+
+    const done = degradedNotice(degradedSearch({ ...HEALTHY, pages: 5608, facts: 4 }));
+    expect(done[0]).toMatch(/consolidat/i);
+  });
+
+  test('an empty brain gets a setup hint and no notice — one lane per state', () => {
+    // `no_content_yet` is deliberately absent from the notice table. The
+    // sentence a user needs there names an action, and that is `setup`'s job;
+    // saying it in both lanes is the same news twice in one response.
+    const degraded = degradedSearch(EMPTY);
+    expect(degraded?.reasons).toContain('no_content_yet');
+    expect(degradedNotice(degraded)).toEqual([]);
+    expect(setupHint(EMPTY, WEB_APP)).not.toBeNull();
+  });
+
+  test('a cold briefing gets no notice, because that state is not temporary', () => {
+    // `consolidation_pending` is the permanent and correct state of a free-tier
+    // brain (R8). A line promising it fills in would be false there, and the
+    // bounded upgrade prompt is already the sentence written for it.
+    const degraded = degradedBriefing(HEALTHY, { materialized: false });
+    expect(degraded?.reasons).toContain('consolidation_pending');
+    expect(degradedNotice(degraded)).toEqual([]);
+  });
+
+  test('a per-call arm loss is worth a line too, and says it is worth retrying', () => {
+    const notice = degradedNotice(degradedSearch(HEALTHY, ['rerank_unavailable']));
+    expect(notice).toHaveLength(1);
+    expect(notice[0]).toMatch(/again/i);
+  });
+
+  test('every line the table can emit fits the lane and reads as prose', () => {
+    for (const line of ALL_NOTICE_LINES) {
+      expect(line.length).toBeLessThan(220);
+      // No reason names, no snake_case: this is the half of the envelope that
+      // is addressed to a person rather than to a parser.
+      expect(line).not.toMatch(/[a-z]+_[a-z]+/);
+    }
+  });
+});
+
+/** Every notice the table can produce, reached through the public function. */
+const ALL_NOTICE_LINES: readonly string[] = [
+  degradedSearch({ ...HEALTHY, importInProgress: true }),
+  degradedSearch({ ...HEALTHY, pages: 5608, facts: 4 }),
+  degradedSearch({ ...HEALTHY, chunksPendingEmbedding: 400 }),
+  degradedSearch(HEALTHY, ['query_too_complex']),
+  degradedSearch(HEALTHY, ['embedding_unavailable']),
+  degradedSearch(HEALTHY, ['rerank_unavailable']),
+].flatMap((degraded) => degradedNotice(degraded));
+
+describe('setup earns its slot', () => {
+  test('a brain with no source and no memory is told what fills it, with somewhere to go', () => {
+    const hint = setupHint(EMPTY, WEB_APP);
+    expect(hint?.kind).toBe('connect_source');
+    // The destination is the hint. A suggestion the user cannot act on is the
+    // failure `forget`'s notice was rewritten to close.
+    expect(hint?.url).toContain(WEB_APP);
+  });
+
+  test('a brain with material but nothing the user ever told it asks for the habit', () => {
+    const hint = setupHint({ ...HEALTHY, capturedByAgent: 0 }, WEB_APP);
+    expect(hint?.kind).toBe('first_memory');
+  });
+
+  test('a brain that is merely behind is left alone', () => {
+    // The task's third rung: a brain that is consolidating needs no action from
+    // the user at all, so `setup` says nothing and the notice carries the news.
+    expect(setupHint({ ...HEALTHY, pages: 5608, facts: 167 }, WEB_APP)).toBeNull();
+  });
+
+  test('only the first rung fires when both would', () => {
+    // An empty brain has captured nothing either. Two hints in one response is
+    // two demands, and the lane holds one by type — the ladder is what decides
+    // which, rather than whichever branch was written last.
+    const hint = setupHint({ ...EMPTY, ingestRuns: 0, capturedByAgent: 0 }, WEB_APP);
+    expect(hint?.kind).toBe('connect_source');
+  });
+
+  test('a source that has delivered nothing this connection can see reads as no source', () => {
+    // `ingestRuns` is fenced like every other counter here: a run whose origin
+    // this grant cannot read is not this connection's source. The hint is
+    // therefore true of the brain this caller has, which is the only brain it
+    // can act on.
+    expect(setupHint({ ...EMPTY, ingestRuns: 0 }, WEB_APP)?.kind).toBe('connect_source');
+  });
+
+  test('one remember ends the second rung for good', () => {
+    const before = setupHint({ ...HEALTHY, capturedByAgent: 0 }, WEB_APP);
+    const after = setupHint({ ...HEALTHY, capturedByAgent: 1 }, WEB_APP);
+    expect(before).not.toBeNull();
+    expect(after).toBeNull();
   });
 });

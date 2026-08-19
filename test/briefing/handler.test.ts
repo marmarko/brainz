@@ -220,12 +220,20 @@ describe('the upgrade prompt rides the advisory lane, bounded', () => {
 
   test('it fires once on the crossing, in `notice` rather than in the payload', async () => {
     const first = await fixture.call('briefing', WINDOW);
-    expect(first.envelope.notice?.length).toBe(1);
-    const notice = first.envelope.notice?.[0] ?? '';
-    expect(notice).toContain('waiting');
+
+    // **The lane has a second tenant now, and its position is the assertion.**
+    // This fixture's chunks carry no vector, so the read really is partial and
+    // the degradation line really does belong here. It appends *behind* the
+    // prompt because the prompt banks itself as shown the moment it fires
+    // (`advanceBriefingCursor`): a line that sorted ahead of it would not delay
+    // it past the two-entry ceiling, it would consume it, and this credential
+    // would never be shown it again.
+    const notice = first.envelope.notice ?? [];
+    expect(notice.filter((line) => line.includes('waiting'))).toHaveLength(1);
+    expect(notice[0]).toContain('waiting');
     // R12a's reachable path, and R8's rule about which counter it reads.
-    expect(notice).toContain('remember');
-    expect(notice.toLowerCase()).not.toContain('contradict');
+    expect(notice[0]).toContain('remember');
+    expect((notice[0] ?? '').toLowerCase()).not.toContain('contradict');
   });
 
   test('AND IS SILENT THE NEXT MORNING — the bound, over the wire', async () => {
@@ -234,7 +242,15 @@ describe('the upgrade prompt rides the advisory lane, bounded', () => {
       since: '2026-08-14T00:00:00.000Z',
       until: '2026-08-15T00:00:00.000Z',
     });
-    expect(second.envelope.notice).toBeUndefined();
+    // **The bound is on the prompt, and the lane is no longer only the
+    // prompt's.** Asserting the whole lane is empty was a fair proxy while one
+    // tenant lived here; it now conflates two different kinds of bound. The
+    // prompt's is a stored cursor — a fortnight, or the next band. The
+    // degradation's is the brain's own state: it says the corpus is not fully
+    // embedded for exactly as long as that is true, and stops without anyone
+    // recording anything. Only the first is what this test is about.
+    const notice = second.envelope.notice ?? [];
+    expect(notice.some((line) => line.includes('waiting'))).toBe(false);
   });
 
   test('the debt counter is fenced: another origin\'s backlog is not yours', async () => {

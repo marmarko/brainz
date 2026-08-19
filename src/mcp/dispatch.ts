@@ -600,7 +600,11 @@ export async function dispatch(
     attestation: receipt,
     webAppBaseUrl: deps.webAppBaseUrl ?? DEFAULT_WEB_APP_BASE_URL,
     async indexState() {
-      cachedState ??= await indexState(sql, grant);
+      // The write origin travels with the fence, because one of the counters is
+      // "what has this connection been told to remember" — and that is a
+      // question about the origin this credential writes to, which a handler
+      // may not name and an argument may never widen.
+      cachedState ??= await indexState(sql, grant, claims.writeOrigin);
       return cachedState;
     },
   };
