@@ -342,11 +342,14 @@ describe('consolidation_behind — a corpus that is indexed but not yet worked o
     expect(degraded?.reasons).toContain('consolidation_behind');
   });
 
-  test('and the notice collapses the same way, so the promise stays true', () => {
-    // The line for "behind" says the layer sharpens as consolidation catches
-    // up. On a brain whose layer has never completed — the permanent state of a
-    // free-tier one — that is a promise the product does not keep, so the
-    // stronger reason silences it rather than sitting beside it.
+  test('and the notice collapses the same way, so one state is one sentence', () => {
+    // Both reasons are true of a cold brain and they are one piece of news, so
+    // the stronger reason silences the weaker rather than sitting beside it.
+    //
+    // This collapse is reachable from `briefing` alone — `degradedSearch` never
+    // pushes `consolidation_pending` — so it is NOT what keeps the behind-line
+    // honest on `recall`. That line has to be true on its own, and the test
+    // below is the one that holds it to that.
     const notice = degradedNotice(
       degradedBriefing(
         { ...HEALTHY, pages: 5608, chunks: 16_913, facts: 167 },
@@ -380,6 +383,37 @@ describe('the notice a user actually hears', () => {
     expect(notice[0]).toMatch(/consolidat/i);
     // Prose, not a code: the whole point is that the model relays it.
     expect(notice[0]).not.toContain('consolidation_behind');
+  });
+
+  test('a free-tier-shaped brain is not told it is catching up', () => {
+    // THE PROMISE THIS LINE USED TO MAKE ON EVERY FREE-TIER `recall`.
+    //
+    // The chain, and every link of it is load-bearing: `degradedSearch` pushes
+    // `consolidation_behind` and never `consolidation_pending`; the guard in
+    // `degradedNotice` that would silence the weaker line only ever sees both
+    // reasons on `briefing`, so it is unreachable from `recall` and `search`;
+    // and the cycle skips every model phase on the free tier, so the layer it
+    // was promising would catch up never grows. "It sharpens as consolidation
+    // catches up" was therefore permanently false for that user, on every read,
+    // with no call they could make to change it.
+    //
+    // **The fix is not more plumbing, and that is the point of this test.** The
+    // read path has no access to the tenant's tier by design —
+    // `consolidationBehind` uses grant-fenced state only, so that a per-grant
+    // sentence is never made out of a fact about origins the grant may not
+    // reach — so the line cannot know whether the state is temporary. What it
+    // can state is what the counts show. It must say only that, on both tiers.
+    const freeShaped: IndexState = { ...HEALTHY, pages: 5608, chunks: 16_913, facts: 167 };
+    const notice = degradedNotice(degradedSearch(freeShaped));
+
+    expect(notice).toHaveLength(1);
+    // The observation, which is true whichever tier this brain is on.
+    expect(notice[0]).toContain('leans on raw passages');
+    // And no claim about a future the state cannot show. `yet` is included
+    // deliberately: it is the smallest word that smuggles the promise back in.
+    expect(notice[0]).not.toMatch(/catch(es|ing)? up/i);
+    expect(notice[0]).not.toContain('sharpens');
+    expect(notice[0]).not.toMatch(/\byet\b/);
   });
 
   test('several reasons at once still produce one line, never one per cause', () => {

@@ -549,13 +549,22 @@ function detailFor(reasons: readonly DegradedReason[], state: IndexState): strin
  * it in both lanes is one piece of news twice in one response, which is how a
  * two-line lane becomes a paragraph.
  *
- * **`consolidation_pending` is deliberately absent too, and that one is a
- * promise problem rather than a duplication one.** Every line here tells the
- * user the state is temporary. On the free tier a layer that has never
- * consolidated is the permanent and correct state (R8), so the same sentence
- * would be a promise the product does not keep — and `briefing`, the only read
- * that can produce the reason, already carries the bounded upgrade prompt
- * written for exactly that state.
+ * **No line here may say the state is temporary, and the `consolidation_behind`
+ * line learned that the expensive way.** It used to end "it sharpens as
+ * consolidation catches up", and on the free tier that was a permanent lie told
+ * on every `recall`: the cycle skips every model phase there, so the layer it
+ * promised would catch up never grows. The reason the sentence could not simply
+ * be made conditional is the shape of this surface — a read carries no tier.
+ * {@link IndexState} has none, and {@link consolidationBehind} uses grant-fenced
+ * counts on purpose, so that a per-grant sentence is never made out of a fact
+ * about origins the grant may not reach. A line that cannot know whether a state
+ * is temporary must not say that it is. Every line below states what the counts
+ * show and stops there.
+ *
+ * **`consolidation_pending` is deliberately absent**, and now for the plain
+ * reason rather than the promise one: `briefing` is the only read that can
+ * produce it, and it already carries the bounded upgrade prompt written for
+ * exactly that state. A second sentence here would be the same news twice.
  */
 const NOTICE_LINES: readonly (readonly [DegradedReason, string])[] = [
   [
@@ -564,7 +573,7 @@ const NOTICE_LINES: readonly (readonly [DegradedReason, string])[] = [
   ],
   [
     'consolidation_behind',
-    'Most of what is indexed here has not been turned into facts yet, so this answer leans on raw passages — it sharpens as consolidation catches up.',
+    'Most of what is indexed here has not been turned into facts, so this answer leans on raw passages rather than the summarised layer consolidation builds.',
   ],
   [
     'embedding_backlog',
@@ -608,9 +617,14 @@ export function degradedNotice(degraded: Degraded | null): readonly string[] {
   if (degraded === null) return [];
 
   const reasons = new Set<DegradedReason>(degraded.reasons);
-  // The same precedence `detailFor` applies: a layer that has never completed is
-  // behind by construction, and the line for "behind" promises a catching-up
-  // that a brain which has never consolidated is not doing.
+  // The same precedence `detailFor` applies, and for the same reason it applies
+  // there: a layer that has never completed is behind by construction, so a cold
+  // brain fires both and the ratio line is the weaker half of one piece of news.
+  // Duplication, not a promise — the "behind" line no longer makes one. Note
+  // this collapse is reachable from `briefing` alone, because `degradedSearch`
+  // never pushes `consolidation_pending`; it is not what keeps the line honest
+  // on `recall`, and treating it as though it were is what let a permanent
+  // promise ride every free-tier read.
   if (reasons.has('consolidation_pending')) reasons.delete('consolidation_behind');
 
   for (const [reason, line] of NOTICE_LINES) {
