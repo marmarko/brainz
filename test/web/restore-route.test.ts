@@ -619,16 +619,33 @@ describe('the port that is actually wired', () => {
       });
       expect(unknown.ok).toBe(false);
 
-      // Not a timestamp at all. Refused rather than cast in SQL, where it would
-      // come back as a 500 on a request anybody can make.
-      const nonsense = await port.restore({
-        tenantId: TENANT,
-        deletedAt: 'yesterday',
-        confirm: 'yesterday',
-      });
-      expect(nonsense.ok).toBe(false);
-      if (nonsense.ok) return;
-      expect(nonsense.reason).toBe('not_found');
+      // **Every shape a hand-shaped request can take, not just the easy one.**
+      // This probed only `'yesterday'` — the one value `Date.parse` rejects —
+      // while the guard it was asserting used `Date.parse`, so the three inputs
+      // that actually reached the `::timestamptz` cast went untested and came
+      // back as a 500 the comment above claimed to prevent. `'2026'` parses in
+      // JavaScript and is refused by PostgreSQL; the two boundary dates are
+      // out of range for the column and in range for `Date`.
+      for (const shaped of [
+        'yesterday',
+        '2026',
+        '2026-08-19',
+        '0000-01-01T00:00:00.000Z',
+        '+275760-09-13T00:00:00.000Z',
+        new Date().toISOString().replace('Z', '+00:00'),
+      ]) {
+        const nonsense = await port.restore({
+          tenantId: TENANT,
+          deletedAt: shaped,
+          confirm: shaped,
+        });
+        expect(nonsense.ok).toBe(false);
+        if (nonsense.ok) return;
+        // `not_found`, never a throw: the route turns an exception into
+        // `internal_error`, which tells a user their brain is broken when what
+        // happened is that they typed something odd into a URL.
+        expect(nonsense.reason).toBe('not_found');
+      }
     },
     120_000,
   );

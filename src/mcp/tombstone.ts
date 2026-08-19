@@ -733,11 +733,58 @@ function targetKindOf(
  * and the surface can say when the window closed. Past the purge's own cutoff
  * the ledger row is gone and `null` becomes the truth again.
  */
+/**
+ * The one spelling of an instant this surface issues, and therefore the only one
+ * it accepts back. `toISOString()`'s exact output: four-digit year through
+ * milliseconds, `Z`. Deliberately narrower than either `Date.parse` or
+ * `timestamptz` — a restore key is an echo of something this module printed, not
+ * free text, so the strictest reading that still round-trips is the correct one.
+ */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+/**
+ * Whether a string is an instant this module could have printed.
+ *
+ * Three checks, and the third is the one a shape test alone misses:
+ * `'0000-01-01T00:00:00.000Z'` matches the pattern, parses in JavaScript, round
+ * trips through `toISOString()` — and is refused by `timestamptz`, whose range
+ * starts at 4713 BC but which has no year zero. So the year is bounded too, at
+ * the only range a retraction can honestly occupy: this product did not exist
+ * before 1970 and a four-digit year cannot exceed 9999.
+ *
+ * The round trip is what makes the pattern more than a spelling check — it
+ * rejects `'2026-02-30T00:00:00.000Z'`, which is well-formed, parseable, and not
+ * a day.
+ */
+function isRestoreKey(value: string): boolean {
+  if (!ISO_INSTANT.test(value)) return false;
+  const parsed = new Date(value);
+  const ms = parsed.getTime();
+  if (Number.isNaN(ms)) return false;
+  const year = parsed.getUTCFullYear();
+  if (year < 1970 || year > 9999) return false;
+  return parsed.toISOString() === value;
+}
+
 export async function findRestorable(
   sql: SQL,
   request: { readonly deletedAt: string; readonly ttlHours?: number },
 ): Promise<RestorableRetraction | null> {
-  if (Number.isNaN(Date.parse(request.deletedAt))) return null;
+  // **`Date.parse` and PostgreSQL do not speak the same language, and the gap is
+  // a 500.** The guard here used to be `Number.isNaN(Date.parse(...))`, which
+  // catches `'yesterday'` and nothing else: `'2026'`, `'0000-01-01T00:00:00Z'`
+  // and `'+275760-09-13T00:00:00Z'` all parse in JavaScript and are then refused
+  // by the `::timestamptz` cast — the throw reaching the route as
+  // `internal_error` on a request anybody can shape by hand. This is the exact
+  // failure the comment above claimed to prevent while the test probed only the
+  // covered case.
+  //
+  // So the shape is checked rather than the parse: a strict ISO-8601 instant
+  // with an explicit UTC offset, which is the only spelling this surface ever
+  // issues — every value reaches it from `at` in a listing this module produced,
+  // via `toISOString()`. A hand-shaped anything-else is `null`, which is the
+  // truthful answer: there is no retraction of yours at that instant.
+  if (!isRestoreKey(request.deletedAt)) return null;
   const ttlMs = retentionHoursOf(request.ttlHours) * 3600_000;
   const rows = await readLedgers(sql, {
     predicate: 'at = $1::timestamptz',
