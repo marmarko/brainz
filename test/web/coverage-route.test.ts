@@ -60,7 +60,13 @@ import {
   type CoveragePort,
 } from '../../src/web/app.ts';
 import { coveragePort } from '../../src/web/serve.ts';
-import type { CoverageView } from '../../src/web/coverage.ts';
+import {
+  CYCLE_PHASE_NAMES,
+  CYCLE_PHASE_STOPS,
+  CYCLE_STOP_REASONS,
+  ENTITY_KINDS,
+  type CoverageView,
+} from '../../src/web/coverage.ts';
 import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../src/schema/vector-index.ts';
 import {
@@ -712,6 +718,51 @@ describe('the port that is actually wired', () => {
       expect(rendered).not.toContain(SECRET_TITLE);
       expect(rendered).not.toContain(SECRET_STATEMENT);
       expect(rendered).not.toContain(SECRET_NAME);
+    },
+    120_000,
+  );
+
+  // -------------------------------------------------------------------------
+  // 5. The restated vocabularies, checked against the database's own alphabet.
+  //
+  // `coverage.ts` restates four CHECKs rather than importing them, which is the
+  // right call — importing `phases.ts` would pull the cycle's module graph into
+  // a page render — but a restatement drifts silently, because it type-checks
+  // while it is wrong. Two of the four HAD drifted: `stop_reason` was missing
+  // `out_of_time` (rung 19) and `stopped_phase_code` was missing
+  // `input_rejected` (rung 21), so a run record carrying either reached a page
+  // whose types said it could not exist.
+  //
+  // The assertion is both directions against `pg_get_constraintdef`, which is
+  // the database's own answer rather than the migration file the restatement was
+  // copied from. Missing a member is the drift that already happened; inventing
+  // one is a page rendering a state nothing can write.
+  // -------------------------------------------------------------------------
+
+  /** The quoted literals of a `col IN ('a', 'b')` CHECK, as the database holds it. */
+  async function checkAlphabet(constraint: string): Promise<string[]> {
+    const rows = (await brainSql.unsafe(
+      `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = $1`,
+      [constraint],
+    )) as Array<{ def: string }>;
+    const def = rows[0]?.def;
+    if (def === undefined) throw new Error(`no such constraint: ${constraint}`);
+    return [...def.matchAll(/'([^']+)'/g)].map((match) => match[1] as string).sort();
+  }
+
+  test(
+    'every vocabulary this page restates is the one the database accepts',
+    async () => {
+      expect(await checkAlphabet('entity_type_is_known')).toEqual([...ENTITY_KINDS].sort());
+      expect(await checkAlphabet('consolidation_run_stop_reason_is_known')).toEqual(
+        [...CYCLE_STOP_REASONS].sort(),
+      );
+      expect(await checkAlphabet('consolidation_run_stopped_phase_is_known')).toEqual(
+        [...CYCLE_PHASE_NAMES].sort(),
+      );
+      expect(await checkAlphabet('consolidation_run_stopped_phase_code_is_known')).toEqual(
+        [...CYCLE_PHASE_STOPS].sort(),
+      );
     },
     120_000,
   );

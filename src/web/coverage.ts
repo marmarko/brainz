@@ -71,18 +71,48 @@
  * ===========================================================================
  *
  * This is a page load, not a report, and it runs against a database that may be
- * cold. Every statement below either matches a partial index's predicate exactly
- * or is bounded by a table that stays small:
+ * cold. Each statement below is named by the mechanism that actually bounds it,
+ * and **"the predicate matches" and "an index answers it" are kept apart** —
+ * they are different claims and only the second one is cheap. An earlier draft
+ * of this list ran them together and made three of six statements sound like
+ * index lookups when they are passes:
  *
- *   * per-origin documents  → `page_live_by_origin` (v2:261), predicate matched;
- *   * documents behind      → `page_ingested_live` (v3:533), a range scan;
- *   * the run record        → primary-key backward scan, one row;
- *   * facts                 → `fact_by_derivation` (v3:536) plus a heap recheck
- *                             for `quarantined_at`, bounded by live facts;
+ *   * per-origin documents  → a pass over the brain's **live pages**.
+ *                             `page_live_by_origin` (v2:261) matches the
+ *                             predicate exactly and its leading column is the
+ *                             `GROUP BY` key, but every `FILTER` here reads
+ *                             `derivation`, which the index does not carry — so
+ *                             each live page is visited on the heap whichever
+ *                             plan wins;
+ *   * documents behind      → `page_ingested_live` (v3:533): predicate matched
+ *                             exactly and `created_at` is the key, so this one
+ *                             is a true range scan — and the only statement here
+ *                             that gets cheaper the healthier the brain is;
+ *   * the latest run        → primary-key backward scan, one row. **The two
+ *                             scalars beside it are not.** `last_completed_at`
+ *                             and `ever_dreamt` both filter `finished_at IS NOT
+ *                             NULL`, and the table's only non-PK index
+ *                             (`consolidation_run_open`, v3:129) is partial on
+ *                             `finished_at IS NULL` — the complement, which
+ *                             serves neither. They are scans, affordable because
+ *                             the table holds one row per cycle, not because
+ *                             anything indexes them;
+ *   * facts                 → a pass over live facts. Two partial indexes cover
+ *                             two of the three predicates each and neither
+ *                             covers the third: `fact_live` (v2:411) has no
+ *                             `superseded_by`, `fact_by_derivation` (v3:536) has
+ *                             no `quarantined_at`, and the query names no
+ *                             `derivation` to seek on. Every candidate is fetched
+ *                             from the heap either way. This is the statement to
+ *                             watch as `fact` grows;
  *   * entities by type      → a sequential scan of `entity`, which is the one
  *                             small table this page makes hot, and the number to
  *                             watch if it ever stops being small;
- *   * edges / contradictions / review → partial indexes whose predicates match.
+ *   * edges / contradictions / review → `entity_edge_by_object` (v2:701),
+ *                             `contradiction_open` (v2:791), `review_queue_open`
+ *                             (v3:416). These three are the index-answered ones:
+ *                             each query matches its partial index's predicate
+ *                             exactly and needs no column the index lacks.
  *
  * **What is deliberately not here.** `sourceStaleness` (`src/ingest/log.ts`) is
  * the richest per-source view in the system and it is a `GROUP BY` over the whole
@@ -106,45 +136,86 @@ import type { SQL } from 'bun';
 export const COVERAGE_WINDOW_DAYS = 7;
 
 /**
- * `entity.entity_type`'s CHECK (`v2-knowledge-core.sql:537`), restated rather
- * than imported: a web page reading a closed vocabulary should break at compile
- * time when the vocabulary changes, and the schema is the source of truth.
+ * The four closed vocabularies this page renders, restated from the schema
+ * rather than imported.
+ *
+ * **Restated, because a web page reading a closed vocabulary should break at
+ * compile time when the vocabulary changes** and the alternative — importing
+ * `src/worker/consolidate/phases.ts` — pulls the cycle's module graph into a
+ * page render. The schema is the source of truth for all four.
+ *
+ * **Declared as data rather than only as types, for the reason `PHASE_STOPS` is:
+ * a union cannot be enumerated at runtime, and a restatement that cannot be
+ * enumerated is one nothing can check.** Two of these four had already drifted
+ * behind the schema by a member each while reading as though they were current —
+ * `out_of_time` (rung 19) and `input_rejected` (rung 21) — and a stale
+ * restatement is worse than an import, because it type-checks. The arrays below
+ * are asserted equal to the database's own CHECKs, in both directions, by
+ * `test/web/coverage-route.test.ts`, so the next widening fails a test here
+ * instead of arriving as a value this page has no name for.
  */
-export type EntityKind =
-  | 'person'
-  | 'organization'
-  | 'place'
-  | 'project'
-  | 'product'
-  | 'event'
-  | 'topic'
-  | 'other';
 
-/** `consolidation_run.stop_reason`'s CHECK (`v3-consolidation.sql:109`). */
-export type CycleStopReason = 'complete' | 'free_tier' | 'budget_exhausted' | 'phase_failed' | 'cancelled';
+/** `entity.entity_type`'s CHECK (`v2-knowledge-core.sql:537`). */
+export const ENTITY_KINDS = [
+  'person',
+  'organization',
+  'place',
+  'project',
+  'product',
+  'event',
+  'topic',
+  'other',
+] as const;
+
+export type EntityKind = (typeof ENTITY_KINDS)[number];
+
+/**
+ * `consolidation_run.stop_reason`'s CHECK, as rung 19 left it
+ * (`v19-cycle-resume.sql:50`, widening `v3-consolidation.sql:109`).
+ */
+export const CYCLE_STOP_REASONS = [
+  'complete',
+  'free_tier',
+  'budget_exhausted',
+  'phase_failed',
+  'cancelled',
+  'out_of_time',
+] as const;
+
+export type CycleStopReason = (typeof CYCLE_STOP_REASONS)[number];
 
 /** `consolidation_run.stopped_phase`'s CHECK (`v20-stopped-phase.sql:71`). */
-export type CyclePhaseName =
-  | 'dedup'
-  | 'link_reconcile'
-  | 'staleness'
-  | 'entity_merge'
-  | 'salience'
-  | 'cluster'
-  | 'transcribe'
-  | 'extract'
-  | 'enrich'
-  | 'synopsis'
-  | 'contradiction'
-  | 'salience_refine';
+export const CYCLE_PHASE_NAMES = [
+  'dedup',
+  'link_reconcile',
+  'staleness',
+  'entity_merge',
+  'salience',
+  'cluster',
+  'transcribe',
+  'extract',
+  'enrich',
+  'synopsis',
+  'contradiction',
+  'salience_refine',
+] as const;
 
-/** `consolidation_run.stopped_phase_code`'s CHECK (`v20-stopped-phase.sql:81`). */
-export type CyclePhaseStop =
-  | 'budget_exhausted'
-  | 'model_unavailable'
-  | 'bad_output'
-  | 'payload_unavailable'
-  | 'out_of_time';
+export type CyclePhaseName = (typeof CYCLE_PHASE_NAMES)[number];
+
+/**
+ * `consolidation_run.stopped_phase_code`'s CHECK, as rung 21 left it
+ * (`v21-unreadable-page.sql:132`, widening `v20-stopped-phase.sql:81`).
+ */
+export const CYCLE_PHASE_STOPS = [
+  'budget_exhausted',
+  'model_unavailable',
+  'input_rejected',
+  'bad_output',
+  'payload_unavailable',
+  'out_of_time',
+] as const;
+
+export type CyclePhaseStop = (typeof CYCLE_PHASE_STOPS)[number];
 
 /**
  * One credential's contribution, and the only place on this page where a source
