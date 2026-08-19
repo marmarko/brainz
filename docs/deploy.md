@@ -820,6 +820,14 @@ page that has **durably** refused twice, by setting `page.quarantined_at` — wh
 the candidate query has always honoured — with `page.quarantine_reason` recording
 which code, and `page.consolidation_refusals` counting the evidence.
 
+**Retiring a page costs more than its summary, and this is the part to know
+before you read the counts.** `quarantined_at` is the column U9's junk gate uses
+and every read in the system honours it — so a page retired here leaves
+**search, the briefing and the user's own self-export** as well as the
+summariser's queue, until it is un-quarantined. The single statement below
+restores all of it at once. If a brain's owner reports that a document they
+still have has stopped coming back, this table is the first place to look.
+
 *Durable* is doing all the work in that sentence, and it is deliberately narrow:
 only `input_rejected` (a 400/413/422-class status — the provider refusing the
 request itself) and an answer that could not be parsed at all. **A rate limit, a

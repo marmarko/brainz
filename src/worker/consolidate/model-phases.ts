@@ -715,6 +715,14 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
    * pass. That asymmetry is the point of the whole rung: the freeze this fixes
    * is loud, and a page wrongly retired is silent, so the two mistakes are not
    * priced the same and the code is not allowed to treat them as if they were.
+   *
+   * **And retirement costs more than a missing summary.** `quarantined_at` is
+   * U9's column and every read honours it, so the page leaves search, the
+   * briefing and the self-export as well as this queue until an operator runs
+   * the statement rung 21's header spells out. Nothing below this line should be
+   * loosened without reading that paragraph: the threshold and the narrow
+   * durable class are what stand between a bad minute at the provider and a
+   * user's document disappearing from their own brain.
    */
   const strike = async (pageId: string, reason: QuarantineReason): Promise<void> => {
     // One statement, and the threshold is evaluated by the database against the

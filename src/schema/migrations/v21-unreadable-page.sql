@@ -63,6 +63,22 @@
 -- `model_unavailable` and `payload_unavailable` are excluded on purpose — none
 -- of them is anything the page did, so none of them may ever appear here.
 --
+-- **What retirement actually costs, stated here because it is larger than the
+-- phase that causes it.** `quarantined_at` is U9's column and every read in the
+-- system already honours it — so a page retired by the synopsis phase leaves
+-- SEARCH, THE BRIEFING and THE USER'S OWN SELF-EXPORT as well as consolidation,
+-- until it is un-quarantined. That is a heavier consequence than "the brain
+-- could not summarise this", and it is the reason the threshold and the narrow
+-- durable class exist rather than being caution for its own sake: this is not a
+-- page filed differently, it is a page the user stops being shown.
+--
+-- The alternative was a second column consumed only by the candidate query, so
+-- that an unsummarisable page stayed searchable. It was not taken because the
+-- mechanism was specified, and because a page the summariser cannot parse is
+-- usually a page the retrieval path is also getting nothing useful out of — but
+-- the trade is a judgement, not a fact, and a later rung that splits the two
+-- should read this paragraph first.
+--
 -- **Together they are the operator's whole view**, and it is deliberately two
 -- numbers and a word rather than a report:
 --
@@ -71,7 +87,8 @@
 --      WHERE quarantined_at IS NOT NULL AND quarantine_reason IS NOT NULL
 --      GROUP BY quarantine_reason;
 --
--- **Un-quarantining is one statement, and it must clear the counter too:**
+-- **Un-quarantining is one statement, it restores all of the above at once, and
+-- it must clear the counter too:**
 --
 --     UPDATE page
 --        SET quarantined_at = NULL, quarantine_reason = NULL, consolidation_refusals = 0

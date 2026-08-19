@@ -229,15 +229,17 @@ export interface CycleResult {
   /**
    * Pages this cycle retired from a phase's candidate set, across every phase.
    *
-   * **A cycle that removed something of the user's says so.** A page the brain
-   * has stopped trying to consolidate is a page its owner can no longer find
-   * summarised, and unlike every other stop on this record that decision is
-   * invisible from the outside: nothing fails, nothing stalls, the fact count
-   * simply grows over a slightly smaller brain. The durable record is on the
-   * pages themselves (`quarantined_at`, `quarantine_reason`, the refusal
-   * counter rung 21 adds) — this number is the line in the fleet log that tells
-   * an operator to go and look at them, and a non-zero one repeating cycle
-   * after cycle is the shape of a misclassification rather than a bad page.
+   * **A cycle that removed something of the user's says so.** The column a page
+   * is retired through is U9's `quarantined_at`, which every read in the system
+   * already honours — so the page leaves search, the briefing and the user's own
+   * self-export too, not just the summariser's queue. And unlike every other
+   * stop on this record that decision is invisible from the outside: nothing
+   * fails, nothing stalls, the fact count simply grows over a slightly smaller
+   * brain. The durable record is on the pages themselves (`quarantined_at`,
+   * `quarantine_reason`, the refusal counter rung 21 adds) — this number is the
+   * line in the fleet log that tells an operator to go and look at them, and a
+   * non-zero one repeating cycle after cycle is the shape of a misclassification
+   * rather than of bad pages.
    */
   readonly quarantined: number;
   readonly estimate: CycleEstimate;
