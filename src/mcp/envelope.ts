@@ -38,13 +38,21 @@
 
 import { advertisedTools, toolByName, type Endpoint } from './tools/index.ts';
 
-/** The MCP revision this surface speaks. Sessions were retired in it. */
-export const PROTOCOL_VERSION = '2026-07-28';
+/**
+ * The MCP revision this surface speaks. Sessions were retired in it.
+ *
+ * **Named `MCP_` rather than left bare, and that prefix is the fix.** A constant
+ * called `PROTOCOL_VERSION` in a file that owns a response envelope reads as
+ * "the version of the envelope", and it was used as both — see
+ * {@link MEMORY_VERBS_VERSION} for the failure that produced. The bare name is
+ * what invited the reuse; leaving it bare invites the next one.
+ */
+export const MCP_PROTOCOL_VERSION = '2026-07-28';
 
 /**
  * The revisions `initialize` may answer with, newest first.
  *
- * **The failure this closes.** `initialize` used to answer `PROTOCOL_VERSION`
+ * **The failure this closes.** `initialize` used to answer `MCP_PROTOCOL_VERSION`
  * whatever the client asked for. The spec is the other way round: a server that
  * can serve the requested revision MUST echo it, and a client that receives a
  * revision it does not know SHOULD disconnect. So a connector built against an
@@ -57,7 +65,7 @@ export const PROTOCOL_VERSION = '2026-07-28';
  * JSON-RPC batching was mandatory before it and removed in it; this surface has
  * never decoded a batch. Echoing an older revision would be a promise of a
  * framing we do not parse, which trades a legible refusal for a wrong answer.
- * Anything outside the list is answered with `PROTOCOL_VERSION` — the spec's
+ * Anything outside the list is answered with `MCP_PROTOCOL_VERSION` — the spec's
  * own fallback, and the branch that lets a client decide for itself whether it
  * can proceed.
  *
@@ -66,7 +74,7 @@ export const PROTOCOL_VERSION = '2026-07-28';
  * echoing an older revision honest rather than merely accommodating.
  */
 export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = [
-  PROTOCOL_VERSION,
+  MCP_PROTOCOL_VERSION,
   '2025-11-25',
   '2025-06-18',
 ];
@@ -75,18 +83,43 @@ export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = [
  * The revision to answer a given `initialize` with.
  *
  * Deliberately total: a missing, non-string or unknown `protocolVersion` all
- * resolve to `PROTOCOL_VERSION`, because the one thing this must never do is
+ * resolve to `MCP_PROTOCOL_VERSION`, because the one thing this must never do is
  * throw on the first message of every session.
  */
 export function negotiateProtocolVersion(requested: unknown): string {
   return typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
     ? requested
-    : PROTOCOL_VERSION;
+    : MCP_PROTOCOL_VERSION;
 }
+
+/**
+ * The version of the envelope's own shape. An integer, and not a date.
+ *
+ * **The failure this closes.** `buildEnvelope` used to stamp
+ * {@link MCP_PROTOCOL_VERSION} here, because one constant carried two unrelated
+ * dimensions: a dated MCP wire revision negotiated per connection, and the
+ * version of this response body. They move on different cadences, are read by
+ * different parties, and have different types. Reusing one for both was
+ * survivable only while `initialize` answered the same literal unconditionally
+ * — the moment revision negotiation landed, the field became false under *both*
+ * readings at once: a client that negotiated `2025-11-25` was told `2025-11-25`
+ * at `initialize` and then handed `"2026-07-28"` in every envelope of that same
+ * connection. That is neither the envelope's version nor the revision the
+ * connection agreed on, and there is no reader for whom it was ever true.
+ *
+ * `1` because this is the shape brainz publishes as `memory-verbs-v1-partial`
+ * (`upstream/memory-verbs-v1-partial.json`), whose profile is v1.
+ */
+export const MEMORY_VERBS_VERSION = 1;
 
 /**
  * The model-facing keys. Frozen: additive forever.
  *
+ * `protocol_version` — {@link MEMORY_VERBS_VERSION}, the version of this body's
+ *                      shape. Never the MCP wire revision, which is negotiated
+ *                      per connection and answered at `initialize`. It was the
+ *                      only frozen key with no line here, which is how the two
+ *                      came to be the same constant.
  * `degraded` — why this read was partial, as a named shape (never a bare bool).
  * `notice`   — at most two short lines worth relaying to the user.
  * `next`     — at most three concrete follow-up calls.
@@ -167,7 +200,13 @@ export interface Degraded {
 }
 
 export interface Envelope {
-  readonly protocol_version: string;
+  /**
+   * Typed `number` rather than the literal `1` on purpose: the violation check
+   * below exists to catch a builder that stamped the wrong value, and a literal
+   * type would make the only input that triggers it unconstructable — an
+   * assertion nothing can reach is an assertion nobody has shown to work.
+   */
+  readonly protocol_version: number;
   readonly degraded?: Degraded;
   readonly notice?: readonly string[];
   readonly next?: readonly NextCall[];
@@ -194,7 +233,7 @@ export function buildEnvelope(input: EnvelopeInput): Envelope {
   const notice = (input.notice ?? []).slice(0, MAX_NOTICE);
   const next = (input.next ?? []).slice(0, MAX_NEXT);
   return {
-    protocol_version: PROTOCOL_VERSION,
+    protocol_version: MEMORY_VERBS_VERSION,
     ...(input.degraded == null ? {} : { degraded: input.degraded }),
     ...(notice.length > 0 ? { notice } : {}),
     ...(next.length > 0 ? { next } : {}),
@@ -218,7 +257,7 @@ export function envelopeViolations(envelope: Envelope, endpoint: Endpoint): stri
     }
   }
 
-  if (envelope.protocol_version !== PROTOCOL_VERSION) {
+  if (envelope.protocol_version !== MEMORY_VERBS_VERSION) {
     findings.push(`protocol_version is ${JSON.stringify(envelope.protocol_version)}`);
   }
 

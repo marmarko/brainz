@@ -371,7 +371,7 @@ describe('the transcript format is stable by contract', () => {
 describe('a setup capability does not survive a round trip through a transcript', () => {
   const envelope =
     'Here is what came back:\n' +
-    '{"protocol_version":"2026-07-28","setup":{"kind":"connect_source",' +
+    '{"protocol_version":1,"setup":{"kind":"connect_source",' +
     '"detail":"Connect Gmail to fill your brain","url":"https://brainz.app/claim/s3cr3t-token"},' +
     '"notice":["one line"]}\n' +
     'and the meta block {"brainz.app/setup_url":"https://brainz.app/claim/s3cr3t-token"}';

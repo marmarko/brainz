@@ -784,7 +784,7 @@ describe('the envelope on a real response', () => {
     async () => {
       const { envelopeViolations } = await import('../../src/mcp/envelope.ts');
       const result = await fixture.call('recall', { query: 'renewal' });
-      expect(result.envelope.protocol_version).toBe('2026-07-28');
+      expect(result.envelope.protocol_version).toBe(1);
       expect(envelopeViolations(result.envelope, 'mcp')).toEqual([]);
     },
     TEST_TIMEOUT_MS,

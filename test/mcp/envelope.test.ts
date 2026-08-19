@@ -27,7 +27,8 @@ import {
   META_KEYS,
   MAX_NEXT,
   MAX_NOTICE,
-  PROTOCOL_VERSION,
+  MCP_PROTOCOL_VERSION,
+  MEMORY_VERBS_VERSION,
   buildEnvelope,
   degradedSearch,
   envelopeViolations,
@@ -53,14 +54,40 @@ describe('the closed key set', () => {
     for (const key of Object.keys(envelope)) {
       expect(ENVELOPE_KEYS as readonly string[]).toContain(key);
     }
-    expect(envelope.protocol_version).toBe(PROTOCOL_VERSION);
+    expect(envelope.protocol_version).toBe(MEMORY_VERBS_VERSION);
+  });
+
+  /**
+   * The failure this pins: one constant carried two unrelated versions.
+   *
+   * `protocol_version` is the version of *this response body's shape*. The MCP
+   * wire revision is a different dimension — dated, negotiated per connection,
+   * and answered at `initialize`. Stamping the revision here made the field
+   * false under both readings the moment negotiation landed: a client that
+   * agreed on `2025-11-25` was handed `2026-07-28` in every envelope of that
+   * same connection, which is neither the envelope version nor the revision it
+   * negotiated.
+   */
+  test('stamps the memory-verbs envelope version, never the MCP wire revision', () => {
+    const envelope = buildEnvelope({ endpoint: 'mcp' });
+    expect(typeof envelope.protocol_version).toBe('number');
+    expect(Number.isInteger(envelope.protocol_version)).toBe(true);
+    expect(envelope.protocol_version).not.toBe(MCP_PROTOCOL_VERSION as unknown as number);
+  });
+
+  test('an envelope carrying the wire revision is a violation, not a variant', () => {
+    const findings = envelopeViolations(
+      { protocol_version: MCP_PROTOCOL_VERSION as unknown as number },
+      'mcp',
+    );
+    expect(findings.join(' ')).toMatch(/protocol_version/);
   });
 });
 
 describe('the bounded lanes', () => {
   test('refuses more than two notices', () => {
     const findings = envelopeViolations(
-      { protocol_version: PROTOCOL_VERSION, notice: ['a', 'b', 'c'] },
+      { protocol_version: MEMORY_VERBS_VERSION, notice: ['a', 'b', 'c'] },
       'mcp',
     );
     expect(findings.join(' ')).toMatch(/notice/);
@@ -68,7 +95,7 @@ describe('the bounded lanes', () => {
 
   test('refuses more than three suggestions', () => {
     const next = new Array(MAX_NEXT + 1).fill({ tool: 'recall', args: {}, why: 'why' });
-    const findings = envelopeViolations({ protocol_version: PROTOCOL_VERSION, next }, 'mcp');
+    const findings = envelopeViolations({ protocol_version: MEMORY_VERBS_VERSION, next }, 'mcp');
     expect(findings.join(' ')).toMatch(/next/);
   });
 
@@ -95,7 +122,7 @@ describe('referential integrity on next[]', () => {
     // suggestion that crosses endpoints teaches the model a call that fails.
     const findings = envelopeViolations(
       {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: MEMORY_VERBS_VERSION,
         next: [{ tool: 'recall', args: { query: 'x' }, why: 'read it back' }],
       },
       'openai',
@@ -106,7 +133,7 @@ describe('referential integrity on next[]', () => {
   test('a suggestion carrying an argument outside the tool schema is a violation', () => {
     const findings = envelopeViolations(
       {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: MEMORY_VERBS_VERSION,
         next: [{ tool: 'recall', args: { qeury: 'typo' }, why: 'read it back' }],
       },
       'mcp',
@@ -117,7 +144,7 @@ describe('referential integrity on next[]', () => {
   test('a suggestion naming an unadvertised-but-dispatchable tool is still a violation', () => {
     for (const hidden of ['manage', 'synthesize']) {
       const findings = envelopeViolations(
-        { protocol_version: PROTOCOL_VERSION, next: [{ tool: hidden, args: {}, why: 'no' }] },
+        { protocol_version: MEMORY_VERBS_VERSION, next: [{ tool: hidden, args: {}, why: 'no' }] },
         'mcp',
       );
       expect(findings.join(' ')).toMatch(new RegExp(hidden));
