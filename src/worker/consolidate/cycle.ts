@@ -227,21 +227,26 @@ export interface CycleResult {
   readonly spentMicroUsd: number;
   readonly modelCalls: number;
   /**
-   * Pages this cycle retired from a phase's candidate set, across every phase.
+   * Items this cycle passed over, across every per-item phase.
    *
-   * **A cycle that removed something of the user's says so.** The column a page
-   * is retired through is U9's `quarantined_at`, which every read in the system
-   * already honours — so the page leaves search, the briefing and the user's own
-   * self-export too, not just the summariser's queue. And unlike every other
-   * stop on this record that decision is invisible from the outside: nothing
-   * fails, nothing stalls, the fact count simply grows over a slightly smaller
-   * brain. The durable record is on the pages themselves (`quarantined_at`,
-   * `quarantine_reason`, the refusal counter rung 21 adds) — this number is the
-   * line in the fleet log that tells an operator to go and look at them, and a
-   * non-zero one repeating cycle after cycle is the shape of a misclassification
-   * rather than of bad pages.
+   * **A cycle that could not read something says so, because nothing else
+   * will.** A per-item failure no longer stops its phase — that link is what
+   * froze a brain at 167 facts — so it no longer reaches `stopReason` or
+   * `stoppedPhase` either, and a cycle that summarised nothing because every
+   * candidate was unreadable would otherwise read on the run record exactly like
+   * a brain with nothing left to do. This number is the difference between those
+   * two, and it is why completing through a failure is not the same as
+   * swallowing one.
+   *
+   * A count rather than a list, and it is the coarse half of the picture on
+   * purpose: `page.consolidation_refusals` says WHICH pages and for how long,
+   * and this says how many, in the line an operator is already watching. Small
+   * and steady is a few unreadable documents, which now cost one model call each
+   * per cycle forever and nothing else. Equal to a phase's whole candidate set,
+   * cycle after cycle, is a broken prompt or a seat whose output ceiling is too
+   * tight — and that is a change to make, not a page to blame.
    */
-  readonly quarantined: number;
+  readonly skippedItems: number;
   readonly estimate: CycleEstimate;
 }
 
@@ -292,7 +297,7 @@ export async function runConsolidationCycle(
   const phases: PhaseRecord[] = [];
   let spent = opened.spentMicroUsd;
   let modelCalls = 0;
-  let quarantined = 0;
+  let skippedItems = 0;
   let refined = false;
   let stop: StopReason = 'complete';
   /**
@@ -453,7 +458,7 @@ export async function runConsolidationCycle(
 
     spent += outcome.spentMicroUsd;
     modelCalls += outcome.modelCalls;
-    quarantined += outcome.quarantined;
+    skippedItems += outcome.skippedItems;
 
     if (outcome.stopped === null) {
       await completePhase(deps.sql, run, phase, {
@@ -529,7 +534,7 @@ export async function runConsolidationCycle(
     wallClockMs,
     spentMicroUsd: spent,
     modelCalls,
-    quarantined,
+    skippedItems,
     estimate: priced,
   };
 }

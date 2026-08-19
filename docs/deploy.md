@@ -781,9 +781,9 @@ cycle, a lost lease, or the clock read *between* two phases.
 
 | `stopped_phase_code` | What it means | What to do |
 |---|---|---|
-| `model_unavailable` | the gateway could not complete the call: a rate limit, a 5xx, a dropped connection, a key that would not resolve | usually the provider, and usually transient. Waiting is the remedy. Nothing is ever retired on this code, however long it lasts |
-| `input_rejected` | the provider read the request and refused it — a 400/413/422-class status | the request, not the provider. Waiting does not fix it. On `synopsis` this is also what retires a page; see below |
-| `bad_output` | the model answered with something this code cannot read | a prompt or an input problem, not a provider one. Waiting does not fix it |
+| `model_unavailable` | the gateway could not complete the call: a rate limit, a 5xx, a dropped connection, a key that would not resolve, a scope that was denied | usually the provider, and usually transient. Waiting is the remedy. No page is ever blamed for it, however long it lasts |
+| `input_rejected` | the provider read the request and refused it — a 400/413/422-class status | the request, not the provider. Waiting does not fix it: the payload has to get smaller or the seat wider |
+| `bad_output` | the model answered with something this code cannot read | a prompt or an input problem, not a provider one. Waiting does not fix it. Only a whole-batch phase reports it — on a per-item phase an unreadable answer is one item skipped, and never reaches this column |
 | `payload_unavailable` | `transcribe` only: the stored object was not there | object storage or the prefix credential; the attachment is deliberately not marked done |
 | `budget_exhausted` | this phase asked for money the cap would not give | matches `stop_reason`; the phase named is the first one to want it, not the expensive one |
 | `out_of_time` | the attempt's clock ran out inside this phase | matches `stop_reason`; see the phase-cost table below |
@@ -798,69 +798,78 @@ flat is the visible part; `stopped_phase` names the phase actually holding the
 run open. Fix that phase and the run completes, which clears the checkpoints and
 lets the next cycle run every phase again.
 
-**One item can no longer do that on its own.** `synopsis` calls the model once
-per page, and it used to return on the first page it could not summarise — so a
-single unusable page out of thousands held the whole chain above open. It now
-skips that page (nothing is written, so the next cycle offers it again) and keeps
-going. It stops and names a code only when **three items in a row** fail, or when
-it summarised nothing at all — a run of failures that long is the provider or the
-prompt rather than an item, and a phase that wrote nothing while failing at
-something has not succeeded. So `stopped_phase_code` on `synopsis` now means
-"this is systemic", not "one page was odd", and the ceiling on what the tolerance
-costs is three wasted calls per cycle. `transcribe` — the cycle's other per-item
-loop — still stops on its first bad item.
+**One item can no longer do that on its own, and this is the paragraph to read
+before acting on a `synopsis` code.** `synopsis` calls the model once per page,
+and it used to return on the first page it could not summarise — so a single
+unusable page out of thousands held the whole chain above open. A per-item
+failure is now the *item's* outcome: the page is skipped, nothing is written for
+it, the phase carries on, and the phase **completes** — including when every
+page it was given was skipped. It is offered again on the next cycle, and on
+every cycle after that for as long as it stays unreadable, at a cost of one model
+call each.
 
-**Skipping alone only moved the freeze, so a page can also leave.** The candidate
-query excludes a page once a summary exists for it, and a skipped page writes
-nothing — so every usable page leaves the set and every unusable one stays, until
-the unusable ones are all that is left, adjacent at the head of a fixed ordering,
-tripping the three-in-a-row bound on the first three calls of every cycle. That
-is the original freeze arriving a few cycles later. So `synopsis` now retires a
-page that has **durably** refused twice, by setting `page.quarantined_at` — which
-the candidate query has always honoured — with `page.quarantine_reason` recording
-which code, and `page.consolidation_refusals` counting the evidence.
+That standing cost is deliberate and it is the cheaper half of the trade. The
+alternative — retiring the page so it stops being a candidate — was built and
+rejected: the column that removes a page from the summariser's queue is U9's
+`quarantined_at`, and **every read in the system honours it**, so the page would
+have left search, the briefing and the user's own self-export too. The evidence
+cannot support that. The widest failure by far is an HTTP 200 whose body will not
+parse, which is a page the model can never read and one badly sampled answer at
+the same time, and nothing in the phase can tell those apart. So nothing is
+retired, ever, and no operator action is needed to bring a page back.
 
-**Retiring a page costs more than its summary, and this is the part to know
-before you read the counts.** `quarantined_at` is the column U9's junk gate uses
-and every read in the system honours it — so a page retired here leaves
-**search, the briefing and the user's own self-export** as well as the
-summariser's queue, until it is un-quarantined. The single statement below
-restores all of it at once. If a brain's owner reports that a document they
-still have has stopped coming back, this table is the first place to look.
+**What still stops the phase is a failure that is provably not about the item**,
+and it is decided from the answer rather than from a count of failures. If the
+provider never gave the request a verdict — an auth refusal, a key that will not
+resolve, a rate limit, a 5xx, a dropped connection — then every remaining page
+would fail identically, so the phase stops on the **first** such answer, names
+`model_unavailable`, and leaves the run open for a cycle that can finish the work.
+`budget_exhausted` and `out_of_time` stop for the same reason. Everything else —
+`input_rejected` on one page, an answer that will not parse — is one page skipped.
 
-*Durable* is doing all the work in that sentence, and it is deliberately narrow:
-only `input_rejected` (a 400/413/422-class status — the provider refusing the
-request itself) and an answer that could not be parsed at all. **A rate limit, a
-5xx, a timeout or a dropped connection increments nothing**, however many pages
-it touches or how long it lasts, because retiring a good page is silent where
-this freeze is loud.
+So a `stopped_phase_code` on `synopsis` now always means "systemic", never "one
+page was odd". A brain whose pages cannot be summarised produces **no code at
+all**; it produces a completing cycle with a non-zero skip count, which is the
+next section. `transcribe` — the cycle's other per-item loop — still stops on its
+first bad item.
 
-Read what it has taken, and from where:
+### Pages the summariser could not read
+
+Nothing here retires anything, so the signal is a count rather than a state to
+undo. The fleet's `cycle` log line carries the per-cycle number as
+`skipped_items`: how many candidates the cycle passed over, across every per-item
+phase. Zero is the healthy reading.
+
+A non-zero one is not on its own a problem — an unreadable page costs one model
+call a cycle and nothing else — but it is the only symptom, since a per-item
+failure deliberately no longer reaches `stop_reason` or `stopped_phase`. Without
+this number, a cycle that summarised nothing because every candidate was
+unreadable reads on the run record exactly like a brain with nothing left to do.
+
+Which pages, and for how long, is on the pages themselves:
 
 ```sql
-SELECT quarantine_reason, count(*)
+SELECT page_id, consolidation_refusals
   FROM page
- WHERE quarantined_at IS NOT NULL AND quarantine_reason IS NOT NULL
- GROUP BY quarantine_reason;
+ WHERE consolidation_refusals > 0
+ ORDER BY consolidation_refusals DESC
+ LIMIT 20;
 ```
 
-The fleet's `cycle` log line carries the per-cycle count as `quarantined`. A
-non-zero count repeating cycle after cycle is the shape of a misclassification
-(a broken prompt template, a seat whose output ceiling is too tight) rather than
-of bad pages — three per cycle is the ceiling the three-in-a-row bound imposes,
-so it creeps rather than sweeps, and every such cycle also reports `phase_failed`.
+Read the shape, not the total:
 
-**Undoing one is a single statement, and it must clear the counter too:**
+* **A few pages with high counts** is a few genuinely unreadable documents. They
+  cost one call each per cycle. Nothing needs doing, and if a re-chunk or a wider
+  seat later makes one acceptable, it is summarised on the next cycle with nobody
+  involved.
+* **Every page with a low count, climbing together** is not the corpus. That is a
+  broken prompt template or a seat whose output ceiling is too tight, and it is a
+  change to make rather than pages to blame.
 
-```sql
-UPDATE page
-   SET quarantined_at = NULL, quarantine_reason = NULL, consolidation_refusals = 0
- WHERE page_id = <id>;
-```
-
-Leaving `consolidation_refusals` set would put the page one durable refusal from
-being retired again, so the decision would survive exactly one cycle and look as
-though it had not been applied.
+**A transient never appears here.** A rate limit, a 5xx, a timeout or a dropped
+connection stops the phase before any page is charged for it, however many pages
+it would have touched, so a non-zero count is never an outage — and an outage is
+never mistaken for a bad corpus.
 
 **`out_of_time` is a clean stop, not a failure.** The cycle reads the deadline
 its own lease stamps, finishes the unit of work in flight, writes its run record

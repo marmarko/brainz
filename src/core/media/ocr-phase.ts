@@ -152,10 +152,13 @@ function outcomeOf(
     applied: progress.applied,
     queued: 0,
     logged: progress.logged,
-    // This phase retires nothing. An attachment it cannot read stays queued —
-    // `ocr_text` is left NULL on purpose so the item comes back — and the one
-    // thing R23 promised never to do is retire a payload nobody ever read.
-    quarantined: 0,
+    // Zero, and not because this phase has nothing to skip: it is the cycle's
+    // other per-item loop and it still stops on its first bad item. The synopsis
+    // phase's skip-and-complete has not been carried here, because a payload
+    // that is not in object storage is a storage or credential fault that meets
+    // every remaining attachment identically — the systemic side of the same
+    // line — and because `ocr_text` staying NULL already brings the item back.
+    skippedItems: 0,
     // The budget's own figure, not the chat calls' sum: the transcript's page
     // pays for its embedding out of this same phase budget, and reporting only
     // the vision calls would under-report what the phase spent.

@@ -1,110 +1,109 @@
 -- ===========================================================================
--- brainz tenant schema — rung 21, a page the model can never read
+-- brainz tenant schema — rung 21, a page the model cannot read
 --
--- Two columns on `page` and one widened CHECK on `consolidation_run`, and they
--- exist because rung 20's diagnosis was correct and the repair it enabled was
--- not enough.
+-- One column on `page` and one widened CHECK on `consolidation_run`. This rung
+-- was drafted twice and the second draft is what shipped, so the argument
+-- against the first is part of the rung rather than lost to the branch.
 --
 -- ---------------------------------------------------------------------------
--- **The failure, one link further down than rung 20 could see.**
+-- **The failure.**
 --
 -- A production brain sat at 5,608 pages and 167 facts. Rung 20 named the cause:
 -- the cycle stopped in `synopsis`, on a page the model would not summarise. The
--- first repair let the phase SKIP that page and carry on — and skipping defers
--- the freeze rather than removing it. The candidate query excludes a page only
--- once a summary row exists for it, and a skipped page writes nothing. So every
--- usable page leaves the candidate set and every unusable one stays. The set
--- converges monotonically onto the unusable pages; the ordering key is fixed, so
--- they end up adjacent at its head; the phase's consecutive-failure bound then
--- trips on the first three calls of every cycle with nothing applied. The
--- terminal state is the state the skip was written to fix — the cycle stops, the
--- run stays open, and a model phase holding a checkpoint against an open run is
--- skipped on every resume, which is what pinned extraction and therefore the
--- fact count.
---
--- The link that has to break is the candidate set. `page.quarantined_at` already
--- exists and the candidate query already honours it; nothing set it from this
--- path. These columns are what make setting it defensible.
+-- chain from there is four links long and only the first is about the page — a
+-- model phase that stops stops the cycle; a cycle that stops short leaves its
+-- run OPEN, because that null `finished_at` is the resume signal; and a model
+-- phase holding a checkpoint against an open run is skipped on every resume. So
+-- `extract`, banked at its batch bound, was skipped forever. One unusable page
+-- stopped extraction for every other page.
 --
 -- ---------------------------------------------------------------------------
--- **`consolidation_refusals` — the evidence a page must accumulate first.**
+-- **The draft this replaces, and why it was refused.**
 --
--- Quarantining on a transient failure is a WORSE bug than the freeze, and the
--- asymmetry is the whole design constraint: the freeze is loud — it is on the
--- run record, in the cycle log and in a fact count that stops moving — while a
--- page wrongly dropped from consolidation is silent. The user is never told that
--- the brain stopped reading something.
+-- The first draft broke the chain by removing the page: two durable refusals set
+-- `page.quarantined_at`, which `selectIngestedPages` already honours, plus a
+-- `quarantine_reason` column recording under which code. It worked, and it was
+-- the wrong column. `quarantined_at` is U9's junk gate and **every read in the
+-- system honours it** — `src/core/search/arms.ts`, the briefing, and the user's
+-- own self-export in `src/core/export/reconstruct.ts`. The harm was never "this
+-- page is missing from consolidation"; it was a document its owner still has, no
+-- longer coming back when they search their own brain, with nothing anywhere
+-- saying so.
 --
--- So a page earns its way out of the set. The counter is incremented only by a
--- DURABLE refusal (`src/worker/consolidate/model-phases.ts`), and a phase run
--- tries a given page at most once, so reaching the threshold necessarily spans
--- more than one cycle and more than one independent answer from the model. A
--- provider that is rate-limiting or down increments nothing at all, however long
--- the outage lasts and however many pages it touches.
+-- And the evidence could not carry that weight. `stopFor` can prove a
+-- 400/413/422 is the provider refusing THIS request. It cannot say the same of
+-- the widest failure by far — an HTTP 200 whose body will not parse — which is a
+-- page the model can never read and a badly sampled answer at once, and which
+-- `model-phases.ts` says in as many words it cannot tell apart in one exchange.
+-- A provider emitting unparseable 200s under load would have retired real
+-- documents on an inference the code admits it cannot make.
 --
--- `smallint NOT NULL DEFAULT 0` rather than nullable: "this page has never been
--- refused" and "nobody has looked" are the same state here, and a nullable
--- counter would invite a reader to distinguish them. The DEFAULT is what keeps
--- the rung expand-only — every INSERT the previous fleet version issues names
--- the old column list and must keep working.
+-- **So nothing is retired.** The phase skips the item it cannot summarise and
+-- completes; the page stays a candidate and costs one model call a cycle for as
+-- long as it stays unreadable. That is a small, permanent, bounded price, and it
+-- is the correct side of the trade against removing somebody's document from
+-- their own brain. `quarantine_reason` went with the mechanism it existed for:
+-- a reason column for a retirement that cannot happen is a column whose only
+-- possible future is somebody finding a use for it.
 --
 -- ---------------------------------------------------------------------------
--- **`quarantine_reason` — a code, and never the page.**
+-- **`consolidation_refusals` — kept, and now purely telemetry.**
 --
--- Rung 20's discipline, applied to the table that holds the user's own words:
--- the reason is one of a closed vocabulary the CHECK enumerates, so no title, no
--- excerpt and no provider sentence can be filed here. The temptation is the same
--- one rung 20 recorded — the obvious "improvement" on "this page was retired" is
--- to say what it was about — and the refusal is again held by the database
--- rather than by whoever writes the next materializer.
+-- It survives because the redesign creates the question it answers. Nothing
+-- stops any more, so an operator watching a summary count that will not move has
+-- to be able to tell three unreadable pages refused forty times each from every
+-- page refused once, which is a broken prompt or a seat whose output ceiling is
+-- too tight. The per-cycle count in the fleet's `cycle` log says HOW MANY; this
+-- says WHICH, and how long it has been going on.
 --
--- The vocabulary is a subset of `PHASE_STOPS`: the two codes a per-item model
--- phase can attribute to the item itself. `budget_exhausted`, `out_of_time`,
--- `model_unavailable` and `payload_unavailable` are excluded on purpose — none
--- of them is anything the page did, so none of them may ever appear here.
+-- **Nothing reads it to make a decision, and that is the property to preserve.**
+-- The moment a threshold is compared against this column, the refuted draft is
+-- back: a counter that decides is a counter whose increments have to be trusted,
+-- and the parse-failure increment is exactly the signal that cannot be. It is
+-- incremented on the two per-item outcomes the model is answerable for — a
+-- durable `input_rejected`, and an answer that could not be parsed — and never
+-- by a transient. A provider that is rate-limiting or down stops the phase
+-- before any page is charged for it, however long the outage lasts, so an
+-- operator reading a non-zero count is never reading an outage.
 --
--- **What retirement actually costs, stated here because it is larger than the
--- phase that causes it.** `quarantined_at` is U9's column and every read in the
--- system already honours it — so a page retired by the synopsis phase leaves
--- SEARCH, THE BRIEFING and THE USER'S OWN SELF-EXPORT as well as consolidation,
--- until it is un-quarantined. That is a heavier consequence than "the brain
--- could not summarise this", and it is the reason the threshold and the narrow
--- durable class exist rather than being caution for its own sake: this is not a
--- page filed differently, it is a page the user stops being shown.
+-- `integer` rather than the smallint the first draft used. That draft's counter
+-- stopped at a threshold of two; a counter that only counts has no ceiling but
+-- the column's, and a page that stays unreadable accumulates one per cycle
+-- forever. At smallint's 32,767 the increment inside the phase would eventually
+-- raise, which would be a new way for one page to break a run — the exact class
+-- of failure this rung exists to remove.
 --
--- The alternative was a second column consumed only by the candidate query, so
--- that an unsummarisable page stayed searchable. It was not taken because the
--- mechanism was specified, and because a page the summariser cannot parse is
--- usually a page the retrieval path is also getting nothing useful out of — but
--- the trade is a judgement, not a fact, and a later rung that splits the two
--- should read this paragraph first.
+-- `NOT NULL DEFAULT 0` rather than nullable: "this page has never been refused"
+-- and "nobody has looked" are the same state here, and a nullable counter would
+-- invite a reader to distinguish them. The DEFAULT is what keeps the rung
+-- expand-only — every INSERT the previous fleet version issues names the old
+-- column list and must keep working.
 --
--- **Together they are the operator's whole view**, and it is deliberately two
--- numbers and a word rather than a report:
+-- **The operator's whole view**, deliberately a number and an id rather than a
+-- report, and carrying no page content at all:
 --
---     SELECT quarantine_reason, count(*)
+--     SELECT page_id, consolidation_refusals
 --       FROM page
---      WHERE quarantined_at IS NOT NULL AND quarantine_reason IS NOT NULL
---      GROUP BY quarantine_reason;
+--      WHERE consolidation_refusals > 0
+--      ORDER BY consolidation_refusals DESC;
 --
--- **Un-quarantining is one statement, it restores all of the above at once, and
--- it must clear the counter too:**
---
---     UPDATE page
---        SET quarantined_at = NULL, quarantine_reason = NULL, consolidation_refusals = 0
---      WHERE page_id = <id>;
---
--- Leaving `consolidation_refusals` alone would put the page one durable refusal
--- from re-quarantine, so an operator's judgement call would survive exactly one
--- cycle and look like it had not been applied at all.
+-- There is no undo statement here, because there is nothing to undo. A page that
+-- becomes summarisable — a re-chunk, a bigger seat, a fixed prompt — is
+-- summarised on the next cycle with nobody involved, and its count simply stops
+-- growing.
 --
 -- ---------------------------------------------------------------------------
 -- **The widened CHECK, and why a drop is admissible here.**
 --
 -- Rung 20 spelled `PHASE_STOPS` into `consolidation_run_stopped_phase_code_is_known`.
--- `input_rejected` joins that vocabulary — the distinction between "the provider
--- was unavailable" and "the provider refused what we sent" is what licenses the
--- quarantine above, so the run record has to be able to say which one happened.
+-- `input_rejected` joins that vocabulary and outlives the draft that motivated
+-- it, on its own merit: "the provider read the request and refused it" and "the
+-- provider never answered" want opposite responses from whoever reads the run
+-- record — the first is a request that has to change, the second is a wait — and
+-- rung 20's column could say only the second. It now informs diagnosis rather
+-- than licensing a retirement, which is the honest use for a signal the phase
+-- can trust about the transport and not about the document.
+--
 -- The DROP is paired with an ADD of the same constraint name in this same rung,
 -- which is the one shape `findExpandContractViolations` admits, and the
 -- replacement is strictly WIDER: every code the previous fleet version can write
@@ -116,33 +115,15 @@
 -- against a live database that the alphabet the CHECK accepts is exactly
 -- `PHASE_STOPS`, in both directions.
 --
--- **Additive, and no backfill.** A page quarantined before this rung was
--- quarantined by U9's junk gate for a different reason, and has no
--- `quarantine_reason` to be given. Inferring one would be inventing history,
--- which is the objection rung 17 records against rewriting rows to a cause
--- derived later.
+-- **Additive, and no backfill.** A page that was refused before this rung has no
+-- count to be given and must not be invented one, which is the objection rung 17
+-- records against rewriting rows to a cause derived later.
 -- ===========================================================================
 
-ALTER TABLE page ADD COLUMN consolidation_refusals smallint NOT NULL DEFAULT 0;
-ALTER TABLE page ADD COLUMN quarantine_reason text;
+ALTER TABLE page ADD COLUMN consolidation_refusals integer NOT NULL DEFAULT 0;
 
 ALTER TABLE page ADD CONSTRAINT page_consolidation_refusals_are_counted CHECK (
   consolidation_refusals >= 0
-);
-
--- The two codes a per-item model phase can attribute to the item. See above for
--- why the other four members of `PHASE_STOPS` are not here.
-ALTER TABLE page ADD CONSTRAINT page_quarantine_reason_is_a_code CHECK (
-  quarantine_reason IS NULL
-  OR quarantine_reason IN ('input_rejected', 'bad_output')
-);
-
--- A reason with no quarantine is a page describing a retirement that did not
--- happen. The converse is allowed and is not an oversight: U9's junk gate has
--- been setting `quarantined_at` alone since rung one, and every one of those
--- rows predates this vocabulary.
-ALTER TABLE page ADD CONSTRAINT page_quarantine_reason_needs_a_quarantine CHECK (
-  quarantine_reason IS NULL OR quarantined_at IS NOT NULL
 );
 
 -- `PHASE_STOPS`, widened by one. Dropped and re-added under the same name, which

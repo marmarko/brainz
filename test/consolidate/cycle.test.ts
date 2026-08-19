@@ -334,8 +334,17 @@ describe('the run record names the phase the cycle stopped in', () => {
       // arrive as `stop_reason: 'phase_failed'`, and the responses are opposite:
       // one is a provider to chase, the other is a prompt or an input this code
       // cannot read back.
+      //
+      // Asserted on `extract` rather than on `synopsis`, and the reason is the
+      // subject of `convergence.test.ts` section 6. `extract` sends the whole
+      // batch in one request, so an answer it cannot read is the phase's
+      // failure and there is nothing smaller to attribute it to. `synopsis`
+      // sends one page per request, where the same unreadable answer is one
+      // page's outcome — it is skipped, counted, and offered again next cycle,
+      // because a phase that stopped on it held the run open in front of every
+      // other phase and froze a brain at 167 facts.
       const { gateway } = createGateway({
-        chat: { ...FULL_SCRIPT, synopsis: () => 'I am afraid I cannot summarise that.' },
+        chat: { ...FULL_SCRIPT, extract: () => 'I am afraid I cannot do that.' },
       });
 
       const result = await runConsolidationCycle(
@@ -344,13 +353,13 @@ describe('the run record names the phase the cycle stopped in', () => {
       );
 
       expect(result.stopReason).toBe('phase_failed');
-      expect(result.stoppedPhase).toEqual({ phase: 'synopsis', code: 'bad_output' });
+      expect(result.stoppedPhase).toEqual({ phase: 'extract', code: 'bad_output' });
 
       const rows = (await tenant.sql`
         SELECT stopped_phase, stopped_phase_code
           FROM consolidation_run ORDER BY run_id DESC LIMIT 1
       `) as Array<{ stopped_phase: string | null; stopped_phase_code: string | null }>;
-      expect(rows[0]).toEqual({ stopped_phase: 'synopsis', stopped_phase_code: 'bad_output' });
+      expect(rows[0]).toEqual({ stopped_phase: 'extract', stopped_phase_code: 'bad_output' });
     },
     SETUP_TIMEOUT_MS,
   );

@@ -108,15 +108,24 @@ export const FREE_TIER_PHASES: readonly CyclePhase[] = DETERMINISTIC_PHASES;
  *
  * `input_rejected` is the provider refusing the **request** rather than the
  * connection: a 400/413/422-class status, which says the thing we sent is not
- * something it will ever accept. It was `model_unavailable` until rung 21, and
- * collapsing the two cost more than a misleading word. The two want opposite
- * responses — `model_unavailable` means wait, `input_rejected` means the input
- * has to change or go — and `runSynopsisPhase` is now allowed to retire a page
- * that earns the second one. A phase that cannot tell them apart cannot be
- * trusted with that decision, which is why this member had to exist before the
- * quarantine did. 429, 408, every 5xx and a status-less network failure stay
+ * something it will accept while it stays the same. It was `model_unavailable`
+ * until rung 21, and collapsing the two cost more than a misleading word: they
+ * want opposite responses — `model_unavailable` means wait, `input_rejected`
+ * means the payload has to get smaller or the seat wider.
+ *
+ * **It is also the line a per-item phase stops on.** `runSynopsisPhase` sends
+ * one page per request, so a durable refusal is a fact about that page and is
+ * skipped, while anything not durable is a fact about the provider, the
+ * credential or the configuration and would meet every remaining page
+ * identically — so that one stops the phase, at the first answer, without
+ * counting. 429, 408, every 5xx and a status-less network failure stay
  * `model_unavailable`: those are the provider having a bad minute, and no page
  * is answerable for one.
+ *
+ * Nothing is retired on either code. An earlier design let two durable refusals
+ * set `page.quarantined_at`, which every read in the system honours — so a page
+ * the summariser could not parse would have left search, the briefing and the
+ * user's own self-export. These codes inform the diagnosis and never a deletion.
  *
  * **`cancelled` is deliberately not a member.** A lost lease is something the
  * *run* suffered, not something a phase reported, and admitting it here would

@@ -212,14 +212,15 @@ export async function startWorkerFleet(
           wall_clock_ms: result.wallClockMs,
           model_calls: result.modelCalls,
           spent_micro_usd: result.spentMicroUsd,
-          // Pages this cycle stopped trying to consolidate. Every other field
-          // here reports something that went wrong loudly; this one is the only
-          // thing the cycle does that removes a page from the brain's own
-          // reading and produces no other symptom at all. A count rather than a
-          // list, for the same reason `stopped_phase` is a name rather than a
-          // sentence — the pages carry the code, and this log carries nothing
-          // about their contents.
-          quarantined: result.quarantined,
+          // Items this cycle could not read and passed over. Every other field
+          // here reports something that stopped the cycle; a per-item failure
+          // deliberately does not, so without this line a cycle that summarised
+          // nothing because every candidate was unreadable is indistinguishable
+          // from a brain with nothing left to do. A count rather than a list,
+          // for the same reason `stopped_phase` is a name rather than a sentence
+          // — `page.consolidation_refusals` carries the per-page detail, and
+          // this log carries nothing about any page's contents.
+          skipped_items: result.skippedItems,
         })}\n`,
       );
     },

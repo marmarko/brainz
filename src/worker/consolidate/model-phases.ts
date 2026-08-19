@@ -25,45 +25,50 @@
  *     R12's requirement, and the anti-loop guard's storage: a row without them is
  *     a row the next cycle cannot tell from evidence.
  *
- * **A per-item failure is the item's until three in a row say otherwise.** The
- * three properties above were written for the phases that call the model once
- * for a whole batch, where "this answer failed" and "this phase failed" are the
- * same sentence. `synopsis` calls it once per *page*, and there the two come
- * apart: a page the model cannot summarise is one page's problem, and returning
- * on it — which is what this file used to do — stopped the cycle, which left the
- * run open, which left `extract`'s checkpoint standing, which skipped extraction
- * on every resume. One unusable page out of 5,608 pinned a brain at 167 facts.
+ * **A per-item failure is the ITEM's outcome and never the phase's.** The three
+ * properties above were written for the phases that call the model once for a
+ * whole batch, where "this answer failed" and "this phase failed" are the same
+ * sentence. `synopsis` calls it once per *page*, and there the two come apart: a
+ * page the model cannot summarise is one page's problem, and returning on it —
+ * which is what this file used to do — stopped the cycle, which left the run
+ * open, which left `extract`'s checkpoint standing, which skipped extraction on
+ * every resume. One unusable page out of 5,608 pinned a brain at 167 facts.
  *
- * So a per-item loop skips the item and keeps going, bounded by
- * {@link CONSECUTIVE_ITEM_FAILURE_LIMIT}: a run of failures that long is not an
- * item any more, it is the provider or the prompt, and continuing would buy two
- * hundred sequential calls to discover what the first three already said. The
- * bound is on *consecutive* failures rather than total, because a total would
- * make a brain with four scattered unusable pages permanently unable to get past
- * the fourth. `budget_exhausted` and `out_of_time` are exempt and stop at once —
- * neither is anything the item did. And a phase that applied nothing while
- * failing at something reports the failure regardless of the bound, or property
- * 1 would be repealed by the tolerance rather than bounded by it.
+ * So the per-item loop skips the item and **completes**. `stopped: null` even
+ * when every page it was given was skipped, because "the phase stopped" is
+ * precisely what holds the run open in front of every other phase, and a phase
+ * that reported a failure whenever `applied === 0` put the freeze back the
+ * moment the unreadable pages were all that was left — which is the state the
+ * candidate set converges to, since a skipped page writes nothing and is offered
+ * again next cycle.
  *
- * **The skip alone only defers that freeze, so a page can also leave.** A
- * skipped page writes nothing, and `selectIngestedPages(unsummarised)` excludes
- * a page only once a summary exists for it — so every usable page leaves the
- * candidate set and every unusable one stays. The set converges monotonically
- * onto the unusable pages, the ordering key is fixed so they end up adjacent at
- * its head, and the consecutive bound then trips on calls one to three of every
- * cycle with nothing applied. That terminal state is byte-identical to the
- * freeze the skip was written to fix.
+ * The unreadable page therefore stays a candidate forever and costs one model
+ * call a cycle. That price is small, permanent and bounded by the phase's own
+ * candidate limit, and it is the correct side of the trade: the alternative,
+ * tried and refused, was retiring the page via `page.quarantined_at` — U9's
+ * column, which EVERY read honours, so a page the summariser could not parse
+ * would leave search, the briefing and the user's own self-export too. The harm
+ * is not "missing from consolidation"; it is a document its owner still has, no
+ * longer coming back when they search their own brain.
  *
- * The link that has to break is the candidate set itself, and
- * {@link QUARANTINE_AFTER_REFUSALS} is the bar a page clears to leave it. **The
- * hazard is the whole difficulty**: quarantining on a TRANSIENT failure drops a
- * good page from consolidation silently and forever, which is worse than the
- * freeze precisely because the freeze is loud. So two things guard it, and
- * neither is sufficient alone — {@link stopFor} keeps the provider's status
- * instead of collapsing every failure into `model_unavailable`, so only a
- * refusal of the *request* counts at all; and a refusal counts as evidence
- * rather than as a verdict, because one phase run offers a page to the model
- * once and the threshold is more than one.
+ * **One case still stops the phase, and it is decided from the answer rather
+ * than from a count of items: a failure whose cause is provably not the item.**
+ * {@link stopFor} already draws that line — `durable` means the provider read
+ * the request and refused THIS request, and everything else means the request
+ * never got a verdict at all. Every non-transport refusal the gateway can report
+ * is config-shaped (a key that will not resolve, a denied scope, an unpriced
+ * model) and arrives not-durable, as does a rate limit, a 5xx and a dead socket.
+ * Each of those fails the next page identically, so the first one is the whole
+ * of the evidence and no count is needed to reach it. `budget_exhausted` and
+ * `out_of_time` stop for the same reason: they are the cycle's limits, not the
+ * item's.
+ *
+ * The one failure deliberately left on the per-item side is an HTTP 200 whose
+ * body will not parse. It is a page the model can never read and a badly sampled
+ * answer at the same time, and nothing here can tell those apart in one
+ * exchange — so it is counted against the page ({@link noteRefusal}) for an
+ * operator to read, and never acted on. The honest handling of a signal the code
+ * cannot trust is to skip the item, not to stop the brain.
  *
  * **What no phase does is mutate on the model's say-so.** ≥0.8 applies, 0.5–0.8
  * queues for a human, <0.5 is counted and dropped. The contradiction phase does
@@ -123,16 +128,21 @@ export interface PhaseOutcome {
   readonly queued: number;
   readonly logged: number;
   /**
-   * Items this phase retired from its own candidate set, a subset of `logged`.
+   * Items this phase passed over, a subset of `logged`.
    *
-   * Non-zero only on a per-item phase that can prove an item is unusable — see
-   * {@link QUARANTINE_AFTER_REFUSALS}. It is counted separately from `logged`
-   * because the two mean opposite things to whoever reads them: `logged` is
-   * work the brain will try again, and this is work it has decided to stop
-   * trying. A number that never appears anywhere would make removing a user's
-   * page the quietest thing this file does.
+   * Named for the items rather than bare `skipped` because `PhaseRecord.skipped`
+   * in `cycle.ts` already means "this phase did not run at all, and here is
+   * why", and the two are in scope together throughout the phase loop.
+   *
+   * Non-zero only on a per-item phase, where an item's failure is the item's
+   * outcome rather than the phase's. It is counted separately from `logged`
+   * because the phase now COMPLETES through these — nothing in `stopped` will
+   * mention them — and a pass that summarised nothing because every page was
+   * unreadable would otherwise be indistinguishable on the run record from a
+   * brain with nothing left to summarise. This number is the difference, and it
+   * is why completing through a failure is not the same as swallowing one.
    */
-  readonly quarantined: number;
+  readonly skippedItems: number;
   readonly spentMicroUsd: number;
   readonly modelCalls: number;
   readonly stopped: PhaseStop | null;
@@ -167,41 +177,6 @@ export interface ModelPhaseDeps {
 
 const DEFAULT_LIMIT = 200;
 
-/**
- * How many items in a row may fail before a per-item phase stops trying.
- *
- * The number that separates "this page" from "this provider". A broken provider
- * or a broken prompt fails the very next call too, so three is enough to tell
- * them apart; an unusable page is surrounded by usable ones, so three is more
- * than enough not to be tripped by one. It is the ceiling on what tolerance
- * costs — at most this many wasted calls per phase per cycle — and it is
- * deliberately small, because the thing being bought is the ability to get past
- * one page, not the ability to grind through an outage.
- */
-export const CONSECUTIVE_ITEM_FAILURE_LIMIT = 3;
-
-/**
- * How many DURABLE refusals a page must collect before it leaves the candidate
- * set for good.
- *
- * **Two, and the second one is what the number is for.** A phase run offers a
- * given page to the model at most once, so a second strike is necessarily a
- * second cycle — a separate attempt, a separate completion, and for the parse
- * case a separately sampled answer. One durable refusal is a fact about one
- * exchange; two is a fact about the page.
- *
- * Not one, because the cheapest way to be wrong here is to believe a single
- * answer. Not three, because each extra strike is another whole cycle in which
- * the phase spends a call on a page it will not use, and every cycle before the
- * last one is a cycle where the unreadable pages are still adjacent at the head
- * of the ordering and still tripping {@link CONSECUTIVE_ITEM_FAILURE_LIMIT} —
- * which is the freeze, arriving later.
- */
-export const QUARANTINE_AFTER_REFUSALS = 2;
-
-/** Where a quarantine decision is recorded. A code from `PHASE_STOPS`, never a sentence. */
-type QuarantineReason = Extract<PhaseStop, 'input_rejected' | 'bad_output'>;
-
 function empty(phase: ModelPhase, stopped: PhaseStop | null = null): PhaseOutcome {
   return {
     phase,
@@ -209,7 +184,7 @@ function empty(phase: ModelPhase, stopped: PhaseStop | null = null): PhaseOutcom
     applied: 0,
     queued: 0,
     logged: 0,
-    quarantined: 0,
+    skippedItems: 0,
     spentMicroUsd: NO_SPEND,
     modelCalls: 0,
     stopped,
@@ -226,8 +201,8 @@ function empty(phase: ModelPhase, stopped: PhaseStop | null = null): PhaseOutcom
  * are the ones a wider rule would have swept in:
  *
  *   * **429 and 408** are 4xx and are not durable. A rate limit is the fleet's
- *     pace, and a request timeout is work that started. Quarantining on either
- *     would let one busy hour retire a shelf of perfectly good pages.
+ *     pace, and a request timeout is work that started. Charging either to a
+ *     page would let one busy hour blame a shelf of perfectly good documents.
  *   * **401/403** say the credential is wrong, which is a configuration remedy.
  *     The page is blameless and every page would fail identically.
  *
@@ -243,20 +218,25 @@ const DURABLE_PROVIDER_STATUSES: ReadonlySet<number> = new Set([400, 413, 422]);
 /**
  * A phase stop, and whether the request itself is what was refused.
  *
- * `durable` is the fact `stopFor` used to throw away, and it is the only thing
- * that separates "the provider was rate-limiting us, wait" from "this page will
- * never parse". Nothing may retire a page without it.
+ * `durable` is the fact `stopFor` used to throw away, and it is what a per-item
+ * loop needs in order to know **whose** failure it is holding: a durable refusal
+ * is the provider's verdict on this one request, and everything else is the
+ * provider, the credential or the configuration, which the next item will meet
+ * identically. That is the whole of the stop/skip decision in
+ * {@link runSynopsisPhase} — no counting, because a fact that is true of every
+ * remaining item is already complete at the first one.
  */
 interface PhaseFailure {
   readonly stop: PhaseStop;
   /**
    * True only when re-sending the same input would be refused the same way.
    *
-   * Fail-closed: everything this function cannot positively prove durable is
-   * transient, because the cost of the two mistakes is not symmetric. Treating
-   * a durable refusal as transient costs one wasted model call per cycle and is
-   * visible in the run record; treating a transient as durable retires a page
-   * the user can no longer find, and nothing says so.
+   * Fail-closed, and the two mistakes are priced very differently. Calling a
+   * durable refusal transient stops a phase that could have skipped one page and
+   * kept going — recoverable, loud, and on the run record. Calling a transient
+   * durable makes an outage read as a per-item outcome, so the phase would walk
+   * a whole candidate set into a dead provider, complete, close the run and bank
+   * a checkpoint saying it was paid for.
    */
   readonly durable: boolean;
 }
@@ -270,8 +250,10 @@ function stopFor(result: Extract<GatewayResult, { ok: false }>): PhaseFailure {
     }
   }
   // Everything else: a provider that was down, a network that dropped, a key
-  // that would not resolve, a seat whose output ceiling is too tight. Each has
-  // a remedy and none of them is the page's.
+  // that would not resolve, a scope that was denied, a model nobody priced. Each
+  // has a remedy, none of them is the page's, and every one of them would meet
+  // the next page in exactly the same way — which is what makes them the phase's
+  // failure rather than an item's.
   return { stop: 'model_unavailable', durable: false };
 }
 
@@ -478,9 +460,11 @@ export async function runExtractPhase(deps: ModelPhaseDeps): Promise<PhaseOutcom
         applied,
         queued,
         logged,
-        // A whole-batch phase never retires an item: the request it sent was a
-        // batch, so a refusal indicts the batch and not any page inside it.
-        quarantined: 0,
+        // A whole-batch phase skips nothing: the request it sent was a batch, so
+        // an answer it cannot read indicts the batch and not any item inside it.
+        // "This answer failed" and "this phase failed" are one sentence here,
+        // which is why only the per-item loops need the distinction at all.
+        skippedItems: 0,
         spentMicroUsd: spent,
         modelCalls: 1,
         stopped: embedded.reason === 'budget_exhausted' ? 'budget_exhausted' : 'model_unavailable',
@@ -538,7 +522,7 @@ export async function runExtractPhase(deps: ModelPhaseDeps): Promise<PhaseOutcom
     applied,
     queued,
     logged,
-    quarantined: 0,
+    skippedItems: 0,
     spentMicroUsd: spent,
     modelCalls: 1,
     stopped: null,
@@ -643,7 +627,7 @@ export async function runEnrichPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome
     applied,
     queued,
     logged,
-    quarantined: 0,
+    skippedItems: 0,
     spentMicroUsd: answer.costMicroUsd,
     modelCalls: 1,
     stopped: null,
@@ -681,17 +665,7 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
   let applied = 0;
   let logged = 0;
   let calls = 0;
-  let quarantined = 0;
-  /**
-   * Failures since the last page the model answered readably.
-   *
-   * Reset on the parse, not on the write: a summary the seam then refuses is the
-   * model working and this code declining the result, which says nothing about
-   * whether the provider is up.
-   */
-  let consecutiveFailures = 0;
-  /** The code the last failure reported, for the two stops that report one. */
-  let lastFailure: PhaseStop | null = null;
+  let skippedItems = 0;
 
   const outcome = (stopped: PhaseStop | null): PhaseOutcome => ({
     phase,
@@ -699,52 +673,44 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
     applied,
     queued: 0,
     logged,
-    quarantined,
+    skippedItems,
     spentMicroUsd: deps.budget.spentMicroUsd(),
     modelCalls: calls,
     stopped,
   });
 
   /**
-   * Record one durable refusal against a page, and retire it if it has now
-   * earned that.
+   * Count one refusal against a page. **Telemetry, and nothing reads it back.**
    *
-   * **Called for a durable refusal and nothing else.** A transient leaves this
-   * untouched — no counter moves, no row is written — so an outage of any
-   * length quarantines exactly zero pages however many times it recurs in one
-   * pass. That asymmetry is the point of the whole rung: the freeze this fixes
-   * is loud, and a page wrongly retired is silent, so the two mistakes are not
-   * priced the same and the code is not allowed to treat them as if they were.
+   * Nothing is retired any more, which is exactly why this exists: an operator
+   * watching a summary count that will not move needs to tell three unreadable
+   * pages refused forty times each from every page refused once, and only the
+   * second of those is a broken prompt or a seat whose ceiling is too tight. The
+   * phase's `skippedItems` says how many; this says which, and for how long.
    *
-   * **And retirement costs more than a missing summary.** `quarantined_at` is
-   * U9's column and every read honours it, so the page leaves search, the
-   * briefing and the self-export as well as this queue until an operator runs
-   * the statement rung 21's header spells out. Nothing below this line should be
-   * loosened without reading that paragraph: the threshold and the narrow
-   * durable class are what stand between a bad minute at the provider and a
-   * user's document disappearing from their own brain.
+   * **The moment anything compares this against a threshold, the refuted design
+   * is back.** A counter that decides is a counter whose increments have to be
+   * trusted, and the parse-failure increment below is precisely the signal this
+   * code says it cannot trust. It is written to be read by a person.
+   *
+   * Called only for the two outcomes the model is answerable for. A transient
+   * stops the phase before any page is charged for it, so an outage of any
+   * length moves nothing here, however many pages it touches — and an operator
+   * reading a non-zero count is therefore never reading an outage.
+   *
+   * `updated_at` is deliberately left alone. It is the page's *content* clock,
+   * read by exports and sync diffs, and a page whose bytes did not change must
+   * not look changed because a phase failed to read it.
    */
-  const strike = async (pageId: string, reason: QuarantineReason): Promise<void> => {
-    // One statement, and the threshold is evaluated by the database against the
-    // stored count rather than against anything this process remembers. A read
-    // followed by a write would let two attempts of the same run race to the
-    // same strike, and the losing one would be a refusal nobody counted.
-    const rows = (await deps.sql`
+  const noteRefusal = async (pageId: string): Promise<void> => {
+    // One statement against the stored count rather than a read followed by a
+    // write: two attempts of the same run can meet the same page, and the losing
+    // half of a read-modify-write would be a refusal nobody counted.
+    await deps.sql`
       UPDATE page
-         SET consolidation_refusals = consolidation_refusals + 1,
-             quarantined_at = CASE
-               WHEN consolidation_refusals + 1 >= ${QUARANTINE_AFTER_REFUSALS} THEN ${deps.now}
-               ELSE quarantined_at
-             END,
-             quarantine_reason = CASE
-               WHEN consolidation_refusals + 1 >= ${QUARANTINE_AFTER_REFUSALS} THEN ${reason}
-               ELSE quarantine_reason
-             END,
-             updated_at = ${deps.now}
-       WHERE page_id = ${pageId}::bigint AND quarantined_at IS NULL
-      RETURNING (quarantined_at IS NOT NULL) AS retired
-    `) as Array<{ retired: boolean }>;
-    if (rows[0]?.retired === true) quarantined += 1;
+         SET consolidation_refusals = consolidation_refusals + 1
+       WHERE page_id = ${pageId}::bigint
+    `;
   };
 
   for (const page of pages) {
@@ -763,17 +729,25 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
       // The cap is not the page's fault and no other page will fare better
       // against it, so it stops the phase at once and under its own name — the
       // cycle turns it into `budget_exhausted` rather than `phase_failed`, and
-      // burning two more calls to rediscover it would be spending money the
-      // budget has already refused.
+      // burning another call to rediscover it would be spending money the budget
+      // has already refused.
       if (answer.stop === 'budget_exhausted') return outcome('budget_exhausted');
-      // `input_rejected` and nothing else: the provider read the request and
-      // refused it, which is a fact about this page. A 429 or a 503 arrives here
-      // as `model_unavailable` with `durable: false` and costs the page nothing.
-      if (answer.durable) await strike(page.pageId, 'input_rejected');
+      // **The stop/skip line, and it is drawn from the answer rather than from a
+      // tally.** Not durable means the provider never gave this request a
+      // verdict: it was down, the socket died, the key would not resolve, the
+      // scope was denied, we were rate-limited. Every remaining page meets that
+      // identically, so the first one is the whole of the evidence — counting to
+      // three would only buy two more calls into the same wall — and the phase
+      // stops, which keeps the run open for a cycle that can finish the work.
+      if (!answer.durable) return outcome(answer.stop);
+      // Durable: the provider read the request and refused THIS request, a
+      // 400/413/422. That is one page's outcome. It is skipped, counted, and
+      // offered again next cycle — a payload too large today is a payload a
+      // re-chunk or a wider seat accepts tomorrow, and none of that is the
+      // document's fault.
+      await noteRefusal(page.pageId);
       logged += 1;
-      consecutiveFailures += 1;
-      lastFailure = answer.stop;
-      if (consecutiveFailures >= CONSECUTIVE_ITEM_FAILURE_LIMIT) return outcome(answer.stop);
+      skippedItems += 1;
       continue;
     }
     calls += 1;
@@ -781,21 +755,23 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
     const body = parseJsonObject(answer.text);
     const summary = body === null ? null : text(body, 'summary');
     if (summary === null) {
-      // **The other durable refusal, and the one that needs the threshold most.**
-      // The provider was reachable, billed us, and produced something this code
+      // **The widest failure, and the one that must never be acted on.** The
+      // provider was reachable, billed us, and produced something this code
       // cannot read — which for a page whose size or shape defeats the model is
       // permanent, and for a model that sampled badly once is not. Nothing here
-      // can tell those apart in one exchange, so neither is decided in one: the
-      // strike is recorded and {@link QUARANTINE_AFTER_REFUSALS} makes the page
-      // prove it across independent cycles before it leaves the set.
-      await strike(page.pageId, 'bad_output');
+      // can tell those apart in one exchange, and a previous design that retired
+      // the page after two of these would have removed real documents from the
+      // owner's search on an inference this comment concedes cannot be made.
+      //
+      // So it is the page's outcome and it is only ever recorded: skipped,
+      // counted, offered again next cycle, forever if need be. One wasted call
+      // per unreadable page per cycle is the standing price, and it is the right
+      // side of the trade.
+      await noteRefusal(page.pageId);
       logged += 1;
-      consecutiveFailures += 1;
-      lastFailure = 'bad_output';
-      if (consecutiveFailures >= CONSECUTIVE_ITEM_FAILURE_LIMIT) return outcome('bad_output');
+      skippedItems += 1;
       continue;
     }
-    consecutiveFailures = 0;
 
     const written = await writeCanonicalSummary(deps.sql, {
       sourcePageId: page.pageId,
@@ -806,28 +782,42 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
       runId: deps.runId,
     });
     // A synthesis whose inputs span more than one origin has no honest scalar to
-    // be filed under, and the seam refuses it. Counted as `logged` rather than
-    // `applied`: the page was seen and the model was paid for, and nothing was
-    // written. Unreachable from here today — `selectIngestedPages` derives
-    // `origins` from a page's own scalar column — and read rather than ignored,
-    // because a caller that discarded the outcome is how the seam's refusal
-    // would come to mean nothing the day a phase summarises across pages.
+    // be filed under, and the seam refuses it. Counted as `logged` and skipped
+    // but NOT as a refusal on the page: the model answered, this code declined
+    // the result, and a counter named for what the summariser could not read
+    // must not fill up with what this file would not write. Unreachable from
+    // here today — `selectIngestedPages` derives `origins` from a page's own
+    // scalar column — and read rather than ignored, because a caller that
+    // discarded the outcome is how the seam's refusal would come to mean nothing
+    // the day a phase summarises across pages.
     if (!written.ok) {
       logged += 1;
+      skippedItems += 1;
       continue;
     }
     applied += 1;
   }
 
-  // **A phase that wrote nothing while failing at something has not succeeded**,
-  // however few pages it was given. Returning `null` here would bank a
-  // checkpoint saying `synopsis` is paid for and put a cycle that summarised
-  // nothing on the run record as `complete` — indistinguishable from a brain
-  // with nothing left to summarise, which is the exact reading the "a refusal is
-  // carried out, never swallowed" rule exists to refuse. The consecutive bound
-  // catches this on a large brain; on a small one there are not three pages to
-  // fail, and this is what catches it.
-  return outcome(applied === 0 && lastFailure !== null ? lastFailure : null);
+  // **The phase did everything it could do, so it completes — including when
+  // everything it could do was skip.**
+  //
+  // This is the line the whole redesign turns on, and it looks wrong until the
+  // chain behind it is read. `stopped` is not a report card; it is what makes
+  // the cycle stop, which leaves the run open, which strands every other model
+  // phase's checkpoint behind it. An earlier version returned the last failure
+  // whenever `applied === 0` — reasonable-sounding, and it put the freeze back
+  // exactly when it mattered: a skipped page is offered again next cycle, so the
+  // candidate set converges onto the unreadable ones, and the pass where they
+  // are all that is left is a pass that applied nothing. `extract` stayed
+  // skipped and the fact count stayed flat, which is the incident.
+  //
+  // A pass that summarised nothing is not thereby hidden. `items`, `logged` and
+  // `skippedItems` are on this outcome and reach the fleet's cycle log, and the
+  // per-page counter says which pages and for how long. The refusal that must
+  // not be swallowed is the systemic one, and that is carried out above, at the
+  // first answer that proves it — not inferred here from an empty pass, which
+  // an unreadable corpus and a dead provider produce alike.
+  return outcome(null);
 }
 
 // ---------------------------------------------------------------------------
@@ -920,7 +910,7 @@ export async function runContradictionPhase(deps: ModelPhaseDeps): Promise<Phase
     applied: 0,
     queued: reported,
     logged,
-    quarantined: 0,
+    skippedItems: 0,
     spentMicroUsd: answer.costMicroUsd,
     modelCalls: 1,
     stopped: null,
@@ -988,7 +978,7 @@ export async function runSalienceRefinePhase(deps: ModelPhaseDeps): Promise<Phas
     applied,
     queued: 0,
     logged,
-    quarantined: 0,
+    skippedItems: 0,
     spentMicroUsd: answer.costMicroUsd,
     modelCalls: 1,
     stopped: null,
