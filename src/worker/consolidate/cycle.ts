@@ -364,6 +364,13 @@ export async function runConsolidationCycle(
     }
 
     if (!isModelPhase(phase)) {
+      // **What this phase had banked before the attempt started**, which is not
+      // always what it is allowed to resume from: `bankedFor` withholds a
+      // deterministic checkpoint from a resume that is not on the clock, and the
+      // phase then re-runs. Both facts are needed below — one to run the phase,
+      // the other to judge whether running it got anywhere.
+      const snapshot = opened.banked.get(phase);
+
       const outcome = await runDeterministicPhase(deps.sql, phase, {
         run,
         now: options.now,
@@ -376,20 +383,37 @@ export async function runConsolidationCycle(
       // brain nobody consolidated.
       const total = (banked?.items ?? 0) + outcome.items;
 
+      // **Rows changed are progress wherever they happen.** A collapse, a merge,
+      // a supersession or an edge taken down is work the next attempt will not
+      // find waiting, whether or not the phase that did it finished.
+      if (outcome.mutations > 0) advanced = true;
+
       if (outcome.done) {
         await completePhase(deps.sql, run, phase, {
           items: total,
           spentMicroUsd: NO_SPEND,
           now: options.now,
         });
-        advanced = true;
+        // A completion is progress only if it was not already banked. When a
+        // resume is not on the clock the free work runs again — legitimately,
+        // because the brain has moved since — but a phase completing over rows
+        // nobody changed is repetition, and reading it as progress is what kept
+        // the continuation gate permanently open.
+        if (snapshot?.completed !== true) advanced = true;
       } else if (outcome.cursor !== null) {
         await bankPhaseProgress(deps.sql, run, phase, {
           items: total,
           cursor: outcome.cursor,
           now: options.now,
         });
-        if (outcome.cursor !== (banked?.cursor ?? null)) advanced = true;
+        // A position is progress when the phase *resumed* from the one it
+        // replaces, or when there was none to resume from. A phase whose
+        // checkpoint was withheld started at the beginning again, and the
+        // positions it reaches on the way back to where it already was are
+        // repetition wearing a new number.
+        if (snapshot === undefined || (banked !== undefined && outcome.cursor !== banked.cursor)) {
+          advanced = true;
+        }
         stop = attempt.stop() ?? 'out_of_time';
       } else {
         // Stopped with no position to hand over: a whole-set phase that will
@@ -500,6 +524,27 @@ export async function runConsolidationCycle(
 }
 
 /**
+ * What one deterministic phase did, in the two counts that answer two questions.
+ *
+ * `items` is what the phase looked at, and it is what an operator reads. It is
+ * **not** an answer to "did this attempt get anywhere", because two of the six
+ * phases re-do their whole output every pass by design: salience re-scores every
+ * page because the recency term decays with wall clock, and clustering rebuilds
+ * membership from the current corpus. Counting either as progress makes an
+ * attempt that repeated itself indistinguishable from one that moved, which is
+ * exactly the reading that kept a stuck continuation asking to be run again.
+ *
+ * `mutations` is the narrower count: rows this phase changed in a way no later
+ * attempt will do again. Zero for salience and clustering — not because they did
+ * nothing, but because what they did, they will do again next pass, and their
+ * real position is the cursor.
+ */
+export interface DeterministicOutcome extends PhaseProgress {
+  readonly items: number;
+  readonly mutations: number;
+}
+
+/**
  * One deterministic phase, by name, under the attempt's clock.
  *
  * The staleness phase re-reconciles when it invalidated something, and that is
@@ -538,18 +583,32 @@ export async function runDeterministicPhase(
      */
     readonly batch?: number;
   },
-): Promise<{ readonly items: number } & PhaseProgress> {
+): Promise<DeterministicOutcome> {
   const { run, now, cursor, attempt: budget } = options;
   const batched = options.batch === undefined ? {} : { batch: options.batch };
 
   switch (phase) {
     case 'dedup': {
       const result = await collapseDuplicateFacts(sql, { budget });
-      return { items: result.collapsed, done: result.done, cursor: result.cursor };
+      // Every collapse is a fact that leaves the live set for good, so the next
+      // attempt's read is strictly smaller. Repetition is not possible here.
+      return {
+        items: result.collapsed,
+        mutations: result.collapsed,
+        done: result.done,
+        cursor: result.cursor,
+      };
     }
     case 'link_reconcile': {
       const result = await reconcileAllEdges(sql, { taxonomyVersion: 1, budget });
-      return { items: result.added + result.removed, done: result.done, cursor: result.cursor };
+      // `kept` is deliberately not counted: an edge the projection re-derives
+      // unchanged is the phase agreeing with itself, which every pass does.
+      return {
+        items: result.added + result.removed,
+        mutations: result.added + result.removed,
+        done: result.done,
+        cursor: result.cursor,
+      };
     }
     case 'staleness': {
       const result = await markStaleness(sql, { now, cursor, budget, ...batched });
@@ -570,7 +629,12 @@ export async function runDeterministicPhase(
       if (result.factsInvalidated > 0) await reopenPhase(sql, run, 'link_reconcile');
 
       if (!result.done) {
-        return { items: result.staled, done: false, cursor: result.cursor };
+        return {
+          items: result.staled,
+          mutations: result.staled,
+          done: false,
+          cursor: result.cursor,
+        };
       }
 
       // The walk is over, so the fix point is owed exactly when reconciliation
@@ -578,7 +642,7 @@ export async function runDeterministicPhase(
       // cases — this call retired something, or an earlier attempt did — which
       // is what makes it a fix point rather than a coincidence of scheduling.
       if (await phaseIsComplete(sql, run, 'link_reconcile')) {
-        return { items: result.staled, done: true, cursor: null };
+        return { items: result.staled, mutations: result.staled, done: true, cursor: null };
       }
 
       const again = await reconcileAllEdges(sql, { taxonomyVersion: 1, budget });
@@ -591,7 +655,7 @@ export async function runDeterministicPhase(
         // walk itself is over, so there is no position to hand on; the phase
         // says so and restarts, which is cheap because a page already marked
         // stale is not selected again.
-        return { items: result.staled, done: false, cursor: null };
+        return { items: result.staled, mutations: result.staled, done: false, cursor: null };
       }
       // The debt is discharged where it was recorded. `items` is the fix point's
       // own diff rather than a sum with the pass this re-opened: the earlier
@@ -603,19 +667,42 @@ export async function runDeterministicPhase(
         spentMicroUsd: NO_SPEND,
         now,
       });
-      return { items: result.staled, done: true, cursor: null };
+      // The fix point's own diff counts. An attempt that resumed past every row
+      // it had already staled retires nothing and still takes down the edges an
+      // earlier attempt's supersessions left unsupported — real work, and the
+      // only work that attempt did.
+      return {
+        items: result.staled,
+        mutations: result.staled + again.added + again.removed,
+        done: true,
+        cursor: null,
+      };
     }
     case 'entity_merge': {
       const result = await mergeEntitiesByRule(sql, { budget });
-      return { items: result.merged, done: result.done, cursor: result.cursor };
+      // A merged loser is tombstoned, so it is gone from the next attempt's read
+      // for the same reason a collapsed fact is.
+      return {
+        items: result.merged,
+        mutations: result.merged,
+        done: result.done,
+        cursor: result.cursor,
+      };
     }
     case 'salience': {
       const result = await computeDeterministicSalience(sql, { now, cursor, budget, ...batched });
-      return { items: result.scored, done: result.done, cursor: result.cursor };
+      // **No mutations, and the zero is the assertion.** Every page is re-scored
+      // on every pass on purpose — the recency term decays with wall clock — so
+      // `scored` counts work that will be done again and is worth nothing as
+      // evidence of progress. The cursor is where this phase's progress lives.
+      return { items: result.scored, mutations: 0, done: result.done, cursor: result.cursor };
     }
     case 'cluster': {
       const result = await clusterByEmbedding(sql, { runId: null, cursor, budget, ...batched });
-      return { items: result.clusters, done: result.done, cursor: result.cursor };
+      // Zero for the same reason as salience: a fresh start rebuilds membership
+      // from the current corpus, so a cluster count is a restatement rather than
+      // an advance. Its progress is the cursor over the seed walk.
+      return { items: result.clusters, mutations: 0, done: result.done, cursor: result.cursor };
     }
     default:
       throw new Error(`invariant: '${phase}' is not a deterministic phase`);
