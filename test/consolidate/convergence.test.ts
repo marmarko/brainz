@@ -410,3 +410,50 @@ describe('a partial checkpoint is a deterministic-phase thing, structurally', ()
     SETUP_TIMEOUT_MS,
   );
 });
+
+describe('a continuation that got stuck stops being treated as one', () => {
+  test(
+    'free work banked more than a ceiling period ago is redone, not skipped',
+    async () => {
+      await seedBrain(20);
+      const { gateway } = createGateway({ chat: SCRIPT });
+      const deps = { sql: tenant.sql, gateway, tenantId: TENANT, caller: CALLER };
+      const started = new Date('2026-08-01T00:00:00Z');
+
+      const first = await runConsolidationCycle(deps, {
+        trigger: 'time_ceiling',
+        tier: 'paid',
+        now: started,
+        clock: tickingClock(),
+        budgetMs: 7,
+      });
+      expect(first.stopReason).toBe('out_of_time');
+      const bankedPhases = (await banked()).map((row) => row.phase);
+      expect(bankedPhases.length).toBeGreaterThan(0);
+
+      // Two days later. The run is still open and still says `out_of_time`, but
+      // "nothing has changed since" — the entire argument for skipping the free
+      // work — is no longer a claim anyone can make about this brain.
+      const later = new Date(started.getTime() + 2 * 24 * 60 * 60 * 1000);
+      const second = await runConsolidationCycle(deps, {
+        trigger: 'time_ceiling',
+        tier: 'paid',
+        now: later,
+      });
+      expect(second.runId).toBe(first.runId);
+
+      const rerun = second.phases.filter(
+        (record) => record.tier === 'deterministic' && record.ran,
+      );
+      expect(rerun.map((record) => record.phase).sort()).toEqual([
+        'cluster',
+        'dedup',
+        'entity_merge',
+        'link_reconcile',
+        'salience',
+        'staleness',
+      ]);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+});

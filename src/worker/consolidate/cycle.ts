@@ -61,6 +61,7 @@ import { fleetIdentity } from '../../control/secrets.ts';
 import type { StoredPayloadReader } from '../../core/media/accept.ts';
 import type { HandlerOutcome, JobContext, JobHandler } from '../runner.ts';
 import type { JobTrigger } from '../jobs.ts';
+import { ALPHA_CEILING_MS } from '../scheduler.ts';
 import {
   bankEstimate,
   bankPhaseProgress,
@@ -208,6 +209,25 @@ function profileOf(deps: CycleDeps): NamedProfile {
 
 const DEFAULT_LIMIT = 200;
 
+/**
+ * How old an open run may be and still have its free work treated as current.
+ *
+ * The deterministic tier's checkpoints are honoured while a run is being
+ * *continued* — attempts seconds apart, working the same brain down. They are
+ * not honoured for a continuation that got stuck, because the argument for
+ * skipping them is "nothing has changed since", and after a day of ingestion
+ * something has.
+ *
+ * One ceiling period, derived rather than typed: past that the tenant would have
+ * been given a fresh cycle anyway, so a run still open beyond it is not a
+ * continuation in any sense the scheduler recognises. Without this bound, a run
+ * that stalls at a whole-set phase it cannot fit would go on skipping dedup and
+ * staleness on every daily cycle for as long as it stayed open — which is the
+ * exact silent-free-tier failure the original checkpoint asymmetry was
+ * protecting against, arriving through the door the fix opened.
+ */
+const CONTINUATION_HORIZON_MS = ALPHA_CEILING_MS;
+
 export async function runConsolidationCycle(
   deps: CycleDeps,
   options: CycleOptions,
@@ -251,7 +271,8 @@ export async function runConsolidationCycle(
   // be hours old over a brain that has ingested since, and skipping its free
   // work would be the free tier quietly stopping. See the header.
   const continuingOnTheClock =
-    opened.previousStop === 'out_of_time' || opened.previousStop === 'cancelled';
+    (opened.previousStop === 'out_of_time' || opened.previousStop === 'cancelled') &&
+    options.now.getTime() - run.startedAt.getTime() < CONTINUATION_HORIZON_MS;
   const bankedFor = (phase: CyclePhase): PhaseCheckpoint | undefined => {
     const banked = opened.banked.get(phase);
     if (banked === undefined) return undefined;
