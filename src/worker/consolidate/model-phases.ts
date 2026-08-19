@@ -698,9 +698,14 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
    * length moves nothing here, however many pages it touches — and an operator
    * reading a non-zero count is therefore never reading an outage.
    *
-   * `updated_at` is deliberately left alone. It is the page's *content* clock,
-   * read by exports and sync diffs, and a page whose bytes did not change must
-   * not look changed because a phase failed to read it.
+   * `updated_at` is deliberately left alone, where the retiring version of this
+   * write moved it. Today the column's only other writer is the staleness phase
+   * marking a page stale, so its one established meaning is "something about
+   * this page changed" — and a phase failing to READ a page has changed nothing
+   * about it. Nothing consumes the column yet, which is the argument for care
+   * rather than against it: the cheapest moment to keep a timestamp honest is
+   * before anything depends on it, and a counter that moved it would make an
+   * untouched document look edited to whatever reads it first.
    */
   const noteRefusal = async (pageId: string): Promise<void> => {
     // One statement against the stored count rather than a read followed by a
