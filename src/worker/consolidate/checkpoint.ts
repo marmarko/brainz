@@ -278,6 +278,52 @@ export async function bankPhaseProgress(
   `;
 }
 
+/**
+ * Whether the phase is banked as **finished** against this run.
+ *
+ * Asked rather than remembered, and that is the point. A phase that triggers
+ * another phase's work — staleness re-running reconciliation over the fact set
+ * it just changed — used to decide on a per-*call* local, which is a correct
+ * answer only for a cycle that runs each phase exactly once. Under a resumable
+ * walk the attempt that creates the debt and the attempt that discharges it are
+ * different processes, and the only thing both can see is this table.
+ */
+export async function phaseIsComplete(sql: SQL, run: CycleRun, phase: CyclePhase): Promise<boolean> {
+  const rows = (await sql`
+    SELECT completed
+      FROM consolidation_checkpoint
+     WHERE phase = ${phase} AND run_id = ${run.runId}::bigint
+  `) as Array<{ completed: boolean }>;
+  return rows[0]?.completed === true;
+}
+
+/**
+ * Withdraw a phase's completion, because a later phase invalidated its inputs.
+ *
+ * **A DELETE, not an update to `completed = false`.** Rung 19's CHECK requires an
+ * incomplete row to carry a position, and a whole-set phase has none to carry —
+ * the only position it could offer is "from the beginning", which is what the
+ * absence of a row already says. Writing a placeholder cursor would be inventing
+ * a resume point for a phase that cannot resume.
+ *
+ * **Deterministic phases only.** Re-opening a model phase would re-pay for it,
+ * which is the one thing KTD11's checkpoint exists to prevent — and the caller
+ * that wanted to would be expressing a dependency the cycle's cheap→expensive
+ * order says cannot exist. Structural rather than documented, for the same
+ * reason {@link bankPhaseProgress} refuses the mirror case.
+ */
+export async function reopenPhase(sql: SQL, run: CycleRun, phase: CyclePhase): Promise<void> {
+  if (isModelPhase(phase)) {
+    throw new Error(
+      `invariant: '${phase}' is a model phase and cannot be re-opened — a phase whose cost is a provider invoice is checkpointed so it is never paid for twice`,
+    );
+  }
+  await sql`
+    DELETE FROM consolidation_checkpoint
+     WHERE phase = ${phase} AND run_id = ${run.runId}::bigint
+  `;
+}
+
 export interface FinishRequest {
   readonly dreamt: boolean;
   readonly stopReason: StopReason;

@@ -34,13 +34,21 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
-import { completePhase, openRun } from '../../src/worker/consolidate/checkpoint.ts';
-import { runDeterministicPhase } from '../../src/worker/consolidate/cycle.ts';
+import {
+  bankPhaseProgress,
+  completePhase,
+  openRun,
+  recordProgress,
+} from '../../src/worker/consolidate/checkpoint.ts';
+import { runConsolidationCycle, runDeterministicPhase } from '../../src/worker/consolidate/cycle.ts';
 import { createAttemptBudget } from '../../src/worker/consolidate/deadline.ts';
 import { reconcileAllEdges } from '../../src/worker/consolidate/deterministic.ts';
 import { NO_SPEND } from '../../src/worker/consolidate/estimate.ts';
 import {
+  CALLER,
+  TENANT,
   countRows,
+  createGateway,
   createTenantFixture,
   seedFact,
   seedPage,
@@ -157,6 +165,7 @@ describe('a phase does not bank a completion for work it triggered and did not f
       dispossessed.abort();
 
       const outcome = await runDeterministicPhase(tenant.sql, 'staleness', {
+        run: opened.run,
         now,
         cursor: null,
         attempt: createAttemptBudget({ signal: dispossessed.signal }),
@@ -173,6 +182,89 @@ describe('a phase does not bank a completion for work it triggered and did not f
       // still live, so a phase banked complete here would be banking a lie.
       expect(await countRows(tenant.sql, 'fact', 'superseded_by IS NOT NULL')).toBe(1);
       expect(await liveEmployers()).toEqual(['Acme Corp', 'Globex Ltd']);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+});
+
+describe('the staleness fix point survives being split across attempts', () => {
+  test(
+    'the attempt that finishes the walk still reconciles what an earlier one retired',
+    async () => {
+      const pair = await seedSupersededPair('mail:thread-2', 'Bella Novak');
+      const now = new Date('2026-03-01T00:00:00Z');
+      const opened = await openRun(tenant.sql, {
+        trigger: 'time_ceiling',
+        tier: 'free',
+        now,
+        estimateMicroUsd: NO_SPEND,
+      });
+
+      const reconciled = await reconcileAllEdges(tenant.sql, { taxonomyVersion: 1 });
+      await completePhase(tenant.sql, opened.run, 'link_reconcile', {
+        items: reconciled.added,
+        spentMicroUsd: NO_SPEND,
+        now,
+      });
+      expect(await liveEmployers()).toEqual(['Acme Corp', 'Globex Ltd']);
+
+      // ---- Attempt N. It retires the fact and runs out of clock mid-walk. ----
+      //
+      // A batch of one and a budget of nothing is the two-line version of the
+      // measured case: three hundred facts superseded and committed, a cursor
+      // banked, the process out of time. Driven through the phase dispatcher
+      // rather than through `runConsolidationCycle`, because the cycle leaves
+      // every walk at its tuned batch and reaching a mid-walk stop through it
+      // would mean seeding five hundred superseded pages to assert one thing.
+      const stalenessN = await runDeterministicPhase(tenant.sql, 'staleness', {
+        run: opened.run,
+        now,
+        cursor: null,
+        attempt: createAttemptBudget({ budgetMs: 0 }),
+        batch: 1,
+      });
+      expect(stalenessN.done).toBe(false);
+      expect(stalenessN.cursor).toBe(pair.stalePageId);
+      // It really did retire the claim before it ran out — that is what makes
+      // the edge below unsupported, and what the next attempt cannot see.
+      expect(await countRows(tenant.sql, 'fact', 'superseded_by IS NOT NULL')).toBe(1);
+
+      await bankPhaseProgress(tenant.sql, opened.run, 'staleness', {
+        items: stalenessN.items,
+        cursor: stalenessN.cursor as string,
+        now,
+      });
+      await recordProgress(tenant.sql, opened.run, {
+        dreamt: false,
+        stopReason: 'out_of_time',
+        spentMicroUsd: NO_SPEND,
+        modelCalls: 0,
+        phasesRun: 2,
+        wallClockMs: 1,
+        now,
+      });
+
+      // ---- Attempt N+1. It resumes past those rows and finishes. ----
+      //
+      // A real cycle this time, on the clock, seconds later — the continuation
+      // the checkpoints are honoured for. Free tier so nothing is paid for and
+      // the deterministic tier is the whole cycle.
+      const { gateway } = createGateway();
+      const next = await runConsolidationCycle(
+        { sql: tenant.sql, gateway, tenantId: TENANT, caller: CALLER },
+        { trigger: 'time_ceiling', tier: 'free', now },
+      );
+      expect(next.runId).toBe(opened.run.runId);
+      expect(next.stopReason).toBe('free_tier');
+
+      // **The claim.** This attempt's `markStaleness` resumes past the row the
+      // last one superseded, so it retires nothing and `factsInvalidated` is
+      // zero — and `link_reconcile` was banked complete before any of this
+      // happened, so on the old code it was skipped. The edge to the employer
+      // nothing states any more therefore survived a *completed* cycle, which is
+      // the strongest form of the defect: not "not yet reconciled" but
+      // "reconciled, and wrong".
+      expect(await liveEmployers()).toEqual(['Globex Ltd']);
     },
     SETUP_TIMEOUT_MS,
   );

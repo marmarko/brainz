@@ -68,8 +68,11 @@ import {
   completePhase,
   finishRun,
   openRun,
+  phaseIsComplete,
   recordProgress,
+  reopenPhase,
   type ConsolidationTier,
+  type CycleRun,
   type PhaseCheckpoint,
   type StopReason,
 } from './checkpoint.ts';
@@ -362,6 +365,7 @@ export async function runConsolidationCycle(
 
     if (!isModelPhase(phase)) {
       const outcome = await runDeterministicPhase(deps.sql, phase, {
+        run,
         now: options.now,
         cursor: banked?.cursor ?? null,
         attempt,
@@ -516,12 +520,27 @@ export async function runDeterministicPhase(
   sql: SQL,
   phase: CyclePhase,
   options: {
+    /** Whose checkpoints this phase reads and writes. See the `staleness` arm. */
+    readonly run: CycleRun;
     readonly now: Date;
     readonly cursor: string | null;
     readonly attempt: AttemptBudget;
+    /**
+     * The keyset batch the walking phases take per read/write pair.
+     *
+     * The cycle never sets it: every phase's tuned constant is the right number
+     * against a real brain, and a cycle that second-guessed them would be a
+     * second tuning nobody measured. It is a parameter because the property the
+     * arms below have to hold — that an attempt interrupted mid-walk hands the
+     * next one its position — is only reachable over more rows than one batch,
+     * and a suite that had to seed five hundred superseded pages to reach it
+     * would be a suite that stopped being run.
+     */
+    readonly batch?: number;
   },
 ): Promise<{ readonly items: number } & PhaseProgress> {
-  const { now, cursor, attempt: budget } = options;
+  const { run, now, cursor, attempt: budget } = options;
+  const batched = options.batch === undefined ? {} : { batch: options.batch };
 
   switch (phase) {
     case 'dedup': {
@@ -533,13 +552,33 @@ export async function runDeterministicPhase(
       return { items: result.added + result.removed, done: result.done, cursor: result.cursor };
     }
     case 'staleness': {
-      const result = await markStaleness(sql, { now, cursor, budget });
+      const result = await markStaleness(sql, { now, cursor, budget, ...batched });
       // The re-reconcile is skipped when this pass did not finish, because it is
       // a *fix point* over the whole edge set: running it against a fact set the
       // next attempt is still retiring from would remove edges that attempt is
       // about to re-derive, and re-add them, once per attempt.
-      if (!result.done || result.factsInvalidated === 0) {
-        return { items: result.staled, done: result.done, cursor: result.cursor };
+      // **The debt is banked, not carried in a local.** `factsInvalidated` counts
+      // what *this call* retired, and the walk is resumable — so the attempt
+      // that supersedes three hundred facts and the attempt that finishes the
+      // walk need not be the same process. Withdrawing reconciliation's
+      // completion is how the first tells the second, and it is the only form of
+      // that message which survives the process that discovered it. Without it,
+      // attempt N+1 resumed past those rows, finished with `factsInvalidated`
+      // zero, skipped a `link_reconcile` banked complete in attempt N, and left
+      // every edge whose only support had been retired standing over a cycle
+      // that reported itself complete.
+      if (result.factsInvalidated > 0) await reopenPhase(sql, run, 'link_reconcile');
+
+      if (!result.done) {
+        return { items: result.staled, done: false, cursor: result.cursor };
+      }
+
+      // The walk is over, so the fix point is owed exactly when reconciliation
+      // is not banked complete against this run. That one question answers both
+      // cases — this call retired something, or an earlier attempt did — which
+      // is what makes it a fix point rather than a coincidence of scheduling.
+      if (await phaseIsComplete(sql, run, 'link_reconcile')) {
+        return { items: result.staled, done: true, cursor: null };
       }
 
       const again = await reconcileAllEdges(sql, { taxonomyVersion: 1, budget });
@@ -554,6 +593,16 @@ export async function runDeterministicPhase(
         // stale is not selected again.
         return { items: result.staled, done: false, cursor: null };
       }
+      // The debt is discharged where it was recorded. `items` is the fix point's
+      // own diff rather than a sum with the pass this re-opened: the earlier
+      // count went with the withdrawn row, and inventing a total across two
+      // reconciliations of the same edge set would be double-counting an
+      // idempotent pass.
+      await completePhase(sql, run, 'link_reconcile', {
+        items: again.added + again.removed,
+        spentMicroUsd: NO_SPEND,
+        now,
+      });
       return { items: result.staled, done: true, cursor: null };
     }
     case 'entity_merge': {
@@ -561,11 +610,11 @@ export async function runDeterministicPhase(
       return { items: result.merged, done: result.done, cursor: result.cursor };
     }
     case 'salience': {
-      const result = await computeDeterministicSalience(sql, { now, cursor, budget });
+      const result = await computeDeterministicSalience(sql, { now, cursor, budget, ...batched });
       return { items: result.scored, done: result.done, cursor: result.cursor };
     }
     case 'cluster': {
-      const result = await clusterByEmbedding(sql, { runId: null, cursor, budget });
+      const result = await clusterByEmbedding(sql, { runId: null, cursor, budget, ...batched });
       return { items: result.clusters, done: result.done, cursor: result.cursor };
     }
     default:
