@@ -489,6 +489,18 @@ describe('a deployment with no connector vendor', () => {
     expect(recorded.disconnected).toEqual([]);
   });
 
+  test('the dashboard is the way in to what you can still undo', async () => {
+    // **The feature had exactly one door, and it was inside the room.** The only
+    // link to `/retractions` in the whole app was on the notice you reach AFTER
+    // clicking Restore, so the way to find out what you could undo was to have
+    // already undone something. A recovery surface nobody can reach is the same
+    // as no recovery surface, which is what the 72-hour promise had before it.
+    await reset();
+    const cookie = await signedIn();
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).toContain('href="/retractions"');
+  });
+
   test('the dashboard does not offer a button whose route answers 501', async () => {
     await reset();
     const cookie = await signedIn('paid');

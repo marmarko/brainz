@@ -783,6 +783,7 @@ connector vendor whether or not the brain is used, which the free plan cannot ca
           page.tenantId === null ? '' : ` &middot; brain <code>${escapeHtml(page.tenantId)}</code>`
         }</p>
 <p><a href="/connect">Connect brainz to Claude &rarr;</a></p>
+<p><a href="/retractions">What you can still undo &rarr;</a></p>
 <h2>Connected accounts</h2>
 ${connectors}
 <h2>Your own model key</h2>
