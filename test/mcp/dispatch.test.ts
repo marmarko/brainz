@@ -229,8 +229,56 @@ describe('the advertised surface', () => {
     const result = await fixture.call('synthesize', { query: 'what matters this week' });
     expect(result.ok).toBe(false);
     expect(result.error?.code).toBe('unavailable');
-    expect(result.error?.suggestion).toBe('briefing');
+    // Prose, not a bare tool name. A caller cannot self-correct from the token
+    // `briefing`; it can from a sentence saying what to call and why.
+    expect(result.error?.suggestion).toMatch(/`briefing`/);
+    expect(result.error?.suggestion?.split(/\s+/).length ?? 0).toBeGreaterThan(3);
   });
+});
+
+/**
+ * **Every ordinary refusal carries a fix, because that is the argument the whole
+ * surface is built on.**
+ *
+ * `docs/research/2026-08-11-tool-surface-design.md` justifies growing arguments
+ * instead of tools on exactly one property: a wrong parameter "returns
+ * `invalid_params` + `suggestion` and self-corrects next turn; a wrong tool
+ * choice returns a plausible wrong answer and teaches nothing." The slot existed
+ * and exactly one handler in the surface filled it, so the trade-off the design
+ * is built around was unimplemented at the point where it pays off — every
+ * ordinary refusal was a dead end.
+ *
+ * Driven per tool rather than per helper: a `suggestion` added to `invalid()`
+ * and forgotten at the four `not_found`/`scope_denied` returns would pass a test
+ * written against the helper.
+ */
+describe('a refusal tells the caller what to do next', () => {
+  const REFUSALS: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
+    ['recall', {}],
+    ['recall', { id: 'nonsense' }],
+    ['search', {}],
+    ['fetch', {}],
+    ['fetch', { id: 'nonsense' }],
+    ['entity', {}],
+    ['briefing', { since: 'last tuesday' }],
+    ['remember', {}],
+    ['remember', { statement: 'a fact', source_type: 'email' }],
+    ['forget', {}],
+    ['forget', { id: 'nonsense' }],
+    ['synthesize', { query: 'anything' }],
+  ];
+
+  for (const [tool, args] of REFUSALS) {
+    test(`${tool}(${JSON.stringify(args)}) refuses with a fix`, async () => {
+      const result = await fixture.call(tool, args, { endpoint: tool === 'search' || tool === 'fetch' ? 'openai' : 'mcp' });
+      expect(result.ok, `${tool} was expected to refuse`).toBe(false);
+      const suggestion = result.error?.suggestion ?? '';
+      expect(suggestion.trim().length, `${tool} suggestion`).toBeGreaterThan(0);
+      // A sentence, not a token: the field is what an agent reads to correct
+      // itself, and one word names a destination without naming the move.
+      expect(suggestion.trim().split(/\s+/).length, `${tool} suggestion`).toBeGreaterThan(3);
+    }, TEST_TIMEOUT_MS);
+  }
 });
 
 describe('search and fetch are projections, not a second stack', () => {

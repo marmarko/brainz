@@ -133,25 +133,50 @@ async function managementTwin(
 export const manage: Handler = async (ctx, args) => {
   const action = stringArg(args, 'action');
   if (action === null || !MANAGE_ACTION_NAMES.includes(action as never)) {
-    return invalid(`\`action\` must be one of ${MANAGE_ACTION_NAMES.join(', ')}.`);
+    return invalid(
+      `\`action\` must be one of ${MANAGE_ACTION_NAMES.join(', ')}.`,
+      `Pass \`action\` as one of ${MANAGE_ACTION_NAMES.join(', ')} with the \`value\` it acts on. ` +
+        'Everything irreversible — disconnecting, deleting, exporting, sharing — is not on this ' +
+        'tool at all; those are done by the user in the web app.',
+    );
   }
 
   // Every action acts on something — a cap, a policy, a source — so a call with
   // no value is refused rather than reaching a store that would have to invent
   // a default.
   const value = stringArg(args, 'value');
-  if (value === null) return invalid(`\`${action}\` needs a \`value\`.`);
+  if (value === null) {
+    return invalid(
+      `\`${action}\` needs a \`value\`.`,
+      `Every action changes something, so \`${action}\` needs the setting to change passed as ` +
+        '`value`. Read the current settings back with `brain` if you are not sure what it is now.',
+    );
+  }
 
   if (ctx.settings === null) {
     return {
       ok: false,
       code: 'unavailable',
       message: 'This brain’s settings could not be reached.',
+      suggestion:
+        'Nothing was changed. The settings store did not answer — try the same call again shortly, ' +
+        'and point the user at their dashboard if it keeps failing.',
     };
   }
 
   const outcome = await applyManageAction(ctx.settings, action, value, ctx.authority);
-  if (!outcome.ok) return { ok: false, code: outcome.code, message: outcome.message };
+  if (!outcome.ok) {
+    return {
+      ok: false,
+      code: outcome.code,
+      message: outcome.message,
+      suggestion:
+        outcome.code === 'unavailable'
+          ? 'Nothing was changed, so retrying is safe — try the same call again shortly.'
+          : `Nothing was changed. Re-read the message for the shape \`${action}\` accepts and pass ` +
+            '`value` in it.',
+    };
+  }
 
   return {
     ok: true,
@@ -189,6 +214,9 @@ function applyManageAction(
         ok: false,
         code: 'invalid_params',
         message: `\`${action}\` has no implementation on this surface.`,
+        suggestion:
+          `\`${action}\` is named by this brain but not served by it — this is a gap here, not a ` +
+          'mistake you made. Tell the user to make the change in their dashboard.',
       });
   }
 }
@@ -199,7 +227,15 @@ export const synthesize: Handler = () =>
     code: 'unavailable',
     message:
       'This server does not run server-side synthesis. `briefing` assembles the same material from work already paid for, and your own model writes the prose.',
-    suggestion: 'briefing',
+    // **Prose, not the bare token `briefing`.** This was the one populated
+    // suggestion in the whole surface and it named a destination without naming
+    // the move — a caller reading one word has to guess whether it is a tool, a
+    // page or a parameter. The field is what an agent self-corrects from, so it
+    // says what to call, with what, and why the answer is as good.
+    suggestion:
+      'Call `briefing` instead. It returns the same material — meetings, commitments, open threads ' +
+      'over a window — already assembled by the nightly cycle, and your own model writes the prose ' +
+      'from it with the whole conversation in context, which this server does not have.',
   });
 
 /** The endpoint-aware tool matrix `brain` publishes, exported for the server. */

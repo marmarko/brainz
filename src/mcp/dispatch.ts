@@ -196,6 +196,25 @@ export interface DispatchRequest {
   readonly resume?: ResumeInput;
 }
 
+/**
+ * The fix a refusal carries when the caller named something this surface does
+ * not serve.
+ *
+ * Deliberately one sentence for both `unknown_tool` sites — a name absent from
+ * the table and a name in the table with no handler wired are the same fact to a
+ * caller, and telling them apart would publish which of brainz's own tools are
+ * stubs.
+ */
+const UNKNOWN_TOOL_FIX =
+  'Call `tools/list` and use a name from it exactly as spelled. The names differ per endpoint, so ' +
+  'a name that works elsewhere is not necessarily one this connection serves.';
+
+/** The fix for a brain whose database did not answer. Retry, then degrade honestly. */
+const BRAIN_UNREACHABLE_FIX =
+  'Nothing was read or written, so retrying is safe. This brain\'s database did not answer — try ' +
+  'the same call again shortly, and if it fails again answer from what you already have rather ' +
+  'than telling the user their memory is empty.';
+
 export interface DispatchError {
   readonly code: string;
   readonly message: string;
@@ -459,7 +478,9 @@ export async function dispatch(
   // ---- 2. The tool, and its gate, before the database is opened. -----------
   const def = toolByName(request.tool);
   if (def === undefined || !isDispatchable(request.tool, deps.endpoint)) {
-    return refuse('unknown_tool', `No tool named ${JSON.stringify(request.tool)}.`, 'unknown_tool', actor);
+    return refuse('unknown_tool', `No tool named ${JSON.stringify(request.tool)}.`, 'unknown_tool', actor, {
+      suggestion: UNKNOWN_TOOL_FIX,
+    });
   }
 
   // U14's gate. It lives here rather than in the handler for the reason
@@ -512,7 +533,9 @@ export async function dispatch(
   // ---- 3. The tenant's database, by an identity that reaches no other. -----
   const opened = await deps.connections.open(authenticatedTenantId);
   if (!opened.ok) {
-    return refuse('unavailable', 'This brain could not be reached.', 'unavailable', actor);
+    return refuse('unavailable', 'This brain could not be reached.', 'unavailable', actor, {
+      suggestion: BRAIN_UNREACHABLE_FIX,
+    });
   }
 
   const { sql, coldStart } = opened.connection;
@@ -547,7 +570,9 @@ export async function dispatch(
   try {
     grant = await resolveGrant(claims, () => brainOrigins(sql));
   } catch {
-    return refuse('unavailable', 'This brain could not be reached.', 'unavailable', actor);
+    return refuse('unavailable', 'This brain could not be reached.', 'unavailable', actor, {
+      suggestion: BRAIN_UNREACHABLE_FIX,
+    });
   }
 
   let cachedState: IndexState | null = null;
@@ -583,7 +608,9 @@ export async function dispatch(
   // ---- 5. The handler. -----------------------------------------------------
   const handler = HANDLERS[request.tool];
   if (handler === undefined) {
-    return refuse('unknown_tool', `No tool named ${JSON.stringify(request.tool)}.`, 'unknown_tool', actor);
+    return refuse('unknown_tool', `No tool named ${JSON.stringify(request.tool)}.`, 'unknown_tool', actor, {
+      suggestion: UNKNOWN_TOOL_FIX,
+    });
   }
 
   let outcome: Awaited<ReturnType<Handler>>;
@@ -593,7 +620,12 @@ export async function dispatch(
     // A handler that throws is a bug, and a bug must not become a stack trace
     // on the wire: the message would be the ordinary way a user's row content
     // reaches a log this system promises holds none.
-    return refuse('error', 'That call could not be completed.', 'error', actor);
+    return refuse('error', 'That call could not be completed.', 'error', actor, {
+      suggestion:
+        'This is a fault in the brain, not in the call. Retrying the same call once is safe; if it ' +
+        'fails again, answer from what you already have and tell the user their brain is not ' +
+        'answering right now.',
+    });
   }
 
   const meta = {

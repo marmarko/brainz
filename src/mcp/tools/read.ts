@@ -27,6 +27,7 @@ import {
   project,
   stringArg,
   type Handler,
+  type HandlerFailure,
   type HandlerOutcome,
   type ProjectedRecord,
   type ToolContext,
@@ -37,6 +38,30 @@ const RECORD_BASE = 'https://app.brainz.test';
 
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
+
+/**
+ * The one refusal for every "this brain has no such record", and its one fix.
+ *
+ * A function rather than three literals because the three sites must not drift:
+ * an id that does not parse and an id that names no live row are the same fact
+ * to a caller (see `recallById`), so two different sentences here would
+ * re-introduce the distinction the codes just stopped making.
+ */
+const OUTSIDE_THIS_CONNECTION =
+  'This connection is scoped to part of the brain and that record sits outside it. No parameter ' +
+  'widens it — read what this connection can reach with `recall`, or ask the user to reconnect ' +
+  'with the origins they want this agent to see.';
+
+const NO_SUCH_RECORD_FIX =
+  'Ids are minted by this brain and are only valid inside it. Run `recall` or `search` and pass ' +
+  "a result's `id` field back verbatim, rather than composing one or reusing one from elsewhere.";
+
+const noSuchRecord = (): HandlerFailure => ({
+  ok: false,
+  code: 'not_found',
+  message: 'No such record.',
+  suggestion: NO_SUCH_RECORD_FIX,
+});
 
 /** The briefing's default and maximum token ceilings. */
 const DEFAULT_BRIEFING_TOKENS = 4000;
@@ -53,7 +78,13 @@ export const recall: Handler = async (ctx, args) => {
   if (id !== null) return recallById(ctx, id);
 
   const query = stringArg(args, 'query') ?? stringArg(args, 'entity');
-  if (query === null) return invalid('recall needs either `query` or `id`.');
+  if (query === null) {
+    return invalid(
+      'recall needs either `query` or `id`.',
+      "Pass `query` with what you are looking for in the user's own words, or `id` to read back one " +
+        'record you already have from an earlier result.',
+    );
+  }
 
   const limit = intArg(args, 'limit', DEFAULT_LIMIT, MAX_LIMIT);
   const response = await rankedRead({
@@ -131,7 +162,7 @@ async function recallById(ctx: ToolContext, rawId: string): Promise<HandlerOutco
   // for parameters the schema itself rejects, and split one fact the caller
   // cannot act on differently into two codes it would branch on.
   const parsed = parseId(rawId);
-  if (parsed === null) return { ok: false, code: 'not_found', message: 'No such record.' };
+  if (parsed === null) return noSuchRecord();
 
   const outcome = await fetchRecord(ctx.sql, ctx.grant, parsed);
   if (outcome.status !== 'ok') {
@@ -140,8 +171,9 @@ async function recallById(ctx: ToolContext, rawId: string): Promise<HandlerOutco
           ok: false,
           code: 'scope_denied',
           message: 'That record is outside the origins this connection may read.',
+          suggestion: OUTSIDE_THIS_CONNECTION,
         }
-      : { ok: false, code: 'not_found', message: 'No such record.' };
+      : noSuchRecord();
   }
 
   const projected = project(outcome.record, ctx.nonce);
@@ -158,7 +190,9 @@ async function recallById(ctx: ToolContext, rawId: string): Promise<HandlerOutco
  */
 export const search: Handler = async (ctx, args) => {
   const query = stringArg(args, 'query');
-  if (query === null) return invalid('search needs a `query`.');
+  if (query === null) {
+    return invalid('search needs a `query`.', "Pass `query` with what you are looking for, in the user's own words.");
+  }
 
   const outcome = await recall(ctx, { query, ...(args.limit === undefined ? {} : { limit: args.limit }) });
   if (!outcome.ok) return outcome;
@@ -181,13 +215,15 @@ export const search: Handler = async (ctx, args) => {
 /** `fetch` — `recall({id})`, rendered as one record rather than a list of one. */
 export const fetchOne: Handler = async (ctx, args) => {
   const id = stringArg(args, 'id');
-  if (id === null) return invalid('fetch needs an `id`.');
+  if (id === null) {
+    return invalid('fetch needs an `id`.', NO_SUCH_RECORD_FIX);
+  }
 
   const outcome = await recallById(ctx, id);
   if (!outcome.ok) return outcome;
 
   const record = outcome.projection?.[0];
-  if (record === undefined) return { ok: false, code: 'not_found', message: 'No such record.' };
+  if (record === undefined) return noSuchRecord();
 
   return {
     ok: true,
@@ -218,7 +254,14 @@ export const fetchOne: Handler = async (ctx, args) => {
 export const entity: Handler = async (ctx, args) => {
   const started = performance.now();
   const name = stringArg(args, 'name');
-  if (name === null) return invalid('entity needs a `name`.');
+  if (name === null) {
+    return invalid(
+      'entity needs a `name`.',
+      'Pass `name` as the person, company or project you want the card for — a slug like ' +
+        '`people/ada-lovelace`, or the plain name. A miss is not an error: it answers ' +
+        '`found: false` with near matches to choose from.',
+    );
+  }
 
   const outcome = await entityCard(ctx.sql, ctx.grant, name);
   const latency = Math.max(0, Math.round(performance.now() - started));
@@ -228,6 +271,7 @@ export const entity: Handler = async (ctx, args) => {
       ok: false,
       code: 'scope_denied',
       message: 'That entity is outside the origins this connection may read.',
+      suggestion: OUTSIDE_THIS_CONNECTION,
     };
   }
 
@@ -295,7 +339,11 @@ export const briefing: Handler = async (ctx, args) => {
   // neither. Defaulting at this layer erased the difference.
   const since = stringArg(args, 'since');
   if ((since !== null && Number.isNaN(Date.parse(since))) || Number.isNaN(Date.parse(until))) {
-    return invalid('`since` and `until` must be ISO dates.');
+    return invalid(
+      '`since` and `until` must be ISO dates.',
+      'Pass them as ISO-8601 timestamps, e.g. `2026-08-11T00:00:00Z`. Or omit `since` entirely — the ' +
+        'window then resumes from wherever this connection last read.',
+    );
   }
 
   const focus = stringArg(args, 'focus');

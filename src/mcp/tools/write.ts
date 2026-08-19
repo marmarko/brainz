@@ -22,7 +22,7 @@ import { mediaPolicyForRemember, rememberMediaMessage } from '../../core/media/a
 import { createBudget } from '../../ai/gateway.ts';
 import { parseId } from '../ids.ts';
 import { forgetRecord } from '../tombstone.ts';
-import { invalid, stringArg, type Handler } from './context.ts';
+import { invalid, stringArg, type Handler, type HandlerFailure } from './context.ts';
 
 /**
  * The source types a `remember` may declare.
@@ -57,7 +57,14 @@ export const REMEMBER_SPEND_CEILING = 600;
 
 export const remember: Handler = async (ctx, args) => {
   const statement = stringArg(args, 'statement');
-  if (statement === null) return invalid('remember needs a `statement`.');
+  if (statement === null) {
+    return invalid(
+      'remember needs a `statement`.',
+      'Pass `statement` as the single claim to store, written as a sentence — "Ada prefers ' +
+        'async updates", not a topic or a keyword. One claim per call; the write path ' +
+        'de-duplicates, so restating something already known costs nothing.',
+    );
+  }
 
   // U21 step 4, and it runs *before* the write: a caller that declared a file
   // gets an answer about the file, not a memory of the sentence describing it.
@@ -65,12 +72,21 @@ export const remember: Handler = async (ctx, args) => {
   // acceptance the whole media path is designed against.
   const mediaType = stringArg(args, 'media_type');
   if (mediaType !== null) {
-    return invalid(rememberMediaMessage(mediaPolicyForRemember(mediaType)));
+    return invalid(
+      rememberMediaMessage(mediaPolicyForRemember(mediaType)),
+      'Store what you want remembered about the attachment as a `statement` in words, with no ' +
+        '`media_type`. This tool writes one claim; it does not ingest files.',
+    );
   }
 
   const declared = stringArg(args, 'source_type') ?? 'note';
   if (!ALLOWED_SOURCE_TYPES.has(declared)) {
-    return invalid(`\`source_type\` must be one of ${[...ALLOWED_SOURCE_TYPES].join(', ')}.`);
+    return invalid(
+      `\`source_type\` must be one of ${[...ALLOWED_SOURCE_TYPES].join(', ')}.`,
+      'Omit `source_type` unless the user is dictating from a document or a file — it defaults to ' +
+        '`note`, which is right for anything said in conversation. Types naming an external ' +
+        'channel are not writable here: those are stamped by the connector that imported them.',
+    );
   }
 
   const outcome = await writeRemember(
@@ -103,6 +119,12 @@ export const remember: Handler = async (ctx, args) => {
       ok: false,
       code: failure.reason === 'embed_failed' ? 'unavailable' : 'invalid_params',
       message: `The memory was not stored (${failure.reason}).`,
+      suggestion:
+        failure.reason === 'embed_failed'
+          ? 'Nothing was written, so retrying is safe. The embedding provider did not answer — try ' +
+            'the same call again shortly, and tell the user it is not stored yet if it fails twice.'
+          : 'Nothing was written. Shorten `statement` to the single claim worth keeping and try ' +
+            'again — a whole document pasted into one call is refused rather than billed.',
     };
   }
 
@@ -127,15 +149,37 @@ export const remember: Handler = async (ctx, args) => {
   };
 };
 
+/**
+ * The one refusal for "no such record to retract", shared by both sites for the
+ * reason `read.ts` shares its own: an id that does not parse and an id naming no
+ * live row are the same fact to a caller, so two sentences here would
+ * re-introduce the distinction the codes stopped making.
+ */
+const noSuchRecordToRetract = (): HandlerFailure => ({
+  ok: false,
+  code: 'not_found',
+  message: 'No such record.',
+  suggestion:
+    'Ids are minted by this brain and are only valid inside it. Run `recall` or `search` and pass ' +
+    "a result's `id` field back verbatim. If it was already retracted, it is already gone from " +
+    'reads — retracting again is not an error and returns an empty cascade.',
+});
+
 export const forget: Handler = async (ctx, args) => {
   const raw = stringArg(args, 'id');
-  if (raw === null) return invalid('forget needs an `id`.');
+  if (raw === null) {
+    return invalid(
+      'forget needs an `id`.',
+      'Pass `id` as the opaque id of the one record to retract. Run `recall` or `search` first ' +
+        "and pass a result's `id` field back verbatim.",
+    );
+  }
 
   // Same rule as `recall({id})`: the schema declares `id` as a plain string, so
   // an id this brain never issued is `not_found` however it is malformed. A
   // missing `id` above stays `invalid_params` — that one the schema does reject.
   const parsed = parseId(raw);
-  if (parsed === null) return { ok: false, code: 'not_found', message: 'No such record.' };
+  if (parsed === null) return noSuchRecordToRetract();
 
   const outcome = await forgetRecord(ctx.sql, { id: parsed, grant: ctx.grant, now: ctx.now });
   if (!outcome.ok) {
@@ -144,8 +188,12 @@ export const forget: Handler = async (ctx, args) => {
           ok: false,
           code: 'scope_denied',
           message: 'That record is outside the origins this connection may reach.',
+          suggestion:
+            'This connection is scoped to part of the brain and that record sits outside it. No ' +
+            'parameter widens it — retract what this connection can reach, or ask the user to do ' +
+            'it themselves in the web app.',
         }
-      : { ok: false, code: 'not_found', message: 'No such record.' };
+      : noSuchRecordToRetract();
   }
 
   return {

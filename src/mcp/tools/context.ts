@@ -137,7 +137,24 @@ export interface HandlerFailure {
   readonly ok: false;
   readonly code: ErrorCode;
   readonly message: string;
-  /** A tool the caller should try instead. Referentially checked by the envelope. */
+  /**
+   * What the caller should do next, as a sentence: problem, cause, fix.
+   *
+   * **Not a bare tool name, and the correction matters.** This field used to be
+   * documented as "a tool the caller should try instead, referentially checked
+   * by the envelope" — neither half of which was true. Nothing checks it (the
+   * referential rule is `next[].tool`'s, and only that), and the two sites in
+   * `dispatch.ts` that were already filling it were already writing prose. Only
+   * `synthesize` wrote a bare name, and a caller cannot self-correct from the
+   * token `briefing`: it names a destination without naming the move.
+   *
+   * **Why it is worth requiring at all.** The tool-surface design grows
+   * arguments rather than tools on exactly one property — a wrong parameter
+   * "returns `invalid_params` + `suggestion` and self-corrects next turn; a
+   * wrong tool choice returns a plausible wrong answer and teaches nothing."
+   * A refusal without this field is the dead end that argument says cannot
+   * happen.
+   */
   readonly suggestion?: string;
 }
 
@@ -201,8 +218,16 @@ export function project(record: Record_, nonce: string): ProjectedRecord {
   };
 }
 
-export function invalid(message: string): HandlerFailure {
-  return { ok: false, code: 'invalid_params', message };
+/**
+ * A parameter refusal, and the fix for it.
+ *
+ * `suggestion` is a REQUIRED positional rather than an option bag, because the
+ * failure this closes is a call site that did not think about it. The old
+ * one-argument form made a fixless refusal the path of least resistance, and
+ * every call site in the surface took it.
+ */
+export function invalid(message: string, suggestion: string): HandlerFailure {
+  return { ok: false, code: 'invalid_params', message, suggestion };
 }
 
 /** Reads a string argument, trimmed, or `null` when it is absent or empty. */
