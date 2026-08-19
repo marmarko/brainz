@@ -60,6 +60,13 @@ import type { SQL } from 'bun';
 import { grantOperatorTier, revokeOperatorTier } from '../control/billing.ts';
 import { causeOf, readConnectorHealth } from '../control/connector-health.ts';
 import { discardConnectorLanes } from '../control/connector-lanes.ts';
+import { readConnectorLinks } from '../control/connector-pg.ts';
+import {
+  fleetConnectorVerdict,
+  freshnessOf,
+  type ConnectorFreshness,
+  type FleetConnectorVerdict,
+} from '../control/connector-staleness.ts';
 import { createReconcilePorts } from '../control/reconcile-ports.ts';
 import { reconcileTenants } from '../control/reconcile.ts';
 import { CONNECTOR_SOURCES, isConnectorSource } from '../ingest/cursor.ts';
@@ -409,7 +416,7 @@ export async function adminDispatch(deps: AdminDeps, request: AdminRequest): Pro
 
   switch (request.name as AdminOperation) {
     case 'fleet_status':
-      return { ok: true, content: await fleetStatus(deps.controlSql) };
+      return { ok: true, content: await fleetStatus(deps.controlSql, now) };
     case 'tenant_directory':
       return tenantDirectory(deps.controlSql, deps.owners, requestedLimit(request));
     /**
@@ -477,12 +484,29 @@ export async function adminDispatch(deps: AdminDeps, request: AdminRequest): Pro
       return { ok: true, content: await poolStatus(deps.controlSql) };
     case 'queue_status':
       return { ok: true, content: await queueStatus(deps.controlSql) };
+    /**
+     * **With a tenant, why that brain is not polling. Without one, which brain.**
+     *
+     * The bare call used to be refused for a missing `tenant_id`, and the refusal
+     * was the gap: during the ten hours nothing imported, the operation that held
+     * the answer required the one fact nobody had, because nobody knew anything
+     * was wrong. `fleet_status` is what a monitor pages on; this is the call that
+     * turns that page into a tenant id, and then the same call with that id is
+     * the diagnosis.
+     *
+     * Naming tenants here is not a widening of what `/admin` may say: the same
+     * credential can already list every tenant in the fleet beside an owner
+     * digest ({@link tenantDirectory}). It is a widening of what `fleet_status`
+     * may say that is deliberately NOT made — that answer is the one that gets
+     * pasted into a channel, so it stays counts-only and this one carries the
+     * ids.
+     */
     case 'connector_status': {
       const tenantId = namedTenant(request);
       if (tenantId === null) {
-        return { ok: false, code: 'invalid_params', message: 'tenant_id is required.' };
+        return { ok: true, content: await degradedConnectors(deps.controlSql, now) };
       }
-      return { ok: true, content: await connectorStatus(deps.controlSql, tenantId) };
+      return { ok: true, content: await connectorStatus(deps.controlSql, tenantId, now) };
     }
     /**
      * **The way back from a dead lane, and the only one that does not cost the
@@ -633,7 +657,152 @@ function refusalText(reason: 'unknown_tenant' | 'not_ready' | 'not_granted'): st
   }
 }
 
-async function fleetStatus(sql: SQL): Promise<Record<string, unknown>> {
+/**
+ * How many connected links one fleet-health pass will read.
+ *
+ * The rule that decides each one is a TypeScript function rather than SQL — on
+ * purpose, because a second copy of it expressed as a `WHERE` clause is a second
+ * place for the thresholds to drift, and drift on this surface means a monitor
+ * that disagrees with the dashboard about whether somebody's mail is arriving.
+ * That means rows are materialised, so there is a bound.
+ *
+ * **Hitting the bound is reported as degradation rather than swallowed.** The
+ * answer is a health verdict: a pass that did not finish reading the fleet
+ * cannot say the fleet is `ok`, and quietly answering `ok` from a partial scan
+ * is the failure this whole surface exists to end, rebuilt one layer up. Three
+ * per tenant at today's connector count, so the fleet reaches this at a size
+ * where the aggregation belongs in the database and somebody has to decide how.
+ */
+export const FLEET_CONNECTOR_SCAN_LIMIT = 5_000;
+
+/** How many degraded lanes the drill-down names. Small by construction; capped anyway. */
+export const FLEET_CONNECTOR_LIST_LIMIT = 200;
+
+interface FleetConnectorRow {
+  readonly tenantId: string;
+  readonly source: string;
+  readonly freshness: ConnectorFreshness;
+  readonly lastSuccessAt: Date | null;
+  readonly runOutcome: string | null;
+  readonly cause: string | null;
+}
+
+interface FleetConnectorHealth {
+  readonly verdict: FleetConnectorVerdict;
+  readonly counts: Readonly<Record<ConnectorFreshness, number>>;
+  readonly total: number;
+  readonly truncated: boolean;
+  readonly rows: readonly FleetConnectorRow[];
+}
+
+/**
+ * **Is anything in this fleet failing to import, without being told where to
+ * look.**
+ *
+ * **The gap this closes, and it is measured in hours.** Every connector on one
+ * brain stopped importing and nothing surfaced it. `queue_status` was spotless —
+ * a halted pull returns `stopped`, a stopped run is deliberately not thrown on,
+ * so every job completed and nothing was ever late or dead. {@link
+ * connectorStatus} held the answer and required a `tenant_id`, which is exactly
+ * what nobody had, because nobody knew to ask. And `fleet_status` knew about
+ * tenants and spend and nothing about connectors at all. There was no field
+ * anywhere that an uptime monitor could have polled.
+ *
+ * **The link is joined and it is not decoration.** Nothing deletes a health row
+ * on disconnect — its foreign key is to the tenant, not to the link — so a
+ * source somebody removed in March keeps an ancient `last_success_at` forever.
+ * Reading health alone would page on every abandoned connector in the fleet, the
+ * alert would be muted inside a week, and this surface would be worse than none.
+ *
+ * **`source::text` on both sides of the join.** `control.connector_link.source`
+ * and `control.connector_health.source` are two different enum types that happen
+ * to carry the same three labels — deliberately, so that a fourth added to one
+ * and not the other is refused rather than silently unschedulable. Postgres will
+ * not compare them, and the cast is the whole reason this join runs.
+ */
+async function fleetConnectorHealth(sql: SQL, now: Date): Promise<FleetConnectorHealth> {
+  const rows = await sql<
+    {
+      tenant_id: string;
+      source: string;
+      linked_at: Date;
+      attempted: boolean;
+      last_success_at: Date | null;
+      run_outcome: string | null;
+      ingest_failure_code: string | null;
+      job_failure_code: string | null;
+    }[]
+  >`
+    SELECT l.tenant_id::text            AS tenant_id,
+           l.source::text               AS source,
+           l.created_at                 AS linked_at,
+           (h.tenant_id IS NOT NULL)    AS attempted,
+           h.last_success_at,
+           h.run_outcome::text          AS run_outcome,
+           h.ingest_failure_code::text  AS ingest_failure_code,
+           h.job_failure_code::text     AS job_failure_code
+      FROM control.connector_link l
+      LEFT JOIN control.connector_health h
+        ON h.tenant_id = l.tenant_id AND h.source::text = l.source::text
+     -- Connected links only. See the header: a health row outlives a disconnect.
+     WHERE l.state IS NOT NULL
+     ORDER BY l.tenant_id, l.source
+     LIMIT ${FLEET_CONNECTOR_SCAN_LIMIT + 1}`;
+
+  const truncated = rows.length > FLEET_CONNECTOR_SCAN_LIMIT;
+  const counted = truncated ? rows.slice(0, FLEET_CONNECTOR_SCAN_LIMIT) : rows;
+
+  const read = counted.map<FleetConnectorRow>((row) => ({
+    tenantId: row.tenant_id,
+    source: row.source,
+    freshness: freshnessOf({
+      source: row.source,
+      // Every row here is a connected link; the query decided that.
+      link: 'connected',
+      attempt: row.attempted
+        ? {
+            lastSuccessAt: row.last_success_at,
+            runOutcome: row.run_outcome as never,
+          }
+        : undefined,
+      // The link's own age, which is a floor rather than this connection's age:
+      // a reconnect reuses the row and bumps the fence. A floor expires the
+      // first-success window earlier, which is the direction that errs towards
+      // saying something on an operator surface.
+      attemptingSince: row.linked_at,
+      now,
+    }).state,
+    lastSuccessAt: row.last_success_at,
+    runOutcome: row.run_outcome,
+    // The run's own code where there is one, the queue's where there is not —
+    // the same precedence `causeOf` applies for the dashboard.
+    cause: row.ingest_failure_code ?? row.job_failure_code ?? null,
+  }));
+
+  const counts: Record<ConnectorFreshness, number> = {
+    current: 0,
+    slipping: 0,
+    stale: 0,
+    unattended: 0,
+    never_succeeded: 0,
+    starting: 0,
+    unpolled: 0,
+    not_connected: 0,
+  };
+  for (const row of read) counts[row.freshness] += 1;
+
+  const verdict = fleetConnectorVerdict(read.map((row) => row.freshness));
+  return {
+    // A scan that did not finish cannot answer `ok`. See the limit's own note.
+    verdict: truncated && verdict === 'ok' ? 'degraded' : verdict,
+    counts,
+    total: read.length,
+    truncated,
+    rows: read,
+  };
+}
+
+async function fleetStatus(sql: SQL, now: Date): Promise<Record<string, unknown>> {
   const rows = await sql<{ state: string; tier: string; n: number }[]>`
     SELECT state::text AS state, tier::text AS tier, count(*)::int AS n
     FROM control.tenant GROUP BY state, tier ORDER BY state, tier`;
@@ -645,10 +814,39 @@ async function fleetStatus(sql: SQL): Promise<Record<string, unknown>> {
     SELECT sum(spend_micro_usd)::bigint AS total,
            sum(hosted_cogs_micro_usd)::bigint AS cogs
       FROM control.tenant`;
+  // **The one field an uptime monitor polls, on the operation that already
+  // reports whether the fleet is alive.** A monitor's rule is
+  // `.content.connectors.verdict != "ok"` — one string, three levels, monotone,
+  // so *warn on degraded, page on stalled* is expressible without walking the
+  // JSON. It rides here rather than on a new route because an unauthenticated
+  // liveness endpoint on this origin is a way for a stranger to wake every
+  // scale-to-zero container in the fleet, which `src/mcp/edge.ts` refuses in as
+  // many words and `docs/deploy.md` repeats.
+  //
+  // **No tenant identifier is in it, and that is a property of the answer rather
+  // than a habit.** This response is the artifact most likely to be pasted into
+  // a channel or a status page. Which brain is affected is one call away, on
+  // `connector_status`, under the same credential.
+  const connectors = await fleetConnectorHealth(sql, now);
   return {
     tenants: rows.map((row) => ({ state: row.state, tier: row.tier, count: row.n })),
     spend_micro_usd: Number(spend[0]?.total ?? 0),
     hosted_cogs_micro_usd: Number(spend[0]?.cogs ?? 0),
+    connectors: {
+      verdict: connectors.verdict,
+      total: connectors.total,
+      // Every reading, including the benign ones. A count that only listed the
+      // bad states could not tell an empty fleet from a healthy one, and "no
+      // connectors at all" is a fact an operator reading a green verdict needs.
+      current: connectors.counts.current,
+      slipping: connectors.counts.slipping,
+      stale: connectors.counts.stale,
+      unattended: connectors.counts.unattended,
+      never_succeeded: connectors.counts.never_succeeded,
+      starting: connectors.counts.starting,
+      unpolled: connectors.counts.unpolled,
+      truncated: connectors.truncated,
+    },
   };
 }
 
@@ -785,7 +983,49 @@ async function tenantDirectory(
  * item id here and no message text: `ingest_log.external_ref` is the provider's
  * own id for one of somebody's messages, and it stays in their database.
  */
-async function connectorStatus(sql: SQL, tenantId: string): Promise<Record<string, unknown>> {
+/**
+ * Every connector in the fleet that is not importing, and whose it is.
+ *
+ * **Only what is not fine.** A list that included healthy connectors would grow
+ * with the fleet and would have to be read rather than acted on, which is the
+ * difference between a drill-down and a dump. `current` is the one reading
+ * excluded; `starting` and `unpolled` stay, because an operator answering a page
+ * needs to see a connector that has not got going as much as one that stopped.
+ *
+ * Codes, counts and instants, exactly as {@link connectorStatus} publishes them.
+ * A tenant id is fleet-minted and is not a word a user wrote.
+ */
+async function degradedConnectors(sql: SQL, now: Date): Promise<Record<string, unknown>> {
+  const fleet = await fleetConnectorHealth(sql, now);
+  const degraded = fleet.rows.filter((row) => row.freshness !== 'current');
+  const listed = degraded.slice(0, FLEET_CONNECTOR_LIST_LIMIT);
+  return {
+    // Stamped, so the two answers this operation can give are told apart by
+    // something better than which keys happen to be present.
+    scope: 'fleet',
+    verdict: fleet.verdict,
+    connectors: listed.map((row) => ({
+      tenant_id: row.tenantId,
+      source: row.source,
+      freshness: row.freshness,
+      last_success_at: row.lastSuccessAt,
+      run_outcome: row.runOutcome,
+      cause: row.cause,
+    })),
+    // The fleet's connected total, not the page's — the same reason
+    // `tenant_directory` reports the fleet's count: "2 of 900" is what somebody
+    // reading a page needs, and "2" is the number that says the fleet is smaller
+    // than it is.
+    total: fleet.total,
+    truncated: fleet.truncated || degraded.length > listed.length,
+  };
+}
+
+async function connectorStatus(
+  sql: SQL,
+  tenantId: string,
+  now: Date,
+): Promise<Record<string, unknown>> {
   const lanes = await sql<
     {
       target: string;
@@ -806,6 +1046,11 @@ async function connectorStatus(sql: SQL, tenantId: string): Promise<Record<strin
      ORDER BY target, run_at DESC`;
 
   const health = await readConnectorHealth(sql, { tenantId });
+  // **The link, so this answer and the user's own page cannot disagree.** The
+  // freshness reading is decided from the link first and the health row second,
+  // because a health row outlives a disconnect — and an operator told a source
+  // somebody removed in March is "stale" is an operator sent to look at nothing.
+  const links = await readConnectorLinks(sql, { tenantId, now });
 
   return {
     tenant_id: tenantId,
@@ -830,6 +1075,20 @@ async function connectorStatus(sql: SQL, tenantId: string): Promise<Record<strin
         source: record.source,
         last_attempt_at: record.lastAttemptAt,
         last_success_at: record.lastSuccessAt,
+        // The same rule the dashboard renders and the fleet verdict folds, so
+        // there is one answer to "is this importing" rather than three readers
+        // each deciding for themselves from the two timestamps above.
+        freshness: freshnessOf({
+          source: record.source,
+          link: links.get(record.source) ?? 'absent',
+          attempt: record,
+          // This surface holds the health row, not the queue, so it has no
+          // first-attempt anchor. Read as expired rather than as young: on an
+          // operator's answer, "I cannot tell how long this has been trying"
+          // must not resolve to "assume it just started".
+          attemptingSince: null,
+          now,
+        }).state,
         run_outcome: record.runOutcome,
         // Both codes, unmerged. Which vocabulary answered is itself the fact an
         // operator reads: an ingest code means the attempt reached the provider,

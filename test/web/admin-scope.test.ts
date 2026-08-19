@@ -44,6 +44,7 @@ import {
   adminToolVerdict,
 } from '../../src/web/admin.ts';
 import { ensureConnectorHealthSchema } from '../../src/control/connector-health.ts';
+import { ensureConnectorLinkSchema } from '../../src/control/connector-pg.ts';
 import { TOOL_NAMES } from '../../src/mcp/tools/index.ts';
 import { createGateway } from '../consolidate/fixture.ts';
 import {
@@ -79,6 +80,12 @@ beforeAll(async () => {
   // `createControlPlane` applies `schema.sql` alone, so a suite that composes
   // past the entrypoint ensures for itself — as `app.test.ts` does beside it.
   await ensureConnectorHealthSchema(controlSql);
+  // And the link beside it, ensured by the same boot for the same reason.
+  // `fleet_status` joins it now: the fleet's connector verdict is decided from
+  // connected links first, because a health row outlives a disconnect and a
+  // verdict read from health alone would page on every source anybody ever
+  // removed.
+  await ensureConnectorLinkSchema(controlSql);
   await seedTenant(controlSql, TENANT);
 }, 60_000);
 
