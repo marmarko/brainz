@@ -26,11 +26,16 @@
 import { describe, expect, test } from 'bun:test';
 
 import type { ConnectorHealthView } from '../../src/control/connector-health.ts';
-import { statusFor, type PullHistory } from '../../src/web/connector-panel.ts';
-import { causeSentence } from '../../src/web/pages.ts';
+import type { ConnectorLinkView } from '../../src/control/connector-pg.ts';
+import { statusFor, type ConnectorStatus, type PullHistory } from '../../src/web/connector-panel.ts';
+import { causeSentence, renderPage } from '../../src/web/pages.ts';
 
 const NOW = new Date('2026-08-17T09:00:00.000Z');
 const EARLIER = new Date(NOW.getTime() - 3_600_000);
+const TWO_HOURS_AGO = new Date(NOW.getTime() - 2 * 3_600_000);
+const TEN_HOURS_AGO = new Date(NOW.getTime() - 10 * 3_600_000);
+const TWO_DAYS_AGO = new Date(NOW.getTime() - 48 * 3_600_000);
+const LAST_WEEK = new Date(NOW.getTime() - 7 * 24 * 3_600_000);
 
 function history(overrides: Partial<PullHistory> = {}): PullHistory {
   return {
@@ -39,6 +44,7 @@ function history(overrides: Partial<PullHistory> = {}): PullHistory {
     openAttempts: 0,
     openMaxAttempts: 0,
     openRunAt: null,
+    firstQueuedAt: LAST_WEEK,
     lastDoneAt: null,
     deadAt: null,
     deadCode: null,
@@ -46,6 +52,36 @@ function history(overrides: Partial<PullHistory> = {}): PullHistory {
     deadMaxAttempts: 0,
     ...overrides,
   };
+}
+
+/**
+ * {@link statusFor} against the clock this file shares.
+ *
+ * The resolution rule takes a `now` because staleness is a claim about elapsed
+ * time and a function that read the wall clock could not be tested for it. The
+ * cases below that are not about the clock say so by not restating it; the ones
+ * that are pass it explicitly.
+ */
+function panel(
+  source: string,
+  hist: PullHistory | undefined,
+  link: ConnectorLinkView = 'connected',
+  record: ConnectorHealthView | undefined = undefined,
+): ConnectorStatus {
+  return statusFor(source, hist, link, record, NOW);
+}
+
+/** The page a browser gets for one source, rendered from its status. */
+function dashboard(status: ConnectorStatus): string {
+  return renderPage({
+    kind: 'dashboard',
+    tier: 'internal',
+    status: 'ready',
+    tenantId: 'alice',
+    connectorsAvailable: true,
+    connectors: [status],
+    providers: [],
+  });
 }
 
 function health(overrides: Partial<ConnectorHealthView> = {}): ConnectorHealthView {
@@ -65,7 +101,7 @@ function health(overrides: Partial<ConnectorHealthView> = {}): ConnectorHealthVi
 
 describe('a lane that is retrying is not a lane that is checking', () => {
   test('an open row with attempts spent reads as retrying, and names the cause', () => {
-    const status = statusFor('gmail', history({ open: 1, openAttempts: 1 }), 'connected', health());
+    const status = panel('gmail', history({ open: 1, openAttempts: 1 }), 'connected', health());
     expect(status).toMatchObject({ state: 'retrying', cause: 'auth_expired' });
   });
 
@@ -74,7 +110,7 @@ describe('a lane that is retrying is not a lane that is checking', () => {
     // than "is there a health record": a first check has nothing to explain, and
     // a source that failed last week and is being polled again now must not
     // wear last week's code while this attempt is still running.
-    const status = statusFor(
+    const status = panel(
       'gmail',
       history({ open: 1, openAttempts: 0, lastDoneAt: EARLIER }),
       'connected',
@@ -88,7 +124,7 @@ describe('a lane that is retrying is not a lane that is checking', () => {
     // stopped retrying, `cause` is why the attempts failed. Collapsing them was
     // the original defect — the user was shown the first and told it was the
     // second.
-    const status = statusFor(
+    const status = panel(
       'gmail',
       history({ deadAt: NOW, deadCode: 'handler_error' }),
       'connected',
@@ -105,7 +141,7 @@ describe('a lane that is retrying is not a lane that is checking', () => {
     // A code on a source the user has removed is a red line with no control to
     // clear it — the same rule the dead-letter reading already followed.
     for (const link of ['absent', 'pending'] as const) {
-      expect(statusFor('gmail', history({ open: 1, openAttempts: 3 }), link, health())).toMatchObject(
+      expect(panel('gmail', history({ open: 1, openAttempts: 3 }), link, health())).toMatchObject(
         { cause: null, itemsFailed: 0 },
       );
     }
@@ -115,7 +151,7 @@ describe('a lane that is retrying is not a lane that is checking', () => {
     // The upgrade case. A connector last polled by a fleet older than
     // `control.connector_health` has a job row and no health row, and the panel
     // must degrade to what it used to say rather than invent a reason.
-    const status = statusFor('gmail', history({ open: 1, openAttempts: 2 }), 'connected', undefined);
+    const status = panel('gmail', history({ open: 1, openAttempts: 2 }), 'connected', undefined);
     expect(status).toMatchObject({ state: 'retrying', cause: null, itemsFailed: 0 });
     expect(causeSentence(status.cause)).toBeNull();
   });
@@ -124,7 +160,7 @@ describe('a lane that is retrying is not a lane that is checking', () => {
     // A `stopped` run completes its job — the cursor is held and the next tick
     // resumes it — so a poll that came back short leaves no failing lane at all.
     // This is the only place a user hears about it.
-    const status = statusFor(
+    const status = panel(
       'gmail',
       history({ lastDoneAt: NOW }),
       'connected',
@@ -138,7 +174,7 @@ describe('a lane that is retrying is not a lane that is checking', () => {
   });
 
   test('the job code is used only when no run recorded one', () => {
-    const unreachable = statusFor(
+    const unreachable = panel(
       'gmail',
       history({ open: 1, openAttempts: 1 }),
       'connected',
@@ -149,7 +185,7 @@ describe('a lane that is retrying is not a lane that is checking', () => {
     // And the run's own code wins when there is one. `handler_error` beside an
     // ingest code is the runner saying "a handler threw", which is true and is
     // not the answer anybody wants.
-    const refused = statusFor(
+    const refused = panel(
       'gmail',
       history({ open: 1, openAttempts: 1 }),
       'connected',
@@ -237,7 +273,7 @@ describe('the copy tells the user what to do, and only when there is something',
  */
 describe('the three worlds a failing connector can be in', () => {
   test('a lane stopped below its budget reads as blocked, not as one that gave up', () => {
-    const status = statusFor(
+    const status = panel(
       'gmail',
       history({ deadAt: NOW, deadCode: 'handler_error', deadAttempts: 1, deadMaxAttempts: 12 }),
       'connected',
@@ -247,7 +283,7 @@ describe('the three worlds a failing connector can be in', () => {
   });
 
   test('a lane that reached its budget reads as failing, and carries the count', () => {
-    const status = statusFor(
+    const status = panel(
       'gmail',
       history({ deadAt: NOW, deadCode: 'handler_error', deadAttempts: 12, deadMaxAttempts: 12 }),
       'connected',
@@ -266,7 +302,7 @@ describe('the three worlds a failing connector can be in', () => {
     // `run_at` on the open row and nothing inferred, so the panel can only say
     // it when the queue has actually written one.
     const soon = new Date(NOW.getTime() + 30 * 60_000);
-    const status = statusFor(
+    const status = panel(
       'gmail',
       history({ open: 1, openAttempts: 2, openMaxAttempts: 12, openRunAt: soon }),
       'connected',
@@ -286,7 +322,7 @@ describe('the three worlds a failing connector can be in', () => {
     // be the `retrying`-for-`checking` confusion in a second place: a user
     // told their working first check has a retry scheduled reads that as
     // something having already gone wrong.
-    const status = statusFor(
+    const status = panel(
       'gmail',
       history({ open: 1, openAttempts: 0, openMaxAttempts: 12, openRunAt: NOW }),
       'connected',
@@ -296,7 +332,7 @@ describe('the three worlds a failing connector can be in', () => {
   });
 
   test('a healthy lane offers no attempt count and no next attempt', () => {
-    const status = statusFor('gmail', history({ lastDoneAt: EARLIER }), 'connected', undefined);
+    const status = panel('gmail', history({ lastDoneAt: EARLIER }), 'connected', undefined);
     expect(status).toMatchObject({
       state: 'connected',
       nextAttemptAt: null,
@@ -308,12 +344,146 @@ describe('the three worlds a failing connector can be in', () => {
   test('a dead-lettered lane on a source the user removed is still not a red line', () => {
     // The `blocked` reading must not escape the link check either: a source that
     // was disconnected has no state worth alarming anybody about.
-    const status = statusFor(
+    const status = panel(
       'gmail',
       history({ deadAt: NOW, deadCode: 'handler_error', deadAttempts: 1, deadMaxAttempts: 12 }),
       'absent',
       health(),
     );
     expect(status).toMatchObject({ state: 'absent', cause: null });
+  });
+});
+
+/**
+ * **The ten-hour silence, at the surface that told the lie.**
+ *
+ * Every connector on a brain stopped importing for roughly ten hours and the
+ * dashboard rendered as usual, because each of the three clocks a reader could
+ * reach kept moving: a halted pull returns `stopped`, a stopped run is not
+ * thrown on, so its job completed and `finished_at` advanced; `last_attempt_at`
+ * is stamped on every attempt; and `items_failed` stayed at zero because both
+ * halt paths break out of the item loop before anything is counted as lost.
+ *
+ * The panel read the queue, found a completed job minutes old, and printed
+ * *"Connected. Last checked 12:04."* — and then suppressed the cause it was
+ * holding, because that clause was gated on `itemsFailed > 0`, a counter that is
+ * zero by construction on exactly the runs that need explaining.
+ *
+ * So these cases assert the page, not the struct. A case that asserted
+ * `statusFor` returned some field would have passed while the sentence stayed
+ * wrong.
+ */
+describe('the ten-hour silence, on the page', () => {
+  /** The incident's own row: minutes since the last attempt, ten hours since the last success. */
+  function silent(): ConnectorStatus {
+    return statusFor(
+      'gmail',
+      history({ lastDoneAt: new Date(NOW.getTime() - 5 * 60_000), firstQueuedAt: LAST_WEEK }),
+      'connected',
+      health({
+        runOutcome: 'stopped',
+        ingestFailureCode: 'budget_exhausted',
+        lastSuccessAt: TEN_HOURS_AGO,
+        // Zero, exactly as the live row read. This is the field the old copy
+        // gated the cause on.
+        itemsFailed: 0,
+      }),
+      NOW,
+    );
+  }
+
+  test('THE CASE: a connector that has imported nothing for ten hours is not rendered as connected', () => {
+    const status = silent();
+    // The queue still says the last job finished five minutes ago, and that is
+    // true. It is simply not the question anybody was asking.
+    expect(status).toMatchObject({ state: 'connected', freshness: 'stale' });
+
+    const page = dashboard(status);
+    // The sentence the page used to be, in full. If this ever matches again, the
+    // ten hours are back.
+    expect(page).not.toMatch(/<p>Connected\. Last checked <time[^>]*>[^<]*<\/time>\.<\/p>/);
+    expect(page).toContain('Nothing has been imported since');
+    expect(page).toContain(TEN_HOURS_AGO.toISOString());
+  });
+
+  test('and the cause it was holding the whole time is printed', () => {
+    // The suppression, in one clause: `itemsFailed <= 0` hid the cause on
+    // precisely the runs that produce no failed items. `connector_health`'s own
+    // CHECK constraint says a completed run may name no cause — so a cause that
+    // is present at all IS the evidence that the last run did not complete, and
+    // no counter needs to agree with it.
+    const page = dashboard(silent());
+    expect(page).toContain('spending cap stopped the import');
+  });
+
+  test('a connector that has never once succeeded says so rather than counting from nothing', () => {
+    const status = statusFor(
+      'gmail',
+      history({ lastDoneAt: EARLIER, firstQueuedAt: LAST_WEEK }),
+      'connected',
+      health({ runOutcome: 'stopped', ingestFailureCode: 'embed_unavailable', lastSuccessAt: null }),
+      NOW,
+    );
+    expect(status.freshness).toBe('never_succeeded');
+    expect(dashboard(status)).toContain('No check has ever finished importing anything');
+  });
+
+  test('a connector nothing has polled since it last worked names the fleet, not the user', () => {
+    // The dead-scheduler cell. The last attempt COMPLETED, so nothing is
+    // failing and there is nothing for the user to do — which is the sentence.
+    const status = statusFor(
+      'gmail',
+      history({ lastDoneAt: TWO_DAYS_AGO, firstQueuedAt: LAST_WEEK }),
+      'connected',
+      health({ runOutcome: 'completed', ingestFailureCode: null, lastSuccessAt: TWO_DAYS_AGO }),
+      NOW,
+    );
+    expect(status.freshness).toBe('unattended');
+    expect(dashboard(status)).toContain('Nothing has checked this source since');
+  });
+
+  test('and the healthy page is left exactly as quiet as it was', () => {
+    // The other half of the error budget. A staleness banner on a working
+    // connector is how the banner stops being read, so the same render must be
+    // silent when the clock is fine — including across a two-hour deploy gap,
+    // which is a completed run with an old success and nothing wrong.
+    const working = statusFor(
+      'gmail',
+      history({ lastDoneAt: EARLIER, firstQueuedAt: LAST_WEEK }),
+      'connected',
+      health({ runOutcome: 'completed', ingestFailureCode: null, lastSuccessAt: EARLIER }),
+      NOW,
+    );
+    expect(working.freshness).toBe('current');
+    const page = dashboard(working);
+    expect(page).toContain('Connected. Last checked');
+    expect(page).not.toContain('Nothing has been imported since');
+    expect(page).not.toContain('class="failing"');
+
+    const acrossADeploy = statusFor(
+      'gmail',
+      history({ lastDoneAt: TWO_HOURS_AGO, firstQueuedAt: LAST_WEEK }),
+      'connected',
+      health({ runOutcome: 'completed', ingestFailureCode: null, lastSuccessAt: TWO_HOURS_AGO }),
+      NOW,
+    );
+    expect(acrossADeploy.freshness).toBe('current');
+    expect(dashboard(acrossADeploy)).not.toContain('Nothing has been imported since');
+  });
+
+  test('a source the user disconnected is never called stale, however old its health row', () => {
+    // Nothing deletes a health row on disconnect — the foreign key is to the
+    // tenant, not to the link. A staleness reading that skipped the link check
+    // would paint a permanent red line on a source somebody removed, with no
+    // control anywhere on the page to clear it.
+    const removed = statusFor(
+      'gmail',
+      history({ lastDoneAt: LAST_WEEK, firstQueuedAt: LAST_WEEK }),
+      'absent',
+      health({ runOutcome: 'stopped', lastSuccessAt: LAST_WEEK }),
+      NOW,
+    );
+    expect(removed).toMatchObject({ state: 'absent', freshness: 'not_connected', lastSuccessAt: null });
+    expect(dashboard(removed)).not.toContain('Nothing has been imported since');
   });
 });

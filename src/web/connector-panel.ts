@@ -60,6 +60,7 @@ import type { SQL } from 'bun';
 
 import { causeOf, readConnectorHealth, type ConnectorHealthView } from '../control/connector-health.ts';
 import type { ConnectorLinkView } from '../control/connector-pg.ts';
+import { freshnessOf, type ConnectorFreshness } from '../control/connector-staleness.ts';
 
 /**
  * What the panel knows, in seven values.
@@ -112,6 +113,29 @@ export interface ConnectorStatus {
   readonly state: ConnectorPanelState;
   /** The last completed check, or the moment the lane died. Null when neither. */
   readonly lastCheckedAt: Date | null;
+  /**
+   * Whether anything is actually arriving, on the second axis
+   * ({@link import('../control/connector-staleness.ts').ConnectorFreshness}).
+   *
+   * **The state above cannot answer this and it is not a near miss.** Every
+   * member of {@link ConnectorPanelState} is derived from row existence and
+   * counters: is a job open, did one die, is a link live. During the ten hours
+   * this fleet imported nothing, all of those read exactly as they do on a
+   * healthy brain — the halted pulls completed their jobs — so the panel state
+   * was `connected` the whole time and was right to be. Freshness is the
+   * orthogonal reading, off `last_success_at`, and it is what turns "a check
+   * finished five minutes ago" into "and it has imported nothing since
+   * yesterday".
+   */
+  readonly freshness: ConnectorFreshness;
+  /**
+   * When an attempt last actually completed, which is not when one last ran.
+   *
+   * Null on a source that is not connected, whatever its health row says: the
+   * record outlives a disconnect, and a success time from a connection the user
+   * removed is a clock nothing on the page can clear.
+   */
+  readonly lastSuccessAt: Date | null;
   /**
    * The **queue's** code for the lane's death: `handler_error`,
    * `tenant_unavailable`, `lease_stolen`. Present on `failing` only.
@@ -186,6 +210,19 @@ export interface PullHistory {
   readonly openMaxAttempts: number;
   /** When the open row becomes claimable. The queue's `run_at`, unmodified. */
   readonly openRunAt: Date | null;
+  /**
+   * When a pull for this source was **first** enqueued, over every row the queue
+   * still holds.
+   *
+   * The only thing it decides is whether a connector that has never once
+   * succeeded is still inside its first window or is a connector that has never
+   * worked — and that question has no clock anywhere else, because
+   * `connector_health` keeps one row per source and overwrites it. It is a floor
+   * rather than the connection's age (a reconnect reuses the link and mints new
+   * jobs), and a floor is the conservative direction here: it expires the grace
+   * earlier, so the reading errs towards saying something.
+   */
+  readonly firstQueuedAt: Date | null;
   readonly lastDoneAt: Date | null;
   readonly deadAt: Date | null;
   readonly deadCode: string | null;
@@ -216,8 +253,9 @@ export interface PullHistory {
 export function statusFor(
   source: string,
   history: PullHistory | undefined,
-  link: ConnectorLinkView = 'absent',
-  health: ConnectorHealthView | undefined = undefined,
+  link: ConnectorLinkView,
+  health: ConnectorHealthView | undefined,
+  now: Date,
 ): ConnectorStatus {
   // A success after the dead-lettering clears it. See the header.
   const stillDead =
@@ -227,6 +265,20 @@ export function statusFor(
 
   const cause = causeOf(health);
   const itemsFailed = health?.itemsFailed ?? 0;
+
+  // **The clock is an argument, and every parameter above is now required.** A
+  // resolution rule that read the wall clock itself could not be tested for the
+  // one property this whole reading exists to have — that ten hours of failing
+  // polls stop reading as healthy — and the defaults that used to sit on `link`
+  // and `health` are what would have let a fifth argument be forgotten at a call
+  // site rather than refused by the compiler.
+  const freshness = freshnessOf({
+    source,
+    link,
+    attempt: health,
+    attemptingSince: history?.firstQueuedAt ?? null,
+    now,
+  });
 
   // **Only while the link is live.** A dead letter that outlived a disconnect
   // would paint a red line on a source the user has removed, and the only way
@@ -252,6 +304,8 @@ export function statusFor(
       history.deadAttempts < history.deadMaxAttempts;
     return {
       source,
+      freshness: freshness.state,
+      lastSuccessAt: freshness.lastSuccessAt,
       state: stoppedEarly ? 'blocked' : 'failing',
       lastCheckedAt: history.deadAt,
       failureCode: history.deadCode,
@@ -271,6 +325,8 @@ export function statusFor(
     // with no control to clear it.
     return {
       source,
+      freshness: freshness.state,
+      lastSuccessAt: freshness.lastSuccessAt,
       state: link === 'pending' ? 'pending' : 'absent',
       lastCheckedAt: null,
       failureCode: null,
@@ -288,6 +344,8 @@ export function statusFor(
     const retrying = history.openAttempts > 0;
     return {
       source,
+      freshness: freshness.state,
+      lastSuccessAt: freshness.lastSuccessAt,
       state: retrying ? 'retrying' : 'checking',
       lastCheckedAt: history.lastDoneAt,
       failureCode: null,
@@ -308,6 +366,8 @@ export function statusFor(
   if (history !== undefined && history.lastDoneAt !== null) {
     return {
       source,
+      freshness: freshness.state,
+      lastSuccessAt: freshness.lastSuccessAt,
       state: 'connected',
       lastCheckedAt: history.lastDoneAt,
       failureCode: null,
@@ -327,6 +387,8 @@ export function statusFor(
   // for as long as half an hour after they authorize, and the copy says so.
   return {
     source,
+    freshness: freshness.state,
+    lastSuccessAt: freshness.lastSuccessAt,
     state: 'attached',
     lastCheckedAt: null,
     failureCode: null,
@@ -353,6 +415,13 @@ export async function connectorStatuses(
     readonly tenantId: string;
     readonly sources: readonly string[];
     readonly links?: ReadonlyMap<string, ConnectorLinkView>;
+    /**
+     * The instant the page is rendered at. Required rather than defaulted,
+     * because staleness is the one reading here that is a claim about elapsed
+     * time — and a default would have been the quiet way for a caller to get a
+     * clock nobody chose.
+     */
+    readonly now: Date;
   },
 ): Promise<readonly ConnectorStatus[]> {
   const rows = await controlSql<
@@ -362,6 +431,7 @@ export async function connectorStatuses(
       open_attempts: number;
       open_max_attempts: number;
       open_run_at: Date | null;
+      first_queued_at: Date | null;
       last_done_at: Date | null;
       dead_at: Date | null;
       dead_code: string | null;
@@ -385,6 +455,13 @@ export async function connectorStatuses(
            -- started, which rendered as a next attempt would be a time in the
            -- past.
            min(run_at) FILTER (WHERE state = 'due')                        AS open_run_at,
+           -- Over every row, filtered by nothing: the question it answers is
+           -- "how long has this source been being polled at all", and a
+           -- connector that has never succeeded has no done row to date from.
+           -- created_at rather than run_at because backoff moves the second one
+           -- forward, so a lane that has been retrying for a day would date
+           -- itself from its next attempt.
+           min(created_at)                                                 AS first_queued_at,
            max(finished_at) FILTER (WHERE state = 'done')                  AS last_done_at,
            max(dead_lettered_at) FILTER (WHERE state = 'dead')             AS dead_at,
            (array_agg(failure_code::text ORDER BY dead_lettered_at DESC)
@@ -415,6 +492,7 @@ export async function connectorStatuses(
       openAttempts: row.open_attempts,
       openMaxAttempts: row.open_max_attempts,
       openRunAt: row.open_run_at,
+      firstQueuedAt: row.first_queued_at,
       lastDoneAt: row.last_done_at,
       deadAt: row.dead_at,
       deadCode: row.dead_code,
@@ -428,6 +506,7 @@ export async function connectorStatuses(
       byTarget.get(source),
       request.links?.get(source) ?? 'absent',
       health.get(source),
+      request.now,
     ),
   );
 }

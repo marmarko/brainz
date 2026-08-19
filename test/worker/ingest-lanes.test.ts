@@ -438,6 +438,10 @@ describe('a failed poll is diagnosable', () => {
       tenantId: TENANT,
       sources: ['gmail'],
       links: new Map([['gmail', 'connected']]),
+      // The instant this fixture's whole run is dated from, so the staleness
+      // reading is judged against the same clock the queue rows were written
+      // under rather than against whenever the suite happens to reach here.
+      now: NOW,
     });
   }
 

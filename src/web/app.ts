@@ -2107,6 +2107,11 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
             tenantId,
             sources: CONNECTOR_SOURCES,
             links: await readConnectorLinks(deps.controlSql, { tenantId, now: now() }),
+            // The same clock the link read is judged against. Staleness is the
+            // one thing on this panel that is a claim about elapsed time, and
+            // the two readings disagreeing by a request's worth of drift is a
+            // page that contradicts itself.
+            now: now(),
           })
         : [];
       return html(

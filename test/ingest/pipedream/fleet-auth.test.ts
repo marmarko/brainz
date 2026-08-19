@@ -151,6 +151,12 @@ function dashboardFor(overrides: Partial<ConnectorStatus>): string {
     source: 'gmail',
     state: 'blocked',
     lastCheckedAt: NOW,
+    // This file is about which instruction each CAUSE earns, so the freshness
+    // axis is pinned to the reading that adds no sentence of its own. A stale
+    // connector renders an extra clause, and a clause this file did not put
+    // there is a clause its regexes would be judging by accident.
+    freshness: 'current',
+    lastSuccessAt: NOW,
     failureCode: null,
     cause: null,
     itemsFailed: 0,

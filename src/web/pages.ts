@@ -422,6 +422,75 @@ function lossSentence(status: ConnectorStatus): string {
 }
 
 /**
+ * **Whether anything is arriving, which is the question the rest of this panel
+ * could not ask.**
+ *
+ * Every other sentence here is built from the queue: a job is open, one died, a
+ * lane is on attempt three. During the ten hours this fleet imported nothing,
+ * every one of those read as it does on a healthy brain — a pull that halts
+ * returns `stopped`, a stopped run is deliberately not thrown on, so its job
+ * *completed* — and the panel printed *"Connected. Last checked 12:04."* over a
+ * connector that had imported nothing since breakfast. The clock that had
+ * stopped was `last_success_at`, and nothing on this page read it.
+ *
+ * **An instant, never a duration.** The rule that makes {@link moment} ISO
+ * applies twice over here: the server renders once and the page is read at an
+ * unknown later time, so *"nothing for ten hours"* is a number that starts
+ * lying the moment it is sent — and it is the number a worried person would
+ * quote back. The comparison against the threshold is safe to do server-side
+ * because it compares two instants; the rendered string says *since when*.
+ *
+ * Silent on the readings that are not a claim: a working connector, a single
+ * refused poll, a source still inside its first window, a source nobody has
+ * connected. A staleness banner on a healthy brain is how the banner stops being
+ * read, and this page only gets one chance at being believed.
+ */
+function stalenessSentence(status: ConnectorStatus): string {
+  switch (status.freshness) {
+    case 'stale':
+      return status.lastSuccessAt === null
+        ? ''
+        : ` <strong>Nothing has been imported since ${moment(status.lastSuccessAt)}</strong>, which is` +
+            ` longer than a check should ever take.`;
+    case 'never_succeeded':
+      // Deliberately not a duration and not a clock: there is no success to
+      // count from, which is the whole of what this state says. "It has failed
+      // since March" and "it has never worked once" are different emergencies.
+      //
+      // And deliberately no instruction. Which remedy is right depends entirely
+      // on the cause — reconnecting fixes a withdrawn permission and wastes a
+      // trip to the provider on an exhausted spend cap or on a credential of
+      // ours — and {@link causeSentence} is printed beside this and already
+      // says the right one. A second instruction here would be the panel giving
+      // the same advice to everybody again, which is the defect that copy was
+      // written to end.
+      return ` <strong>No check has ever finished importing anything from this source.</strong>`;
+    case 'unattended':
+      // The last attempt COMPLETED — nothing is failing, nothing is even being
+      // tried. There is no action for the user in it, so none is asked of them.
+      return status.lastSuccessAt === null
+        ? ''
+        : ` <strong>Nothing has checked this source since ${moment(status.lastSuccessAt)}.</strong>` +
+            ` That is ours, not yours.`;
+    case 'current':
+    case 'slipping':
+    case 'starting':
+    case 'unpolled':
+    case 'not_connected':
+      return '';
+  }
+}
+
+/** Whether the freshness reading is one the page should paint as a problem. */
+function readsAsBroken(status: ConnectorStatus): boolean {
+  return (
+    status.freshness === 'stale' ||
+    status.freshness === 'never_succeeded' ||
+    status.freshness === 'unattended'
+  );
+}
+
+/**
  * How far along the ladder this lane is, when the queue can say.
  *
  * Silent when either number is missing — a lane polled by a fleet older than the
@@ -505,21 +574,38 @@ function connectorStatusSentence(status: ConnectorStatus): string {
         `${ladderSentence(status)}` +
         `${cause === null ? '' : ` ${cause}`}` +
         `${lossSentence(status)}` +
+        // A retrying lane says how this attempt is going. It does not say how
+        // long it has been since one worked, and a user reading "it is trying
+        // again on its own" has no way to tell a lane four minutes into a
+        // backoff from one that has been saying it since yesterday.
+        `${stalenessSentence(status)}` +
         `${status.lastCheckedAt === null ? '' : ` The last check that finished was ${moment(status.lastCheckedAt)}.`}` +
         `</p>`
       );
     case 'checking':
       return (
-        `<p>Connected. A check is queued or running now` +
-        `${status.lastCheckedAt === null ? ', and none has finished yet' : `; last checked ${moment(status.lastCheckedAt)}`}.</p>`
+        `<p${readsAsBroken(status) ? ' class="failing"' : ''}>Connected. A check is queued or running now` +
+        `${status.lastCheckedAt === null ? ', and none has finished yet' : `; last checked ${moment(status.lastCheckedAt)}`}.` +
+        // A queued check says nothing about whether the last several worked. A
+        // lane can be checking every half hour and importing nothing all week.
+        `${stalenessSentence(status)}</p>`
       );
     case 'connected':
       return (
-        `<p>Connected. Last checked ${status.lastCheckedAt === null ? 'at an unrecorded time' : moment(status.lastCheckedAt)}.` +
-        // A `stopped` or `refused` run completes its job — the cursor is held and
-        // the next tick resumes it — so this is the one place a user is told
-        // that the last check came back short rather than empty.
-        `${cause === null || status.itemsFailed <= 0 ? '' : ` ${cause}`}${lossSentence(status)}</p>`
+        `<p${readsAsBroken(status) ? ' class="failing"' : ''}>Connected. Last checked ${status.lastCheckedAt === null ? 'at an unrecorded time' : moment(status.lastCheckedAt)}.` +
+        // **The clause that used to be gated on `itemsFailed > 0`, and the gate
+        // is what hid the ten hours.** A halted run's failed-item count is zero
+        // by construction — the halt breaks out of the loop before anything is
+        // counted as lost — so the cause was suppressed on exactly the runs it
+        // existed to explain.
+        //
+        // No counter is consulted now, and none is needed: `connector_health`'s
+        // own CHECK constraint says a completed run may name no cause, so a
+        // cause that is present at all IS the evidence that the last run did not
+        // complete. A `stopped` or `refused` run completes its *job* — the
+        // cursor is held and the next tick resumes it — so this stays the one
+        // place a user is told that a check came back short rather than empty.
+        `${stalenessSentence(status)}${cause === null ? '' : ` ${cause}`}${lossSentence(status)}</p>`
       );
     // The half hour between authorizing and the first poll, said out loud. A
     // user who is told only "connected" and then sees nothing arrive concludes
