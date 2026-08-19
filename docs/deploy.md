@@ -775,7 +775,7 @@ the top every attempt — because at current phase costs it is seconds:
 | phase | shape of its cost | measured |
 |---|---|---|
 | `dedup` | one read, plus one write per collapse | — |
-| `link_reconcile` | one batched name resolution per **500 names** + one diff write per **500 edges**, so per **pass** | 7 cold / 4 warm on a 240-fact fixture, down from 8.42 per live fact |
+| `link_reconcile` | one batched name resolution per **500 names** + one diff write per **500 edges**, so per **pass** — **plus an unbatched widen sequence (~5 + 2·degree round trips) for every entity whose origin set grows in that pass** | 7 cold / 4 warm on a 240-fact fixture, down from 8.42 per live fact. A second connector's first pass over a corpus the brain already knows costs `5·entities + 4·edges` and is the one shape that still overruns an attempt |
 | `staleness` | one read per batch of superseded pages | — |
 | `entity_merge` | one read, plus a few writes per merge | — |
 | `salience` | one read + one write per **500 pages** | 24 round trips on that brain, down from 11,217 |

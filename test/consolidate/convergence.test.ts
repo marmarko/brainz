@@ -239,6 +239,13 @@ describe('the deterministic prefix fits one attempt at the current phase costs',
       // rate itself is pinned in its own test at the bottom of this file, which
       // is where the arithmetic back to a 5,608-page brain is written out.
       const facts = await countRows(tenant.sql, 'fact', 'superseded_by IS NULL');
+      // `facts / 4` is sound only for a pass in which no entity's origin set
+      // grows, and this fixture structurally cannot widen — cold creates
+      // everything, warm and grown change no origins. So this bound has no
+      // teeth against the one shape that still costs per fact:
+      // `5·W + 2·Σdegree(W)` for the W entities whose origins grow. That is
+      // measured and disclosed in docs/deploy.md rather than asserted here,
+      // because a bound this fixture cannot violate is not a guard.
       expect(cost.get('link_reconcile')).toBeLessThanOrEqual(facts / 4);
 
       // **The whole prefix, end to end, through the cycle the fleet runs.** One

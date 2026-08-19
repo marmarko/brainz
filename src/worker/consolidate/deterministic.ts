@@ -287,7 +287,14 @@ export const RECONCILE_EDGE_BATCH = 500;
  * is resolved, so they are resolved as a set
  * (`write/links.ts:resolveOrCreateEntities`); the diff's removals and insertions
  * are set-based writes. What is left is a handful of statements per pass plus one
- * per {@link RECONCILE_EDGE_BATCH}, and the per-fact term is gone — which is the
+ * per {@link RECONCILE_EDGE_BATCH}. The per-fact term is gone **for a pass in
+ * which no entity's origin set grows** — which is every steady-state pass, and
+ * is not the pass where a second connector meets a corpus this brain already
+ * knows. There `widenEntityOrigins` still runs unbatched, `5 + 2·degree` round
+ * trips per widened entity, and that is the one shape that can still overrun an
+ * attempt. Stated rather than buried because the measurement that reassured
+ * everyone last time was taken on the one fixture that structurally cannot
+ * widen — which is the
  * property `test/consolidate/convergence.test.ts` asserts, by doubling the corpus
  * and watching the statement count stand still.
  */
