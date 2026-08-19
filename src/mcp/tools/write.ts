@@ -131,8 +131,11 @@ export const forget: Handler = async (ctx, args) => {
   const raw = stringArg(args, 'id');
   if (raw === null) return invalid('forget needs an `id`.');
 
+  // Same rule as `recall({id})`: the schema declares `id` as a plain string, so
+  // an id this brain never issued is `not_found` however it is malformed. A
+  // missing `id` above stays `invalid_params` — that one the schema does reject.
   const parsed = parseId(raw);
-  if (parsed === null) return invalid(`\`${raw}\` is not a record id this brain issued.`);
+  if (parsed === null) return { ok: false, code: 'not_found', message: 'No such record.' };
 
   const outcome = await forgetRecord(ctx.sql, { id: parsed, grant: ctx.grant, now: ctx.now });
   if (!outcome.ok) {

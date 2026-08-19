@@ -293,7 +293,10 @@ describe('the same identity gets the same answers through /mcp and /openai', () 
       for (const [id, expected] of [
         [outOfGrant, 'scope_denied'],
         [absent, 'not_found'],
-        ['not-an-id', 'invalid_params'],
+        // Unparseable is `not_found` too, on both surfaces: the schema declares
+        // `id` as a plain string, so a caller's string is never the wrong type
+        // — only an id this brain never issued. See `forget.test.ts`.
+        ['not-an-id', 'not_found'],
       ] as const) {
         const viaFetch = await fixture.call(
           'fetch',

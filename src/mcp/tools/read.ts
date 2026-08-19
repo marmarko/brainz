@@ -121,8 +121,17 @@ export const recall: Handler = async (ctx, args) => {
 
 /** `recall({id})` — the whole-record read, in the ranked read's shape. */
 async function recallById(ctx: ToolContext, rawId: string): Promise<HandlerOutcome> {
+  // **`not_found`, not `invalid_params`, and the schema is why.** `recall`
+  // declares `id` as a plain `string` with no pattern: the id grammar is
+  // deliberately unpublished, because ids are minted here and a caller able to
+  // construct one would be addressing rows rather than quoting them back. A
+  // caller's string is therefore never the wrong *type* — whether it names a
+  // record is a lookup, and a lookup that finds nothing is `not_found`.
+  // Answering `invalid_params` published the grammar in the vocabulary reserved
+  // for parameters the schema itself rejects, and split one fact the caller
+  // cannot act on differently into two codes it would branch on.
   const parsed = parseId(rawId);
-  if (parsed === null) return invalid(`\`${rawId}\` is not a record id this brain issued.`);
+  if (parsed === null) return { ok: false, code: 'not_found', message: 'No such record.' };
 
   const outcome = await fetchRecord(ctx.sql, ctx.grant, parsed);
   if (outcome.status !== 'ok') {

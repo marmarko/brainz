@@ -137,10 +137,33 @@ describe('forget is a tombstone', () => {
     expect((second.content as { cascade: Record<string, number> }).cascade.chunks).toBe(0);
   }, TEST_TIMEOUT_MS);
 
-  test('an unknown id is not_found and a malformed one is invalid_params', async () => {
-    expect((await fixture.call('forget', { id: 'chunk:999999999' })).error?.code).toBe('not_found');
-    expect((await fixture.call('forget', { id: 'chunk:not-a-number' })).error?.code).toBe('invalid_params');
-    expect((await fixture.call('forget', { id: 'nonsense' })).error?.code).toBe('invalid_params');
+  /**
+   * **An id this brain never issued is `not_found`, however it is malformed.**
+   *
+   * This used to split three ways: `chunk:999999999` was `not_found` and
+   * `chunk:not-a-number` was `invalid_params`. The split was grammar leakage.
+   * `forget`'s schema declares `id` as a plain `string` with no pattern — the
+   * grammar is deliberately unpublished, because ids are minted here and a
+   * caller that could construct one would be addressing rows rather than
+   * quoting them back. So a caller's string is never the wrong *type*; whether
+   * it names a record is a lookup, and a lookup that finds nothing is
+   * `not_found`. Reporting the grammar violation separately told a caller
+   * exactly which shapes brainz parses, in the vocabulary reserved for
+   * parameters the schema itself rejects.
+   *
+   * From the caller's side "that is not one of my ids" and "I have no such id"
+   * are the same fact and have the same fix, which is what the suggestion says.
+   *
+   * A MISSING `id` is still `invalid_params` — the schema marks it required, so
+   * that one really is a parameter error, and the two halves are pinned
+   * together here so the collapse cannot go one step too far.
+   */
+  test('an id this brain never issued is not_found, however it is malformed', async () => {
+    for (const id of ['chunk:999999999', 'chunk:not-a-number', 'nonsense']) {
+      const refused = await fixture.call('forget', { id });
+      expect(refused.error?.code, id).toBe('not_found');
+    }
+    expect((await fixture.call('forget', {})).error?.code).toBe('invalid_params');
   }, TEST_TIMEOUT_MS);
 });
 
