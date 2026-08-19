@@ -1,0 +1,393 @@
+/**
+ * What a brain holds, as counts — the read behind `/dashboard?view=coverage`.
+ *
+ * ===========================================================================
+ * THE GAP THIS CLOSES
+ * ===========================================================================
+ *
+ * The dashboard rendered the plumbing and nothing else: plan, connect link,
+ * connected accounts, a key form, a spend note. A user who connected three
+ * accounts and waited a week had exactly one way to learn whether any of it
+ * worked — ask the assistant something and judge the answer. That is why a
+ * ten-hour ingest outage and a multi-day consolidation freeze were both found by
+ * somebody reading SQL rather than by the person they were happening to.
+ *
+ * The connector panel could not have caught either, and the reason is worth
+ * stating because it is the argument for opening a tenant database at all:
+ * `control.connector_health` records *attempts*, and during the outage every
+ * attempt completed — so the panel said `connected` and was right to. Arrivals
+ * exist only in the tenant's own database. This is the reading of arrivals.
+ *
+ * ===========================================================================
+ * THE PRIVACY LINE, WHICH IS THE SHARP PART, AND WHERE IT IS ENFORCED
+ * ===========================================================================
+ *
+ * This is the first surface in the product that deliberately shows
+ * content-derived information back to its owner. It is legitimate — it is their
+ * brain, behind their session — but it means the rule has to be written where
+ * the next person edits, and it is this:
+ *
+ *   **Counts, closed-vocabulary codes, and instants. No names, no titles, no
+ *   statements — including the user's own.**
+ *
+ * `control.connector_health` states the same rule for failures ("a failure
+ * reason is a code and a timestamp, not a subject line") and `src/mcp/panel.ts`
+ * states it for the panel view. Four arguments carry it here:
+ *
+ *   1. **A title is the most dangerous string in the system.** `src/mcp/reads.ts`
+ *      says why: a title is row content and a mail subject is attacker-authored.
+ *      A page listing recent document titles renders strings a stranger chose.
+ *   2. **This page's job is to be looked at.** It gets screenshotted into support
+ *      threads, cast to a meeting-room display, left open on a desk. A count
+ *      survives all three; a list of forty names does not — and it is the
+ *      *aggregation* that does the damage, because any one name is in the user's
+ *      mail anyway while this page would be the only artifact that renders their
+ *      whole address book in one screenful.
+ *   3. **The web session carries no grant.** Every content read in this system is
+ *      fenced by origin: MCP reads carry a `Grant`, `fenceRow` is a subset rule.
+ *      `app.ts` is explicit that a session is admission to *ledgers* — records of
+ *      shape — precisely because a whole-brain unfenced listing is not something
+ *      a cookie should reach. Counts and codes stay on the ledger side of that
+ *      line. Names cross it, and would make this the product's first fence-free
+ *      content read.
+ *   4. **The useful half is a different product.** "Your brain knows 340 people"
+ *      answers *is it working*. "Here are their names" answers *what does it know
+ *      about Alice*, which is retrieval — it needs a fence, a grant and
+ *      pagination that this page has none of. The assistant is that product.
+ *
+ * So every field on {@link CoverageView} is a number, an instant, or a string
+ * from a set the schema declares in a CHECK. `origin_context` is the one string
+ * that looks like content and is not: it is `<class>:<source>` — the U18 context
+ * class and one of three schema-declared source labels — carrying no address, no
+ * display name and no account key, and it is already on the connectors panel and
+ * already what `/api/severance` demands as its own echo.
+ *
+ * A consequence, deliberately taken: the entity histogram is **not** broken down
+ * per origin. A count of one is a name — "1 person, from work:mail, first arrival
+ * 14:32" is a fingerprint — and a cross-tab is where cells go to one.
+ *
+ * ===========================================================================
+ * WHY EACH NUMBER IS AFFORDABLE, WHICH IS NOT THE SAME AS "SMALL"
+ * ===========================================================================
+ *
+ * This is a page load, not a report, and it runs against a database that may be
+ * cold. Every statement below either matches a partial index's predicate exactly
+ * or is bounded by a table that stays small:
+ *
+ *   * per-origin documents  → `page_live_by_origin` (v2:261), predicate matched;
+ *   * documents behind      → `page_ingested_live` (v3:533), a range scan;
+ *   * the run record        → primary-key backward scan, one row;
+ *   * facts                 → `fact_by_derivation` (v3:536) plus a heap recheck
+ *                             for `quarantined_at`, bounded by live facts;
+ *   * entities by type      → a sequential scan of `entity`, which is the one
+ *                             small table this page makes hot, and the number to
+ *                             watch if it ever stops being small;
+ *   * edges / contradictions / review → partial indexes whose predicates match.
+ *
+ * **What is deliberately not here.** `sourceStaleness` (`src/ingest/log.ts`) is
+ * the richest per-source view in the system and it is a `GROUP BY` over the whole
+ * of `ingest_log`, which has no indexes at all and holds one row per item — the
+ * fastest-growing table in the tenant. Chunk-level embed backlog is worse and is
+ * worst in the healthy case: proving zero pending means scanning every chunk,
+ * and it is per embedding *seat*, so a count of `embedding IS NULL` reports the
+ * entire brain as unembedded the day the active seat moves
+ * (`src/schema/embedding-seat.ts`). Both need a schema rung before any page can
+ * carry them. Embed failure already reaches the dashboard as a connector-health
+ * code.
+ *
+ * A composite "brain score" is absent on purpose: it is a number with no attached
+ * action. Every figure below either names an incident it would have made visible
+ * or sits beside one that does.
+ */
+
+import type { SQL } from 'bun';
+
+/** How far back "recently" reaches. One number, so the page and the query agree. */
+export const COVERAGE_WINDOW_DAYS = 7;
+
+/**
+ * `entity.entity_type`'s CHECK (`v2-knowledge-core.sql:537`), restated rather
+ * than imported: a web page reading a closed vocabulary should break at compile
+ * time when the vocabulary changes, and the schema is the source of truth.
+ */
+export type EntityKind =
+  | 'person'
+  | 'organization'
+  | 'place'
+  | 'project'
+  | 'product'
+  | 'event'
+  | 'topic'
+  | 'other';
+
+/** `consolidation_run.stop_reason`'s CHECK (`v3-consolidation.sql:109`). */
+export type CycleStopReason = 'complete' | 'free_tier' | 'budget_exhausted' | 'phase_failed' | 'cancelled';
+
+/** `consolidation_run.stopped_phase`'s CHECK (`v20-stopped-phase.sql:71`). */
+export type CyclePhaseName =
+  | 'dedup'
+  | 'link_reconcile'
+  | 'staleness'
+  | 'entity_merge'
+  | 'salience'
+  | 'cluster'
+  | 'transcribe'
+  | 'extract'
+  | 'enrich'
+  | 'synopsis'
+  | 'contradiction'
+  | 'salience_refine';
+
+/** `consolidation_run.stopped_phase_code`'s CHECK (`v20-stopped-phase.sql:81`). */
+export type CyclePhaseStop =
+  | 'budget_exhausted'
+  | 'model_unavailable'
+  | 'bad_output'
+  | 'payload_unavailable'
+  | 'out_of_time';
+
+/**
+ * One credential's contribution, and the only place on this page where a source
+ * is named.
+ *
+ * `origin` is `<class>:<source>` and is structural rather than content — see the
+ * header. `documents` counts **ingested** pages only: `page` also holds the
+ * brain's own model-written summaries (`src/worker/consolidate/materialize.ts`
+ * writes them with an `origin_context`), and counting those would report the
+ * brain's own writing back to the user as mail that arrived from their mailbox.
+ */
+export interface CoverageSource {
+  readonly origin: string;
+  readonly documents: number;
+  /** When the most recent document from this credential arrived. */
+  readonly lastArrivedAt: string | null;
+  /** How many arrived inside {@link COVERAGE_WINDOW_DAYS}. */
+  readonly thisWeek: number;
+}
+
+/**
+ * The last consolidation cycle, as the run record states it.
+ *
+ * `finishedAt === null` means a cycle is running right now, which is a different
+ * sentence from any finished state and is half of "honest when the brain is
+ * thin": a small fact count during an active cycle is a snapshot, not a verdict.
+ */
+export interface CoverageCycle {
+  readonly tier: 'free' | 'paid';
+  readonly dreamt: boolean;
+  readonly stopReason: CycleStopReason | null;
+  readonly stoppedPhase: CyclePhaseName | null;
+  readonly stoppedPhaseCode: CyclePhaseStop | null;
+  readonly startedAt: string;
+  readonly finishedAt: string | null;
+}
+
+/**
+ * What the brain holds. **Every field is a number, an instant, or a string from a
+ * set the schema declares** — see this module's header for why that is the type's
+ * job and not a habit.
+ */
+export interface CoverageView {
+  readonly sources: readonly CoverageSource[];
+  /** Live ingested pages, all origins. The sum of {@link sources}. */
+  readonly documents: number;
+  readonly documentsThisWeek: number;
+  /** The most recent run, finished or not. `null` before the first cycle. */
+  readonly latestCycle: CoverageCycle | null;
+  /** When the last **completed** cycle finished — the backlog's anchor. */
+  readonly lastCompletedAt: string | null;
+  /**
+   * Documents that arrived after {@link lastCompletedAt}, or every document when
+   * no cycle has ever completed — which is the truth in that state rather than a
+   * missing value.
+   */
+  readonly documentsSinceLastCycle: number;
+  /** Whether the model tier has ever completed. Decides the two counts below. */
+  readonly everDreamt: boolean;
+  /** Live, unquarantined, and **not superseded**. The label matches exactly. */
+  readonly facts: number;
+  readonly entities: number;
+  readonly edges: number;
+  readonly entityTypes: readonly { readonly type: EntityKind; readonly count: number }[];
+  /** `null` — not `0` — when no model tier has run: absent rather than empty. */
+  readonly openContradictions: number | null;
+  readonly openReview: number | null;
+  readonly windowDays: number;
+}
+
+/** Bun's SQL returns `timestamptz` as a `Date`; a `text` cast would return a string. */
+function isoOf(value: Date | string | null): string | null {
+  if (value === null) return null;
+  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+}
+
+/**
+ * The whole page, in five statements plus one conditional sixth.
+ *
+ * **Unfenced, and that is deliberate rather than an omission.** Every other
+ * content read in this system takes a `Grant`. This one is admitted by
+ * `tenantOf(session.accountId)` alone, for the reason the retractions listing is:
+ * it is whole-brain by construction and it reads shape rather than rows. There is
+ * no origin to fence *to* — the caller is the brain's owner, and the answer is a
+ * count.
+ *
+ * **One connection, one clock.** The backlog anchor is read from the run record
+ * in this same connection rather than from `control.tenant.last_cycle_at`: the
+ * control-plane counter of that name accrues on MCP writes and counts nothing a
+ * connector ingested, so the two are different quantities that would agree just
+ * often enough to hide the bug.
+ */
+export async function readCoverage(sql: SQL, options: { readonly now: Date }): Promise<CoverageView> {
+  const since = new Date(options.now.getTime() - COVERAGE_WINDOW_DAYS * 86_400_000).toISOString();
+
+  // One scan of `page_live_by_origin`, three aggregates. The `FILTER` clauses are
+  // what keep model-written summaries out of a documents count without a second
+  // pass over the same rows.
+  const sourceRows = (await sql.unsafe(
+    `SELECT origin_context,
+            count(*) FILTER (WHERE derivation = 'ingested')::int AS documents,
+            max(created_at) FILTER (WHERE derivation = 'ingested') AS last_arrived_at,
+            count(*) FILTER (WHERE derivation = 'ingested' AND created_at > $1::timestamptz)::int AS this_week
+       FROM page
+      WHERE deleted_at IS NULL AND quarantined_at IS NULL
+      GROUP BY origin_context
+      ORDER BY origin_context`,
+    [since],
+  )) as Array<{
+    origin_context: string;
+    documents: number;
+    last_arrived_at: Date | string | null;
+    this_week: number;
+  }>;
+
+  const sources: CoverageSource[] = sourceRows
+    // An origin whose only live rows are the brain's own summaries has no
+    // documents, and a source row reading "0 documents" for a credential that was
+    // never connected would be a panel inventing a connection.
+    .filter((row) => row.documents > 0)
+    .map((row) => ({
+      origin: row.origin_context,
+      documents: row.documents,
+      lastArrivedAt: isoOf(row.last_arrived_at),
+      thisWeek: row.this_week,
+    }));
+
+  // The most recent run, open or finished. `run_id DESC` rather than
+  // `finished_at DESC` on purpose: an open run has no `finished_at` and is
+  // exactly the row a user needs to see, because "a cycle is running" is the one
+  // state in which a small number below is a snapshot rather than a verdict.
+  const cycleRows = (await sql.unsafe(
+    `SELECT tier, dreamt, stop_reason, stopped_phase, stopped_phase_code, started_at, finished_at
+       FROM consolidation_run
+      ORDER BY run_id DESC
+      LIMIT 1`,
+    [],
+  )) as Array<{
+    tier: 'free' | 'paid';
+    dreamt: boolean;
+    stop_reason: CycleStopReason | null;
+    stopped_phase: CyclePhaseName | null;
+    stopped_phase_code: CyclePhaseStop | null;
+    started_at: Date | string;
+    finished_at: Date | string | null;
+  }>;
+  const cycleRow = cycleRows[0];
+  const latestCycle: CoverageCycle | null =
+    cycleRow === undefined
+      ? null
+      : {
+          tier: cycleRow.tier,
+          dreamt: cycleRow.dreamt,
+          stopReason: cycleRow.stop_reason,
+          stoppedPhase: cycleRow.stopped_phase,
+          stoppedPhaseCode: cycleRow.stopped_phase_code,
+          startedAt: isoOf(cycleRow.started_at) ?? '',
+          finishedAt: isoOf(cycleRow.finished_at),
+        };
+
+  // The anchor and the two derived totals, in one round trip.
+  //
+  // `everDreamt` comes from the run record and never from a card count: an empty
+  // card table says "cold" for a fully consolidated brain that happens to know
+  // about nobody, which is the inference `briefing/assemble.ts` refuses for the
+  // same reason.
+  const scalarRows = (await sql.unsafe(
+    `SELECT
+       (SELECT finished_at FROM consolidation_run
+         WHERE finished_at IS NOT NULL
+         ORDER BY finished_at DESC, run_id DESC LIMIT 1) AS last_completed_at,
+       EXISTS (SELECT 1 FROM consolidation_run WHERE finished_at IS NOT NULL AND dreamt) AS ever_dreamt,
+       (SELECT count(*) FROM fact
+         WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL)::int AS facts,
+       (SELECT count(*) FROM entity_edge WHERE deleted_at IS NULL)::int AS edges`,
+    [],
+  )) as Array<{
+    last_completed_at: Date | string | null;
+    ever_dreamt: boolean;
+    facts: number;
+    edges: number;
+  }>;
+  const scalars = scalarRows[0] ?? {
+    last_completed_at: null,
+    ever_dreamt: false,
+    facts: 0,
+    edges: 0,
+  };
+  const lastCompletedAt = isoOf(scalars.last_completed_at);
+
+  // `page_ingested_live`'s predicate, restated exactly — including `stale_at IS
+  // NULL`, which is what makes this a range scan on that partial index rather
+  // than an anti-join over every page ever written. `-infinity` is the honest
+  // anchor for a brain that has never consolidated: everything is behind.
+  const behindRows = (await sql.unsafe(
+    `SELECT count(*)::int AS behind
+       FROM page
+      WHERE derivation = 'ingested'
+        AND deleted_at IS NULL AND quarantined_at IS NULL AND stale_at IS NULL
+        AND created_at > coalesce($1::timestamptz, '-infinity'::timestamptz)`,
+    [lastCompletedAt],
+  )) as Array<{ behind: number }>;
+
+  const typeRows = (await sql.unsafe(
+    `SELECT entity_type, count(*)::int AS n
+       FROM entity
+      WHERE deleted_at IS NULL
+      GROUP BY entity_type
+      ORDER BY n DESC, entity_type`,
+    [],
+  )) as Array<{ entity_type: EntityKind; n: number }>;
+  const entityTypes = typeRows.map((row) => ({ type: row.entity_type, count: row.n }));
+
+  // Asked only when the model tier has completed. A count that is structurally
+  // zero for the tier the reader is on is a dead panel — it teaches them the
+  // feature is broken rather than that it has not run.
+  let openContradictions: number | null = null;
+  let openReview: number | null = null;
+  if (scalars.ever_dreamt) {
+    const openRows = (await sql.unsafe(
+      `SELECT
+         (SELECT count(*) FROM contradiction_report WHERE status = 'open')::int AS contradictions,
+         (SELECT count(*) FROM review_queue WHERE state = 'open')::int AS review`,
+      [],
+    )) as Array<{ contradictions: number; review: number }>;
+    openContradictions = openRows[0]?.contradictions ?? 0;
+    openReview = openRows[0]?.review ?? 0;
+  }
+
+  return {
+    sources,
+    documents: sources.reduce((total, source) => total + source.documents, 0),
+    documentsThisWeek: sources.reduce((total, source) => total + source.thisWeek, 0),
+    latestCycle,
+    lastCompletedAt,
+    documentsSinceLastCycle: behindRows[0]?.behind ?? 0,
+    everDreamt: scalars.ever_dreamt,
+    facts: scalars.facts,
+    entities: entityTypes.reduce((total, bucket) => total + bucket.count, 0),
+    edges: scalars.edges,
+    entityTypes,
+    openContradictions,
+    openReview,
+    windowDays: COVERAGE_WINDOW_DAYS,
+  };
+}

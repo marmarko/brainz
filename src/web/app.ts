@@ -77,6 +77,7 @@ import { reviveDeadLane } from '../worker/queue.ts';
 import { CONNECT_STEPS, claudeCodeCommand, connectionStatus, installLink } from './connect.ts';
 import { adminDispatch, createBrainOwnerDirectory } from './admin.ts';
 import { connectorStatuses } from './connector-panel.ts';
+import type { CoverageView } from './coverage.ts';
 import { BRAIN_SETUP_PATH, renderPage } from './pages.ts';
 
 export const SESSION_COOKIE = 'bz_session';
@@ -277,6 +278,34 @@ export interface RetractionPort {
   >;
 }
 
+/**
+ * What the brain holds, as counts — the first surface that shows a user their
+ * own content rather than their plumbing.
+ *
+ * **The gap it closes.** The dashboard showed connectors and retractions and
+ * nothing about the brain, so a user who connected three accounts and waited a
+ * week could only find out whether it worked by asking the assistant a question
+ * and judging the answer. A ten-hour ingest outage and a multi-day consolidation
+ * freeze were both found by somebody reading SQL rather than by the person they
+ * were happening to; the connector panel could not have caught either, because
+ * it reads *attempts* and every attempt during the outage completed.
+ *
+ * **A session, never a grant, and the same argument `RetractionPort` makes.**
+ * The view is whole-brain and unfenced by construction — it counts rows rather
+ * than reading them — so `tenantOf(session.accountId)` is the only admission and
+ * a credential must not reach it. What keeps that safe is the *type*:
+ * {@link CoverageView}'s every field is a number, an instant, or a string from a
+ * set the schema declares in a CHECK. `src/web/coverage.ts` carries the full
+ * argument for that rule and the four reasons a name would break it.
+ *
+ * **One method, and no confirmation.** Nothing here destroys anything, so there
+ * is no echo to check and no preview to be stale — the reason `SeverancePort`
+ * has two methods does not carry over.
+ */
+export interface CoveragePort {
+  read(request: { readonly tenantId: string }): Promise<CoverageView>;
+}
+
 export interface ConnectorVendor {
   mintClaimUrl(request: {
     readonly tenantId: string;
@@ -375,6 +404,18 @@ export interface WebAppDeps {
    * `test/web/port-supply.test.ts` fails if any port declared here is not.
    */
   readonly retractions?: RetractionPort;
+  /**
+   * What the brain holds, as counts. Absent renders the explanation rather than
+   * zeroes — and here the rule bites harder than anywhere else it is applied: a
+   * coverage page with no port would render `0 documents, 0 facts, 0 people`,
+   * which is indistinguishable from an empty brain on the one page whose entire
+   * job is telling those two states apart. A `501` that says the deployment
+   * cannot read is the only honest absent-state this surface has.
+   *
+   * Supplied unconditionally by `src/web/serve.ts`, and
+   * `test/web/port-supply.test.ts` fails if any port declared here is not.
+   */
+  readonly coverage?: CoveragePort;
   /** The Stripe endpoint signing secret, resolved from the secret store. */
   readonly stripeWebhookSecret: string;
   /** Set for an operator deployment; absent disables `/admin` entirely. */
@@ -774,7 +815,29 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     // The redirect runs both ways: an account that *has* a brain is not offered
     // a form to build a second one, so a stale bookmark or a back button lands
     // on the dashboard instead of on an affordance whose route would refuse it.
-    if (path === '/' || path === '/dashboard') return renderDashboard(session);
+    // **Coverage is a query parameter on the dashboard rather than its own
+    // path, and that is a deployment constraint rather than a design taste.**
+    // `src/mcp/edge.ts` fronts this app with an *enumerated* set of web paths —
+    // never a prefix, so that a new endpoint cannot become public merely by
+    // being written — and a path missing from that set is `unrouted` at the
+    // edge. A `/coverage` literal added here alone would 404 in every
+    // deployment while passing every test in this file: the port-nobody-supplies
+    // defect, relocated one layer up. A query parameter needs no entry, so the
+    // page is reachable the moment it ships. Promoting it to `/coverage` (with
+    // an `/api/coverage` twin) is a two-line addition to `WEB_PATHS`, and the
+    // route-parity test in `test/mcp/router.test.ts` is what will hold the two
+    // files together when somebody makes it.
+    //
+    // The default render is unchanged and still opens no tenant database: only
+    // the deliberate click does, which is the whole cost argument for a separate
+    // view. Tens of thousands of brains are suspended most of the time, and
+    // waking one because its owner asked is defensible where waking one because
+    // they logged in is not.
+    if (path === '/' || path === '/dashboard') {
+      return url.searchParams.get('view') === 'coverage'
+        ? renderCoverage(session)
+        : renderDashboard(session);
+    }
     if (path === '/brain') return renderBrainSetup(session);
     if (path === '/connect') return renderConnect(session);
     if (path === '/retractions') return renderRetractions(session);
@@ -2125,6 +2188,67 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
           providers: [...BYOK_PROVIDERS],
         }),
       );
+    }
+
+    /**
+     * What the brain holds, as a page.
+     *
+     * **Four states, and the fourth is the one a sketch forgets.** No port is a
+     * `501` explanation; no brain is the setup page, for the reason every other
+     * handler redirects there; an empty brain **renders** rather than blanking,
+     * because "nothing has arrived from this account yet" is the single most
+     * useful sentence this page can say to somebody who connected an hour ago.
+     * And a brain that will not open is explained rather than 500'd.
+     *
+     * **Why the throw is caught here.** `withTenant` throws when a connection
+     * secret will not resolve, and the entrypoint turns that into a generic 500
+     * — right for severance, wrong for the one page whose job is explaining
+     * state. A suspended compute, a slow cold start or a genuinely broken tenant
+     * would blank the page at the exact moment somebody is trying to find out
+     * what is wrong. `renderDashboard` already swallows a reconciler failure for
+     * the same reason and writes the same kind of line to stderr, where an
+     * operator is.
+     *
+     * **The tier is read from the control plane, not from the tenant.** It costs
+     * no tenant round trip and it is what makes the cold-layer sentence true
+     * rather than alarming: on the free tier a brain that has never dreamt is
+     * the plan working, and a page that said "not consolidated" without saying
+     * that would read as a fault report for every free user.
+     */
+    async function renderCoverage(session: Session): Promise<Response> {
+      const subscription = await subscriptionOf(deps.sql, session.accountId);
+      if (deps.coverage === undefined) {
+        return html(
+          renderPage({
+            kind: 'coverage',
+            available: false,
+            reachable: false,
+            tier: subscription.tier,
+            view: null,
+          }),
+          501,
+        );
+      }
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return seeOther(BRAIN_SETUP_PATH);
+      const tier = await effectiveTierOf(deps.controlSql, tenantId, subscription.tier);
+
+      let view: CoverageView;
+      try {
+        view = await deps.coverage.read({ tenantId });
+      } catch (error) {
+        process.stderr.write(
+          `${JSON.stringify({
+            event: 'coverage_unreadable',
+            tenant: tenantId,
+            message: error instanceof Error ? error.message : String(error),
+          })}\n`,
+        );
+        return html(
+          renderPage({ kind: 'coverage', available: true, reachable: false, tier, view: null }),
+        );
+      }
+      return html(renderPage({ kind: 'coverage', available: true, reachable: true, tier, view }));
     }
 
     async function renderConnect(session: Session): Promise<Response> {

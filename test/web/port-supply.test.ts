@@ -76,7 +76,12 @@ describe('a port declared on WebAppDeps is supplied by the composition root', ()
     expect(ports).toContain('severance');
     expect(ports).toContain('subjectErasure');
     expect(ports).toContain('retractions');
-    expect(ports.length).toBeGreaterThanOrEqual(3);
+    // The coverage view, which is the first port whose absence would not read as
+    // a refusal at all: a page with no port would render `0 documents, 0 facts,
+    // 0 people`, and that is indistinguishable from an empty brain on the one
+    // surface built to tell those two states apart.
+    expect(ports).toContain('coverage');
+    expect(ports.length).toBeGreaterThanOrEqual(4);
   });
 
   test('every one of them appears as a supplied key in serve.ts', () => {

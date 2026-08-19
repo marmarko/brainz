@@ -34,7 +34,7 @@ import {
 import { ensureConnectorHealthSchema } from '../../src/control/connector-health.ts';
 import { generateSealingKeyMaterial, importSealingKey } from '../../src/control/sealed.ts';
 import { connectSource } from '../../src/ingest/cursor.ts';
-import { BRAIN_SETUP_PATH, escapeHtml } from '../../src/web/pages.ts';
+import { BRAIN_SETUP_PATH, COVERAGE_PATH, escapeHtml } from '../../src/web/pages.ts';
 // The other fleet's page, imported rather than described: the sentence it prints
 // is a claim about a page this one serves, and the two are separate processes.
 import { noBrainYetPage } from '../../src/mcp/server.ts';
@@ -499,6 +499,19 @@ describe('a deployment with no connector vendor', () => {
     const cookie = await signedIn();
     const page = await (await app()(get('/dashboard', { cookie }))).text();
     expect(page).toContain('href="/retractions"');
+  });
+
+  test('and the way in to what the brain actually holds', async () => {
+    // The same defect, refused a second time. The dashboard showed the plumbing
+    // — plan, connect link, connected accounts, a key form — and nothing about
+    // the content, so a user who had connected three accounts and waited a week
+    // could only find out whether it worked by asking the assistant a question
+    // and judging the answer. A coverage page nobody can find from the front
+    // door would leave that exactly where it was.
+    await reset();
+    const cookie = await signedIn();
+    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    expect(page).toContain(`href="${COVERAGE_PATH}"`);
   });
 
   test('the dashboard does not offer a button whose route answers 501', async () => {

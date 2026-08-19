@@ -22,6 +22,13 @@
 import type { ConnectorStatus } from './connector-panel.ts';
 
 /**
+ * Imported for the same reason: the coverage view's vocabulary is decided where
+ * the counts are read, and its type is the enforcement of the privacy rule this
+ * page renders — every field a number, an instant, or a schema-declared code.
+ */
+import type { CoverageView, EntityKind } from './coverage.ts';
+
+/**
  * Where a signed-in account with no brain is offered one.
  *
  * **A constant because two fleets name this page.** The MCP fleet renders the
@@ -47,6 +54,23 @@ export const BRAIN_SETUP_PATH = '/brain';
  * action on every page to a route that exists.
  */
 export const CONNECTORS_PATH = '/api/connectors';
+
+/**
+ * Where the dashboard's coverage link points.
+ *
+ * **A query parameter on the dashboard rather than `/coverage`, and the reason
+ * is `src/mcp/edge.ts`.** That file fronts this app with an enumerated set of
+ * web paths — deliberately not a prefix, so a new endpoint cannot become public
+ * merely by being written — and a path absent from it is `unrouted` at the edge.
+ * A `/coverage` literal would therefore 404 in every deployment while passing
+ * every test in this repository that does not cross that boundary, which is the
+ * port-nobody-supplies defect one layer up. The dispatch and the follow-up are
+ * written down at the route in `src/web/app.ts`.
+ *
+ * A constant because two places name it: the dashboard that links to it and the
+ * test that follows every link on every page to a route that answers.
+ */
+export const COVERAGE_PATH = '/dashboard?view=coverage';
 
 export type Page =
   | {
@@ -198,6 +222,33 @@ export type Page =
       readonly kind: 'retraction_notice';
       readonly heading: string;
       readonly message: string;
+    }
+  | {
+      /**
+       * What the brain holds — the first page in this product that shows its
+       * owner content-derived information rather than plumbing.
+       *
+       * **Every field is shape, and the type is what makes that structural
+       * rather than careful.** {@link CoverageView} admits only numbers,
+       * instants and strings from sets the schema declares in a CHECK, so there
+       * is no title, statement, canonical name, alias or external reference
+       * available to render here even by mistake. `src/web/coverage.ts` carries
+       * the four arguments for that line; the one that decides it is that a web
+       * session carries no grant, so a names listing here would be this
+       * product's first fence-free content read, reached with a cookie.
+       *
+       * **Three renders, not one.** `available: false` is a deployment with no
+       * port and gets the explanation rather than zeroes — on this page zeroes
+       * would be indistinguishable from an empty brain, which is the one
+       * distinction it exists to draw. `reachable: false` is a brain that would
+       * not open. Both keep the way back on the page.
+       */
+      readonly kind: 'coverage';
+      readonly available: boolean;
+      readonly reachable: boolean;
+      /** The account's effective plan, which decides whether a cold layer is a fault. */
+      readonly tier: string;
+      readonly view: CoverageView | null;
     };
 
 /** HTML-escape. Five characters, applied to every interpolation without exception. */
@@ -783,6 +834,7 @@ connector vendor whether or not the brain is used, which the free plan cannot ca
           page.tenantId === null ? '' : ` &middot; brain <code>${escapeHtml(page.tenantId)}</code>`
         }</p>
 <p><a href="/connect">Connect brainz to Claude &rarr;</a></p>
+<p><a href="${COVERAGE_PATH}">What your brain knows &rarr;</a></p>
 <p><a href="/retractions">What you can still undo &rarr;</a></p>
 <h2>Connected accounts</h2>
 ${connectors}
@@ -946,6 +998,9 @@ claiming more than it told us.</p>
 <p><a href="/retractions">Back to what you can undo</a></p>`,
       );
 
+    case 'coverage':
+      return coveragePage(page);
+
     case 'retractions':
       return shell(
         'What you can undo — brainz',
@@ -972,6 +1027,215 @@ ${
 <p><a href="/dashboard">Back to your dashboard</a></p>`,
       );
   }
+}
+
+/** `1 document` / `2 documents`, so no line on this page reads like a stub. */
+function count(n: number, one: string, many: string): string {
+  return `${escapeHtml(String(n))} ${n === 1 ? one : many}`;
+}
+
+/**
+ * What each entity type is called to a person.
+ *
+ * The keys are `entity.entity_type`'s CHECK and nothing else — a closed set of
+ * eight, declared in the schema. "Your brain knows 340 people and 88
+ * organizations" is the most legible sentence on this page for somebody who has
+ * no other window into their brain, and it costs no name.
+ */
+const ENTITY_NOUNS: Readonly<Record<EntityKind, readonly [string, string]>> = {
+  person: ['person', 'people'],
+  organization: ['organization', 'organizations'],
+  place: ['place', 'places'],
+  project: ['project', 'projects'],
+  product: ['product', 'products'],
+  event: ['event', 'events'],
+  topic: ['topic', 'topics'],
+  other: ['other thing', 'other things'],
+};
+
+/**
+ * What the last cycle did, in a sentence rather than a code.
+ *
+ * **The vocabularies are closed sets from the schema, and they are kept apart on
+ * purpose.** `stop_reason` is what the *run* did (`v3-consolidation.sql:109`)
+ * and `stopped_phase_code` is what a *phase* did (`v20-stopped-phase.sql:81`);
+ * the schema refuses to let them blur, and so does this. A cycle that stopped at
+ * `extract` with `model_unavailable` is a different thing to know than one that
+ * stopped because the plan has no model half, and telling a free user that
+ * something went wrong when nothing did is the failure this page would most
+ * easily commit.
+ *
+ * The raw codes are rendered beside the sentence rather than replaced by it:
+ * they are what a user can quote when they ask for help.
+ */
+function cycleSentence(cycle: NonNullable<CoverageView['latestCycle']>): string {
+  if (cycle.finishedAt === null) {
+    return `A cycle is running now. It started ${moment(new Date(cycle.startedAt))}.`;
+  }
+  const when = `Your last cycle finished ${moment(new Date(cycle.finishedAt))}.`;
+  if (cycle.dreamt) return `${when} It ran the whole pipeline.`;
+  switch (cycle.stopReason) {
+    case 'free_tier':
+      return `${when} It ran the deterministic half only: on the free plan, the half that turns
+documents into facts, people and companies is on the paid plan. That is the plan working rather than
+something going wrong.`;
+    case 'budget_exhausted':
+      return `${when} It stopped early because the spend budget for one cycle ran out. The next cycle
+picks up where this one left off.`;
+    case 'phase_failed':
+      return `${when} It stopped in the <code>${escapeHtml(cycle.stoppedPhase ?? 'unnamed')}</code>
+phase, reporting <code>${escapeHtml(cycle.stoppedPhaseCode ?? 'no code')}</code>. Everything the
+phases before it produced is in the numbers below; nothing after it ran.`;
+    case 'cancelled':
+      return `${when} It was cancelled before it got to the end.`;
+    case 'complete':
+      return `${when} It completed without needing the model half.`;
+    default:
+      return when;
+  }
+}
+
+/**
+ * What the brain holds.
+ *
+ * **The order is the argument.** Arrivals first, because "nothing has come from
+ * this account in nine days" is the sentence that would have made a ten-hour
+ * ingest outage visible to the person it was happening to. Consolidation second
+ * and *before* the derived numbers, because a small fact count means one thing
+ * when the cycle ran last night and something else entirely when it has been
+ * frozen for a week — and a page that printed the number without the sentence
+ * would be presenting a symptom as a truth. Everything derived comes after the
+ * explanation of why it might be small.
+ *
+ * **No number here links anywhere.** "Your brain knows 340 people" answers *is
+ * it working*; "here are their names" answers *what does it know about her*,
+ * which is retrieval — it needs a fence, a grant and pagination that this page
+ * has none of, and the assistant already is that product.
+ */
+function coveragePage(page: Extract<Page, { kind: 'coverage' }>): string {
+  const back = '<p><a href="/dashboard">Back to your dashboard</a></p>';
+  // The rule, at the top, where somebody deciding whether to screenshot this is.
+  const rule = `<p class="note">This page shows counts, codes and times. It never shows a title, a
+name, a subject line or a sentence from anything you have stored — not even your own. It is meant to
+be safe to screenshot, to put on a meeting-room screen, and to leave open on a desk.</p>`;
+
+  if (!page.available) {
+    return shell(
+      'What your brain knows — brainz',
+      `<h1>What your brain knows</h1>
+<p class="problem">This deployment cannot read your brain, so this page has nothing to count. A page
+of zeroes would be indistinguishable from a brain with nothing in it, and telling those two apart is
+the only reason this page exists.</p>
+${back}`,
+    );
+  }
+
+  if (!page.reachable || page.view === null) {
+    return shell(
+      'What your brain knows — brainz',
+      `<h1>What your brain knows</h1>
+<p class="problem">Your brain could not be reached just now. That is most often a database waking up
+after a quiet spell — loading this page again in a few seconds is usually the whole remedy.</p>
+<p class="note">Nothing has been lost and nothing has stopped: what arrives while this page cannot be
+drawn still arrives. Your plan, your connected accounts and everything else on your dashboard are
+unaffected.</p>
+${back}`,
+    );
+  }
+
+  const view = page.view;
+  // The total is stated rather than left to be added up: the derived numbers
+  // below only mean anything beside it — a large pile of documents with very few
+  // facts under it is a diagnosis, and a fact count on its own is decoration.
+  const total = `<p>${count(view.documents, 'document held', 'documents held')}, ${escapeHtml(
+    String(view.documentsThisWeek),
+  )} of them in the last ${escapeHtml(String(view.windowDays))} days.</p>`;
+  const sources =
+    view.sources.length === 0
+      ? `<p class="note">Nothing has reached this brain yet. This page notices when something does.</p>`
+      : `${total}
+<ul class="sources">
+${view.sources
+  .map(
+    (source) => `  <li>
+    <div><code>${escapeHtml(source.origin)}</code></div>
+    <p class="note">${count(source.documents, 'document', 'documents')} &middot; most recent
+${source.lastArrivedAt === null ? 'never' : moment(new Date(source.lastArrivedAt))} &middot;
+${escapeHtml(String(source.thisWeek))} in the last ${escapeHtml(String(view.windowDays))} days</p>
+  </li>`,
+  )
+  .join('\n')}
+</ul>`;
+
+  // Never from a card count: an empty card table says "cold" for a fully
+  // consolidated brain that happens to know about nobody.
+  const cold =
+    page.tier === 'paid'
+      ? `<p>Your brain has not consolidated yet. Everything you have sent is stored and searchable —
+the half that turns documents into facts, people and companies has not run, so the numbers below stay
+small until it does.</p>`
+      : `<p>Your brain has not consolidated yet. On the free plan that is the plan rather than a
+fault: everything you send is stored and searchable, and the half that turns documents into facts,
+people and companies is on the paid plan.</p>`;
+
+  const behind =
+    view.documentsSinceLastCycle === 0
+      ? ''
+      : `\n<p class="note">${count(view.documentsSinceLastCycle, 'document has', 'documents have')}
+arrived ${view.lastCompletedAt === null ? 'and are waiting for the first cycle' : 'since then'}. They
+are stored and searchable; they are not in the numbers below.</p>`;
+
+  const types =
+    view.entityTypes.length === 0
+      ? ''
+      : `\n<h2>What it knows about</h2>
+<ul class="sources">
+${view.entityTypes
+  .map((bucket) => {
+    const nouns = ENTITY_NOUNS[bucket.type];
+    return `  <li>${count(bucket.count, nouns[0], nouns[1])}</li>`;
+  })
+  .join('\n')}
+</ul>`;
+
+  // Only once the model tier has completed. A count that is structurally zero
+  // for the tier the reader is on is a dead panel, and a dead panel teaches them
+  // the feature is broken rather than that it has not run.
+  const open =
+    view.openContradictions === null || view.openReview === null
+      ? ''
+      : `\n<h2>Waiting on you</h2>
+<p>${count(view.openContradictions, 'contradiction', 'contradictions')} and
+${count(view.openReview, 'proposal', 'proposals')} are open. Ask your assistant about them.</p>`;
+
+  // A brain with nothing in it is rendered without the derived section at all.
+  // Three zeroes under a heading reading "what it made of them" is a small
+  // number presented as a truth about a pipeline that has had nothing to do —
+  // which is the exact failure this page exists to stop the dashboard making.
+  const nothingYet = view.documents === 0 && view.facts === 0 && view.entities === 0;
+  const derived = nothingYet
+    ? ''
+    : `\n<h2>What it made of them</h2>
+<p>${count(view.facts, 'fact', 'facts')} &middot;
+${count(view.entities, 'person, company or thing', 'people, companies and things')} &middot;
+${count(view.edges, 'stated relationship', 'stated relationships')}</p>
+<p class="note">These are what the brain derived from your documents, and they are the numbers to
+read next to the document count above: a large pile of documents with very few facts under it means
+consolidation is behind, not that there was nothing in them.</p>${types}${open}`;
+
+  return shell(
+    'What your brain knows — brainz',
+    `<h1>What your brain knows</h1>
+${rule}
+<h2>Where it came from</h2>
+${sources}
+<p class="note">Documents, not passages: counting every passage of a large brain is a scan of the
+biggest table it has, and this is a page load. If a source has stopped arriving, the connected
+accounts panel on your dashboard is where the reason is.</p>
+<h2>Consolidation</h2>
+${view.latestCycle === null ? cold : `<p>${cycleSentence(view.latestCycle)}</p>`}${behind}${derived}
+${back}`,
+  );
 }
 
 /**

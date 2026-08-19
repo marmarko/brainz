@@ -38,6 +38,7 @@ import { SQL } from 'bun';
 import {
   createWebApp,
   type ConnectorVendor,
+  type CoveragePort,
   type ProviderKeyWriter,
   type RetractionPort,
   type SeverancePort,
@@ -82,6 +83,7 @@ import {
 import { controlPlaneIdentity, fleetIdentity, isValidTenantId } from '../control/secrets.ts';
 import { createTenantStorage } from '../control/storage.ts';
 import { createPipedreamConnectorVendor } from './connectors.ts';
+import { readCoverage } from './coverage.ts';
 import {
   openConnectorClient,
   openControlPlane,
@@ -154,6 +156,11 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
     // three times, and `test/web/port-supply.test.ts` is what makes the third
     // the last.
     retractions: retractionPort(withTenant),
+    // Supplied in the same change that declares it, for the reason two lines up.
+    // This one is read-only, which changes nothing about the rule: the defect is
+    // a declared port with no supplier, and a route that answers `501` about a
+    // count is as unreachable as one that answers `501` about a restore.
+    coverage: coveragePort(withTenant),
     provisioner: reportedProvisioner(
       createBrainProvisioner({
         controlSql,
@@ -537,6 +544,42 @@ export function retractionPort(withTenant: TenantWork): RetractionPort {
         };
       });
     },
+  };
+}
+
+/**
+ * What a brain holds, given the caller it never had.
+ *
+ * **The reading no other surface can do.** `control.connector_health` records
+ * *attempts*, so during the ten-hour ingest outage every attempt completed and
+ * the panel said `connected` — correctly. Arrivals live in the tenant's own
+ * database, which is why this goes through `withTenant` rather than through the
+ * control plane. That the web fleet composes no model gateway is irrelevant
+ * here: this reads counts, and counting needs no model.
+ *
+ * **Exported, for `retractionPort`'s reason.** The gate on this one is the
+ * *shape of what crosses* — `readCoverage` returns numbers, instants and
+ * schema-declared codes and nothing else, and a test driving a fake would be
+ * asserting its own fixture rather than the query that actually runs against a
+ * brain full of subject lines. `test/web/coverage-route.test.ts` drives this
+ * object against a real schema and asserts a seeded title, statement and name
+ * appear nowhere in the rendered page.
+ *
+ * **No echo, and a throw that the page catches.** Nothing here destroys
+ * anything, so there is no confirmation to check before the connection opens.
+ * `withTenant` still throws when a connection secret will not resolve, and
+ * `app.ts:renderCoverage` catches it deliberately: the entrypoint's generic 500
+ * is right for severance and wrong for the one page whose job is explaining
+ * state.
+ */
+export function coveragePort(withTenant: TenantWork): CoveragePort {
+  return {
+    read: (request) =>
+      // `new Date()` here rather than a clock passed from the request: the only
+      // thing the read uses it for is the "last seven days" window, and a page
+      // rendered from one process's clock and windowed by another's is a
+      // contradiction nobody can see.
+      withTenant(request.tenantId, (sql) => readCoverage(sql, { now: new Date() })),
   };
 }
 
