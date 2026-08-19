@@ -172,6 +172,33 @@ describe('stateless streamable HTTP', () => {
     expect(body.result?.isError).toBe(true);
   });
 
+  /**
+   * The failure this pins: the error code was reachable only by unwrapping.
+   *
+   * brainz deliberately adopted the memory-verbs error vocabulary — `ErrorCode`
+   * in `tools/context.ts` is that enum — and then shipped it inside a container
+   * nothing else parses. Every reader of this surface, including the protocol's
+   * own conformance runner, reads `body.error` as the code STRING with
+   * `message` and `suggestion` as its siblings; brainz answered with
+   * `body.error = {code, message}`, so a caller checking `error === 'not_found'`
+   * saw `[object Object]` and could not branch on any refusal at all. The
+   * nesting was never argued anywhere: it is not in `ENVELOPE_KEYS`, not in the
+   * tool-surface design's error contract, and was bolted on at serialisation.
+   */
+  test('an error result names its code at the top level, beside message', async () => {
+    const response = await server.fetch(rpc('tools/call', { name: 'synthesize', arguments: {} }));
+    const body = (await response.json()) as {
+      result: { content: { text: string }[]; structuredContent: Record<string, unknown> };
+    };
+    const payload = body.result.structuredContent;
+    expect(payload.error).toBe('unavailable');
+    expect(typeof payload.message).toBe('string');
+    expect(payload.protocol_version).toBe(1);
+    // The text lane is the same object serialised, never a summary of it — a
+    // client reading only text must be able to branch on the same code.
+    expect(JSON.parse(body.result.content[0]?.text ?? '{}')).toEqual(payload);
+  });
+
   test('an unparseable body is a JSON-RPC parse error, not a 500', async () => {
     const response = await server.fetch(
       new Request('https://mcp.brainz.test/mcp', {

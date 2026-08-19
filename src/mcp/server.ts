@@ -313,7 +313,25 @@ function isObject(value: unknown): value is Record<string, unknown> {
 function toolResult(result: DispatchResult): Record<string, unknown> {
   const payload = result.ok
     ? { ...(result.content as Record<string, unknown>), ...result.envelope }
-    : { error: result.error, ...result.envelope };
+    : {
+        // **Flat, because a code nobody can read is a code nobody can act on.**
+        // This surface deliberately speaks the memory-verbs error vocabulary
+        // (`ErrorCode` in `tools/context.ts`), and every reader of that
+        // vocabulary — including the protocol's own conformance runner — reads
+        // `error` as the code string with `message` and `suggestion` as its
+        // siblings. Serialising `{error: {code, message}}` handed those readers
+        // `[object Object]` where they expected `not_found`, so no caller could
+        // branch on any refusal this server issued. The nesting was never
+        // argued: it is not in `ENVELOPE_KEYS`, not in the tool-surface
+        // design's error contract, and was introduced here at serialisation.
+        // `?? 'error'` because `DispatchResult.error` is optional on the type
+        // and a refusal that serialised `error: undefined` would be a failure
+        // that reads as a success with no content.
+        error: result.error?.code ?? 'error',
+        message: result.error?.message ?? 'That call could not be completed.',
+        ...(result.error?.suggestion === undefined ? {} : { suggestion: result.error.suggestion }),
+        ...result.envelope,
+      };
 
   return {
     // The `input_required` lift (SEP-2322). It is a *result type*, not an
