@@ -21,6 +21,32 @@
  *    therefore recomputes rather than remembers, which is what gives an edge
  *    attested by two pages the property of surviving one of them dropping it.
  *
+ * **Every phase is interruptible, and two of them are resumable.** The cycle
+ * runs under a wall-clock ceiling it did not choose (`locks.ts`), so a phase
+ * that cannot be stopped can only be *reaped* — and a reaped phase banks no
+ * position, so the next attempt walks the same rows in the same order and is
+ * reaped in the same place. Each function below therefore takes an
+ * {@link AttemptBudget}, consults it between units of work, and returns a
+ * {@link PhaseProgress} saying whether it finished. `salience` and `cluster` also
+ * return a **cursor**, because they are the two whose work is a walk over an
+ * ordered set and therefore the two where "where I got to" is expressible; the
+ * rest are whole-set computations whose intermediate state is not a row id, and
+ * they restart — which is why they yield to a lost lease (`cancelled`) and not to
+ * the clock (`stop`). A phase that restarts and is interrupted on the clock is a
+ * phase the cycle can never get past, whatever budget it is given. That asymmetry is affordable exactly because those four are the
+ * cheap ones: measured on a 5,608-page brain, dedup, link reconciliation,
+ * staleness and entity merge together cost under 400ms of database work, while
+ * salience and clustering cost 28,799 of the pass's 30,850 round trips.
+ *
+ * **Round trips, not rows, were the wall.** Salience issued `1 + 2N` sequential
+ * statements — a per-page fact query and a per-page UPDATE — which is 11,217 on
+ * that brain, and at a worker-to-database latency of 36ms that alone is fifteen
+ * minutes. It now reads and writes in batches, which is the same work in ~2
+ * statements per {@link SALIENCE_BATCH} pages. Clustering paid a whole
+ * transaction (`BEGIN`, two `SET LOCAL`, `COMMIT`) per seed and one INSERT per
+ * member; it now amortizes the transaction over a batch of seeds and writes each
+ * cluster with its members in one statement.
+ *
  * **Nothing here collapses across credentials.** R15 makes `origin_contexts`
  * immutable, so a row cannot absorb a second credential's attestation — and
  * R12a's corroboration is *defined* on there being two rows with two origins.
@@ -38,9 +64,54 @@ import { normalize } from '../../core/write/normalize.ts';
 import { textArrayLiteral } from '../../core/write/pg-values.ts';
 import { ACTIVE_EMBEDDING_SEAT, seatColumnSql } from '../../schema/embedding-seat.ts';
 import { candidatePoolFor, withVectorScan } from '../../schema/vector-query.ts';
+import { unboundedAttempt, type AttemptBudget } from './deadline.ts';
 
 /** What `live` means for a fact, matching `src/core/write/dedup.ts`. */
 const LIVE_FACT = 'deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL';
+
+/**
+ * How far a phase got, in the two states that are not "finished".
+ *
+ * `done: true` is the only value that lets the cycle bank a completion. The
+ * other two are different in a way that matters to the next attempt:
+ * `{done: false, cursor: X}` resumes at X, and `{done: false, cursor: null}` is a
+ * phase that ran out of time without a position to hand over and will restart —
+ * honest about the fact that its work is a whole-set computation rather than a
+ * walk.
+ */
+export interface PhaseProgress {
+  readonly done: boolean;
+  readonly cursor: string | null;
+}
+
+/** Finished. Written out so the three shapes are visible at every return site. */
+const FINISHED: PhaseProgress = Object.freeze({ done: true, cursor: null });
+
+/** Ran out of the attempt's clock with nothing to hand the next one. */
+const RESTARTS: PhaseProgress = Object.freeze({ done: false, cursor: null });
+
+/**
+ * The floor for every keyset cursor here.
+ *
+ * Both cursors are over `GENERATED ALWAYS AS IDENTITY` columns, which start at
+ * 1, so "before the first row" is expressible as a value rather than as a null —
+ * and a value keeps the resume path and the fresh path the *same* statement
+ * instead of two that can drift.
+ */
+const CURSOR_START = '0';
+
+/**
+ * A `bigint[]` / `float8[]` literal, for the batched writes below.
+ *
+ * `textArrayLiteral`'s escaping is deliberately absent, and its absence is the
+ * thing to check when editing: every value passed here is either a row id this
+ * process just read out of the database (digits) or a number this file computed
+ * and clamped to [0, 1]. Neither can carry a quote, and neither is user text.
+ * Hand it anything from a document and the escaping has to come back.
+ */
+function numericArrayLiteral(values: readonly (string | number)[]): string {
+  return `{${values.join(',')}}`;
+}
 
 /**
  * A grouping key over a set of origins.
@@ -76,7 +147,11 @@ export interface DedupResult {
  * point at it, so the collapse is auditable and reversible. Deleting would make
  * "these two were the same claim" a fact only this run ever knew.
  */
-export async function collapseDuplicateFacts(sql: SQL): Promise<DedupResult> {
+export async function collapseDuplicateFacts(
+  sql: SQL,
+  options: { readonly budget?: AttemptBudget } = {},
+): Promise<DedupResult & PhaseProgress> {
+  const budget = options.budget ?? unboundedAttempt();
   const rows = (await sql.unsafe(`
     SELECT fact_id::text AS fact_id, statement, origin_contexts
       FROM fact
@@ -106,9 +181,17 @@ export async function collapseDuplicateFacts(sql: SQL): Promise<DedupResult> {
       `;
       collapsed += 1;
     }
+    // `cancelled`, not `stop`: this phase has no cursor, so abandoning it on the
+    // clock would make the next attempt redo the same prefix and stop in the
+    // same place — a phase the cycle can never get past. A lost lease is the one
+    // interruption worth taking, because from there every write is unfenced
+    // against the tenant and refused against the control plane.
+    if (budget.cancelled() !== null) {
+      return { collapsed, groups: collapsedGroups, ...RESTARTS };
+    }
   }
 
-  return { collapsed, groups: collapsedGroups };
+  return { collapsed, groups: collapsedGroups, ...FINISHED };
 }
 
 // ---------------------------------------------------------------------------
@@ -150,8 +233,9 @@ function edgeKey(subjectId: string, edgeType: string, objectId: string): string 
  */
 export async function reconcileAllEdges(
   sql: SQL,
-  options: { readonly taxonomyVersion: number },
-): Promise<ReconcileResult> {
+  options: { readonly taxonomyVersion: number; readonly budget?: AttemptBudget },
+): Promise<ReconcileResult & PhaseProgress> {
+  const budget = options.budget ?? unboundedAttempt();
   const facts = (await sql.unsafe(`
     SELECT statement, origin_contexts FROM fact WHERE ${LIVE_FACT} ORDER BY fact_id
   `)) as Array<{ statement: string; origin_contexts: string[] }>;
@@ -159,6 +243,14 @@ export async function reconcileAllEdges(
   const desired = new Map<string, { subjectId: string; objectId: string; edgeType: string; confidence: number; origins: string[] }>();
 
   for (const fact of facts) {
+    // **The desired set has to be complete before anything is diffed against
+    // it**, so this phase cannot bank a partial position: an edge missing from a
+    // half-built desired set is an edge the diff below would *delete*. It
+    // therefore yields to a lost lease and not to the clock — abandoning it on
+    // the clock would make it the phase the cycle can never get past. Affordable
+    // because it is small: 214ms and 1,074 round trips on a 5,608-page brain,
+    // against the 28,799 round trips salience and clustering used to cost.
+    if (budget.cancelled() !== null) return { added: 0, removed: 0, kept: 0, ...RESTARTS };
     const extracted = extractFromStatement(fact.statement);
     if (extracted === null) continue;
     for (const implied of impliedEdges([extracted])) {
@@ -233,7 +325,7 @@ export async function reconcileAllEdges(
     else kept += 1;
   }
 
-  return { added, removed, kept };
+  return { added, removed, kept, ...FINISHED };
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +336,9 @@ export interface StalenessResult {
   readonly staled: number;
   readonly factsInvalidated: number;
 }
+
+/** Superseded pages per staleness batch. Bounds the walk, not the corpus. */
+export const STALENESS_BATCH = 500;
 
 /**
  * Mark superseded versions of an upstream item, and retire the claims they made.
@@ -263,66 +358,93 @@ export interface StalenessResult {
  */
 export async function markStaleness(
   sql: SQL,
-  options: { readonly now: Date },
-): Promise<StalenessResult> {
-  const superseded = (await sql`
-    SELECT older.page_id::text AS stale_page_id, newer.page_id::text AS live_page_id
-      FROM page older
-      JOIN page newer
-        ON newer.external_ref = older.external_ref
-       AND newer.page_id <> older.page_id
-       AND newer.deleted_at IS NULL AND newer.quarantined_at IS NULL AND newer.stale_at IS NULL
-       AND (newer.created_at, newer.page_id) > (older.created_at, older.page_id)
-     WHERE older.external_ref IS NOT NULL
-       AND older.stale_at IS NULL
-       AND older.deleted_at IS NULL
-       AND older.derivation = 'ingested'
-  `) as Array<{ stale_page_id: string; live_page_id: string }>;
-
+  options: {
+    readonly now: Date;
+    /** Resume point from a previous attempt. Null starts at the first page. */
+    readonly cursor?: string | null;
+    readonly budget?: AttemptBudget;
+    readonly batch?: number;
+  },
+): Promise<StalenessResult & PhaseProgress> {
+  const budget = options.budget ?? unboundedAttempt();
+  const batch = Math.max(1, Math.trunc(options.batch ?? STALENESS_BATCH));
+  let cursor = options.cursor ?? CURSOR_START;
   let staled = 0;
   let factsInvalidated = 0;
 
-  for (const pair of superseded) {
-    const marked = (await sql`
-      UPDATE page SET stale_at = ${options.now}, updated_at = ${options.now}
-       WHERE page_id = ${pair.stale_page_id}::bigint AND stale_at IS NULL
-      RETURNING page_id
-    `) as unknown[];
-    if (marked.length === 0) continue;
-    staled += 1;
+  for (;;) {
+    // **`DISTINCT ON` is the difference between linear and quadratic.** The
+    // join emits every `(older, newer)` pair, so K versions of one upstream item
+    // produce K(K-1)/2 rows and the loop below paid a round trip to discover
+    // that all but one of them named a page it had already marked. One row per
+    // superseded page, and the `newer` it carries is the *newest* live version
+    // rather than whichever the planner happened to emit first — which is also
+    // the more correct choice for the replacement search that follows.
+    const superseded = (await sql.unsafe(
+      `SELECT DISTINCT ON (older.page_id)
+              older.page_id::text AS stale_page_id, newer.page_id::text AS live_page_id
+         FROM page older
+         JOIN page newer
+           ON newer.external_ref = older.external_ref
+          AND newer.page_id <> older.page_id
+          AND newer.deleted_at IS NULL AND newer.quarantined_at IS NULL AND newer.stale_at IS NULL
+          AND (newer.created_at, newer.page_id) > (older.created_at, older.page_id)
+        WHERE older.external_ref IS NOT NULL
+          AND older.stale_at IS NULL
+          AND older.deleted_at IS NULL
+          AND older.derivation = 'ingested'
+          AND older.page_id > $1::bigint
+        ORDER BY older.page_id, newer.created_at DESC, newer.page_id DESC
+        LIMIT ${batch}`,
+      [cursor],
+    )) as Array<{ stale_page_id: string; live_page_id: string }>;
 
-    const stale = (await sql.unsafe(
-      `SELECT fact_id::text AS fact_id, statement FROM fact WHERE ${LIVE_FACT} AND page_id = $1::bigint`,
-      [pair.stale_page_id],
-    )) as Array<{ fact_id: string; statement: string }>;
-    const replacements = (await sql.unsafe(
-      `SELECT fact_id::text AS fact_id, statement FROM fact WHERE ${LIVE_FACT} AND page_id = $1::bigint`,
-      [pair.live_page_id],
-    )) as Array<{ fact_id: string; statement: string }>;
+    if (superseded.length === 0) return { staled, factsInvalidated, ...FINISHED };
 
-    const byKey = new Map<string, string>();
-    for (const row of replacements) {
-      const extracted = extractFromStatement(row.statement);
-      if (extracted === null) continue;
-      byKey.set(JSON.stringify([normalize(extracted.subject), extracted.topic]), row.fact_id);
+    for (const pair of superseded) {
+      const marked = (await sql`
+        UPDATE page SET stale_at = ${options.now}, updated_at = ${options.now}
+         WHERE page_id = ${pair.stale_page_id}::bigint AND stale_at IS NULL
+        RETURNING page_id
+      `) as unknown[];
+      if (marked.length === 0) continue;
+      staled += 1;
+
+      const stale = (await sql.unsafe(
+        `SELECT fact_id::text AS fact_id, statement FROM fact WHERE ${LIVE_FACT} AND page_id = $1::bigint`,
+        [pair.stale_page_id],
+      )) as Array<{ fact_id: string; statement: string }>;
+      const replacements = (await sql.unsafe(
+        `SELECT fact_id::text AS fact_id, statement FROM fact WHERE ${LIVE_FACT} AND page_id = $1::bigint`,
+        [pair.live_page_id],
+      )) as Array<{ fact_id: string; statement: string }>;
+
+      const byKey = new Map<string, string>();
+      for (const row of replacements) {
+        const extracted = extractFromStatement(row.statement);
+        if (extracted === null) continue;
+        byKey.set(JSON.stringify([normalize(extracted.subject), extracted.topic]), row.fact_id);
+      }
+
+      for (const row of stale) {
+        const extracted = extractFromStatement(row.statement);
+        if (extracted === null) continue;
+        const replacement = byKey.get(
+          JSON.stringify([normalize(extracted.subject), extracted.topic]),
+        );
+        if (replacement === undefined || replacement === row.fact_id) continue;
+        await sql`
+          UPDATE fact SET superseded_by = ${replacement}::bigint
+           WHERE fact_id = ${row.fact_id}::bigint AND superseded_by IS NULL
+        `;
+        factsInvalidated += 1;
+      }
     }
 
-    for (const row of stale) {
-      const extracted = extractFromStatement(row.statement);
-      if (extracted === null) continue;
-      const replacement = byKey.get(
-        JSON.stringify([normalize(extracted.subject), extracted.topic]),
-      );
-      if (replacement === undefined || replacement === row.fact_id) continue;
-      await sql`
-        UPDATE fact SET superseded_by = ${replacement}::bigint
-         WHERE fact_id = ${row.fact_id}::bigint AND superseded_by IS NULL
-      `;
-      factsInvalidated += 1;
-    }
+    cursor = superseded[superseded.length - 1]?.stale_page_id ?? cursor;
+    if (superseded.length < batch) return { staled, factsInvalidated, ...FINISHED };
+    if (budget.stop() !== null) return { staled, factsInvalidated, done: false, cursor };
   }
-
-  return { staled, factsInvalidated };
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +469,11 @@ export interface MergeResult {
  * is the whole reason `entity_slug` holds both kinds in one namespace: an address
  * that used to resolve keeps resolving.
  */
-export async function mergeEntitiesByRule(sql: SQL): Promise<MergeResult> {
+export async function mergeEntitiesByRule(
+  sql: SQL,
+  options: { readonly budget?: AttemptBudget } = {},
+): Promise<MergeResult & PhaseProgress> {
+  const budget = options.budget ?? unboundedAttempt();
   const rows = (await sql`
     SELECT entity_id::text AS entity_id, canonical_name, entity_type, origin_contexts
       FROM entity WHERE deleted_at IS NULL ORDER BY entity_id
@@ -435,9 +561,15 @@ export async function mergeEntitiesByRule(sql: SQL): Promise<MergeResult> {
       await sql`UPDATE entity SET deleted_at = now() WHERE entity_id = ${loser}::bigint`;
       merged += 1;
     }
+    // Between groups, never mid-merge: a merge is aliases, then the slug
+    // redirect, then the edges, then the tombstone, and stopping between two of
+    // those leaves an entity half-absorbed. `cancelled` rather than `stop` for
+    // the same reason as dedup — no cursor means abandoning on the clock buys
+    // nothing and can starve the phase forever.
+    if (budget.cancelled() !== null) return { merged, ...RESTARTS };
   }
 
-  return { merged };
+  return { merged, ...FINISHED };
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +581,17 @@ export interface SalienceResult {
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Pages per salience batch.
+ *
+ * Two statements per batch, so this is the constant that turns `2N + 1` round
+ * trips into `2N/500 + 1`. Large enough that a 5,608-page brain costs 24 round
+ * trips rather than 11,217; small enough that one batch's rows and one `unnest`
+ * literal stay a comfortable object, and that a cursor banked at a batch
+ * boundary loses at most this many pages' work to a reap.
+ */
+export const SALIENCE_BATCH = 500;
 
 /** A saturating count: the tenth fact on a page says less than the second. */
 function saturate(count: number, scale: number): number {
@@ -473,54 +616,119 @@ function clamp01(value: number): number {
  *
  * Bounded to [0, 1] so the model refinement that follows is comparable against
  * it rather than living on a different scale.
+ *
+ * **It walks in batches on a keyset, and that is the whole of why the cycle
+ * converges.** The scoring arithmetic is unchanged — every page is still scored
+ * on every pass, because the recency term decays with wall clock and a
+ * "changed since last time" filter would leave a year-old page carrying a
+ * year-old score. What changed is the shape: one read and one write per
+ * {@link SALIENCE_BATCH} pages instead of two statements per page, and a cursor
+ * at every batch boundary so an attempt that runs out of clock hands the next
+ * one its position instead of its work.
  */
 export async function computeDeterministicSalience(
   sql: SQL,
-  options: { readonly now: Date },
-): Promise<SalienceResult> {
-  const pages = (await sql`
-    SELECT p.page_id::text AS page_id, p.source_type, p.created_at
-      FROM page p
-     WHERE p.deleted_at IS NULL AND p.quarantined_at IS NULL
-     ORDER BY p.page_id
-  `) as Array<{ page_id: string; source_type: SourceType; created_at: Date }>;
-
+  options: {
+    readonly now: Date;
+    /** Resume point from a previous attempt. Null starts at the first page. */
+    readonly cursor?: string | null;
+    readonly budget?: AttemptBudget;
+    /** Pages per read/write pair. Bounds memory, not correctness. */
+    readonly batch?: number;
+  },
+): Promise<SalienceResult & PhaseProgress> {
+  const budget = options.budget ?? unboundedAttempt();
+  const batch = Math.max(1, Math.trunc(options.batch ?? SALIENCE_BATCH));
+  let cursor = options.cursor ?? CURSOR_START;
   let scored = 0;
-  for (const page of pages) {
-    const facts = (await sql.unsafe(
-      `SELECT statement FROM fact WHERE ${LIVE_FACT} AND page_id = $1::bigint`,
-      [page.page_id],
-    )) as Array<{ statement: string }>;
 
-    const subjects = new Set<string>();
-    for (const fact of facts) {
-      const extracted = extractFromStatement(fact.statement);
-      if (extracted === null) continue;
-      subjects.add(normalize(extracted.subject));
-      if (extracted.object.length > 0) subjects.add(normalize(extracted.object));
+  for (;;) {
+    // One statement for the page *and* its facts. The per-page fact query this
+    // replaces was the single most expensive thing in the cycle: 5,608 pages
+    // meant 5,608 sequential round trips before a single score was written.
+    // `LEFT JOIN` rather than a join, because a page with no live facts still
+    // has a recency and a source-type prior and must still be scored — an inner
+    // join would silently leave those pages carrying whatever score they had.
+    const pages = (await sql.unsafe(
+      `SELECT p.page_id::text AS page_id, p.source_type, p.created_at,
+              coalesce(
+                array_agg(f.statement) FILTER (WHERE f.fact_id IS NOT NULL),
+                ARRAY[]::text[]
+              ) AS statements
+         FROM page p
+         LEFT JOIN fact f
+           ON f.page_id = p.page_id
+          AND f.deleted_at IS NULL AND f.quarantined_at IS NULL AND f.superseded_by IS NULL
+        WHERE p.deleted_at IS NULL AND p.quarantined_at IS NULL
+          AND p.page_id > $1::bigint
+        GROUP BY p.page_id, p.source_type, p.created_at
+        ORDER BY p.page_id
+        LIMIT ${batch}`,
+      [cursor],
+    )) as Array<{
+      page_id: string;
+      source_type: SourceType;
+      created_at: Date;
+      statements: string[];
+    }>;
+
+    if (pages.length === 0) return { scored, ...FINISHED };
+
+    const ids: string[] = [];
+    const scores: number[] = [];
+
+    for (const page of pages) {
+      const subjects = new Set<string>();
+      for (const statement of page.statements) {
+        const extracted = extractFromStatement(statement);
+        if (extracted === null) continue;
+        subjects.add(normalize(extracted.subject));
+        if (extracted.object.length > 0) subjects.add(normalize(extracted.object));
+      }
+
+      const ageDays = Math.max(
+        0,
+        (options.now.getTime() - new Date(page.created_at).getTime()) / DAY_MS,
+      );
+      const halfLife = RECENCY_HALF_LIFE_DAYS[page.source_type] ?? 30;
+      const recency = 0.5 ** (ageDays / halfLife);
+      const prior = clamp01(0.5 + (SOURCE_TYPE_PRIOR[page.source_type] ?? 0) * 2);
+
+      ids.push(page.page_id);
+      scores.push(
+        clamp01(
+          0.45 * saturate(page.statements.length, 3) +
+            0.2 * saturate(subjects.size, 3) +
+            0.25 * recency +
+            0.1 * prior,
+        ),
+      );
     }
 
-    const ageDays = Math.max(0, (options.now.getTime() - new Date(page.created_at).getTime()) / DAY_MS);
-    const halfLife = RECENCY_HALF_LIFE_DAYS[page.source_type] ?? 30;
-    const recency = 0.5 ** (ageDays / halfLife);
-    const prior = clamp01(0.5 + (SOURCE_TYPE_PRIOR[page.source_type] ?? 0) * 2);
-
-    const salience = clamp01(
-      0.45 * saturate(facts.length, 3) +
-        0.2 * saturate(subjects.size, 3) +
-        0.25 * recency +
-        0.1 * prior,
+    // One write for the whole batch, through `unnest` rather than a statement
+    // per page. The scores are computed here rather than in SQL on purpose: the
+    // subject count goes through `extractFromStatement` and `normalize`, and a
+    // SQL-side reimplementation of either would be the second normalizer this
+    // module's header refuses.
+    await sql.unsafe(
+      `UPDATE page p
+          SET salience = u.salience,
+              salience_source = 'deterministic',
+              salience_at = $3
+         FROM unnest($1::bigint[], $2::float8[]) AS u(page_id, salience)
+        WHERE p.page_id = u.page_id`,
+      [numericArrayLiteral(ids), numericArrayLiteral(scores), options.now],
     );
 
-    await sql`
-      UPDATE page
-         SET salience = ${salience}, salience_source = 'deterministic', salience_at = ${options.now}
-       WHERE page_id = ${page.page_id}::bigint
-    `;
-    scored += 1;
-  }
+    scored += pages.length;
+    cursor = pages[pages.length - 1]?.page_id ?? cursor;
 
-  return { scored };
+    // A short read means the last batch, and the phase is done regardless of the
+    // clock: checking the budget first would bank a cursor one row past the end
+    // and make the next attempt re-read an empty page to learn nothing.
+    if (pages.length < batch) return { scored, ...FINISHED };
+    if (budget.stop() !== null) return { scored, done: false, cursor };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +745,18 @@ export const CLUSTER_THRESHOLD = 0.8;
 
 /** How many neighbours one seed considers. Sized through the vector helper. */
 export const CLUSTER_POOL = 50;
+
+/**
+ * Seeds per amortized vector scan.
+ *
+ * `withVectorScan` is a transaction — `BEGIN`, two `SET LOCAL`s, `COMMIT` — and
+ * it used to wrap **one** seed, so four fifths of the phase's round trips bought
+ * nothing but the GUCs that were already correct from the seed before. Batching
+ * the probes inside one transaction removes that overhead; the batch stays small
+ * because the other half of the trade is how long a transaction is held open
+ * against the tenant's database while the lease reaper is watching.
+ */
+export const CLUSTER_SEED_BATCH = 100;
 
 /**
  * Greedy agglomeration over the chunk vectors.
@@ -566,85 +786,138 @@ export async function clusterByEmbedding(
   options: {
     readonly runId: string | null;
     readonly threshold?: number;
+    /** A ceiling on seeds considered per call. Absent means the whole corpus. */
     readonly limit?: number;
+    /** Resume point from a previous attempt. Null rebuilds from scratch. */
+    readonly cursor?: string | null;
+    readonly budget?: AttemptBudget;
+    /** Seeds per amortized vector-scan transaction. */
+    readonly batch?: number;
   },
-): Promise<ClusterResult> {
+): Promise<ClusterResult & PhaseProgress> {
   const threshold = options.threshold ?? CLUSTER_THRESHOLD;
-  const limit = options.limit ?? 2_000;
-
-  // A cycle recomputes clusters from scratch: membership is a function of the
-  // current corpus, and an incremental version would carry a chunk's cluster
-  // across an edit that moved it.
-  await sql`DELETE FROM cluster_member`;
-  await sql`DELETE FROM content_cluster`;
+  const budget = options.budget ?? unboundedAttempt();
+  const batch = Math.max(1, Math.trunc(options.batch ?? CLUSTER_SEED_BATCH));
+  const ceiling =
+    options.limit === undefined ? Number.POSITIVE_INFINITY : Math.max(1, Math.trunc(options.limit));
+  const resuming = options.cursor !== undefined && options.cursor !== null;
 
   const column = seatColumnSql(ACTIVE_EMBEDDING_SEAT.column);
-
-  const seeds = (await sql.unsafe(
-    `SELECT chunk_id::text AS chunk_id
-       FROM chunk
-      WHERE ${column} IS NOT NULL AND deleted_at IS NULL AND quarantined_at IS NULL
-      ORDER BY chunk_id
-      LIMIT ${Math.max(1, Math.trunc(limit))}`,
-  )) as Array<{ chunk_id: string }>;
-
   const assigned = new Set<string>();
-  const pool = candidatePoolFor({ limit: CLUSTER_POOL });
-  let clusters = 0;
-  let members = 0;
 
-  for (const seed of seeds) {
-    if (assigned.has(seed.chunk_id)) continue;
-
-    const neighbours = await withVectorScan(sql, { candidatePool: pool }, async (tx) => {
-      const rows = (await tx.unsafe(
-        `WITH probe AS (SELECT ${column} AS v FROM chunk WHERE chunk_id = $1::bigint)
-         SELECT c.chunk_id::text AS chunk_id,
-                1 - (c.${column} <=> (SELECT v FROM probe)) AS similarity
-           FROM chunk c
-          WHERE c.${column} IS NOT NULL AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
-            AND c.chunk_id <> $1::bigint
-          ORDER BY c.${column} <=> (SELECT v FROM probe)
-          LIMIT ${pool}`,
-        [seed.chunk_id],
-      )) as Array<{ chunk_id: string; similarity: number }>;
-      return { rows };
-    });
-
-    const group = neighbours.rows.filter(
-      (row) => !assigned.has(row.chunk_id) && Number(row.similarity) >= threshold,
-    );
-    // A cluster of one is not a pattern; leaving the seed unassigned lets a
-    // later, denser seed pick it up.
-    if (group.length === 0) continue;
-
-    const created = (await sql`
-      INSERT INTO content_cluster (method, run_id, member_count)
-      VALUES ('embedding_greedy',
-              ${options.runId === null ? null : `${options.runId}`}::bigint,
-              ${group.length + 1})
-      RETURNING cluster_id::text AS cluster_id
-    `) as Array<{ cluster_id: string }>;
-    const clusterId = created[0]?.cluster_id;
-    if (clusterId === undefined) throw new Error('could not create a cluster');
-    clusters += 1;
-
-    await sql`
-      INSERT INTO cluster_member (cluster_id, chunk_id, similarity)
-      VALUES (${clusterId}::bigint, ${seed.chunk_id}::bigint, 1)
-    `;
-    assigned.add(seed.chunk_id);
-    members += 1;
-
-    for (const row of group) {
-      await sql`
-        INSERT INTO cluster_member (cluster_id, chunk_id, similarity)
-        VALUES (${clusterId}::bigint, ${row.chunk_id}::bigint, ${Number(row.similarity)})
-      `;
-      assigned.add(row.chunk_id);
-      members += 1;
-    }
+  if (resuming) {
+    // The greedy walk's entire state, recovered in one statement. `assigned` and
+    // `cluster_member` move in lockstep — a chunk is added to the set in the
+    // same step that writes its row — so the table *is* the set, and resuming
+    // does not need it carried across the process boundary in some side table.
+    const members = (await sql`SELECT chunk_id::text AS chunk_id FROM cluster_member`) as Array<{
+      chunk_id: string;
+    }>;
+    for (const member of members) assigned.add(member.chunk_id);
+  } else {
+    // A cycle recomputes clusters from scratch: membership is a function of the
+    // current corpus, and an incremental version would carry a chunk's cluster
+    // across an edit that moved it. Only on a *fresh* start, though — doing it
+    // on resume would delete the work the cursor was banked to protect, which is
+    // how this phase used to be strictly net-zero across an interrupted attempt.
+    await sql`DELETE FROM cluster_member`;
+    await sql`DELETE FROM content_cluster`;
   }
 
-  return { clusters, members };
+  const pool = candidatePoolFor({ limit: CLUSTER_POOL });
+  let cursor = options.cursor ?? CURSOR_START;
+  let clusters = 0;
+  let members = 0;
+  let seen = 0;
+
+  for (;;) {
+    const seeds = (await sql.unsafe(
+      `SELECT chunk_id::text AS chunk_id
+         FROM chunk
+        WHERE ${column} IS NOT NULL AND deleted_at IS NULL AND quarantined_at IS NULL
+          AND chunk_id > $1::bigint
+        ORDER BY chunk_id
+        LIMIT ${Math.min(batch, Number.isFinite(ceiling) ? Math.max(1, ceiling - seen) : batch)}`,
+      [cursor],
+    )) as Array<{ chunk_id: string }>;
+
+    if (seeds.length === 0) return { clusters, members, ...FINISHED };
+
+    const pending = seeds.filter((seed) => !assigned.has(seed.chunk_id));
+
+    // **One transaction for the batch, not one per seed.** `withVectorScan` is a
+    // `BEGIN`, two `SET LOCAL`s and a `COMMIT` — five round trips of overhead
+    // that used to be paid for every single seed. The GUCs it sets are what stop
+    // pgvector truncating the candidate pool to 40 (hazards H1 and H3), and they
+    // hold for the transaction, so a batch shares them correctly.
+    const groups: Array<{ seed: string; rows: Array<{ chunk_id: string; similarity: number }> }> = [];
+    if (pending.length > 0) {
+      const scanned = await withVectorScan(sql, { candidatePool: pool }, async (tx) => {
+        const out: typeof groups = [];
+        for (const seed of pending) {
+          const rows = (await tx.unsafe(
+            `WITH probe AS (SELECT ${column} AS v FROM chunk WHERE chunk_id = $1::bigint)
+             SELECT c.chunk_id::text AS chunk_id,
+                    1 - (c.${column} <=> (SELECT v FROM probe)) AS similarity
+               FROM chunk c
+              WHERE c.${column} IS NOT NULL AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
+                AND c.chunk_id <> $1::bigint
+              ORDER BY c.${column} <=> (SELECT v FROM probe)
+              LIMIT ${pool}`,
+            [seed.chunk_id],
+          )) as Array<{ chunk_id: string; similarity: number }>;
+          out.push({ seed: seed.chunk_id, rows });
+        }
+        return out;
+      });
+      groups.push(...scanned);
+    }
+
+    // The writes are outside that transaction on purpose. Holding it open across
+    // them would lengthen exactly the window the lease reaper is watching, and
+    // the reads it exists for are already done. What each write must still be is
+    // *atomic in itself* — hence one statement per cluster below.
+    for (const group of groups) {
+      if (assigned.has(group.seed)) continue;
+      const members_ = group.rows.filter(
+        (row) => !assigned.has(row.chunk_id) && Number(row.similarity) >= threshold,
+      );
+      // A cluster of one is not a pattern; leaving the seed unassigned lets a
+      // later, denser seed pick it up.
+      if (members_.length === 0) continue;
+
+      // The cluster and every one of its members in **one** statement. Before,
+      // this was one INSERT for the cluster and one per member — up to 250 —
+      // and an attempt reaped in the middle of that left a `content_cluster` row
+      // claiming a `member_count` its `cluster_member` rows did not support.
+      const chunkIds = [group.seed, ...members_.map((row) => row.chunk_id)];
+      const similarities = [1, ...members_.map((row) => Number(row.similarity))];
+      await sql.unsafe(
+        `WITH created AS (
+           INSERT INTO content_cluster (method, run_id, member_count)
+           VALUES ('embedding_greedy', $1::bigint, $2::int)
+           RETURNING cluster_id
+         )
+         INSERT INTO cluster_member (cluster_id, chunk_id, similarity)
+         SELECT created.cluster_id, u.chunk_id, u.similarity
+           FROM created, unnest($3::bigint[], $4::float8[]) AS u(chunk_id, similarity)`,
+        [
+          options.runId,
+          chunkIds.length,
+          numericArrayLiteral(chunkIds),
+          numericArrayLiteral(similarities),
+        ],
+      );
+
+      clusters += 1;
+      for (const chunkId of chunkIds) assigned.add(chunkId);
+      members += chunkIds.length;
+    }
+
+    seen += seeds.length;
+    cursor = seeds[seeds.length - 1]?.chunk_id ?? cursor;
+
+    if (seen >= ceiling) return { clusters, members, done: false, cursor };
+    if (budget.stop() !== null) return { clusters, members, done: false, cursor };
+  }
 }

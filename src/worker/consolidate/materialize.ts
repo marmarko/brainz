@@ -132,6 +132,16 @@ export function admitToCompiledTruth(attestations: readonly Attestation[]): Admi
 export const INGESTED = 'ingested';
 export const MODEL_DERIVED = 'model_derived';
 
+/**
+ * How a canonical summary names the page it summarises.
+ *
+ * One constant rather than two spellings, because the writer and the "has this
+ * already been summarised" reader have to agree byte for byte: they disagreed
+ * only in the sense that the reader did not exist, and the consequence was a
+ * synopsis phase that could never make progress across an interrupted attempt.
+ */
+export const SUMMARY_REF_PREFIX = 'summary:';
+
 export interface CandidateChunk {
   readonly chunkId: string;
   readonly pageId: string;
@@ -200,11 +210,29 @@ export async function selectExtractionCandidates(
   }));
 }
 
-/** Ingested pages, most salient first — what the synopsis and refine phases read. */
+/**
+ * Ingested pages, most salient first — what the synopsis and refine phases read.
+ *
+ * **`unsummarised` is what makes a synopsis phase resumable.** The phase calls
+ * the model once per page, and before this predicate existed a phase cut short
+ * — by a provider, by a cap, by the attempt's clock — left the next attempt
+ * selecting the identical top-N pages by salience and paying for every one of
+ * them again. Worse than wasteful: `writeCanonicalSummary` inserts a page rather
+ * than superseding one, and `page_by_external_ref` is not unique, so the second
+ * pass left a *second* summary of the same page standing beside the first, which
+ * nothing retires and every later cycle then carries. A brain that never
+ * finished a synopsis phase accumulated those forever.
+ *
+ * It is an option rather than the default because the two callers want different
+ * things: the synopsis phase asks "what still needs summarising", and the
+ * salience-refinement phase asks "what are the most salient pages" — and the
+ * answer to the second must not change because something was summarised.
+ */
 export async function selectIngestedPages(
   sql: SQL,
-  options: { readonly limit: number },
+  options: { readonly limit: number; readonly unsummarised?: boolean },
 ): Promise<Array<{ pageId: string; title: string | null; origins: string[]; sourceType: SourceType; externalRef: string | null; text: string }>> {
+  const unsummarised = options.unsummarised === true;
   const rows = (await sql`
     SELECT p.page_id::text AS page_id, p.title, p.origin_context, p.source_type, p.external_ref,
            string_agg(c.content, E'\n' ORDER BY c.ordinal) AS text
@@ -213,6 +241,14 @@ export async function selectIngestedPages(
      WHERE p.deleted_at IS NULL AND p.quarantined_at IS NULL AND p.stale_at IS NULL
        AND p.derivation = ${INGESTED}
        AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
+       AND (
+         NOT ${unsummarised}
+         OR NOT EXISTS (
+           SELECT 1 FROM page summary
+            WHERE summary.external_ref = ${SUMMARY_REF_PREFIX} || p.page_id::text
+              AND summary.deleted_at IS NULL
+         )
+       )
      GROUP BY p.page_id, p.title, p.origin_context, p.source_type, p.external_ref, p.salience
      ORDER BY p.salience DESC NULLS LAST, p.page_id
      LIMIT ${options.limit}
@@ -566,7 +602,7 @@ export async function writeCanonicalSummary(
             (SELECT chunker_version FROM page WHERE page_id = ${input.sourcePageId}::bigint),
             (SELECT normalizer_version FROM page WHERE page_id = ${input.sourcePageId}::bigint),
             ${digest},
-            ${`summary:${input.sourcePageId}`})
+            ${`${SUMMARY_REF_PREFIX}${input.sourcePageId}`})
     RETURNING page_id::text AS page_id
   `) as Array<{ page_id: string }>;
 

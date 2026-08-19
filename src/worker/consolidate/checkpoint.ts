@@ -17,6 +17,15 @@
  * checkpoint that outlived its cycle would skip the next cycle's work while
  * looking like thrift.
  *
+ * **2b. Its subject is position, not only money.** KTD11's sentence is about
+ * re-paying, and for a phase whose cost is a provider invoice a done-flag is the
+ * whole answer. For a phase whose cost is *wall clock* it is not: the
+ * deterministic tier re-ran in full on every attempt, committing its writes and
+ * losing its place, so a brain large enough that the tier outlived one attempt
+ * could never finish it — repeated identical work under a finite attempt
+ * ceiling. Rung 19 adds `completed` and `phase_cursor`, and
+ * {@link bankPhaseProgress} is how an interrupted phase says where it got to.
+ *
  * **3. Resuming is the default, and it is decided by the database.** An open run
  * — one with no `finished_at` — is a cycle that was killed, and the next cycle
  * picks it up rather than starting a second one beside it. That is what makes
@@ -28,11 +37,23 @@ import type { SQL } from 'bun';
 
 import type { JobTrigger } from '../jobs.ts';
 import { NO_SPEND } from './estimate.ts';
-import type { CyclePhase } from './phases.ts';
+import { isModelPhase, type CyclePhase } from './phases.ts';
 
 export type ConsolidationTier = 'free' | 'paid';
 
-export type StopReason = 'complete' | 'free_tier' | 'budget_exhausted' | 'phase_failed' | 'cancelled';
+export type StopReason =
+  | 'complete'
+  | 'free_tier'
+  | 'budget_exhausted'
+  | 'phase_failed'
+  | 'cancelled'
+  /**
+   * The attempt's wall clock ran out with work left. Not a failure and not a
+   * cap: the run stays open, a position is banked, and the correct response is
+   * to run the same cycle again immediately rather than to wait for a provider
+   * or for a spend window. See `deadline.ts`.
+   */
+  | 'out_of_time';
 
 export interface CycleRun {
   readonly runId: string;
@@ -41,12 +62,44 @@ export interface CycleRun {
   readonly startedAt: Date;
 }
 
+/**
+ * One phase's banked state within the open run.
+ *
+ * `completed` is what tells a finished phase from an interrupted one now that
+ * presence of the row no longer can — see rung 19. `cursor` is where inside the
+ * phase the last attempt stopped, opaque to this module: only the phase that
+ * wrote it knows how to read it, which is what keeps the checkpoint table from
+ * growing a column per phase.
+ */
+export interface PhaseCheckpoint {
+  readonly completed: boolean;
+  readonly cursor: string | null;
+  /** Items this phase has done **across the whole run**, not this attempt. */
+  readonly items: number;
+  readonly spentMicroUsd: number;
+}
+
 export interface OpenedRun {
   readonly run: CycleRun;
   /** True when this call adopted a cycle a previous process left open. */
   readonly resumed: boolean;
-  /** Phases already banked against this run. Skipped rather than re-paid. */
-  readonly done: ReadonlySet<CyclePhase>;
+  /**
+   * What each phase has banked against this run — completed phases and
+   * interrupted ones alike. A completed model phase is skipped rather than
+   * re-paid; an interrupted deterministic phase resumes from its cursor rather
+   * than restarting.
+   */
+  readonly banked: ReadonlyMap<CyclePhase, PhaseCheckpoint>;
+  /**
+   * Why the open run stopped last time, or `null` for a run nobody has stopped.
+   *
+   * The cycle reads it to decide whether the deterministic tier's checkpoints
+   * still describe *now*. A run that stopped on the clock is being continued
+   * seconds later and its free work is still current; a run that stopped because
+   * a provider was unavailable may be resumed hours later over a brain that has
+   * ingested since, and its free work is not.
+   */
+  readonly previousStop: StopReason | null;
   /** What the resumed phases already spent, so the run's total stays a total. */
   readonly spentMicroUsd: number;
 }
@@ -56,6 +109,7 @@ interface RunRow {
   readonly trigger_reason: JobTrigger;
   readonly tier: ConsolidationTier;
   readonly started_at: Date;
+  readonly stop_reason: StopReason | null;
 }
 
 /**
@@ -76,7 +130,7 @@ export async function openRun(
   },
 ): Promise<OpenedRun> {
   const open = (await sql`
-    SELECT run_id::text AS run_id, trigger_reason, tier, started_at
+    SELECT run_id::text AS run_id, trigger_reason, tier, started_at, stop_reason
       FROM consolidation_run
      WHERE finished_at IS NULL
      ORDER BY run_id DESC
@@ -86,10 +140,17 @@ export async function openRun(
   const existing = open[0];
   if (existing !== undefined) {
     const banked = (await sql`
-      SELECT phase, spent_micro_usd::bigint AS spent
+      SELECT phase, completed, phase_cursor, items,
+             spent_micro_usd::bigint AS spent
         FROM consolidation_checkpoint
        WHERE run_id = ${existing.run_id}::bigint
-    `) as Array<{ phase: string; spent: string }>;
+    `) as Array<{
+      phase: string;
+      completed: boolean;
+      phase_cursor: string | null;
+      items: number;
+      spent: string;
+    }>;
 
     return {
       run: {
@@ -99,7 +160,18 @@ export async function openRun(
         startedAt: existing.started_at,
       },
       resumed: true,
-      done: new Set(banked.map((row) => row.phase as CyclePhase)),
+      previousStop: existing.stop_reason,
+      banked: new Map(
+        banked.map((row) => [
+          row.phase as CyclePhase,
+          {
+            completed: row.completed,
+            cursor: row.phase_cursor,
+            items: row.items,
+            spentMicroUsd: Number(row.spent),
+          },
+        ]),
+      ),
       spentMicroUsd: banked.reduce((total, row) => total + Number(row.spent), 0),
     };
   }
@@ -112,7 +184,7 @@ export async function openRun(
   const created = (await sql`
     INSERT INTO consolidation_run (trigger_reason, tier, estimated_micro_usd, started_at)
     VALUES (${options.trigger}, ${options.tier}, ${options.estimateMicroUsd}, ${options.now})
-    RETURNING run_id::text AS run_id, trigger_reason, tier, started_at
+    RETURNING run_id::text AS run_id, trigger_reason, tier, started_at, stop_reason
   `) as RunRow[];
 
   const row = created[0];
@@ -126,7 +198,8 @@ export async function openRun(
       startedAt: row.started_at,
     },
     resumed: false,
-    done: new Set<CyclePhase>(),
+    previousStop: null,
+    banked: new Map<CyclePhase, PhaseCheckpoint>(),
     spentMicroUsd: NO_SPEND,
   };
 }
@@ -146,13 +219,62 @@ export async function completePhase(
   outcome: { readonly items: number; readonly spentMicroUsd: number; readonly now: Date },
 ): Promise<void> {
   await sql`
-    INSERT INTO consolidation_checkpoint (phase, run_id, items, spent_micro_usd, completed_at)
-    VALUES (${phase}, ${run.runId}::bigint, ${outcome.items}, ${outcome.spentMicroUsd}, ${outcome.now})
+    INSERT INTO consolidation_checkpoint (phase, run_id, items, spent_micro_usd, completed_at,
+                                          completed, phase_cursor)
+    VALUES (${phase}, ${run.runId}::bigint, ${outcome.items}, ${outcome.spentMicroUsd}, ${outcome.now},
+            true, NULL)
     ON CONFLICT (phase) DO UPDATE
       SET run_id = EXCLUDED.run_id,
           items = EXCLUDED.items,
           spent_micro_usd = EXCLUDED.spent_micro_usd,
-          completed_at = EXCLUDED.completed_at
+          completed_at = EXCLUDED.completed_at,
+          completed = true,
+          -- Cleared, not left: a completed phase with a stale position would
+          -- send the next attempt into the middle of work that is already done.
+          phase_cursor = NULL
+  `;
+}
+
+/**
+ * Bank a phase **mid-flight**, so the next attempt resumes instead of restarting.
+ *
+ * The counterpart to {@link completePhase} and the reason rung 19 exists. A
+ * deterministic phase that ran out of the attempt's wall clock has done real,
+ * committed work and has no way to say so: presence of a checkpoint row used to
+ * mean "finished", so the only honest thing such a phase could do was write
+ * nothing — and the next attempt then walked the same rows in the same order and
+ * was reaped at the same place. Five attempts, no progress, dead lane.
+ *
+ * **Deterministic phases only, and it throws rather than warns.** The previous
+ * fleet version reads every checkpoint row as a completion and skips model
+ * phases on that basis, so a partial row for a model phase would make a
+ * mid-rolling-deploy instance skip a phase that had barely started. It ignores
+ * deterministic rows entirely, which is exactly what makes a partial one safe
+ * there. The rule is structural because the failure is silent and only happens
+ * during a deploy — the worst place to discover a convention.
+ */
+export async function bankPhaseProgress(
+  sql: SQL,
+  run: CycleRun,
+  phase: CyclePhase,
+  progress: { readonly items: number; readonly cursor: string; readonly now: Date },
+): Promise<void> {
+  if (isModelPhase(phase)) {
+    throw new Error(
+      `invariant: '${phase}' is a model phase and cannot bank a partial checkpoint — the previous fleet version reads any checkpoint row as a completion and would skip the phase mid-deploy`,
+    );
+  }
+  await sql`
+    INSERT INTO consolidation_checkpoint (phase, run_id, items, spent_micro_usd, completed_at,
+                                          completed, phase_cursor)
+    VALUES (${phase}, ${run.runId}::bigint, ${progress.items}, ${NO_SPEND}, ${progress.now},
+            false, ${progress.cursor})
+    ON CONFLICT (phase) DO UPDATE
+      SET run_id = EXCLUDED.run_id,
+          items = EXCLUDED.items,
+          completed_at = EXCLUDED.completed_at,
+          completed = false,
+          phase_cursor = EXCLUDED.phase_cursor
   `;
 }
 

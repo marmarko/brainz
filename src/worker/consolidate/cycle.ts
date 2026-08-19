@@ -20,12 +20,32 @@
  *                         of money" and "the provider was down" want different
  *                         responses.
  *
- * **Only model phases are skipped by a checkpoint**, and that asymmetry is
- * deliberate. The checkpoint exists so a killed cycle "never re-pays model
- * calls" — its subject is money. The deterministic phases cost nothing and their
- * inputs move between cycles, so skipping them would mean a tenant sitting at a
- * zero cap silently stops deduplicating anything, which is the free tier failing
- * quietly at exactly the thing it was promised.
+ *   `out_of_time`      — the attempt's wall clock ran out with work left. The
+ *                         run stays **open** and a *position* is banked, so the
+ *                         next attempt resumes inside the phase that was
+ *                         interrupted. The job completes normally and asks to be
+ *                         run again; see {@link createConsolidateHandler}.
+ *   `cancelled`         — the lease was lost or the worker is shutting down.
+ *                         Same banking, different name, because "we were
+ *                         interrupted" and "this brain is bigger than one
+ *                         attempt" want different responses.
+ *
+ * **A checkpoint's subject is money for the model tier and position for the
+ * deterministic one**, and the difference is what makes both true at once. The
+ * original asymmetry — only model phases skipped — was the right reading of
+ * KTD11's "never re-pays model calls" and the wrong reading of a wall clock. The
+ * deterministic phases cost nothing to *run* and everything to run *again* under
+ * a ceiling: on a 5,608-page brain they re-ran in full on every attempt, so five
+ * attempts of fifteen minutes each produced no completed cycle and the lane
+ * dead-lettered.
+ *
+ * So the deterministic tier now resumes, and it resumes **only while the run is
+ * being continued on the clock** (`out_of_time`, `cancelled`). The original
+ * argument survives intact for every other resume: a run that stopped because a
+ * provider was unavailable may be picked up hours later over a brain that has
+ * ingested since, and skipping its free work would be a tenant at a zero cap
+ * silently ceasing to deduplicate — the free tier failing quietly at exactly the
+ * thing it was promised.
  *
  * **The order is asserted, not assumed.** `assertPhaseOrder` runs before the
  * first phase: an order with a model phase ahead of a deterministic one spends
@@ -39,17 +59,20 @@ import { PROFILES, type NamedProfile, type RoutingProfileName } from '../../ai/r
 import type { CallerIdentity } from '../../control/secrets.ts';
 import { fleetIdentity } from '../../control/secrets.ts';
 import type { StoredPayloadReader } from '../../core/media/accept.ts';
-import type { JobContext, JobHandler } from '../runner.ts';
+import type { HandlerOutcome, JobContext, JobHandler } from '../runner.ts';
 import type { JobTrigger } from '../jobs.ts';
 import {
   bankEstimate,
+  bankPhaseProgress,
   completePhase,
   finishRun,
   openRun,
   recordProgress,
   type ConsolidationTier,
+  type PhaseCheckpoint,
   type StopReason,
 } from './checkpoint.ts';
+import { createAttemptBudget, type AttemptBudget } from './deadline.ts';
 import {
   clusterByEmbedding,
   collapseDuplicateFacts,
@@ -57,6 +80,7 @@ import {
   markStaleness,
   mergeEntitiesByRule,
   reconcileAllEdges,
+  type PhaseProgress,
 } from './deterministic.ts';
 import {
   NO_SPEND,
@@ -111,6 +135,26 @@ export interface CycleOptions {
   readonly nonce?: string;
   /** Injected so a test can assert on a duration without sleeping. */
   readonly clock?: () => number;
+  /**
+   * The attempt's wall-clock budget. Absent means unbudgeted, which is what
+   * every caller that is not a job wants.
+   *
+   * It is **not** `DEFAULT_MAX_ATTEMPT_MS`, and it is deliberately not read from
+   * `locks.ts` here: the number that matters is what is left of *this* attempt's
+   * ceiling, which only the lease knows. {@link createConsolidateHandler}
+   * computes it. Hard-coding the constant would make a cycle claimed nine
+   * minutes ago believe it had fifteen.
+   */
+  readonly budgetMs?: number | null;
+  /**
+   * Aborted when the runner loses the lease or is stopping.
+   *
+   * `JobContext` has carried this since U10 and the cycle used to drop it, so a
+   * dispossessed attempt kept issuing statements against the tenant's database
+   * long after its writes to the control plane were fenced. The fence protects
+   * the job row; nothing protected the brain.
+   */
+  readonly signal?: AbortSignal;
 }
 
 export interface PhaseRecord {
@@ -128,6 +172,21 @@ export interface CycleResult {
   readonly resumed: boolean;
   readonly dreamt: boolean;
   readonly stopReason: StopReason;
+  /**
+   * There is work left and running the same cycle again would do it. True only
+   * for the clock stops — a cap that fired or a provider that was down are also
+   * unfinished, and both want to wait rather than to be retried at once.
+   */
+  readonly moreToDo: boolean;
+  /**
+   * This attempt banked something the next one will not redo.
+   *
+   * The guard on the continuation loop. A cycle that stopped out of time having
+   * advanced *nothing* would, if it asked to be re-run, ask again forever at
+   * whatever rate the scheduler ticks. Reported rather than inferred, because
+   * "did anything move" is a fact about the phases and not about the clock.
+   */
+  readonly advanced: boolean;
   readonly phases: readonly PhaseRecord[];
   readonly wallClockMs: number;
   readonly spentMicroUsd: number;
@@ -155,8 +214,11 @@ export async function runConsolidationCycle(
 ): Promise<CycleResult> {
   assertPhaseOrder(CYCLE_PHASES);
 
-  const clock = options.clock ?? Date.now;
-  const startedAt = clock();
+  const attempt = createAttemptBudget({
+    ...(options.clock === undefined ? {} : { clock: options.clock }),
+    ...(options.budgetMs === undefined ? {} : { budgetMs: options.budgetMs }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  });
   const limit = options.limit ?? DEFAULT_LIMIT;
   const profile = profileOf(deps);
 
@@ -180,10 +242,43 @@ export async function runConsolidationCycle(
   let spent = opened.spentMicroUsd;
   let modelCalls = 0;
   let refined = false;
+  let advanced = false;
   let stop: StopReason = 'complete';
+
+  // **Whose checkpoints still describe the brain as it is now.** A run continued
+  // on the clock is the same attempt one process later, so its free work is
+  // current and skipping it is thrift. A run resumed after a provider outage may
+  // be hours old over a brain that has ingested since, and skipping its free
+  // work would be the free tier quietly stopping. See the header.
+  const continuingOnTheClock =
+    opened.previousStop === 'out_of_time' || opened.previousStop === 'cancelled';
+  const bankedFor = (phase: CyclePhase): PhaseCheckpoint | undefined => {
+    const banked = opened.banked.get(phase);
+    if (banked === undefined) return undefined;
+    if (isModelPhase(phase)) return banked;
+    return continuingOnTheClock ? banked : undefined;
+  };
 
   for (const phase of CYCLE_PHASES) {
     if (stop !== 'complete') {
+      phases.push({
+        phase,
+        tier: TIER_OF[phase],
+        ran: false,
+        skipped: 'not_reached',
+        items: 0,
+        spentMicroUsd: NO_SPEND,
+        stopped: null,
+      });
+      continue;
+    }
+
+    // Consulted **between** phases, so the stop is a decision rather than a
+    // reap: whatever is in flight finishes, its position is banked, and the run
+    // record carries a name an operator can act on.
+    const halted = attempt.stop();
+    if (halted !== null) {
+      stop = halted;
       phases.push({
         phase,
         tier: TIER_OF[phase],
@@ -229,11 +324,12 @@ export async function runConsolidationCycle(
       continue;
     }
 
-    // Only model phases are checkpoint-skippable. See the header.
-    if (isModelPhase(phase) && opened.done.has(phase)) {
+    const banked = bankedFor(phase);
+
+    if (banked?.completed === true) {
       phases.push({
         phase,
-        tier: 'model',
+        tier: TIER_OF[phase],
         ran: false,
         skipped: 'checkpointed',
         items: 0,
@@ -244,16 +340,47 @@ export async function runConsolidationCycle(
     }
 
     if (!isModelPhase(phase)) {
-      const items = await runDeterministicPhase(deps.sql, phase, options.now);
-      await completePhase(deps.sql, run, phase, { items, spentMicroUsd: NO_SPEND, now: options.now });
+      const outcome = await runDeterministicPhase(deps.sql, phase, {
+        now: options.now,
+        cursor: banked?.cursor ?? null,
+        attempt,
+      });
+      // Items are banked **cumulatively over the run** and reported per attempt.
+      // A phase resumed three times has done the sum of what its three attempts
+      // did, and a checkpoint that recorded only the last one would describe a
+      // brain nobody consolidated.
+      const total = (banked?.items ?? 0) + outcome.items;
+
+      if (outcome.done) {
+        await completePhase(deps.sql, run, phase, {
+          items: total,
+          spentMicroUsd: NO_SPEND,
+          now: options.now,
+        });
+        advanced = true;
+      } else if (outcome.cursor !== null) {
+        await bankPhaseProgress(deps.sql, run, phase, {
+          items: total,
+          cursor: outcome.cursor,
+          now: options.now,
+        });
+        if (outcome.cursor !== (banked?.cursor ?? null)) advanced = true;
+        stop = attempt.stop() ?? 'out_of_time';
+      } else {
+        // Stopped with no position to hand over: a whole-set phase that will
+        // restart. Nothing is banked, deliberately — a checkpoint here would
+        // claim a completion this phase did not reach.
+        stop = attempt.stop() ?? 'out_of_time';
+      }
+
       phases.push({
         phase,
         tier: 'deterministic',
         ran: true,
         skipped: null,
-        items,
+        items: outcome.items,
         spentMicroUsd: NO_SPEND,
-        stopped: null,
+        stopped: outcome.done ? null : (stop as string),
       });
       continue;
     }
@@ -267,6 +394,7 @@ export async function runConsolidationCycle(
       runId: run.runId,
       now: options.now,
       limit,
+      attempt,
       ...(options.nonce === undefined ? {} : { nonce: options.nonce }),
       ...(deps.payloads === undefined ? {} : { payloads: deps.payloads }),
     });
@@ -280,9 +408,19 @@ export async function runConsolidationCycle(
         spentMicroUsd: outcome.spentMicroUsd,
         now: options.now,
       });
+      advanced = true;
+    } else if (outcome.stopped === 'out_of_time') {
+      // A model phase that ran out of the clock banks nothing — a partial
+      // checkpoint row for a model phase would make the *previous* fleet
+      // version, which reads every row as a completion, skip the phase outright
+      // mid-deploy. Its progress is durable in the content instead: the synopsis
+      // phase no longer re-selects a page it has already summarised, so the next
+      // attempt starts where this one stopped without a row to say so.
+      stop = attempt.stop() ?? 'out_of_time';
     } else {
       stop = outcome.stopped === 'budget_exhausted' ? 'budget_exhausted' : 'phase_failed';
     }
+    if (outcome.applied > 0 || outcome.queued > 0) advanced = true;
 
     phases.push({
       phase,
@@ -298,8 +436,9 @@ export async function runConsolidationCycle(
   const stopReason: StopReason =
     stop === 'complete' && options.tier === 'free' ? 'free_tier' : stop;
   const dreamt = stopReason === 'complete';
-  const wallClockMs = Math.max(0, clock() - startedAt);
+  const wallClockMs = attempt.elapsedMs();
   const ran = phases.filter((phase) => phase.ran).length;
+  const moreToDo = stopReason === 'out_of_time' || stopReason === 'cancelled';
 
   const record = {
     dreamt,
@@ -325,6 +464,8 @@ export async function runConsolidationCycle(
     resumed: opened.resumed,
     dreamt,
     stopReason,
+    moreToDo,
+    advanced,
     phases,
     wallClockMs,
     spentMicroUsd: spent,
@@ -334,7 +475,7 @@ export async function runConsolidationCycle(
 }
 
 /**
- * One deterministic phase, by name.
+ * One deterministic phase, by name, under the attempt's clock.
  *
  * The staleness phase re-reconciles when it invalidated something, and that is
  * the one place this switch does more than dispatch. Reconciliation reads the
@@ -343,26 +484,56 @@ export async function runConsolidationCycle(
  * moved the inputs re-runs the phase that reads them — otherwise an edge whose
  * only support was just retired stands for a whole cycle, which is Gap #18's
  * cancelled meeting still in the briefing.
+ *
+ * **Every phase takes the budget and returns where it got to.** The budget is
+ * consulted inside the phases rather than only between them because two of them
+ * — salience and clustering — are the whole of the cycle's wall clock on a large
+ * brain, and a check that only fires at a phase boundary would never fire inside
+ * the phase that is the reason there is a boundary problem.
  */
-async function runDeterministicPhase(sql: SQL, phase: CyclePhase, now: Date): Promise<number> {
+async function runDeterministicPhase(
+  sql: SQL,
+  phase: CyclePhase,
+  options: {
+    readonly now: Date;
+    readonly cursor: string | null;
+    readonly attempt: AttemptBudget;
+  },
+): Promise<{ readonly items: number } & PhaseProgress> {
+  const { now, cursor, attempt: budget } = options;
+
   switch (phase) {
-    case 'dedup':
-      return (await collapseDuplicateFacts(sql)).collapsed;
+    case 'dedup': {
+      const result = await collapseDuplicateFacts(sql, { budget });
+      return { items: result.collapsed, done: result.done, cursor: result.cursor };
+    }
     case 'link_reconcile': {
-      const result = await reconcileAllEdges(sql, { taxonomyVersion: 1 });
-      return result.added + result.removed;
+      const result = await reconcileAllEdges(sql, { taxonomyVersion: 1, budget });
+      return { items: result.added + result.removed, done: result.done, cursor: result.cursor };
     }
     case 'staleness': {
-      const result = await markStaleness(sql, { now });
-      if (result.factsInvalidated > 0) await reconcileAllEdges(sql, { taxonomyVersion: 1 });
-      return result.staled;
+      const result = await markStaleness(sql, { now, cursor, budget });
+      // The re-reconcile is skipped when this pass did not finish, because it is
+      // a *fix point* over the whole edge set: running it against a fact set the
+      // next attempt is still retiring from would remove edges that attempt is
+      // about to re-derive, and re-add them, once per attempt.
+      if (result.done && result.factsInvalidated > 0) {
+        await reconcileAllEdges(sql, { taxonomyVersion: 1, budget });
+      }
+      return { items: result.staled, done: result.done, cursor: result.cursor };
     }
-    case 'entity_merge':
-      return (await mergeEntitiesByRule(sql)).merged;
-    case 'salience':
-      return (await computeDeterministicSalience(sql, { now })).scored;
-    case 'cluster':
-      return (await clusterByEmbedding(sql, { runId: null })).clusters;
+    case 'entity_merge': {
+      const result = await mergeEntitiesByRule(sql, { budget });
+      return { items: result.merged, done: result.done, cursor: result.cursor };
+    }
+    case 'salience': {
+      const result = await computeDeterministicSalience(sql, { now, cursor, budget });
+      return { items: result.scored, done: result.done, cursor: result.cursor };
+    }
+    case 'cluster': {
+      const result = await clusterByEmbedding(sql, { runId: null, cursor, budget });
+      return { items: result.clusters, done: result.done, cursor: result.cursor };
+    }
     default:
       throw new Error(`invariant: '${phase}' is not a deterministic phase`);
   }
@@ -397,15 +568,61 @@ export interface ConsolidatePorts {
 }
 
 /**
+ * How much of an attempt's ceiling is reserved for stopping.
+ *
+ * A cycle handed exactly `attemptDeadlineAt - now` would start its last unit of
+ * work just inside the ceiling and be reaped while writing its own run record —
+ * which is the failure this whole seam exists to end, arriving one statement
+ * later and looking identical from the outside. A minute covers the closing
+ * writes (the checkpoint, the run record, the tenant settlement) with room for a
+ * database that is having a bad afternoon, against a ceiling of fifteen.
+ */
+export const ATTEMPT_CLOSING_MARGIN_MS = 60_000;
+
+/**
+ * What is left of this attempt's wall-clock ceiling, minus the closing margin.
+ *
+ * Read off the **lease**, not off `DEFAULT_MAX_ATTEMPT_MS`. The constant says how
+ * long an attempt may run; the lease says when *this* attempt must be over, and
+ * they differ by however long the job waited between claim and here. A cycle
+ * that trusted the constant would believe it had fifteen minutes at minute nine.
+ *
+ * `null` when the lease carries no usable deadline — unbudgeted, which is the
+ * behaviour every caller had before this existed, so a lease shape this code
+ * does not recognise degrades to the old cycle rather than to a zero budget that
+ * stops before the first phase.
+ */
+function attemptBudgetMsFor(context: JobContext): number | null {
+  const deadline = context.lease.attemptDeadlineAt;
+  if (!(deadline instanceof Date) || Number.isNaN(deadline.getTime())) return null;
+  return Math.max(0, deadline.getTime() - context.now.getTime() - ATTEMPT_CLOSING_MARGIN_MS);
+}
+
+/**
  * The `consolidate` job, as U10's runner expects it.
  *
  * The lease's trigger is carried onto the run record rather than re-derived:
  * KTD11 has three triggers and the scheduler is the only thing that knows which
  * one fired, so inferring it here would be inventing the answer to the one
  * question a capacity model asks of these rows.
+ *
+ * **It returns a continuation rather than finishing, when there is more to do.**
+ * A whole-brain cycle that does not fit one attempt is a long job, not a broken
+ * one, and the two used to be the same event: the attempt was reaped, an attempt
+ * was charged, and five of those dead-lettered the lane — after which nothing,
+ * not the cadence and not a redeploy, would poll that tenant again until an
+ * operator cleared it. The cycle now stops itself, banks a position, and says
+ * so; the runner completes the job normally and settles the tenant as due again
+ * immediately rather than at the next 24-hour ceiling. Each continuation is a
+ * **fresh job with a fresh attempt ladder**, which is what makes a brain that
+ * needs ten attempts survivable under a policy that allows five.
+ *
+ * **`advanced` gates it.** A cycle that ran out of time having banked nothing
+ * would ask to be re-run forever at whatever rate the scheduler ticks, so it
+ * settles normally instead and waits for the ceiling — slow, and finite.
  */
 export function createConsolidateHandler(ports: ConsolidatePorts): JobHandler {
-  return async (context: JobContext): Promise<void> => {
+  return async (context: JobContext): Promise<HandlerOutcome | undefined> => {
     const world = await ports.open(context.lease.tenantId);
     try {
       const result = await runConsolidationCycle(
@@ -421,9 +638,12 @@ export function createConsolidateHandler(ports: ConsolidatePorts): JobHandler {
           tier: world.tier,
           capMicroUsd: world.capMicroUsd,
           now: context.now,
+          budgetMs: attemptBudgetMsFor(context),
+          signal: context.signal,
         },
       );
       ports.onCycle?.(context.lease.tenantId, result);
+      return result.moreToDo && result.advanced ? { continuation: true } : undefined;
     } finally {
       await world.close();
     }

@@ -59,6 +59,7 @@ import {
   writeEntityCard,
   type Prompt,
 } from './materialize.ts';
+import { unboundedAttempt, type AttemptBudget } from './deadline.ts';
 import { NO_SPEND } from './estimate.ts';
 import type { ModelPhase } from './phases.ts';
 import { PHASE_OP } from './phases.ts';
@@ -75,7 +76,21 @@ export type PhaseStop =
   | 'budget_exhausted'
   | 'model_unavailable'
   | 'bad_output'
-  | 'payload_unavailable';
+  | 'payload_unavailable'
+  /**
+   * The attempt's wall clock ran out (or its lease was lost) part way through a
+   * phase that calls the model **once per item**. Not a failure: the items
+   * already applied are applied, and the cycle re-reads the precise reason off
+   * the budget so `cancelled` and `out_of_time` stay distinguishable on the run
+   * record.
+   *
+   * A phase stopping this way banks **no checkpoint**, on purpose — the previous
+   * fleet version reads any checkpoint row as a completion. Its progress is
+   * durable in the content instead, which is why `selectIngestedPages` grew an
+   * already-summarised predicate: the next attempt simply does not select what
+   * this one finished.
+   */
+  | 'out_of_time';
 
 export interface PhaseOutcome {
   readonly phase: ModelPhase;
@@ -99,6 +114,13 @@ export interface ModelPhaseDeps {
   readonly now: Date;
   /** How many candidates one pass considers. Bounded so a cycle is bounded. */
   readonly limit?: number;
+  /**
+   * The attempt's wall clock, consulted between items by the phases that loop.
+   *
+   * Absent means unbudgeted, which is what a phase test wants and what every
+   * caller had before the cycle could see its own deadline.
+   */
+  readonly attempt?: AttemptBudget;
   /** Injected in tests so a prompt is byte-comparable. Production mints one. */
   readonly nonce?: string;
   /**
@@ -505,7 +527,17 @@ export async function runEnrichPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome
  */
 export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome> {
   const phase: ModelPhase = 'synopsis';
-  const pages = await selectIngestedPages(deps.sql, { limit: deps.limit ?? 25 });
+  const attempt = deps.attempt ?? unboundedAttempt();
+  // `unsummarised` is the phase's resume mechanism. It calls the model once per
+  // page, so it is the one model phase whose cost is a *loop* — 200 sequential
+  // provider round trips at the cycle's default limit, which is the single
+  // largest term in the wall clock of a paid cycle and is independent of how big
+  // the brain is. Whole-phase checkpointing cannot bank a partial loop, so the
+  // progress is banked in the content: a page with a summary is not selected.
+  const pages = await selectIngestedPages(deps.sql, {
+    limit: deps.limit ?? 25,
+    unsummarised: true,
+  });
   if (pages.length === 0) return empty(phase);
 
   let applied = 0;
@@ -513,6 +545,20 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
   let calls = 0;
 
   for (const page of pages) {
+    // Checked **before** the call, not after: the cheapest place to stop is the
+    // one where the next unit of work has not been paid for yet.
+    if (attempt.stop() !== null) {
+      return {
+        phase,
+        items: pages.length,
+        applied,
+        queued: 0,
+        logged,
+        spentMicroUsd: deps.budget.spentMicroUsd(),
+        modelCalls: calls,
+        stopped: 'out_of_time',
+      };
+    }
     const prompt = buildSynopsisPrompt({
       title: page.title,
       text: page.text,

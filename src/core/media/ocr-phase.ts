@@ -283,6 +283,14 @@ export async function runTranscribePhase(deps: ModelPhaseDeps): Promise<PhaseOut
   }
 
   for (const item of pending) {
+    // The other per-item model loop in the cycle, and it stops on the attempt's
+    // clock for the same reason the synopsis phase does: its progress is already
+    // durable in the content (`ocr_text` stops being NULL), so the next attempt
+    // selects only what this one did not reach. Checked before the payload read,
+    // which is the last point where nothing has been spent.
+    if (deps.attempt?.stop() != null) {
+      return outcomeOf(deps, pending.length, progress, 'out_of_time');
+    }
     const stored = await payloads.read(item.objectKey);
     if (stored === null) return outcomeOf(deps, pending.length, progress, 'payload_unavailable');
 
