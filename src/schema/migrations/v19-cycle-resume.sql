@@ -98,5 +98,49 @@ ALTER TABLE consolidation_run
   ADD CONSTRAINT consolidation_run_stop_reason_is_known CHECK (
     stop_reason IS NULL
     OR stop_reason IN ('complete', 'free_tier', 'budget_exhausted', 'phase_failed', 'cancelled',
-                       'out_of_time', 'abandoned')
+                       'out_of_time', 'abandoned', 'phase_does_not_fit')
   );
+
+
+-- ---------------------------------------------------------------------------
+-- consolidation_phase_timing — how long a phase took, the last time it finished.
+--
+-- **Three of the deterministic phases are whole-set computations**, and one of
+-- them cannot be stopped part-way at all: `link_reconcile` builds the desired
+-- edge set from every live fact before diffing the live edges against it, so an
+-- edge absent from a half-built set is an edge the diff *deletes*. It has to run
+-- to the end or not at all.
+--
+-- A phase like that under a wall-clock ceiling has exactly one safe failure
+-- mode, and it is not the one it had. Entering it with four seconds left and
+-- being reaped somewhere inside is a decision nobody made, recorded nowhere, and
+-- indistinguishable from a crash. Declining to start it is a decision, and it
+-- can carry a reason an operator can act on — which is what `phase_does_not_fit`
+-- above is for.
+--
+-- Declining needs a number, and the number has to survive the run that measured
+-- it: `consolidation_checkpoint` is emptied every time a cycle closes, so a
+-- duration banked there would be forgotten by the next cycle and the guard would
+-- have data only within a single run. One row per phase, overwritten by the most
+-- recent completion, because what the guard needs is "how long does this take on
+-- this brain **now**" and an average over a brain that has doubled in size since
+-- is a more confident wrong answer.
+--
+-- Only completions are recorded. A phase that stopped part-way took less than it
+-- costs, and writing that down would be teaching the guard that the phase fits
+-- when the evidence says nothing of the kind.
+--
+-- Operational, like the two tables above it: no user content, no inference, and
+-- nothing here is derived from what anybody wrote.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE consolidation_phase_timing (
+  phase            text        NOT NULL,
+  last_duration_ms bigint      NOT NULL,
+  measured_at      timestamptz NOT NULL,
+
+  CONSTRAINT consolidation_phase_timing_pkey PRIMARY KEY (phase),
+  CONSTRAINT consolidation_phase_timing_duration_is_non_negative CHECK (last_duration_ms >= 0)
+);
+
+COMMENT ON TABLE consolidation_phase_timing IS 'operational — how long each consolidation phase took the last time it ran to completion, so the cycle can decline to start one that will not fit what is left of its attempt.';

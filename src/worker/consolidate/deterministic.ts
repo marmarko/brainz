@@ -29,14 +29,30 @@
  * {@link AttemptBudget}, consults it between units of work, and returns a
  * {@link PhaseProgress} saying whether it finished. `salience` and `cluster` also
  * return a **cursor**, because they are the two whose work is a walk over an
- * ordered set and therefore the two where "where I got to" is expressible; the
- * rest are whole-set computations whose intermediate state is not a row id, and
- * they restart — which is why they yield to a lost lease (`cancelled`) and not to
- * the clock (`stop`). A phase that restarts and is interrupted on the clock is a
- * phase the cycle can never get past, whatever budget it is given. That asymmetry is affordable exactly because those four are the
- * cheap ones: measured on a 5,608-page brain, dedup, link reconciliation,
- * staleness and entity merge together cost under 400ms of database work, while
- * salience and clustering cost 28,799 of the pass's 30,850 round trips.
+ * ordered set and therefore the two where "where I got to" is expressible.
+ *
+ * **The rest are whole-set computations, and they split two ways.** Whether one
+ * may yield to the clock without a cursor is not a question about cursors; it is
+ * a question about whether restarting it costs anything.
+ *
+ *   `dedup` and `entity_merge` are **monotone**: a collapsed fact gets a
+ *   `superseded_by` and a merged entity gets a `deleted_at`, so both leave the
+ *   set the next attempt reads. Restarting costs one whole-set read and finds
+ *   strictly less to do, so these yield to the clock and converge by repetition
+ *   — progress banked in the rows instead of in a checkpoint.
+ *
+ *   `link_reconcile` is **not**: the desired edge set has to be complete before
+ *   anything is diffed against it, because an edge missing from a half-built
+ *   set is an edge the diff deletes. It restarts identically however many
+ *   attempts it is given, so it yields to a lost lease (`cancelled`) and never
+ *   to the clock — and the *cycle* declines to enter it when its last measured
+ *   duration does not fit what is left, which is the only honest thing to do
+ *   with a phase that has to run to the end or not at all.
+ *
+ * That is affordable exactly because these are the cheap ones: measured on a
+ * 5,608-page brain, dedup, link reconciliation, staleness and entity merge
+ * together cost under 400ms of database work, while salience and clustering cost
+ * 28,799 of the pass's 30,850 round trips.
  *
  * **Round trips, not rows, were the wall.** Salience issued `1 + 2N` sequential
  * statements — a per-page fact query and a per-page UPDATE — which is 11,217 on
@@ -181,12 +197,17 @@ export async function collapseDuplicateFacts(
       `;
       collapsed += 1;
     }
-    // `cancelled`, not `stop`: this phase has no cursor, so abandoning it on the
-    // clock would make the next attempt redo the same prefix and stop in the
-    // same place — a phase the cycle can never get past. A lost lease is the one
-    // interruption worth taking, because from there every write is unfenced
-    // against the tenant and refused against the control plane.
-    if (budget.cancelled() !== null) {
+    // **`stop`, not `cancelled`, because this phase is monotone.** It has no
+    // cursor, and the argument against yielding to the clock without one is that
+    // the next attempt redoes the same prefix and stops in the same place. That
+    // argument does not hold here: a collapsed fact carries a `superseded_by`
+    // and is therefore not `LIVE_FACT`, so the read at the top of the next
+    // attempt is *strictly smaller* and the groups already collapsed come back
+    // as singletons the loop skips. The prefix shrinks. Progress is banked in
+    // the rows rather than in a checkpoint, and the phase converges by
+    // repetition — which is what makes stopping cleanly better than being
+    // reaped somewhere inside the write below.
+    if (budget.stop() !== null) {
       return { collapsed, groups: collapsedGroups, ...RESTARTS };
     }
   }
@@ -563,10 +584,12 @@ export async function mergeEntitiesByRule(
     }
     // Between groups, never mid-merge: a merge is aliases, then the slug
     // redirect, then the edges, then the tombstone, and stopping between two of
-    // those leaves an entity half-absorbed. `cancelled` rather than `stop` for
-    // the same reason as dedup — no cursor means abandoning on the clock buys
-    // nothing and can starve the phase forever.
-    if (budget.cancelled() !== null) return { merged, ...RESTARTS };
+    // those leaves an entity half-absorbed. It yields to the clock as well as to
+    // a lost lease for the same reason dedup does — the loser is tombstoned, so
+    // it is gone from the next attempt's `deleted_at IS NULL` read and the group
+    // comes back one row shorter. The prefix shrinks, so a clean stop here costs
+    // one whole-set read and cannot starve the phase.
+    if (budget.stop() !== null) return { merged, ...RESTARTS };
   }
 
   return { merged, ...FINISHED };

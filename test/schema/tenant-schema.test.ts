@@ -113,6 +113,10 @@ const EXPECTED_TABLES: ReadonlyMap<string, TableClass> = new Map([
   // that is fenced.
   ['consolidation_run', 'operational'],
   ['consolidation_checkpoint', 'operational'],
+  // How long each phase took the last time it finished — a number the cycle
+  // reads to decide whether to start a phase it cannot stop part-way. Six rows
+  // at most, none of them about anything anybody wrote.
+  ['consolidation_phase_timing', 'operational'],
   ['entity_card', 'content:derived'],
   ['commitment', 'content:derived'],
   ['review_queue', 'content:derived'],

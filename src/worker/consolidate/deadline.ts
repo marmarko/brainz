@@ -70,6 +70,21 @@ export interface AttemptBudget {
   remainingMs(): number;
   /** How long this attempt has been running. What the run record reports. */
   elapsedMs(): number;
+  /**
+   * Elapsed and remaining **as of the last consultation**, without taking a new
+   * reading.
+   *
+   * The cycle consults this budget at every phase boundary, so the interval
+   * between two of those consultations *is* a phase's duration — measured at the
+   * instants the cycle already decided things at, rather than at two new instants
+   * chosen by the measurement. That difference is not pedantry in either
+   * direction it matters: a second reading taken a few statements after the
+   * boundary attributes the bookkeeping between them to the phase, and under an
+   * injected clock — where the suite's whole technique is one tick per decision —
+   * a guard that took its own readings would move the budget it was reading.
+   */
+  elapsedAtLastCheck(): number;
+  remainingAtLastCheck(): number;
 }
 
 export interface AttemptBudgetOptions {
@@ -101,21 +116,36 @@ export function createAttemptBudget(options: AttemptBudgetOptions = {}): Attempt
       : Math.max(0, options.budgetMs);
   const signal = options.signal;
 
-  const elapsedMs = (): number => Math.max(0, clock() - startedAt);
+  // The last reading taken, so a caller can ask what time it was at the moment
+  // this budget was last consulted without consulting it again. See
+  // {@link AttemptBudget.elapsedAtLastCheck}.
+  let lastElapsed = 0;
+  const elapsedMs = (): number => {
+    lastElapsed = Math.max(0, clock() - startedAt);
+    return lastElapsed;
+  };
+
+  const remainingFrom = (elapsed: number): number =>
+    budgetMs === Number.POSITIVE_INFINITY ? Number.POSITIVE_INFINITY : budgetMs - elapsed;
 
   return {
     elapsedMs,
+    elapsedAtLastCheck: (): number => lastElapsed,
+    remainingAtLastCheck: (): number => remainingFrom(lastElapsed),
     cancelled(): 'cancelled' | null {
       return signal?.aborted === true ? 'cancelled' : null;
     },
     remainingMs(): number {
-      if (budgetMs === Number.POSITIVE_INFINITY) return Number.POSITIVE_INFINITY;
-      return budgetMs - elapsedMs();
+      return remainingFrom(elapsedMs());
     },
     stop(): AttemptStop | null {
       if (signal?.aborted === true) return 'cancelled';
+      // Read even when unbudgeted, which the early return here used to skip. An
+      // unbudgeted attempt has nothing to stop for and still has phases worth
+      // timing, and the readings above are the only ones anybody takes.
+      const elapsed = elapsedMs();
       if (budgetMs === Number.POSITIVE_INFINITY) return null;
-      return elapsedMs() >= budgetMs ? 'out_of_time' : null;
+      return elapsed >= budgetMs ? 'out_of_time' : null;
     },
   };
 }

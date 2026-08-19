@@ -64,7 +64,18 @@ export type StopReason =
    * cycles can tell "we swept this" from "this finished". See the horizon in
    * `cycle.ts`.
    */
-  | 'abandoned';
+  | 'abandoned'
+  /**
+   * A phase that cannot be stopped part-way would not have fitted what was left
+   * of the attempt, so the cycle declined to start it.
+   *
+   * The run stays open and the correct response is the same as `out_of_time` —
+   * run it again, from the top of a fresh attempt's budget. It is a separate
+   * name because it is the one stop an operator may need to act on: a phase
+   * refused twice running is a phase that no longer fits a whole attempt, and no
+   * number of retries will change that.
+   */
+  | 'phase_does_not_fit';
 
 export interface CycleRun {
   readonly runId: string;
@@ -370,6 +381,47 @@ export async function reopenPhase(sql: SQL, run: CycleRun, phase: CyclePhase): P
   await sql`
     DELETE FROM consolidation_checkpoint
      WHERE phase = ${phase} AND run_id = ${run.runId}::bigint
+  `;
+}
+
+/**
+ * How long each phase took the last time it ran to completion.
+ *
+ * Read once per cycle and kept, rather than asked per phase: the answer cannot
+ * change during an attempt (nothing but the end of a phase writes it), and six
+ * round trips to learn one number each is the shape of round-trip cost this
+ * whole seam was cut to remove.
+ */
+export async function readPhaseTimings(sql: SQL): Promise<Map<CyclePhase, number>> {
+  const rows = (await sql`
+    SELECT phase, last_duration_ms::bigint AS last_duration_ms FROM consolidation_phase_timing
+  `) as Array<{ phase: string; last_duration_ms: string }>;
+  return new Map(rows.map((row) => [row.phase as CyclePhase, Number(row.last_duration_ms)]));
+}
+
+/**
+ * Record what a phase cost, **only** when it ran to the end.
+ *
+ * A phase that stopped part-way took less than it costs, and banking that would
+ * teach the guard the phase fits on evidence that says nothing of the kind. The
+ * row is overwritten rather than accumulated: what a decision needs is how long
+ * this takes on this brain now, and an average taken over a brain that has
+ * doubled since is a more confident wrong answer.
+ */
+export async function recordPhaseDuration(
+  sql: SQL,
+  phase: CyclePhase,
+  durationMs: number,
+  now: Date,
+): Promise<void> {
+  const bounded = Math.max(0, Math.round(durationMs));
+  if (!Number.isFinite(bounded)) return;
+  await sql`
+    INSERT INTO consolidation_phase_timing (phase, last_duration_ms, measured_at)
+    VALUES (${phase}, ${bounded}, ${now})
+    ON CONFLICT (phase) DO UPDATE
+      SET last_duration_ms = EXCLUDED.last_duration_ms,
+          measured_at = EXCLUDED.measured_at
   `;
 }
 

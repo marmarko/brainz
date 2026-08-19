@@ -77,6 +77,32 @@ export const CYCLE_PHASES: readonly CyclePhase[] = [...DETERMINISTIC_PHASES, ...
  */
 export const FREE_TIER_PHASES: readonly CyclePhase[] = DETERMINISTIC_PHASES;
 
+/**
+ * The phases that have to run to the end or not at all.
+ *
+ * `link_reconcile` computes the desired edge set from **every** live fact and
+ * then removes the live edges that are missing from it — so an edge absent from
+ * a half-built desired set is an edge the diff deletes. There is no position it
+ * could bank and no prefix a restart could skip, which means an interruption
+ * anywhere inside it is either wasted (a restart) or destructive (a partial
+ * diff). The cycle therefore decides *before entering* whether it fits, which is
+ * the only point at which the answer is still useful.
+ *
+ * A list rather than a boolean on each phase, because it is a claim about the
+ * shape of a computation and the shape is what a reader has to check: adding a
+ * name here is asserting "this one cannot be stopped", and that assertion should
+ * be somewhere it can be read in one place against the six functions it
+ * describes.
+ */
+export const UNYIELDING_PHASES: readonly CyclePhase[] = ['link_reconcile'];
+
+const UNYIELDING_SET = new Set<string>(UNYIELDING_PHASES);
+
+/** Whether stopping this phase part-way is possible at all. See above. */
+export function canStopPartWay(phase: CyclePhase): boolean {
+  return !UNYIELDING_SET.has(phase);
+}
+
 export type PhaseTier = 'deterministic' | 'model';
 
 const MODEL_PHASE_SET = new Set<string>(MODEL_PHASES);

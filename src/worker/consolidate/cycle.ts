@@ -74,6 +74,8 @@ import {
   finishRun,
   openRun,
   phaseIsComplete,
+  readPhaseTimings,
+  recordPhaseDuration,
   recordProgress,
   reopenPhase,
   type ConsolidationTier,
@@ -103,6 +105,7 @@ import {
   CYCLE_PHASES,
   TIER_OF,
   assertPhaseOrder,
+  canStopPartWay,
   isModelPhase,
   type CyclePhase,
   type ModelPhase,
@@ -182,7 +185,12 @@ export interface PhaseRecord {
   readonly phase: CyclePhase;
   readonly tier: 'deterministic' | 'model';
   readonly ran: boolean;
-  readonly skipped: 'checkpointed' | 'free_tier' | 'not_reached' | null;
+  /**
+   * Why the phase did not run. `does_not_fit` is the one that is a *decision*:
+   * the phase cannot be stopped part-way and its last measured duration was
+   * longer than what was left, so the cycle declined to start it.
+   */
+  readonly skipped: 'checkpointed' | 'free_tier' | 'not_reached' | 'does_not_fit' | null;
   readonly items: number;
   readonly spentMicroUsd: number;
   readonly stopped: string | null;
@@ -194,9 +202,11 @@ export interface CycleResult {
   readonly dreamt: boolean;
   readonly stopReason: StopReason;
   /**
-   * There is work left and running the same cycle again would do it. True only
-   * for the clock stops — a cap that fired or a provider that was down are also
-   * unfinished, and both want to wait rather than to be retried at once.
+   * There is work left and running the same cycle again would do it. True for
+   * the clock stops and for a phase declined as too long — all three are cured
+   * by a fresh attempt's full budget. A cap that fired or a provider that was
+   * down are also unfinished, and both want to wait rather than to be retried at
+   * once.
    */
   readonly moreToDo: boolean;
   /**
@@ -290,6 +300,11 @@ export async function runConsolidationCycle(
   let budgets: Readonly<Record<ModelPhase, Budget>> = budgetsFor(estimate, { capMicroUsd: NO_SPEND });
   let priced = estimate;
 
+  // What each phase cost the last time it finished. Read once: nothing but the
+  // end of a phase writes it, so asking again per phase would be six round trips
+  // to learn six numbers that cannot have changed.
+  const timings = await readPhaseTimings(deps.sql);
+
   const phases: PhaseRecord[] = [];
   let spent = opened.spentMicroUsd;
   let modelCalls = 0;
@@ -316,6 +331,18 @@ export async function runConsolidationCycle(
     return continuingOnTheClock ? banked : undefined;
   };
 
+  // **A phase's duration is the interval between the two consultations that
+  // bracket it**, and the cycle already takes both: it asks the budget at every
+  // phase boundary. Measuring from those readings rather than taking its own
+  // means the guard costs nothing and cannot move what it is reading. Only a
+  // phase that *completed* is banked — see `recordPhaseDuration`.
+  let measuring: { readonly phase: CyclePhase; readonly enteredAt: number } | null = null;
+  const closeMeasurement = async (at: number): Promise<void> => {
+    if (measuring === null) return;
+    await recordPhaseDuration(deps.sql, measuring.phase, at - measuring.enteredAt, options.now);
+    measuring = null;
+  };
+
   for (const phase of CYCLE_PHASES) {
     if (stop !== 'complete') {
       phases.push({
@@ -334,6 +361,8 @@ export async function runConsolidationCycle(
     // reap: whatever is in flight finishes, its position is banked, and the run
     // record carries a name an operator can act on.
     const halted = attempt.stop();
+    const boundary = attempt.elapsedAtLastCheck();
+    await closeMeasurement(boundary);
     if (halted !== null) {
       stop = halted;
       phases.push({
@@ -397,6 +426,34 @@ export async function runConsolidationCycle(
     }
 
     if (!isModelPhase(phase)) {
+      // **A phase that has to run to the end is decided about before it starts.**
+      // `link_reconcile` diffs the live edges against a desired set built from
+      // every live fact, so an interruption anywhere inside it is either wasted
+      // or destructive — there is no partial answer it could bank. Entering it
+      // with less than it needs can therefore only end in a reap, which is the
+      // event this whole seam replaces with a decision. Declining is the
+      // decision, and it carries a name so a phase that stops fitting *at all*
+      // is an operator's alert rather than a lane that goes quiet.
+      //
+      // Answered from the boundary reading taken a few statements ago rather
+      // than from a fresh one: that reading is what defines the interval the
+      // measurement below was taken over, and a guard that took its own would be
+      // timing itself.
+      const expected = timings.get(phase);
+      if (!canStopPartWay(phase) && expected !== undefined && expected > attempt.remainingAtLastCheck()) {
+        stop = 'phase_does_not_fit';
+        phases.push({
+          phase,
+          tier: 'deterministic',
+          ran: false,
+          skipped: 'does_not_fit',
+          items: 0,
+          spentMicroUsd: NO_SPEND,
+          stopped: stop,
+        });
+        continue;
+      }
+
       // **What this phase had banked before the attempt started**, which is not
       // always what it is allowed to resume from: `bankedFor` withholds a
       // deterministic checkpoint from a resume that is not on the clock, and the
@@ -410,6 +467,9 @@ export async function runConsolidationCycle(
         cursor: banked?.cursor ?? null,
         attempt,
         ...(options.batch === undefined ? {} : { batch: options.batch }),
+        ...(timings.has('link_reconcile')
+          ? { reconcileCostMs: timings.get('link_reconcile') as number }
+          : {}),
       });
       // Items are banked **cumulatively over the run** and reported per attempt.
       // A phase resumed three times has done the sum of what its three attempts
@@ -423,6 +483,9 @@ export async function runConsolidationCycle(
       if (outcome.mutations > 0) advanced = true;
 
       if (outcome.done) {
+        // Timed from the boundary above to the next one, which is where
+        // `closeMeasurement` collects it.
+        measuring = { phase, enteredAt: boundary };
         await completePhase(deps.sql, run, phase, {
           items: total,
           spentMicroUsd: NO_SPEND,
@@ -449,6 +512,12 @@ export async function runConsolidationCycle(
           advanced = true;
         }
         stop = attempt.stop() ?? 'out_of_time';
+      } else if (outcome.refused !== undefined) {
+        // The phase declined work it triggered rather than starting something it
+        // could not finish — the staleness fix point, which is a reconciliation
+        // by another name and inherits the same rule. Nothing is banked; the
+        // phase is honestly incomplete.
+        stop = 'phase_does_not_fit';
       } else {
         // Stopped with no position to hand over: a whole-set phase that will
         // restart. Nothing is banked, deliberately — a checkpoint here would
@@ -520,8 +589,12 @@ export async function runConsolidationCycle(
     stop === 'complete' && options.tier === 'free' ? 'free_tier' : stop;
   const dreamt = stopReason === 'complete';
   const wallClockMs = attempt.elapsedMs();
+  await closeMeasurement(wallClockMs);
   const ran = phases.filter((phase) => phase.ran).length;
-  const moreToDo = stopReason === 'out_of_time' || stopReason === 'cancelled';
+  const moreToDo =
+    stopReason === 'out_of_time' ||
+    stopReason === 'cancelled' ||
+    stopReason === 'phase_does_not_fit';
 
   const record = {
     dreamt,
@@ -576,6 +649,16 @@ export async function runConsolidationCycle(
 export interface DeterministicOutcome extends PhaseProgress {
   readonly items: number;
   readonly mutations: number;
+  /**
+   * A phase this one would have triggered and declined to start, because its
+   * last measured duration is longer than what is left of the attempt.
+   *
+   * Only the staleness fix point can set it. That call is a `link_reconcile` in
+   * everything but name, so it inherits the rule the phase loop applies to the
+   * named one — otherwise closing the fix point's gap would have re-opened
+   * exactly the un-clocked overrun the guard exists to end, one call site along.
+   */
+  readonly refused?: CyclePhase;
 }
 
 /**
@@ -609,6 +692,15 @@ export async function runDeterministicPhase(
      * leaves each phase at its own tuned constant; see {@link CycleOptions}.
      */
     readonly batch?: number;
+    /**
+     * What `link_reconcile` cost the last time it finished, when anybody knows.
+     *
+     * Only the staleness arm reads it, and only to decline the fix point it
+     * would otherwise start with whatever happens to be left. Absent means no
+     * measurement exists, which is the one case where starting it is the only
+     * way to learn anything.
+     */
+    readonly reconcileCostMs?: number;
   },
 ): Promise<DeterministicOutcome> {
   const { run, now, cursor, attempt: budget } = options;
@@ -670,6 +762,22 @@ export async function runDeterministicPhase(
       // is what makes it a fix point rather than a coincidence of scheduling.
       if (await phaseIsComplete(sql, run, 'link_reconcile')) {
         return { items: result.staled, mutations: result.staled, done: true, cursor: null };
+      }
+
+      // Same rule as the phase loop's, and it must be: this is reconciliation,
+      // and it cannot bank a partial answer here any more than it can there.
+      // `remainingMs` rather than the last reading, because the last reading was
+      // taken before the staleness walk that just ran — which is precisely the
+      // interval a guard on what is *left* must not ignore.
+      const owed = options.reconcileCostMs;
+      if (owed !== undefined && owed > budget.remainingMs()) {
+        return {
+          items: result.staled,
+          mutations: result.staled,
+          done: false,
+          cursor: null,
+          refused: 'link_reconcile',
+        };
       }
 
       const again = await reconcileAllEdges(sql, { taxonomyVersion: 1, budget });
