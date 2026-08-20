@@ -25,6 +25,7 @@ import type { SQL } from 'bun';
 import { createBudget, type Budget } from '../../ai/gateway.ts';
 import { CANONICAL_PRICE_BOOK, costMicroUsd, type PriceBook } from '../../ai/pricing.ts';
 import { IMAGE_INPUT_TOKENS, routeFor, type NamedProfile } from '../../ai/routing.ts';
+import { CONSIDERATION_VERSION, type ConsiderationVersions } from './consideration.ts';
 import { MODEL_PHASES, PHASE_OP, type ModelPhase } from './phases.ts';
 
 /** How much work a phase has, and how big one unit of it is. */
@@ -181,8 +182,22 @@ const TOKENS_PER_ITEM: Readonly<Record<ModelPhase, number>> = Object.freeze({
  * Every count carries the same anti-loop predicate the phases themselves use: an
  * estimate that counted model-derived rows would budget for work the cycle is
  * forbidden to do, and the budget would then look mysteriously generous.
+ *
+ * **And the same consideration predicate**, for a sharper reason than tidiness.
+ * A phase's cap is its share of the estimate, so a count that included rows the
+ * phase will not select prices a batch that will never be sent — and on a
+ * converged brain that is the whole corpus, which turns "nothing to do" into a
+ * generous budget for it. The failure runs the other way too, and that is the
+ * one that bites: the contradiction phase FILLS a short batch of new facts with
+ * already-considered ones, so counting only the new facts would produce a cap
+ * one item wide in front of a prompt two hundred items long, and the phase would
+ * stop on `budget_exhausted` every time a single fact arrived.
  */
-export async function measureWorkload(sql: SQL, limits: { readonly batch: number }): Promise<CycleWorkload> {
+export async function measureWorkload(
+  sql: SQL,
+  limits: { readonly batch: number; readonly consideration?: ConsiderationVersions },
+): Promise<CycleWorkload> {
+  const version = limits.consideration ?? CONSIDERATION_VERSION;
   const scalar = async (query: Promise<unknown>): Promise<number> => {
     const rows = (await query) as Array<{ n: number }>;
     return Math.min(limits.batch, rows[0]?.n ?? 0);
@@ -193,19 +208,41 @@ export async function measureWorkload(sql: SQL, limits: { readonly batch: number
       FROM chunk c JOIN page p ON p.page_id = c.page_id
      WHERE c.deleted_at IS NULL AND c.quarantined_at IS NULL
        AND p.deleted_at IS NULL AND p.quarantined_at IS NULL AND p.stale_at IS NULL
-       AND p.derivation = 'ingested'`);
+       AND p.derivation = 'ingested'
+       AND (c.extract_considered_version IS NULL
+            OR c.extract_considered_version < ${version.extract})`);
 
   const entities = await scalar(sql`
-    SELECT count(*)::int AS n FROM entity WHERE deleted_at IS NULL`);
+    SELECT count(*)::int AS n FROM entity
+     WHERE deleted_at IS NULL
+       AND (enrich_considered_version IS NULL
+            OR enrich_considered_version < ${version.enrich})`);
 
   const pages = await scalar(sql`
     SELECT count(*)::int AS n FROM page
      WHERE deleted_at IS NULL AND quarantined_at IS NULL AND stale_at IS NULL
        AND derivation = 'ingested'`);
 
-  const factPairs = await scalar(sql`
+  const unrefinedPages = await scalar(sql`
+    SELECT count(*)::int AS n FROM page
+     WHERE deleted_at IS NULL AND quarantined_at IS NULL AND stale_at IS NULL
+       AND derivation = 'ingested'
+       AND (salience_refine_considered_version IS NULL
+            OR salience_refine_considered_version < ${version.salience_refine})`);
+
+  // The batch the contradiction phase will actually send: nothing at all when no
+  // fact is unconsidered, and otherwise a full batch, because the phase fills
+  // the space behind the new facts with old ones so a new claim is read beside
+  // the brain's existing ones.
+  const freshFacts = await scalar(sql`
+    SELECT count(*)::int AS n FROM fact
+     WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL
+       AND (contradiction_considered_version IS NULL
+            OR contradiction_considered_version < ${version.contradiction})`);
+  const liveFacts = await scalar(sql`
     SELECT count(*)::int AS n FROM fact
      WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL`);
+  const factPairs = freshFacts === 0 ? 0 : liveFacts;
 
   // The same predicate the phase itself queues on (`ocr-phase.ts`). An estimate
   // that counted quarantined or already-read attachments would budget for calls
@@ -220,7 +257,7 @@ export async function measureWorkload(sql: SQL, limits: { readonly batch: number
     enrich: { items: entities, inputTokensPerItem: TOKENS_PER_ITEM.enrich },
     synopsis: { items: pages, inputTokensPerItem: TOKENS_PER_ITEM.synopsis },
     contradiction: { items: factPairs, inputTokensPerItem: TOKENS_PER_ITEM.contradiction },
-    salience_refine: { items: pages, inputTokensPerItem: TOKENS_PER_ITEM.salience_refine },
+    salience_refine: { items: unrefinedPages, inputTokensPerItem: TOKENS_PER_ITEM.salience_refine },
   };
   return workload;
 }

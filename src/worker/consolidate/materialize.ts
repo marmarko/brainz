@@ -155,7 +155,7 @@ export interface CandidateChunk {
 /**
  * The text a model phase may read.
  *
- * Three predicates and each is load-bearing:
+ * Four predicates and each is load-bearing:
  *
  *  - `p.derivation = 'ingested'` is the anti-loop guard.
  *  - the soft-delete, quarantine and staleness exclusions keep a phase from
@@ -163,13 +163,19 @@ export interface CandidateChunk {
  *  - the **join** to `page` is itself fail-closed: a chunk with no page carries
  *    no derivation, so nothing can prove it is not model-derived, and the safe
  *    reading of "cannot prove" is "not a candidate".
+ *  - **the consideration stamp is what makes the phase's work durable.** Before
+ *    it, this query returned the same top-N by salience on every cycle forever,
+ *    so the only thing that stopped a second cycle re-paying for extraction was
+ *    a checkpoint row belonging to a run — which is per-run, so keeping it meant
+ *    keeping the run open, which is what froze a brain at 167 facts. See
+ *    `consideration.ts`.
  *
  * Ordered by salience, which is what makes budget truncation degrade by
  * importance rather than by primary key.
  */
 export async function selectExtractionCandidates(
   sql: SQL,
-  options: { readonly limit: number },
+  options: { readonly limit: number; readonly consideredVersion: number },
 ): Promise<CandidateChunk[]> {
   const rows = (await sql`
     SELECT c.chunk_id::text AS chunk_id,
@@ -187,6 +193,8 @@ export async function selectExtractionCandidates(
        AND p.quarantined_at IS NULL
        AND p.stale_at IS NULL
        AND p.derivation = ${INGESTED}
+       AND (c.extract_considered_version IS NULL
+            OR c.extract_considered_version < ${options.consideredVersion})
      ORDER BY p.salience DESC NULLS LAST, c.chunk_id
      LIMIT ${options.limit}
   `) as Array<{
@@ -227,12 +235,25 @@ export async function selectExtractionCandidates(
  * things: the synopsis phase asks "what still needs summarising", and the
  * salience-refinement phase asks "what are the most salient pages" — and the
  * answer to the second must not change because something was summarised.
+ *
+ * **`consideredVersion` is the refinement phase's half of the same property**,
+ * and it is a separate option for the same reason: "has this page been
+ * summarised" and "has the model scored this page" are two questions, they go
+ * durable in two places, and a phase that read the other one's answer would skip
+ * work nobody did. Absent — which is what `synopsis` passes — leaves the query
+ * exactly as it was.
  */
 export async function selectIngestedPages(
   sql: SQL,
-  options: { readonly limit: number; readonly unsummarised?: boolean },
+  options: {
+    readonly limit: number;
+    readonly unsummarised?: boolean;
+    readonly consideredVersion?: number;
+  },
 ): Promise<Array<{ pageId: string; title: string | null; origins: string[]; sourceType: SourceType; externalRef: string | null; text: string }>> {
   const unsummarised = options.unsummarised === true;
+  const refining = options.consideredVersion !== undefined;
+  const consideredVersion = options.consideredVersion ?? 0;
   const rows = (await sql`
     SELECT p.page_id::text AS page_id, p.title, p.origin_context, p.source_type, p.external_ref,
            string_agg(c.content, E'\n' ORDER BY c.ordinal) AS text
@@ -248,6 +269,11 @@ export async function selectIngestedPages(
             WHERE summary.external_ref = ${SUMMARY_REF_PREFIX} || p.page_id::text
               AND summary.deleted_at IS NULL
          )
+       )
+       AND (
+         NOT ${refining}
+         OR p.salience_refine_considered_version IS NULL
+         OR p.salience_refine_considered_version < ${consideredVersion}
        )
      GROUP BY p.page_id, p.title, p.origin_context, p.source_type, p.external_ref, p.salience
      ORDER BY p.salience DESC NULLS LAST, p.page_id

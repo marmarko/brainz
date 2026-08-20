@@ -84,6 +84,10 @@ import {
   type ConsolidationTier,
   type StopReason,
 } from './checkpoint.ts';
+import {
+  considerationVersions,
+  type ConsiderationVersions,
+} from './consideration.ts';
 import { createAttemptBudget, type AttemptBudget } from './deadline.ts';
 import {
   clusterByEmbedding,
@@ -146,6 +150,15 @@ export interface CycleOptions {
   /** How many candidates a phase considers. Bounds the cycle, not the corpus. */
   readonly limit?: number;
   readonly nonce?: string;
+  /**
+   * Consideration versions to run the four durable-marker phases at.
+   *
+   * Absent means the shipped numbers in `consideration.ts`, which is what every
+   * production caller wants. A higher number offers the corpus to that phase
+   * again — the seam exists so that expressing a bump is an argument rather than
+   * a mutated module constant.
+   */
+  readonly consideration?: Partial<ConsiderationVersions>;
   /** Injected so a test can assert on a duration without sleeping. */
   readonly clock?: () => number;
   /**
@@ -277,10 +290,15 @@ export async function runConsolidationCycle(
   });
   const limit = options.limit ?? DEFAULT_LIMIT;
   const profile = profileOf(deps);
+  // Resolved once, and handed to both the estimate and the phases. Two
+  // resolutions would be two answers to "which version is this cycle running
+  // at", and the phase whose cap was priced against the other one is the phase
+  // that stops for no reason anybody could reconstruct.
+  const consideration = considerationVersions(options.consideration);
 
   // Estimate before running, and bank it before the first phase: a number
   // computed and then discarded is a calculation nobody can audit against a bill.
-  const workload = await measureWorkload(deps.sql, { batch: limit });
+  const workload = await measureWorkload(deps.sql, { batch: limit, consideration });
   const estimate = estimateCycle({ profile, workload });
 
   const opened = await openRun(deps.sql, {
@@ -355,7 +373,7 @@ export async function runConsolidationCycle(
       if (options.tier !== 'free') {
         priced = estimateCycle({
           profile,
-          workload: await measureWorkload(deps.sql, { batch: limit }),
+          workload: await measureWorkload(deps.sql, { batch: limit, consideration }),
         });
         budgets = budgetsFor(priced, { capMicroUsd: options.capMicroUsd ?? null });
         await bankEstimate(deps.sql, run.runId, priced.totalMicroUsd);
@@ -452,6 +470,7 @@ export async function runConsolidationCycle(
       now: options.now,
       limit,
       attempt,
+      consideration,
       ...(options.nonce === undefined ? {} : { nonce: options.nonce }),
       ...(deps.payloads === undefined ? {} : { payloads: deps.payloads }),
     });

@@ -303,6 +303,32 @@ export async function seedFact(
   return factId;
 }
 
+/**
+ * One entity, by hand.
+ *
+ * The write path resolves entities out of facts, and nothing in the
+ * consolidation cycle creates one — so a suite that wants the enrichment phase
+ * to have candidates has to seed them, or it silently measures the empty case.
+ */
+export async function seedEntity(
+  sql: SQL,
+  input: {
+    readonly name: string;
+    readonly type: string;
+    readonly origins: readonly string[];
+  },
+): Promise<string> {
+  const rows = (await sql.unsafe(
+    `INSERT INTO entity (canonical_name, entity_type, origin_contexts)
+     VALUES ($1, $2, $3::text[])
+     RETURNING entity_id::text AS entity_id`,
+    [input.name, input.type, textArrayLiteral([...input.origins].sort())],
+  )) as Array<{ entity_id: string }>;
+  const entityId = rows[0]?.entity_id;
+  if (entityId === undefined) throw new Error('entity did not insert');
+  return entityId;
+}
+
 // ---------------------------------------------------------------------------
 // The eval corpus, in its pre-consolidation state.
 // ---------------------------------------------------------------------------

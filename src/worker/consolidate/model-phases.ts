@@ -25,6 +25,17 @@
  *     R12's requirement, and the anti-loop guard's storage: a row without them is
  *     a row the next cycle cannot tell from evidence.
  *
+ * **Four of them also record what they have already looked at.** `extract`,
+ * `enrich`, `contradiction` and `salience_refine` stamp a consideration version
+ * on the row they consumed — chunk, entity, fact, page — for every row the model
+ * gave a readable answer about, whatever that answer contained. Before that,
+ * their selectors took the top N by salience or by id with no clause about work
+ * already done, so the only thing between a second cycle and a second invoice
+ * was a checkpoint row belonging to one run; and a per-run row cannot be kept
+ * without keeping the run open, which is what stranded every later phase behind
+ * one unreadable page. `transcribe` and `synopsis` need no stamp: their
+ * durability is in the content. See `consideration.ts`.
+ *
  * **A per-item failure is the ITEM's outcome and never the phase's.** The three
  * properties above were written for the phases that call the model once for a
  * whole batch, where "this answer failed" and "this phase failed" are the same
@@ -104,6 +115,11 @@ import {
   writeEntityCard,
   type Prompt,
 } from './materialize.ts';
+import {
+  CONSIDERATION_VERSION,
+  markConsidered,
+  type ConsiderationVersions,
+} from './consideration.ts';
 import { unboundedAttempt, type AttemptBudget } from './deadline.ts';
 import { NO_SPEND } from './estimate.ts';
 import type { ModelPhase, PhaseStop } from './phases.ts';
@@ -167,6 +183,14 @@ export interface ModelPhaseDeps {
   readonly attempt?: AttemptBudget;
   /** Injected in tests so a prompt is byte-comparable. Production mints one. */
   readonly nonce?: string;
+  /**
+   * The consideration version each phase selects and stamps at.
+   *
+   * Absent means the shipped numbers, which is what production wants and what
+   * every caller had before the marker existed. A caller passes its own only to
+   * express a bump — see `consideration.ts`.
+   */
+  readonly consideration?: ConsiderationVersions;
   /**
    * U21's transcription phase reads the stored payload back through this port.
    * Absent for a fleet with no object store wired: the phase then finds work it
@@ -368,8 +392,10 @@ function confidence(row: Record<string, unknown>): number | null {
  */
 export async function runExtractPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome> {
   const phase: ModelPhase = 'extract';
+  const version = (deps.consideration ?? CONSIDERATION_VERSION).extract;
   const candidates = await selectExtractionCandidates(deps.sql, {
     limit: deps.limit ?? DEFAULT_LIMIT,
+    consideredVersion: version,
   });
   if (candidates.length === 0) return empty(phase);
 
@@ -516,6 +542,21 @@ export async function runExtractPhase(deps: ModelPhaseDeps): Promise<PhaseOutcom
     applied += 1;
   }
 
+  // **Every candidate is now considered, whatever it yielded.** Written here
+  // rather than beside each applied fact, because the unit the model answered
+  // about is the batch: a chunk that stated no claim got an answer just as much
+  // as one that produced three, and a marker that only followed output would
+  // offer the silent chunks again next cycle at the top of the salience queue,
+  // forever.
+  //
+  // Not reached from the refusal paths above, and that asymmetry is deliberate.
+  // A gateway that refused, an answer this code could not read, or an embedding
+  // that failed part way through the loop all mean some of this batch never got
+  // a verdict — so nothing is stamped, the batch is offered again next cycle,
+  // and the duplicate facts a re-run writes are what `dedup` already collapses.
+  // Losing a chunk is the one direction this marker must never be wrong in.
+  await markConsidered(deps.sql, phase, [...byId.keys()], version);
+
   // The embedding calls settle against the same budget, so the phase's spend is
   // what the budget says rather than what the chat call alone cost.
   spent = deps.budget.spentMicroUsd();
@@ -539,6 +580,7 @@ export async function runExtractPhase(deps: ModelPhaseDeps): Promise<PhaseOutcom
 export async function runEnrichPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome> {
   const phase: ModelPhase = 'enrich';
   const limit = deps.limit ?? DEFAULT_LIMIT;
+  const version = (deps.consideration ?? CONSIDERATION_VERSION).enrich;
 
   const entities = (await deps.sql`
     SELECT e.entity_id::text AS entity_id, e.canonical_name, e.entity_type, e.origin_contexts,
@@ -551,6 +593,10 @@ export async function runEnrichPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome
            ) AS evidence
       FROM entity e
      WHERE e.deleted_at IS NULL
+       -- The phase's durability, and the reason a stopped cycle no longer costs
+       -- a second invoice. Without it this query returned the same first N
+       -- entities by id on every cycle for the life of the brain.
+       AND (e.enrich_considered_version IS NULL OR e.enrich_considered_version < ${version})
      ORDER BY e.entity_id
      LIMIT ${limit}
   `) as Array<{
@@ -623,6 +669,12 @@ export async function runEnrichPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome
     });
     applied += 1;
   }
+
+  // The whole batch, card or no card. An entity the model declined to write
+  // about, or scored below the gate, has still been asked about at this version
+  // — and a marker that followed the card would offer the thin entities again
+  // every cycle while the ones behind them waited.
+  await markConsidered(deps.sql, phase, entities.map((entity) => entity.entity_id), version);
 
   return {
     phase,
@@ -845,18 +897,61 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
  * Stale rows are excluded upstream by the staleness phase, which supersedes a
  * superseded page's claims *before* this runs. Without that ordering this phase
  * reports every edit as a conflict, which is Gap #18's exact wording.
+ *
+ * **This is the one phase whose unit of work is not the row it marks**, and the
+ * selection below is shaped by that. The other three ask the model a question
+ * about one row at a time; this one asks about a SET, and a conflict lives
+ * between two members of it. So the consideration stamp cannot simply subtract:
+ * a batch made only of facts nobody has considered would compare each new fact
+ * against other new facts and never against the brain's existing claims, which
+ * is where a contradiction usually is.
+ *
+ * So the stamp governs **admission** rather than membership. A batch must be led
+ * by facts nobody has considered — no unconsidered facts, no batch, no call,
+ * which is what makes closing the run free for this phase too — and it is then
+ * FILLED from already-considered facts up to the same limit, so every new claim
+ * is read beside old ones. The filler is not re-stamped, because it was already
+ * considered at this version and nothing about it changed.
+ *
+ * The coverage this gives is a strict superset of what the phase had. Before,
+ * the query took the first N live facts by id on every cycle forever: fact
+ * N+1 was never in a batch at all, so no pair containing it was ever compared.
+ * Now every fact enters a batch exactly once, alongside the oldest live facts.
  */
 export async function runContradictionPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome> {
   const phase: ModelPhase = 'contradiction';
+  const limit = deps.limit ?? DEFAULT_LIMIT;
+  const version = (deps.consideration ?? CONSIDERATION_VERSION).contradiction;
 
-  const facts = (await deps.sql`
+  const fresh = (await deps.sql`
     SELECT fact_id::text AS fact_id, statement, origin_contexts
       FROM fact
      WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL
+       AND (contradiction_considered_version IS NULL
+            OR contradiction_considered_version < ${version})
      ORDER BY fact_id
-     LIMIT ${deps.limit ?? DEFAULT_LIMIT}
+     LIMIT ${limit}
   `) as Array<{ fact_id: string; statement: string; origin_contexts: string[] }>;
 
+  // Nothing new to say anything about. The already-considered facts have been
+  // compared once at this version and comparing them again buys a second
+  // identical answer at full price.
+  if (fresh.length === 0) return empty(phase);
+
+  const filler =
+    fresh.length >= limit
+      ? []
+      : ((await deps.sql`
+          SELECT fact_id::text AS fact_id, statement, origin_contexts
+            FROM fact
+           WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL
+             AND contradiction_considered_version >= ${version}
+           ORDER BY fact_id
+           LIMIT ${limit - fresh.length}
+        `) as Array<{ fact_id: string; statement: string; origin_contexts: string[] }>);
+
+  const facts = [...fresh, ...filler];
+  // One statement contradicts nothing on its own, and asking costs a call.
   if (facts.length < 2) return empty(phase);
 
   const byId = new Map(facts.map((fact) => [fact.fact_id, fact]));
@@ -910,6 +1005,10 @@ export async function runContradictionPhase(deps: ModelPhaseDeps): Promise<Phase
     reported += 1;
   }
 
+  // Only the facts that led the batch. The filler carries this version already,
+  // and re-stamping it would be a write that changes nothing.
+  await markConsidered(deps.sql, phase, fresh.map((fact) => fact.fact_id), version);
+
   return {
     phase,
     items: facts.length,
@@ -940,7 +1039,11 @@ export async function runContradictionPhase(deps: ModelPhaseDeps): Promise<Phase
  */
 export async function runSalienceRefinePhase(deps: ModelPhaseDeps): Promise<PhaseOutcome> {
   const phase: ModelPhase = 'salience_refine';
-  const pages = await selectIngestedPages(deps.sql, { limit: deps.limit ?? 50 });
+  const version = (deps.consideration ?? CONSIDERATION_VERSION).salience_refine;
+  const pages = await selectIngestedPages(deps.sql, {
+    limit: deps.limit ?? 50,
+    consideredVersion: version,
+  });
   if (pages.length === 0) return empty(phase);
 
   const known = new Set(pages.map((page) => page.pageId));
@@ -979,6 +1082,11 @@ export async function runSalienceRefinePhase(deps: ModelPhaseDeps): Promise<Phas
     `;
     applied += 1;
   }
+
+  // Every page in the batch, scored or not. A model that returned no entry for a
+  // page has still been asked about it at this version, and a marker keyed on
+  // the score would keep re-sending exactly the pages it declines to score.
+  await markConsidered(deps.sql, phase, pages.map((page) => page.pageId), version);
 
   return {
     phase,

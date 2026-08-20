@@ -40,6 +40,7 @@ import {
   runSynopsisPhase,
 } from '../../src/worker/consolidate/model-phases.ts';
 import { openRun } from '../../src/worker/consolidate/checkpoint.ts';
+import { CONSIDERATION_VERSION } from '../../src/worker/consolidate/consideration.ts';
 import { ACTIVE_EMBEDDING_SEAT, EMBEDDING_SEATS } from '../../src/schema/embedding-seat.ts';
 import {
   CALLER,
@@ -94,7 +95,10 @@ describe('1 — the anti-loop guard', () => {
         derivation: 'model_derived',
       });
 
-      const candidates = await selectExtractionCandidates(sql, { limit: 100 });
+      const candidates = await selectExtractionCandidates(sql, {
+        limit: 100,
+        consideredVersion: CONSIDERATION_VERSION.extract,
+      });
       const ids = candidates.map((candidate) => candidate.chunkId);
 
       // The half that keeps this from passing by returning nothing.
@@ -172,7 +176,19 @@ describe('2 — contradictions are reported, never resolved', () => {
         confidence: 0.9,
       });
 
-      const before = (await sql`SELECT * FROM fact WHERE fact_id = ${stated}::bigint`) as unknown[];
+      // Every column of the row except the one that records the phase having
+      // LOOKED at it. `contradiction_considered_version` is the phase saying
+      // "this fact has been read at version N", which is the opposite of a
+      // resolution — it is what stops the phase reading the same fact forever —
+      // and a guard that refused it would be asserting that the phase may not
+      // remember its own work. Everything a reader of this fact would see is
+      // still compared byte for byte.
+      const readBack = async (): Promise<unknown[]> =>
+        (await sql`
+          SELECT to_jsonb(f) - 'contradiction_considered_version' AS row
+            FROM fact f WHERE f.fact_id = ${stated}::bigint
+        `) as unknown[];
+      const before = await readBack();
 
       const { gateway, transport } = createGateway({
         chat: {
@@ -210,7 +226,7 @@ describe('2 — contradictions are reported, never resolved', () => {
       // ...and nothing was done about it. Even at 0.95, which is above the
       // apply gate: the gate governs *mutation*, and a contradiction has no
       // automated mutation to gate.
-      const after = (await sql`SELECT * FROM fact WHERE fact_id = ${stated}::bigint`) as unknown[];
+      const after = await readBack();
       expect(after).toEqual(before);
       expect(await countRows(sql, 'fact', 'superseded_by IS NOT NULL')).toBe(0);
       expect(await countRows(sql, 'fact', 'deleted_at IS NOT NULL')).toBe(0);
@@ -625,14 +641,20 @@ describe('5 — truncation degrades by importance, not by primary key', () => {
       await sql`UPDATE page SET salience = 0.1, salience_source = 'deterministic' WHERE page_id = ${dull.pageId}::bigint`;
       await sql`UPDATE page SET salience = 0.9, salience_source = 'deterministic' WHERE page_id = ${salient.pageId}::bigint`;
 
-      const first = await selectExtractionCandidates(sql, { limit: 1 });
+      const first = await selectExtractionCandidates(sql, {
+        limit: 1,
+        consideredVersion: CONSIDERATION_VERSION.extract,
+      });
       expect(first.length).toBe(1);
       expect(first[0]?.pageId).toBe(salient.pageId);
 
       // And the bound is what left the other one out, not a filter: raise it and
       // both appear, so the assertion above is about ordering rather than about
       // one page being invisible.
-      const both = await selectExtractionCandidates(sql, { limit: 10 });
+      const both = await selectExtractionCandidates(sql, {
+        limit: 10,
+        consideredVersion: CONSIDERATION_VERSION.extract,
+      });
       expect(both.map((candidate) => candidate.pageId).sort()).toEqual(
         [dull.pageId, salient.pageId].sort(),
       );
