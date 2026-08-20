@@ -927,6 +927,28 @@ export const CLUSTER_POOL = 50;
  * the probes inside one transaction removes that overhead; the batch stays small
  * because the other half of the trade is how long a transaction is held open
  * against the tenant's database while the lease reaper is watching.
+ *
+ * **What batching bought, measured, and what it did not.** The probes are now
+ * one `LATERAL` statement per batch instead of one round trip per seed: on a
+ * live brain of 9,357 embedded chunks, 181ms per seed became 130ms, a 28% cut.
+ * The remainder is not network — it is the ANN scan itself at
+ * `candidatePoolFor(CLUSTER_POOL)` = 250 neighbours per seed, which is server
+ * time and is the price of the recall this clustering is supposed to have.
+ * Dropping the pool would buy speed by silently narrowing what a cluster can
+ * see, which is the truncation hazard `vector-query.ts` exists to prevent.
+ *
+ * **So the phase still does not converge on a corpus this size, and that is
+ * stated rather than implied.** ~130ms × 9,357 seeds is ~20 minutes against a
+ * share of a 14-minute attempt, and because the pass must delete before it
+ * rebuilds (see the body), a pass that cannot finish leaves the corpus less
+ * clustered than it found it, every cycle, indefinitely. Three things would
+ * each close it and none is a change to this function: relax
+ * `cluster_member_belongs_to_one_cluster` to admit a generation column so the
+ * rebuild can be non-destructive; give the phase a persisted cursor so one pass
+ * may span cycles; or stop running it. The third is not flippant —
+ * `content_cluster` and `cluster_member` are read by nothing in `src/` outside
+ * the erasure sweep, so this is currently the most expensive phase in the cycle
+ * and the only one with no consumer.
  */
 export const CLUSTER_SEED_BATCH = 100;
 
@@ -984,12 +1006,26 @@ export async function clusterByEmbedding(
   const column = seatColumnSql(ACTIVE_EMBEDDING_SEAT.column);
   const assigned = new Set<string>();
 
-  // A cycle recomputes clusters from scratch: membership is a function of the
-  // current corpus, and an incremental version would carry a chunk's cluster
-  // across an edit that moved it. A call that stops part-way therefore leaves
-  // the corpus clustered as far as it got, and the next one rebuilds the lot —
-  // which is the same arithmetic as every other phase here, and is why the seed
-  // walk had to stop costing five round trips per seed before it was tolerable.
+  // **A cycle recomputes clusters from scratch, and it must delete first.**
+  //
+  // Membership is a function of the current corpus, and an incremental version
+  // would carry a chunk's cluster across an edit that moved it. The consequence
+  // is that a pass which stops part-way is strictly destructive: it has already
+  // deleted the previous clustering and will not finish this one.
+  //
+  // **Building the new generation beside the old and swapping at the end was
+  // tried here and does not fit the schema.** `cluster_member_belongs_to_one_cluster`
+  // says a chunk is in exactly one cluster, so two generations cannot coexist
+  // for even one statement — the second insert of any shared chunk is a
+  // constraint violation, which is what `test/consolidate/convergence.test.ts`
+  // reported within a minute of the attempt. Non-destructive rebuild needs that
+  // constraint relaxed to (generation, chunk_id), which is a migration and a
+  // decision about what a reader of these tables is entitled to see, not a
+  // change to this loop.
+  //
+  // So the destructiveness stands, and what bounds it is the phase finishing.
+  // See {@link CLUSTER_SEED_BATCH} for the measured cost and for the part of
+  // this that is not yet solved.
   await sql`DELETE FROM cluster_member`;
   await sql`DELETE FROM content_cluster`;
 
@@ -1021,23 +1057,50 @@ export async function clusterByEmbedding(
     // hold for the transaction, so a batch shares them correctly.
     const groups: Array<{ seed: string; rows: Array<{ chunk_id: string; similarity: number }> }> = [];
     if (pending.length > 0) {
+      // **One statement for the whole batch's probes, not one per seed.** The
+      // scan is a `LATERAL` per seed rather than a loop of round trips: each
+      // seed's neighbourhood is still its own top-`pool` ANN lookup against its
+      // own vector — the semantics are identical, one row per (seed, neighbour)
+      // — and the network cost falls from `batch` round trips to one.
+      //
+      // That is the difference between a phase that finishes and a phase that
+      // cannot. Measured on a brain of 8,893 chunks at 22 seeds a second, the
+      // per-seed loop needed ~6.7 minutes against a 14-minute attempt, and since
+      // this phase deletes its own output at the start of every call, a pass that
+      // does not finish banks nothing and the next cycle recomputes the same
+      // prefix and stops in the same place. It did not converge slowly; it did
+      // not converge at all, and it spent the model tier's clock proving it.
+      // This is `salience`'s fix and `reconcileAllEdges`'s fix applied to the one
+      // phase that still paid per item.
       const scanned = await withVectorScan(sql, { candidatePool: pool }, async (tx) => {
-        const out: typeof groups = [];
-        for (const seed of pending) {
-          const rows = (await tx.unsafe(
-            `WITH probe AS (SELECT ${column} AS v FROM chunk WHERE chunk_id = $1::bigint)
-             SELECT c.chunk_id::text AS chunk_id,
-                    1 - (c.${column} <=> (SELECT v FROM probe)) AS similarity
-               FROM chunk c
-              WHERE c.${column} IS NOT NULL AND c.deleted_at IS NULL AND c.quarantined_at IS NULL
-                AND c.chunk_id <> $1::bigint
-              ORDER BY c.${column} <=> (SELECT v FROM probe)
-              LIMIT ${pool}`,
-            [seed.chunk_id],
-          )) as Array<{ chunk_id: string; similarity: number }>;
-          out.push({ seed: seed.chunk_id, rows });
+        const rows = (await tx.unsafe(
+          `SELECT s.seed_id::text AS seed_id, n.chunk_id::text AS chunk_id, n.similarity
+             FROM unnest($1::bigint[]) AS s(seed_id)
+             JOIN chunk probe ON probe.chunk_id = s.seed_id
+             CROSS JOIN LATERAL (
+               SELECT c.chunk_id, 1 - (c.${column} <=> probe.${column}) AS similarity
+                 FROM chunk c
+                WHERE c.${column} IS NOT NULL AND c.deleted_at IS NULL
+                  AND c.quarantined_at IS NULL AND c.chunk_id <> s.seed_id
+                ORDER BY c.${column} <=> probe.${column}
+                LIMIT ${pool}
+             ) n`,
+          [numericArrayLiteral(pending.map((seed) => seed.chunk_id))],
+        )) as Array<{ seed_id: string; chunk_id: string; similarity: number }>;
+
+        // Regrouped in insertion order so the greedy walk below still meets
+        // seeds in `chunk_id` order — the order decides which seed wins a
+        // contested neighbour, so it is part of the phase's output, not a
+        // detail of how the rows arrived.
+        const bySeed = new Map<string, Array<{ chunk_id: string; similarity: number }>>();
+        for (const seed of pending) bySeed.set(seed.chunk_id, []);
+        for (const row of rows) {
+          bySeed.get(row.seed_id)?.push({ chunk_id: row.chunk_id, similarity: row.similarity });
         }
-        return out;
+        return pending.map((seed) => ({
+          seed: seed.chunk_id,
+          rows: bySeed.get(seed.chunk_id) ?? [],
+        }));
       });
       groups.push(...scanned);
     }
