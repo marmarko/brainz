@@ -103,7 +103,7 @@ import {
   considerationVersions,
   type ConsiderationVersions,
 } from './consideration.ts';
-import { createAttemptBudget, type AttemptBudget } from './deadline.ts';
+import { createAttemptBudget, shareOfAttempt, type AttemptBudget } from './deadline.ts';
 import {
   clusterByEmbedding,
   collapseDuplicateFacts,
@@ -215,7 +215,7 @@ export interface PhaseRecord {
   readonly tier: 'deterministic' | 'model';
   readonly ran: boolean;
   /** Why the phase did not run, for a phase that did not. */
-  readonly skipped: 'checkpointed' | 'free_tier' | 'not_reached' | null;
+  readonly skipped: 'checkpointed' | 'free_tier' | 'not_reached' | 'prefix_yielded' | null;
   readonly items: number;
   readonly spentMicroUsd: number;
   readonly stopped: string | null;
@@ -292,6 +292,42 @@ function profileOf(deps: CycleDeps): NamedProfile {
 
 const DEFAULT_LIMIT = 200;
 
+/**
+ * The share of an attempt the deterministic prefix may spend before the model
+ * tier is entitled to the rest.
+ *
+ * **The failure this closes, measured.** The two tiers used to share one clock,
+ * first come first served, and the deterministic tier runs first — so a prefix
+ * that outgrew the attempt did not slow the model tier down, it deleted it. On a
+ * brain of 8,893 chunks the `cluster` phase alone measures ~6.7 minutes at 22
+ * seeds a second, against a 14-minute attempt; the prefix consumed the clock,
+ * `runConsolidationCycle` reported `out_of_time` at `cluster`, and `transcribe`,
+ * `extract`, `enrich`, `synopsis`, `contradiction` and `salience_refine` were
+ * all recorded `not_reached`. Every cycle. The brain had 3,402 unsummarised
+ * pages, zero considered chunks and 168 facts, and every clock in the system
+ * said it was working.
+ *
+ * **Why a reserve rather than a faster phase.** The comment on the deterministic
+ * branch below predicted exactly this state and prescribed removing another
+ * round trip. That is the right instinct and it is not sufficient: it makes the
+ * wall further away rather than removing it, and the next corpus arrives at the
+ * new wall. The ordering is the defect. A tier whose output the reader never
+ * sees must not be able to spend the whole budget of the tier that produces
+ * everything they do see — `cluster`'s output, in particular, is read by nothing
+ * in `src/` today outside the erasure sweep.
+ *
+ * **A half rather than a smaller slice.** The prefix's work is real: it resolves
+ * the entities enrichment reads and merges the ones the model tier would
+ * otherwise pay for twice, which is why the estimate is refined on the boundary
+ * between the tiers. Starving it would move the bill rather than the wall. Half
+ * leaves either tier able to finish a large brain's work across a few cycles
+ * while guaranteeing neither is ever reduced to nothing.
+ *
+ * Unbudgeted attempts are unaffected: a share of infinity is infinity, which is
+ * what a CLI or a test run wants.
+ */
+export const DETERMINISTIC_ATTEMPT_SHARE = 0.5;
+
 export async function runConsolidationCycle(
   deps: CycleDeps,
   options: CycleOptions,
@@ -303,6 +339,20 @@ export async function runConsolidationCycle(
     ...(options.budgetMs === undefined ? {} : { budgetMs: options.budgetMs }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   });
+
+  // The prefix's ceiling, measured on the attempt's own clock rather than on a
+  // second one of its own — see `shareOfAttempt` for why a second reading is not
+  // a harmless detail.
+  const prefix = shareOfAttempt(attempt, {
+    ...(options.budgetMs === undefined ? {} : { budgetMs: options.budgetMs }),
+    fraction: DETERMINISTIC_ATTEMPT_SHARE,
+  });
+  /**
+   * Whether a deterministic phase stopped on the prefix's clock rather than the
+   * attempt's. Not a failure and not a completion: there is more prefix work to
+   * do, and the model tier is running anyway.
+   */
+  let prefixYielded = false;
   const limit = options.limit ?? DEFAULT_LIMIT;
   const profile = profileOf(deps);
   // Resolved once, and handed to both the estimate and the phases. Two
@@ -424,9 +474,27 @@ export async function runConsolidationCycle(
     }
 
     if (!isModelPhase(phase)) {
+      // The prefix has already spent its share, so the phases behind it are not
+      // run at all rather than run into an expired clock. Recorded under their
+      // own name: `not_reached` would say the cycle stopped here, and it did
+      // not — the model tier is about to run.
+      if (prefix.stop() !== null) {
+        prefixYielded = true;
+        phases.push({
+          phase,
+          tier: 'deterministic',
+          ran: false,
+          skipped: 'prefix_yielded',
+          items: 0,
+          spentMicroUsd: NO_SPEND,
+          stopped: null,
+        });
+        continue;
+      }
+
       const outcome = await runDeterministicPhase(deps.sql, phase, {
         now: options.now,
-        attempt,
+        attempt: prefix,
         ...(options.batch === undefined ? {} : { batch: options.batch }),
       });
 
@@ -455,12 +523,23 @@ export async function runConsolidationCycle(
         // If this stops being true — if a fleet starts seeing `out_of_time`
         // repeatedly on the same tenant — the answer is another round trip
         // removed from a phase, not a checkpoint added to this loop.
-        stop = attempt.stop() ?? 'out_of_time';
-        // Attributed only for the clock. A `cancelled` run lost its lease, which
-        // is something that happened *to* the cycle: naming the phase that
-        // happened to be in flight would point an operator at whichever phase is
-        // slowest rather than at the deploy or the steal that took the lease.
-        if (stop === 'out_of_time') stoppedPhase = { phase, code: 'out_of_time' };
+        // **Whose clock ran out decides whether the cycle is over.** The
+        // attempt's — or a lost lease — stops everything, as it always did. The
+        // prefix's own share does not: the phase yields, the model tier runs on
+        // what is left, and the next cycle starts this phase again from the top.
+        // Reading the two as one is what let a slow prefix delete the model
+        // tier; see {@link DETERMINISTIC_ATTEMPT_SHARE}.
+        const halted = attempt.stop();
+        if (halted === null) {
+          prefixYielded = true;
+        } else {
+          stop = halted;
+          // Attributed only for the clock. A `cancelled` run lost its lease, which
+          // is something that happened *to* the cycle: naming the phase that
+          // happened to be in flight would point an operator at whichever phase is
+          // slowest rather than at the deploy or the steal that took the lease.
+          if (stop === 'out_of_time') stoppedPhase = { phase, code: 'out_of_time' };
+        }
       }
 
       phases.push({
@@ -470,7 +549,10 @@ export async function runConsolidationCycle(
         skipped: null,
         items: outcome.items,
         spentMicroUsd: NO_SPEND,
-        stopped: outcome.done ? null : stop,
+        // A phase that yielded its share reports `out_of_time` for itself while
+        // the cycle carries on: the record is about the PHASE, and `stop` at
+        // this moment is still `complete`.
+        stopped: outcome.done ? null : stop === 'complete' ? 'out_of_time' : stop,
       });
       continue;
     }
@@ -535,7 +617,11 @@ export async function runConsolidationCycle(
   const dreamt = stopReason === 'complete';
   const wallClockMs = attempt.elapsedMs();
   const ran = phases.filter((phase) => phase.ran).length;
-  const moreToDo = stopReason === 'out_of_time' || stopReason === 'cancelled';
+  // A prefix that yielded leaves real work undone even when every phase after it
+  // ran to the end, so the cycle is complete and the brain is not finished. A
+  // scheduler reading only the stop reason would let a half-clustered corpus sit
+  // until the next ceiling.
+  const moreToDo = stopReason === 'out_of_time' || stopReason === 'cancelled' || prefixYielded;
 
   const record = {
     dreamt,

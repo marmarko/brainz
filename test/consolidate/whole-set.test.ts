@@ -105,14 +105,23 @@ describe('a monotone whole-set phase stops on the clock and keeps what it did', 
       const deps = { sql: tenant.sql, gateway, tenantId: TENANT, caller: CALLER };
       const now = new Date('2026-03-01T00:00:00Z');
 
-      // Three units of work: the phase boundary and two groups. Nothing like
-      // enough for twenty.
+      // Eight units of ATTEMPT, which is four of prefix. Nothing like enough
+      // for twenty groups.
+      //
+      // **Eight rather than three, because the number this test is about is the
+      // deterministic tier's clock and that is now half the attempt's.** The
+      // prefix gets `DETERMINISTIC_ATTEMPT_SHARE` so a slow prefix can no longer
+      // spend the model tier's budget as well as its own; three units of attempt
+      // would leave dedup one, which is a boundary check and no group at all.
+      // The property under test — stops on the clock, keeps what it did,
+      // converges by repetition — is untouched. This test does not pin the
+      // reserve; `deterministic-share.test.ts` does.
       const first = await runConsolidationCycle(deps, {
         trigger: 'time_ceiling',
         tier: 'free',
         now,
         clock: tickingClock(),
-        budgetMs: 3,
+        budgetMs: 8,
       });
 
       // **The claim.** The phase consulted the clock only for a lost lease, so
@@ -136,12 +145,15 @@ describe('a monotone whole-set phase stops on the clock and keeps what it did', 
           tier: 'free',
           now,
           clock: tickingClock(),
-          budgetMs: 3,
+          budgetMs: 8,
         });
         const total = await collapsed();
         expect(total).toBeGreaterThanOrEqual(previous);
         previous = total;
-        if (result.stopReason !== 'out_of_time') break;
+        // A free cycle whose prefix yielded its share reports `complete` with
+        // `moreToDo`, because every phase after it is skipped by the tier rather
+        // than by the clock. Either shape means there is more to do.
+        if (result.stopReason !== 'out_of_time' && !result.moreToDo) break;
       }
 
       // Exactly one survivor per group, and no fact superseded twice: the

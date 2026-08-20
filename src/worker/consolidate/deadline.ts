@@ -150,6 +150,50 @@ export function createAttemptBudget(options: AttemptBudgetOptions = {}): Attempt
   };
 }
 
+/**
+ * A budget that expires early on somebody else's clock.
+ *
+ * **It reads the parent's clock rather than starting its own**, and that is the
+ * whole of the implementation's point. Two independent budgets take two
+ * independent readings, which on a real clock is harmless and under a test's
+ * counting clock is a different number of ticks — so a share built by
+ * constructing a second {@link createAttemptBudget} silently changes how much
+ * work every existing budgeted test does. Sharing the reading also makes the
+ * arithmetic mean what it says: the share is measured from the attempt's start,
+ * so `elapsed >= ceiling` is "this fraction of the attempt is gone", not "this
+ * fraction has passed since somebody happened to construct me".
+ *
+ * A share of an unbudgeted attempt is unbudgeted, because a fraction of infinity
+ * is infinity — a CLI run has no wall to divide.
+ *
+ * Cancellation is NOT scaled: a lost lease stops every budget derived from the
+ * attempt at once, because the fence it lost protects all of them.
+ */
+export function shareOfAttempt(
+  attempt: AttemptBudget,
+  options: { readonly budgetMs?: number | null; readonly fraction: number },
+): AttemptBudget {
+  const budgetMs = options.budgetMs;
+  const ceiling =
+    budgetMs === null || budgetMs === undefined || !Number.isFinite(budgetMs)
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, Math.floor(budgetMs * options.fraction));
+
+  return {
+    elapsedMs: () => attempt.elapsedMs(),
+    elapsedAtLastCheck: () => attempt.elapsedAtLastCheck(),
+    remainingAtLastCheck: () => ceiling - attempt.elapsedAtLastCheck(),
+    cancelled: () => attempt.cancelled(),
+    remainingMs: () => ceiling - attempt.elapsedMs(),
+    stop(): AttemptStop | null {
+      const cancelled = attempt.cancelled();
+      if (cancelled !== null) return cancelled;
+      if (ceiling === Number.POSITIVE_INFINITY) return null;
+      return attempt.elapsedMs() >= ceiling ? 'out_of_time' : null;
+    },
+  };
+}
+
 /** A budget that never stops. The default for every caller that is not a job. */
 export function unboundedAttempt(clock?: () => number): AttemptBudget {
   return createAttemptBudget(clock === undefined ? {} : { clock });
