@@ -242,7 +242,20 @@ export async function measureWorkload(
   const liveFacts = await scalar(sql`
     SELECT count(*)::int AS n FROM fact
      WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL`);
-  const factPairs = freshFacts === 0 ? 0 : liveFacts;
+  // **Priced on the chunks `extract` is about to read, not only on the facts that
+  // exist now — because this measurement runs BEFORE the model tier.** `extract`
+  // runs inside that tier and is what creates the facts `contradiction` consumes,
+  // so on the cycle where extraction is the source of a brain's new claims this
+  // saw `freshFacts === 0`, priced the phase at zero items, and `budgetsFor`
+  // handed it a cap of zero — after which the gateway refused the call the phase
+  // legitimately had to make, the cycle stopped `budget_exhausted` at
+  // `contradiction`, and `salience_refine` behind it was never reached.
+  //
+  // A cycle with unconsidered chunks is a cycle that may have facts by the time
+  // this phase runs. Pricing the full batch for it costs a cap that goes unspent
+  // when extraction yields nothing — the harmless direction — where the old
+  // reading cost the phase its turn on exactly the cycles it had work.
+  const factPairs = freshFacts === 0 && chunks === 0 ? 0 : liveFacts;
 
   // The same predicate the phase itself queues on (`ocr-phase.ts`). An estimate
   // that counted quarantined or already-read attachments would budget for calls
