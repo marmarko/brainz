@@ -125,6 +125,8 @@ const VIEW: CoverageView = {
   documentsThisWeek: 210,
   latestCycle: null,
   lastCompletedAt: null,
+  lastCompleteCycleAt: null,
+  cycleFreshness: 'uncycled',
   documentsSinceLastCycle: 4102,
   everDreamt: false,
   facts: 167,
@@ -522,6 +524,153 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
     expect(page).not.toContain('running now');
     expect(page).not.toContain('has not closed');
     expect(page).not.toContain('has not consolidated yet');
+  });
+
+  // -------------------------------------------------------------------------
+  // The freeze as a DURATION, which is the half the stop-reason sentence cannot
+  // carry.
+  //
+  // Naming the newest cycle's stop is right and it is not enough: "it stopped in
+  // the extract phase" is equally true of one bad Tuesday, which resolves
+  // itself, and of the multi-day freeze this page exists for, which does not.
+  // The brain that sat at 5,608 documents and 167 facts said exactly that
+  // sentence every day for days while every clock the fleet holds — the job's
+  // state, its failure code, `last_cycle_at`, `next_due_at` — stayed clean,
+  // because a cycle that stops short still returns and a job that returns is
+  // done. So the assertions below are about the extra row, and about it staying
+  // silent on the ordinary day.
+  // -------------------------------------------------------------------------
+
+  test('cycles that keep stopping with no completion for days say so as a duration', async () => {
+    const cookie = await signedIn();
+    const frozen: CoverageView = {
+      ...VIEW,
+      latestCycle: {
+        tier: 'paid',
+        dreamt: false,
+        stopReason: 'phase_failed',
+        stoppedPhase: 'extract',
+        stoppedPhaseCode: 'model_unavailable',
+        startedAt: '2026-08-15T02:00:00.000Z',
+        finishedAt: null,
+      },
+      lastCompletedAt: '2026-08-09T00:05:00.000Z',
+      lastCompleteCycleAt: '2026-08-09T00:05:00.000Z',
+      cycleFreshness: 'stale',
+      documentsSinceLastCycle: 1800,
+    };
+    const page = await (await app({ view: frozen })(get(COVERAGE, cookie))).text();
+    // The newest cycle's own reason still renders — this row is in addition to
+    // it, not instead of it.
+    expect(page).toContain('has not closed');
+    expect(page).toContain('extract');
+    // And the sentence that separates a hiccup from a freeze.
+    expect(page).toContain('stopping short for longer than');
+    expect(page).toContain('2026-08-09T00:05:00.000Z');
+    // Cycles ARE running. Saying nothing has run would send the reader to the
+    // wrong place.
+    expect(page).not.toContain('no cycle has run at all');
+  });
+
+  test('one stopped cycle over a healthy completion says nothing extra', async () => {
+    // The failure mode on the other side: a page that prints a warning on an
+    // ordinary day is a page whose warnings stop being read, which is how a week
+    // of silence happens in the first place.
+    const cookie = await signedIn();
+    const slipping: CoverageView = {
+      ...VIEW,
+      latestCycle: {
+        tier: 'paid',
+        dreamt: false,
+        stopReason: 'out_of_time',
+        stoppedPhase: null,
+        stoppedPhaseCode: null,
+        startedAt: '2026-08-16T02:00:00.000Z',
+        finishedAt: null,
+      },
+      lastCompletedAt: '2026-08-15T22:00:00.000Z',
+      lastCompleteCycleAt: '2026-08-15T22:00:00.000Z',
+      cycleFreshness: 'slipping',
+      documentsSinceLastCycle: 40,
+    };
+    const page = await (await app({ view: slipping })(get(COVERAGE, cookie))).text();
+    expect(page).toContain('ran out of the time one attempt is given');
+    expect(page).not.toContain('stopping short for longer than');
+    expect(page).not.toContain('No cycle has ever run all the way through');
+    expect(page).not.toContain('no cycle has run at all');
+  });
+
+  test('a brain nothing has consolidated is a different sentence from one that keeps stopping', async () => {
+    // `unattended` and `stale` are different emergencies with different
+    // remedies: one is the scheduler, one is the brain. A single "consolidation
+    // is behind" for both would send every reader to the same wrong place half
+    // the time.
+    const cookie = await signedIn();
+    const unattended: CoverageView = {
+      ...VIEW,
+      latestCycle: {
+        tier: 'paid',
+        dreamt: true,
+        stopReason: 'complete',
+        stoppedPhase: null,
+        stoppedPhaseCode: null,
+        startedAt: '2026-08-09T02:00:00.000Z',
+        finishedAt: '2026-08-09T02:40:00.000Z',
+      },
+      lastCompletedAt: '2026-08-09T02:40:00.000Z',
+      lastCompleteCycleAt: '2026-08-09T02:40:00.000Z',
+      cycleFreshness: 'unattended',
+    };
+    const page = await (await app({ view: unattended })(get(COVERAGE, cookie))).text();
+    expect(page).toContain('Nothing has consolidated this brain since');
+    expect(page).toContain('no cycle has run at all');
+    expect(page).not.toContain('stopping short for longer than');
+  });
+
+  test('a brain that has never once finished a cycle is told that, not that it stopped', async () => {
+    const cookie = await signedIn();
+    const never: CoverageView = {
+      ...VIEW,
+      latestCycle: {
+        tier: 'paid',
+        dreamt: false,
+        stopReason: 'budget_exhausted',
+        stoppedPhase: null,
+        stoppedPhaseCode: null,
+        startedAt: '2026-08-16T02:00:00.000Z',
+        finishedAt: null,
+      },
+      lastCompletedAt: null,
+      lastCompleteCycleAt: null,
+      cycleFreshness: 'never_completed',
+    };
+    const page = await (await app({ view: never })(get(COVERAGE, cookie))).text();
+    expect(page).toContain('No cycle has ever run all the way through');
+    expect(page).not.toContain('stopping short for longer than');
+  });
+
+  test('the freeze row never names anything a user wrote', async () => {
+    // This page's whole rule. The row added here is a sentence plus one instant,
+    // and it is rendered on the page most likely to be screenshotted.
+    const cookie = await signedIn();
+    const frozen: CoverageView = {
+      ...VIEW,
+      latestCycle: {
+        tier: 'paid',
+        dreamt: false,
+        stopReason: 'phase_failed',
+        stoppedPhase: 'extract',
+        stoppedPhaseCode: 'model_unavailable',
+        startedAt: '2026-08-15T02:00:00.000Z',
+        finishedAt: null,
+      },
+      lastCompleteCycleAt: '2026-08-09T00:05:00.000Z',
+      cycleFreshness: 'stale',
+    };
+    const page = await (await app({ view: frozen })(get(COVERAGE, cookie))).text();
+    expect(page).not.toContain(SECRET_TITLE);
+    expect(page).not.toContain(SECRET_STATEMENT);
+    expect(page).not.toContain(SECRET_NAME);
   });
 
   test('a brain with no cycle at all says so, and says nothing about a cycle', async () => {

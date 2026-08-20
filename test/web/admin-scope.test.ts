@@ -183,6 +183,12 @@ describe('the surface is not simply refusing everything', () => {
       // R22's counter is a counter like the rest — what the platform paid for
       // this tenant, which stops being their metered spend the moment they
       // bring their own key. It carries no more content than `pending_debt`.
+      // A label from a closed set, a boolean and a threshold in seconds. The
+      // reading it carries is deliberately narrow — the control plane cannot
+      // see whether this brain's cycles *complete* — and `completion_observable`
+      // is how the answer says so rather than implying a green it has not
+      // earned.
+      'cycles',
       'hosted_cogs_micro_usd',
       'last_activity',
       'last_cycle_at',

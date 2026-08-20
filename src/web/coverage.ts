@@ -152,6 +152,8 @@
 
 import type { SQL } from 'bun';
 
+import { cycleFreshnessOf, type CycleFreshness } from '../control/cycle-staleness.ts';
+
 /** How far back "recently" reaches. One number, so the page and the query agree. */
 export const COVERAGE_WINDOW_DAYS = 7;
 
@@ -293,8 +295,25 @@ export interface CoverageView {
   readonly documentsThisWeek: number;
   /** The most recent run, finished or not. `null` before the first cycle. */
   readonly latestCycle: CoverageCycle | null;
-  /** When the last **completed** cycle finished — the backlog's anchor. */
+  /** When the last **closed** run finished — the backlog's anchor. */
   readonly lastCompletedAt: string | null;
+  /**
+   * When a cycle last actually *completed*: the newest `finished_at` over runs
+   * whose `stop_reason` closed them. Equal to {@link lastCompletedAt} today and
+   * predicated differently on purpose — see `readCoverage`, and
+   * `src/control/cycle-staleness.ts` for why the distinction is the whole rule.
+   */
+  readonly lastCompleteCycleAt: string | null;
+  /**
+   * Whether this brain is *finishing* its cycles.
+   *
+   * **The one field on this page that a returning-but-never-completing cycle
+   * cannot make look healthy.** Every other clock — `last_cycle_at`,
+   * `next_due_at`, the job's own `finished_at`, this run's `started_at` —
+   * advanced normally through a multi-day freeze, because a cycle that stops
+   * short still returns and a job that returns is `done`.
+   */
+  readonly cycleFreshness: CycleFreshness;
   /**
    * Documents that arrived after {@link lastCompletedAt}, or every document when
    * no cycle has ever completed — which is the truth in that state rather than a
@@ -412,11 +431,28 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
   // card table says "cold" for a fully consolidated brain that happens to know
   // about nobody, which is the inference `briefing/assemble.ts` refuses for the
   // same reason.
+  //
+  // **`last_complete_cycle_at` is a second clock beside `last_completed_at`, and
+  // the duplication is deliberate.** They are equal today, because `finishRun`
+  // is the only writer of `finished_at`. They stop being equal the day somebody
+  // closes the run on every exit — which has been tried once and reverted — and
+  // on that day a reading anchored on `finished_at` starts calling a brain that
+  // has finished nothing "freshly consolidated". The display anchor may take
+  // that risk; the one the staleness rule is judged on may not, so it is
+  // predicated on the two stop reasons that actually close a run
+  // (`src/control/cycle-staleness.ts` states the argument in full).
+  //
+  // `cycling_since` is the first run's start: how long this brain has been
+  // consolidating without ever finishing, which is the only clock that separates
+  // "still chewing through its first import" from "has never once worked".
   const scalarRows = (await sql.unsafe(
     `SELECT
        (SELECT finished_at FROM consolidation_run
          WHERE finished_at IS NOT NULL
          ORDER BY finished_at DESC, run_id DESC LIMIT 1) AS last_completed_at,
+       (SELECT max(finished_at) FROM consolidation_run
+         WHERE stop_reason IN ('complete', 'free_tier')) AS last_complete_cycle_at,
+       (SELECT min(started_at) FROM consolidation_run) AS cycling_since,
        EXISTS (SELECT 1 FROM consolidation_run WHERE finished_at IS NOT NULL AND dreamt) AS ever_dreamt,
        (SELECT count(*) FROM fact
          WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL)::int AS facts,
@@ -424,17 +460,39 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
     [],
   )) as Array<{
     last_completed_at: Date | string | null;
+    last_complete_cycle_at: Date | string | null;
+    cycling_since: Date | string | null;
     ever_dreamt: boolean;
     facts: number;
     edges: number;
   }>;
   const scalars = scalarRows[0] ?? {
     last_completed_at: null,
+    last_complete_cycle_at: null,
+    cycling_since: null,
     ever_dreamt: false,
     facts: 0,
     edges: 0,
   };
   const lastCompletedAt = isoOf(scalars.last_completed_at);
+  const lastCompleteCycleAt = isoOf(scalars.last_complete_cycle_at);
+
+  // The staleness reading, from the completion clock and the newest run's own
+  // claim. This page is the only surface in the system that can compute it: the
+  // pair it needs lives in `consolidation_run`, in this database, and the fleet
+  // health surface holds no tenant handle. See the report's own header.
+  const cycleFreshness = cycleFreshnessOf({
+    completion:
+      latestCycle === null
+        ? undefined
+        : {
+            lastCompleteCycleAt:
+              lastCompleteCycleAt === null ? null : new Date(lastCompleteCycleAt),
+            latestStopReason: latestCycle.stopReason,
+          },
+    cyclingSince: scalars.cycling_since === null ? null : new Date(isoOf(scalars.cycling_since) ?? 0),
+    now: options.now,
+  }).state;
 
   // `page_ingested_live`'s predicate, restated exactly — including `stale_at IS
   // NULL`, which is what makes this a range scan on that partial index rather
@@ -481,6 +539,8 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
     documentsThisWeek: sources.reduce((total, source) => total + source.thisWeek, 0),
     latestCycle,
     lastCompletedAt,
+    lastCompleteCycleAt,
+    cycleFreshness,
     documentsSinceLastCycle: behindRows[0]?.behind ?? 0,
     everDreamt: scalars.ever_dreamt,
     facts: scalars.facts,

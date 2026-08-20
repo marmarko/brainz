@@ -67,6 +67,13 @@ import {
   type ConnectorFreshness,
   type FleetConnectorVerdict,
 } from '../control/connector-staleness.ts';
+import {
+  controlPlaneCycleFreshness,
+  fleetCycleVerdict,
+  unattendedAfterSeconds,
+  type ControlPlaneCycleFreshness,
+  type FleetCycleVerdict,
+} from '../control/cycle-staleness.ts';
 import { createReconcilePorts } from '../control/reconcile-ports.ts';
 import { reconcileTenants } from '../control/reconcile.ts';
 import { CONNECTOR_SOURCES, isConnectorSource } from '../ingest/cursor.ts';
@@ -563,7 +570,7 @@ export async function adminDispatch(deps: AdminDeps, request: AdminRequest): Pro
       if (tenantId === null) {
         return { ok: false, code: 'invalid_params', message: 'tenant_id is required.' };
       }
-      const status = await tenantStatus(deps.controlSql, tenantId);
+      const status = await tenantStatus(deps.controlSql, tenantId, now);
       return status === null
         ? { ok: false, code: 'invalid_params', message: 'No such tenant.' }
         : { ok: true, content: status };
@@ -802,6 +809,109 @@ async function fleetConnectorHealth(sql: SQL, now: Date): Promise<FleetConnector
   };
 }
 
+/**
+ * How many tenants one fleet-cycle pass will read. Same argument as
+ * {@link FLEET_CONNECTOR_SCAN_LIMIT}: the rule is a TypeScript function rather
+ * than a `WHERE` clause, so rows are materialised, so there is a bound — and
+ * hitting it downgrades the verdict rather than being swallowed.
+ */
+export const FLEET_CYCLE_SCAN_LIMIT = 5_000;
+
+interface FleetCycleHealth {
+  readonly verdict: FleetCycleVerdict;
+  readonly counts: Readonly<Record<ControlPlaneCycleFreshness, number>>;
+  readonly total: number;
+  readonly truncated: boolean;
+}
+
+/**
+ * **Is any brain in this fleet failing to consolidate — and the honest answer
+ * about how much of that question this surface can even ask.**
+ *
+ * **The gap, and it is measured in days.** One brain's consolidation froze:
+ * 5,608 documents, 167 facts, flat, for days. Nothing alerted, and the reason is
+ * specific rather than an oversight. A cycle that stops short banks its reason,
+ * leaves its run open and *returns* — so the job completes, `control.job` reads
+ * `state: done, attempts: 1, failure_code: NULL` on every pass, and
+ * `queue.complete()`'s settle stamps `last_cycle_at` and `next_due_at` in the
+ * same transaction. During the freeze the frozen brain's `last_cycle_at` was
+ * five and a half hours old and a healthy canary's was eight. The frozen one
+ * looked better.
+ *
+ * **What this function therefore does NOT claim.** The fact that separates a
+ * returning cycle from a completing one is `consolidation_run.stop_reason`, and
+ * that column lives in the tenant's own database. Every table in the control
+ * plane was checked: `tenant`, `job`, `connector_*`, `pool_project`, `oauth_*`,
+ * `secret_*`, `tenant_flag`. None carries a cycle outcome. `spend_micro_usd` is
+ * cumulative with no per-cycle delta, `pending_debt` is subtracted at settle
+ * whatever the outcome, job duration is a smoke alarm wired to the oven timer.
+ * This fleet holds no tenant handles by design — `AdminDeps` is `controlSql` and
+ * a directory — and inventing a cross-fleet read to fix that would trade a blind
+ * spot for a fan-out that wakes every scale-to-zero database in the fleet on a
+ * health poll.
+ *
+ * So the reading here is {@link controlPlaneCycleFreshness}, whose return type
+ * cannot be `'stale'`, and the count it publishes as `unobserved` is the size of
+ * the blind spot rather than a green light. The rich reading — the one that
+ * fires on the incident — is on `/dashboard?view=coverage`, which opens a tenant
+ * handle and feeds the same rule (`src/web/coverage.ts`). One brain at a time,
+ * and it requires somebody to already suspect: diagnosis, not an alarm.
+ *
+ * **What it does catch, which nothing else did.** A ready tenant nothing has
+ * scheduled at all. That is the dead-scheduler signature, it is the one cell a
+ * return clock answers truthfully, and it was previously invisible for the same
+ * reason everything else was: nobody was reading the column.
+ */
+async function fleetCycleHealth(sql: SQL, now: Date): Promise<FleetCycleHealth> {
+  const rows = await sql<
+    {
+      state: string;
+      last_cycle_at: Date | null;
+      ready_since: Date | null;
+    }[]
+  >`
+    SELECT state::text AS state,
+           last_cycle_at,
+           -- ready_at is when consolidation became this tenant's to do at all;
+           -- created_at is the floor for a row provisioned before that column
+           -- was stamped. A floor expires the first grace earlier, which is the
+           -- direction that errs towards saying something on a health surface.
+           coalesce(ready_at, created_at) AS ready_since
+      FROM control.tenant
+     ORDER BY tenant_id
+     LIMIT ${FLEET_CYCLE_SCAN_LIMIT + 1}`;
+
+  const truncated = rows.length > FLEET_CYCLE_SCAN_LIMIT;
+  const counted = truncated ? rows.slice(0, FLEET_CYCLE_SCAN_LIMIT) : rows;
+
+  const read = counted.map((row) =>
+    controlPlaneCycleFreshness({
+      tenantState: row.state,
+      lastReturnAt: row.last_cycle_at,
+      readySince: row.ready_since,
+      now,
+    }),
+  );
+
+  const counts: Record<ControlPlaneCycleFreshness, number> = {
+    not_ready: 0,
+    uncycled: 0,
+    unattended: 0,
+    unobserved: 0,
+  };
+  for (const state of read) counts[state] += 1;
+
+  const verdict = fleetCycleVerdict(read);
+  return {
+    // A scan that did not finish cannot answer `ok`, for the reason the
+    // connector scan's limit gives at length.
+    verdict: truncated && verdict === 'ok' ? 'degraded' : verdict,
+    counts,
+    total: read.length,
+    truncated,
+  };
+}
+
 async function fleetStatus(sql: SQL, now: Date): Promise<Record<string, unknown>> {
   const rows = await sql<{ state: string; tier: string; n: number }[]>`
     SELECT state::text AS state, tier::text AS tier, count(*)::int AS n
@@ -828,6 +938,14 @@ async function fleetStatus(sql: SQL, now: Date): Promise<Record<string, unknown>
   // a channel or a status page. Which brain is affected is one call away, on
   // `connector_status`, under the same credential.
   const connectors = await fleetConnectorHealth(sql, now);
+  // The second half of the same question, and the one this plane can only half
+  // answer. A monitor's rule is `.content.cycles.verdict != "ok"`, identical in
+  // shape to the connectors one so that *warn on degraded, page on stalled* is
+  // one rule for both. `completion_observable` is the field that says how much
+  // that verdict is worth: while it is `false`, an `ok` here means "nothing I
+  // can see is wrong", and `unobserved` counts the brains it cannot see. See
+  // `fleetCycleHealth` for why, and for the follow-up that ends it.
+  const cycles = await fleetCycleHealth(sql, now);
   return {
     tenants: rows.map((row) => ({ state: row.state, tier: row.tier, count: row.n })),
     spend_micro_usd: Number(spend[0]?.total ?? 0),
@@ -846,6 +964,23 @@ async function fleetStatus(sql: SQL, now: Date): Promise<Record<string, unknown>
       starting: connectors.counts.starting,
       unpolled: connectors.counts.unpolled,
       truncated: connectors.truncated,
+    },
+    cycles: {
+      verdict: cycles.verdict,
+      total: cycles.total,
+      not_ready: cycles.counts.not_ready,
+      uncycled: cycles.counts.uncycled,
+      unattended: cycles.counts.unattended,
+      // Not "everything is fine on these": "this surface cannot tell". Named
+      // rather than folded into a healthy count, because a number that grows
+      // with the fleet is the argument for closing the gap.
+      unobserved: cycles.counts.unobserved,
+      // The states the tenant-side rule can reach and this one cannot are
+      // absent rather than published as zero. Printing `stale: 0` here would
+      // assert that nothing is frozen, which is the sentence this whole surface
+      // exists because nobody was entitled to say.
+      completion_observable: false,
+      truncated: cycles.truncated,
     },
   };
 }
@@ -1112,7 +1247,11 @@ async function connectorStatus(
  * an operator surface that printed them would be handing a reader the namespace
  * to go and ask for, and this surface has no reason to name one.
  */
-async function tenantStatus(sql: SQL, tenantId: string): Promise<Record<string, unknown> | null> {
+async function tenantStatus(
+  sql: SQL,
+  tenantId: string,
+  now: Date,
+): Promise<Record<string, unknown> | null> {
   const rows = await sql<
     {
       tenant_id: string;
@@ -1125,11 +1264,13 @@ async function tenantStatus(sql: SQL, tenantId: string): Promise<Record<string, 
       last_activity: Date | null;
       last_cycle_at: Date | null;
       next_due_at: Date | null;
+      ready_since: Date | null;
     }[]
   >`
     SELECT tenant_id, state::text AS state, tier::text AS tier, schema_version,
            pending_debt, spend_micro_usd, hosted_cogs_micro_usd,
-           last_activity, last_cycle_at, next_due_at
+           last_activity, last_cycle_at, next_due_at,
+           coalesce(ready_at, created_at) AS ready_since
     FROM control.tenant WHERE tenant_id = ${tenantId}`;
 
   const found = rows[0];
@@ -1145,7 +1286,27 @@ async function tenantStatus(sql: SQL, tenantId: string): Promise<Record<string, 
     // moment they bring their own key (R22).
     hosted_cogs_micro_usd: Number(found.hosted_cogs_micro_usd),
     last_activity: found.last_activity,
+    // **A return clock, not a cycle clock, whatever its name says.** It is
+    // stamped by `queue.complete()` for every consolidate job whose handler
+    // returned, and a cycle that stops short returns — so this column stayed
+    // hours fresh through a multi-day freeze. It is here because an operator
+    // reading a tenant wants both instants; the reading beneath it is what says
+    // whether either of them means anything.
     last_cycle_at: found.last_cycle_at,
     next_due_at: found.next_due_at,
+    cycles: {
+      state: controlPlaneCycleFreshness({
+        tenantState: found.state,
+        lastReturnAt: found.last_cycle_at,
+        readySince: found.ready_since,
+        now,
+      }),
+      // The same refusal the fleet block carries, restated where somebody
+      // debugging one brain will read it: whether this brain's cycles are
+      // *completing* is not in the control plane. `/dashboard?view=coverage`
+      // opens the tenant handle and answers it.
+      completion_observable: false,
+      unattended_after_seconds: unattendedAfterSeconds(),
+    },
   };
 }

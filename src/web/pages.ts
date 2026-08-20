@@ -26,6 +26,7 @@ import type { ConnectorStatus } from './connector-panel.ts';
  * the counts are read, and its type is the enforcement of the privacy rule this
  * page renders — every field a number, an instant, or a schema-declared code.
  */
+import { isAlarming } from '../control/cycle-staleness.ts';
 import type { CoverageView, EntityKind } from './coverage.ts';
 
 /**
@@ -1165,6 +1166,68 @@ does not guess between them — either way the numbers below are from before it 
 }
 
 /**
+ * The freeze, said out loud, when a stopped cycle has stopped being an incident
+ * and started being a state.
+ *
+ * **Why this exists on top of {@link cycleSentence}, which already names the
+ * stop.** That sentence describes the *newest* cycle: "it stopped in the extract
+ * phase, reporting bad_output". True, and for one bad Tuesday it is also
+ * sufficient — the next cycle resumes into the open run and the reader needs to
+ * do nothing. What it cannot say is that the same sentence has been true every
+ * day for a week, and that is the entire difference between a hiccup and the
+ * multi-day freeze this page exists for: 5,608 documents, 167 facts, flat,
+ * while a cycle ran and stopped and ran again on the ceiling every single day.
+ * A reader who saw only the newest cycle's reason had no way to tell those
+ * apart, and neither did anybody else — every clock in the control plane
+ * advanced normally throughout, because a cycle that stops short still *returns*
+ * and a job that returns is done.
+ *
+ * So this row is about *duration*, and it is the only thing on the page that is.
+ *
+ * **It states what it observed and promises nothing.** No branch here says a
+ * next cycle will fix it — that is a fact about a worker this page cannot see,
+ * and it is the class of promise the surface exists to stop making. `slipping`
+ * and the two quiet states render nothing at all: a page that prints a warning
+ * on an ordinary day is a page whose warnings stop being read, which is how a
+ * week of silence happens.
+ */
+function freezeNote(view: CoverageView): string {
+  if (!isAlarming(view.cycleFreshness)) return '';
+
+  const since =
+    view.lastCompleteCycleAt === null
+      ? null
+      : `<time datetime="${escapeHtml(view.lastCompleteCycleAt)}">${escapeHtml(
+          view.lastCompleteCycleAt,
+        )}</time>`;
+
+  switch (view.cycleFreshness) {
+    case 'stale':
+      // The incident's own cell. Cycles ARE running — saying "nothing has run"
+      // here would be false and would send the reader looking in the wrong
+      // place.
+      return `\n<p class="problem">Cycles have been running and stopping short for longer than that
+is normally worth waiting out. The last one that finished was ${since ?? 'not recorded'}, so the
+numbers below have not moved since then, however much has arrived.</p>`;
+    case 'never_completed':
+      // Deliberately not the same sentence. "It stopped finishing" and "it has
+      // never once finished" send a reader to different places, and only one of
+      // them is about something that used to work.
+      return `\n<p class="problem">No cycle has ever run all the way through on this brain. What you
+have sent is stored and searchable; the numbers below are what the cycles that stopped managed to
+produce before they stopped.</p>`;
+    case 'unattended':
+      return `\n<p class="problem">Nothing has consolidated this brain since ${
+        since ?? 'before its records begin'
+      }. Nothing here is reporting a failure — no cycle has run at all.</p>`;
+    default:
+      // `isAlarming` is a closed set and the three cases above are it. A reading
+      // added there and not here renders nothing rather than a guess.
+      return '';
+  }
+}
+
+/**
  * What the brain holds.
  *
  * **The order is the argument.** Arrivals first, because "nothing has come from
@@ -1302,7 +1365,9 @@ ${sources}
 biggest table it has, and this is a page load. If a source has stopped arriving, the connected
 accounts panel on your dashboard is where the reason is.</p>
 <h2>Consolidation</h2>
-${view.latestCycle === null ? cold : `<p>${cycleSentence(view.latestCycle, page.tier)}</p>`}${behind}${derived}
+${
+      view.latestCycle === null ? cold : `<p>${cycleSentence(view.latestCycle, page.tier)}</p>`
+    }${freezeNote(view)}${behind}${derived}
 ${back}`,
   );
 }
