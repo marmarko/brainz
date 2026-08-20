@@ -426,16 +426,45 @@ export function buildContradictionPrompt(input: {
   };
 }
 
+/**
+ * How much of one document goes into a salience prompt.
+ *
+ * **This is the only prompt in the cycle that puts a WHOLE candidate set in one
+ * request, so it is the only one whose size is the batch's problem rather than
+ * an item's.** Every other model phase sends one item per call, or a set of
+ * short statements; this one sends N full documents and asks for N scores. With
+ * the page text unbounded and N taken from the cycle's limit, the request grew
+ * with both the corpus and the batch — measured on a real brain, it drew a
+ * durable `input_rejected` on every cycle, which stopped the phase, which meant
+ * the run never reached `complete`, which meant the completion clock never
+ * advanced and every surface reading it called the brain frozen. The freeze was
+ * three phases upstream of where it was reported, again.
+ *
+ * A prefix rather than the whole document, because the question is "how much is
+ * this likely to matter later" and the answer is carried by the subject line and
+ * the opening — an invoice, a newsletter and a term sheet are distinguishable in
+ * their first paragraph, and the tail of a long thread is mostly quoted history
+ * that the model has already been shown in the part above it. Truncating is
+ * visible to the model: the marker below says the document continues, so a score
+ * is never given on the assumption that a two-line prefix was the whole thing.
+ */
+export const SALIENCE_PAGE_CHARS = 1_500;
+
 export function buildSaliencePrompt(input: {
   readonly pages: readonly { readonly pageId: string; readonly title: string | null; readonly text: string; readonly origins: readonly string[] }[];
   readonly nonce?: string;
 }): Prompt {
   const nonce = input.nonce ?? mintDelimiter();
-  const parts = input.pages.map(
-    (page) =>
+  const parts = input.pages.map((page) => {
+    const body =
+      page.text.length > SALIENCE_PAGE_CHARS
+        ? `${page.text.slice(0, SALIENCE_PAGE_CHARS)}\n[document continues]`
+        : page.text;
+    return (
       `page_id: ${page.pageId}\ntitle: ${page.title ?? '(untitled)'}\n` +
-      wrap(page.text, page.origins, nonce),
-  );
+      wrap(body, page.origins, nonce)
+    );
+  });
   return {
     nonce,
     system: dataOnlySystem(

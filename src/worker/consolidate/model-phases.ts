@@ -999,11 +999,28 @@ export async function runContradictionPhase(deps: ModelPhaseDeps): Promise<Phase
  * output survive the cycle that produced it. Its header carries the measurement
  * and the cost.
  */
+/**
+ * Pages per salience request.
+ *
+ * **Its own number rather than the cycle's `limit`, because this phase's unit of
+ * work is the BATCH.** Every other model phase spends `limit` on how many items
+ * it will consider one at a time; here `limit` multiplied the size of a single
+ * request, so a cycle that raised it to get more extraction done made this
+ * phase's one prompt proportionally larger until the provider refused it. Two
+ * knobs that read the same field and mean opposite things is not a knob.
+ *
+ * Bounded with {@link SALIENCE_PAGE_CHARS}, this is ~40KB of document per
+ * request — comfortably inside every seat this op routes to, and it converges
+ * across cycles rather than within one, because rung 22's consideration stamp
+ * means each pass takes pages no pass has scored.
+ */
+const SALIENCE_REFINE_BATCH = 25;
+
 export async function runSalienceRefinePhase(deps: ModelPhaseDeps): Promise<PhaseOutcome> {
   const phase: ModelPhase = 'salience_refine';
   const version = (deps.consideration ?? CONSIDERATION_VERSION).salience_refine;
   const pages = await selectIngestedPages(deps.sql, {
-    limit: deps.limit ?? 50,
+    limit: Math.min(deps.limit ?? SALIENCE_REFINE_BATCH, SALIENCE_REFINE_BATCH),
     consideredVersion: version,
   });
   if (pages.length === 0) return empty(phase);
