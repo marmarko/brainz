@@ -251,7 +251,7 @@ function union(left: readonly string[], right: readonly string[]): string[] {
 }
 
 /**
- * Replaces an entity with a successor carrying the wider origin union.
+ * Replaces a set of entities with successors carrying wider origin unions.
  *
  * The cascade is the price of R15's immutability and every step of it is
  * load-bearing: the slug moves so the entity keeps its address, the aliases
@@ -259,37 +259,120 @@ function union(left: readonly string[], right: readonly string[]): string[] {
  * `entity_edge.origin_contexts` is immutable too *and* the union trigger would
  * refuse an edge narrower than its new endpoint. A live edge left pointing at
  * the tombstoned row is a graph walk into a row nothing else can reach.
+ *
+ * **It takes a set, and that is the whole of the change.** This ran per entity,
+ * at `5 + 2·degree` round trips each, and it was the one shape in the
+ * consolidation pass that could still overrun an attempt: the edge-rewrite loop
+ * is charged per EDGE, so a well-connected corpus pays for the graph twice over.
+ * The measurement that reassured everyone about the pass as a whole was taken on
+ * the one fixture that structurally cannot widen, so the term was never in it.
+ * Seven statements now, whatever the set's size and whatever its degree — the
+ * same treatment `reconcileAllEdges` gave the phase around it.
+ *
+ * **Widening is bounded by entities, never by facts, and this is still worth
+ * batching.** In steady state it fires for nothing at all: the write path widens
+ * as it ingests, so consolidation re-derives a union that is already correct. It
+ * fires in bulk exactly once — the pass where a second connector meets a corpus
+ * this brain already knows — and that pass is where the attempt is tightest.
+ *
+ * **Ordering inside the batch is what keeps it legal.** Every replacement edge
+ * is tombstoned before any is inserted, because `entity_edge_is_stated_once` is
+ * a partial unique index over live rows and a replacement cannot sit beside the
+ * row it replaces. Two statements, not two per edge.
+ *
+ * **An edge between two widened entities is handled once rather than twice.**
+ * The per-entity version met such an edge in both passes — the second pass
+ * finding the row the first one had just written — and unioned each endpoint's
+ * origins in turn. Reading every affected edge once and unioning whichever of
+ * its endpoints are in the set reaches the same row in one write, and cannot
+ * depend on the order the entities happen to come in.
  */
 async function widenEntityOrigins(
   db: SQL,
-  entity: EntityRow,
-  origins: readonly string[],
-): Promise<EntityRow> {
-  const widened = union(entity.originContexts, origins);
+  wanted: ReadonlyMap<string, { readonly entity: EntityRow; readonly missing: readonly string[] }>,
+): Promise<Map<string, EntityRow>> {
+  const successors = new Map<string, EntityRow>();
+  if (wanted.size === 0) return successors;
 
-  const created = (await db`
-    INSERT INTO entity (canonical_name, entity_type, taxonomy_version, origin_contexts,
-                        subject_context, subject_confidence)
-    SELECT canonical_name, entity_type, taxonomy_version, ${textArrayLiteral(widened)}::text[],
-           subject_context, subject_confidence
-      FROM entity WHERE entity_id = ${entity.entityId}::bigint
-    RETURNING entity_id::text AS entity_id, canonical_name, origin_contexts
-  `) as RawEntity[];
+  const oldIds = [...wanted.keys()];
+  const widenedBy = new Map<string, string[]>();
+  for (const [oldId, group] of wanted) {
+    widenedBy.set(oldId, union(group.entity.originContexts, group.missing));
+  }
 
-  const successor = created[0];
-  if (successor === undefined) throw new Error(`could not widen entity ${entity.entityId}`);
+  // 1. Every successor, and the old→new mapping, in one statement.
+  //
+  // **The id is drawn before the insert rather than read back after it**, and
+  // that is what makes the mapping a fact rather than an assumption. `entity_id`
+  // is `GENERATED ALWAYS AS IDENTITY`, so an `INSERT … SELECT … RETURNING`
+  // returns the new ids with nothing on them tying each back to the row it
+  // succeeds: `canonical_name` is not unique (two entities of different types
+  // share one), and the order rows come back in is promised by nothing. Taking
+  // `nextval` in a MATERIALIZED CTE gives both sides the same number. The CTE is
+  // materialized twice over — it is referenced twice AND holds a volatile
+  // function — and it is said out loud anyway, because the correctness of every
+  // statement below rests on `src` being evaluated exactly once.
+  const mapped = (await db.unsafe(
+    `WITH src AS MATERIALIZED (
+       SELECT u.old_id, u.origins::text[] AS origins,
+              nextval(pg_get_serial_sequence('entity', 'entity_id')) AS new_id
+         FROM unnest($1::bigint[], $2::text[]) AS u(old_id, origins)
+     ), born AS (
+       INSERT INTO entity (entity_id, canonical_name, entity_type, taxonomy_version,
+                           origin_contexts, subject_context, subject_confidence)
+       OVERRIDING SYSTEM VALUE
+       SELECT s.new_id, e.canonical_name, e.entity_type, e.taxonomy_version,
+              s.origins, e.subject_context, e.subject_confidence
+         FROM src s JOIN entity e ON e.entity_id = s.old_id
+       RETURNING entity_id, canonical_name, origin_contexts
+     )
+     SELECT s.old_id::text AS old_id, b.entity_id::text AS entity_id,
+            b.canonical_name, b.origin_contexts
+       FROM src s JOIN born b ON b.entity_id = s.new_id`,
+    [
+      numericArrayLiteral(oldIds),
+      textArrayLiteral(oldIds.map((oldId) => textArrayLiteral(widenedBy.get(oldId) ?? []))),
+    ],
+  )) as Array<RawEntity & { old_id: string }>;
 
-  await db`UPDATE entity_slug SET entity_id = ${successor.entity_id}::bigint WHERE entity_id = ${entity.entityId}::bigint`;
-  await db`UPDATE entity_alias SET entity_id = ${successor.entity_id}::bigint WHERE entity_id = ${entity.entityId}::bigint`;
+  const newIdOf = new Map<string, string>();
+  for (const row of mapped) {
+    newIdOf.set(row.old_id, row.entity_id);
+    successors.set(row.old_id, toEntity(row));
+  }
+  if (newIdOf.size !== wanted.size) {
+    throw new Error(`could not widen ${wanted.size - newIdOf.size} of ${wanted.size} entities`);
+  }
 
-  const edges = (await db`
-    SELECT edge_id::text AS edge_id, subject_entity_id::text AS subject_entity_id,
-           edge_type, object_entity_id::text AS object_entity_id,
-           origin_contexts, confidence
-      FROM entity_edge
-     WHERE deleted_at IS NULL
-       AND (subject_entity_id = ${entity.entityId}::bigint OR object_entity_id = ${entity.entityId}::bigint)
-  `) as Array<{
+  const pairs: [string, string] = [
+    numericArrayLiteral(oldIds),
+    numericArrayLiteral(oldIds.map((oldId) => newIdOf.get(oldId) ?? '0')),
+  ];
+
+  // 2 and 3. The address and the alias set follow the entity.
+  await db.unsafe(
+    `UPDATE entity_slug s SET entity_id = m.new_id
+       FROM unnest($1::bigint[], $2::bigint[]) AS m(old_id, new_id)
+      WHERE s.entity_id = m.old_id`,
+    pairs,
+  );
+  await db.unsafe(
+    `UPDATE entity_alias a SET entity_id = m.new_id
+       FROM unnest($1::bigint[], $2::bigint[]) AS m(old_id, new_id)
+      WHERE a.entity_id = m.old_id`,
+    pairs,
+  );
+
+  // 4. Every live edge touching anything in the set, read once.
+  const edges = (await db.unsafe(
+    `SELECT edge_id::text AS edge_id, subject_entity_id::text AS subject_entity_id,
+            edge_type, object_entity_id::text AS object_entity_id,
+            origin_contexts, confidence
+       FROM entity_edge
+      WHERE deleted_at IS NULL
+        AND (subject_entity_id = ANY($1::bigint[]) OR object_entity_id = ANY($1::bigint[]))`,
+    [numericArrayLiteral(oldIds)],
+  )) as Array<{
     edge_id: string;
     subject_entity_id: string;
     edge_type: string;
@@ -298,24 +381,56 @@ async function widenEntityOrigins(
     confidence: number | null;
   }>;
 
-  for (const edge of edges) {
-    // Tombstone first: `entity_edge_is_stated_once` is a partial unique index
-    // over live rows, so the replacement cannot be inserted alongside it.
-    await db`UPDATE entity_edge SET deleted_at = now() WHERE edge_id = ${edge.edge_id}::bigint`;
-    const subject =
-      edge.subject_entity_id === entity.entityId ? successor.entity_id : edge.subject_entity_id;
-    const object =
-      edge.object_entity_id === entity.entityId ? successor.entity_id : edge.object_entity_id;
-    await db`
-      INSERT INTO entity_edge (subject_entity_id, edge_type, object_entity_id, origin_contexts, confidence)
-      VALUES (${subject}::bigint, ${edge.edge_type}, ${object}::bigint,
-              ${textArrayLiteral(union(edge.origin_contexts, widened))}::text[], ${edge.confidence})
-    `;
+  if (edges.length > 0) {
+    // 5. Tombstone every one of them BEFORE inserting any replacement.
+    await db.unsafe(`UPDATE entity_edge SET deleted_at = now() WHERE edge_id = ANY($1::bigint[])`, [
+      numericArrayLiteral(edges.map((edge) => edge.edge_id)),
+    ]);
+
+    // 6. And write them back, re-pointed and re-unioned. An edge whose two
+    // endpoints are both in the set takes both unions here, in one row.
+    const replacements = edges.map((edge) => {
+      let widened = edge.origin_contexts;
+      const fromSubject = widenedBy.get(edge.subject_entity_id);
+      if (fromSubject !== undefined) widened = union(widened, fromSubject);
+      const fromObject = widenedBy.get(edge.object_entity_id);
+      if (fromObject !== undefined) widened = union(widened, fromObject);
+      return {
+        subject: newIdOf.get(edge.subject_entity_id) ?? edge.subject_entity_id,
+        edgeType: edge.edge_type,
+        object: newIdOf.get(edge.object_entity_id) ?? edge.object_entity_id,
+        origins: textArrayLiteral(widened),
+        // `NULL` unquoted is how a Postgres array literal spells an absent
+        // element; the empty string `numericArrayLiteral` would otherwise
+        // produce is not a `float8` and would fail the whole statement.
+        confidence: edge.confidence === null ? 'NULL' : String(edge.confidence),
+      };
+    });
+
+    for (const chunk of batched(replacements)) {
+      await db.unsafe(
+        `INSERT INTO entity_edge (subject_entity_id, edge_type, object_entity_id,
+                                  origin_contexts, confidence)
+         SELECT u.subject, u.edge_type, u.object, u.origins::text[], u.confidence
+           FROM unnest($1::bigint[], $2::text[], $3::bigint[], $4::text[], $5::float8[])
+                AS u(subject, edge_type, object, origins, confidence)`,
+        [
+          numericArrayLiteral(chunk.map((row) => row.subject)),
+          textArrayLiteral(chunk.map((row) => row.edgeType)),
+          numericArrayLiteral(chunk.map((row) => row.object)),
+          textArrayLiteral(chunk.map((row) => row.origins)),
+          numericArrayLiteral(chunk.map((row) => row.confidence)),
+        ],
+      );
+    }
   }
 
-  await db`UPDATE entity SET deleted_at = now() WHERE entity_id = ${entity.entityId}::bigint`;
+  // 7. The predecessors leave.
+  await db.unsafe(`UPDATE entity SET deleted_at = now() WHERE entity_id = ANY($1::bigint[])`, [
+    numericArrayLiteral(oldIds),
+  ]);
 
-  return toEntity(successor);
+  return successors;
 }
 
 export interface ResolveEntityRequest {
@@ -424,18 +539,28 @@ export async function resolveOrCreateEntities(
     perEntity.set(entity.entityId, group);
   }
 
+  // Collected first and widened as a set: the cascade is seven statements for
+  // the whole batch, and it used to be `5 + 2·degree` for each entity in it.
+  // See {@link widenEntityOrigins} for why the edge term is the dangerous half.
+  const widening = new Map<string, { entity: EntityRow; missing: string[]; keys: string[] }>();
   for (const group of perEntity.values()) {
     const missing = [...group.origins].filter(
       (origin) => !group.entity.originContexts.includes(origin),
     );
-    // Not batched, and it does not need to be: this fires once per entity whose
-    // origin set genuinely grows, it is monotone (the next pass finds the union
-    // already there), and in steady state it fires for nothing at all — the
-    // write path widens as it ingests, so consolidation is re-deriving a union
-    // that is already correct. It is bounded by entities, never by facts.
+    // In steady state this is every entity, and the batch below is empty: the
+    // write path widens as it ingests, so consolidation re-derives a union that
+    // is already correct.
     if (missing.length === 0) continue;
-    const successor = await widenEntityOrigins(db, group.entity, missing);
-    for (const key of group.keys) resolved.set(key, successor);
+    widening.set(group.entity.entityId, { entity: group.entity, missing, keys: group.keys });
+  }
+
+  if (widening.size > 0) {
+    const successors = await widenEntityOrigins(db, widening);
+    for (const [oldId, group] of widening) {
+      const successor = successors.get(oldId);
+      if (successor === undefined) continue;
+      for (const key of group.keys) resolved.set(key, successor);
+    }
   }
 
   // ------------------------------------------------------------------

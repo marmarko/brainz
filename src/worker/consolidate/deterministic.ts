@@ -290,13 +290,17 @@ export const RECONCILE_EDGE_BATCH = 500;
  * per {@link RECONCILE_EDGE_BATCH}. The per-fact term is gone **for a pass in
  * which no entity's origin set grows** — which is every steady-state pass, and
  * is not the pass where a second connector meets a corpus this brain already
- * knows. There `widenEntityOrigins` still runs unbatched, `5 + 2·degree` round
- * trips per widened entity, and that is the one shape that can still overrun an
- * attempt. Stated rather than buried because the measurement that reassured
- * everyone last time was taken on the one fixture that structurally cannot
- * widen — which is the
- * property `test/consolidate/convergence.test.ts` asserts, by doubling the corpus
- * and watching the statement count stand still.
+ * knows. That pass widens, and `widenEntityOrigins` used to run unbatched there
+ * — `5 + 2·degree` round trips per widened entity, charged per EDGE, the one
+ * shape left that could overrun an attempt. It takes the whole set now, at seven
+ * statements however large the set and however dense the graph: measured on both
+ * trees, `30 → 86` statements as that corpus tripled before, `9 → 9` after
+ * (`test/core/write/links.test.ts`). It is called out here rather than left
+ * implicit because the measurement that reassured everyone about this pass was
+ * taken on the one fixture that structurally cannot widen, so the term it missed
+ * was the only one still growing — which is the property
+ * `test/consolidate/convergence.test.ts` asserts, by doubling the corpus and
+ * watching the statement count stand still.
  */
 export async function reconcileAllEdges(
   sql: SQL,

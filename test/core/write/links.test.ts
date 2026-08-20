@@ -27,9 +27,12 @@
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
+import type { SQL } from 'bun';
+
 import {
   findEntityByName,
   reconcileEdges,
+  resolveOrCreateEntities,
   resolveOrCreateEntity,
 } from '../../../src/core/write/links.ts';
 import { normalize, slugify } from '../../../src/core/write/normalize.ts';
@@ -97,6 +100,34 @@ async function write(options: {
 /** `remember`, which writes its own page and has no external ref to edit. */
 async function say(statement: string, origin = 'personal') {
   return remember(context(), { originContext: origin, statement });
+}
+
+/**
+ * Every statement the wrapped handle issues, counted.
+ *
+ * The same instrument `test/consolidate/convergence.test.ts` uses, and for the
+ * same reason: the fixture's database is on localhost where a statement costs
+ * microseconds, and the brain that dead-lettered was 36ms away where the same
+ * statement is four hundred times more expensive. What separates the two is the
+ * NUMBER of sequential statements, so that is what is asserted.
+ */
+function countingSql(sql: SQL, tally: { statements: number }): SQL {
+  return new Proxy(sql, {
+    apply(fn, thisArg, args: unknown[]) {
+      tally.statements += 1;
+      return Reflect.apply(fn as (...a: unknown[]) => unknown, thisArg, args);
+    },
+    get(inner, property, receiver) {
+      const value = Reflect.get(inner, property, receiver) as unknown;
+      if (property === 'unsafe' && typeof value === 'function') {
+        return (...args: unknown[]) => {
+          tally.statements += 1;
+          return (value as (...a: unknown[]) => unknown).apply(inner, args);
+        };
+      }
+      return typeof value === 'function' ? (value as () => unknown).bind(inner) : value;
+    },
+  }) as SQL;
 }
 
 async function liveEdges(): Promise<Array<{ subject: string; type: string; object: string }>> {
@@ -281,6 +312,111 @@ describe('origin widening writes a new row rather than mutating an immutable one
       SELECT count(*)::int AS n FROM entity WHERE deleted_at IS NOT NULL
     `) as Array<{ n: number }>;
     expect(tombstoned[0]?.n).toBeGreaterThan(0);
+  }, TEST_TIMEOUT_MS);
+
+  test('a whole set widens in a fixed number of statements, not one pass each', async () => {
+    // **The one shape in the consolidation pass that could still overrun an
+    // attempt.** Widening ran per entity at `5 + 2·degree` statements each — the
+    // edge term charged per EDGE, so a well-connected corpus paid for the graph
+    // twice over. It is not a hot path: in steady state nothing widens at all,
+    // because the write path widens as it ingests. It fires in bulk exactly
+    // once, on the pass where a second connector meets a corpus this brain
+    // already knows, and that is the pass where the attempt is tightest.
+    //
+    // The measurement everyone was reassured by was taken on a fixture that
+    // structurally cannot widen, so this term was never in it. Here the corpus
+    // triples and the statement count stands still.
+    await reset();
+
+    const seed = async (origin: string, n: number) => {
+      for (let index = 0; index < n; index += 1) {
+        await write({
+          origin,
+          ref: `${origin}-${index}`,
+          body: `Person${index} founded Company${index}.`,
+        });
+      }
+    };
+
+    const measure = async (n: number): Promise<number> => {
+      await reset();
+      await seed('personal', n);
+      // The second credential meets every one of them: `2n` entities widen, and
+      // every edge has BOTH endpoints in the widening set — the densest shape
+      // this cascade can be handed.
+      const requests = [];
+      for (let index = 0; index < n; index += 1) {
+        requests.push(
+          { name: `Person${index}`, type: 'person' as const, origins: ['work'], taxonomyVersion: 1 },
+          { name: `Company${index}`, type: 'organization' as const, origins: ['work'], taxonomyVersion: 1 },
+        );
+      }
+      const tally = { statements: 0 };
+      await resolveOrCreateEntities(countingSql(tenant.sql, tally), requests);
+      return tally.statements;
+    };
+
+    const small = await measure(2);
+    const large = await measure(6);
+
+    // Flat: the cascade is a fixed number of statements for the whole batch, so
+    // tripling the corpus adds none. Asserted as equality rather than a bound,
+    // because a bound would pass for a per-entity term that merely got smaller.
+    //
+    // Measured on both trees at the moment this landed: **30 → 86** before,
+    // **9 → 9** after. The per-entity version is what the arithmetic predicts —
+    // four entities of degree one at `5 + 2·degree`, then twelve of them — and
+    // it fails this assertion by reporting 86 where it expects 30.
+    expect(large).toBe(small);
+    // And it is a handful rather than a page of them — the resolve ladder plus
+    // the seven-statement cascade, with nothing charged per entity or per edge.
+    expect(large).toBeLessThan(20);
+  }, TEST_TIMEOUT_MS);
+
+  test('an edge whose two endpoints both widen ends up with both unions', async () => {
+    // The case the batched cascade meets differently from the per-entity one.
+    // Widening each entity in turn met such an edge twice — the second pass
+    // finding the row the first had just written — and unioned one endpoint's
+    // origins each time. Reading every affected edge once has to reach the same
+    // answer without depending on which entity came first.
+    await reset();
+    await write({
+      origin: 'personal',
+      ref: 'p-1',
+      body: 'Marcus Fell founded Kettle Works.',
+    });
+    await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Marcus Fell', type: 'person', origins: ['work'], taxonomyVersion: 1 },
+      { name: 'Kettle Works', type: 'organization', origins: ['legal'], taxonomyVersion: 1 },
+    ]);
+
+    const rows = (await tenant.sql`
+      SELECT e.origin_contexts AS edge_origins,
+             s.canonical_name AS subject, s.origin_contexts AS subject_origins,
+             o.canonical_name AS object, o.origin_contexts AS object_origins
+        FROM entity_edge e
+        JOIN entity s ON s.entity_id = e.subject_entity_id
+        JOIN entity o ON o.entity_id = e.object_entity_id
+       WHERE e.deleted_at IS NULL AND s.deleted_at IS NULL AND o.deleted_at IS NULL
+    `) as Array<{
+      edge_origins: string[];
+      subject: string;
+      subject_origins: string[];
+      object: string;
+      object_origins: string[];
+    }>;
+
+    expect(rows).toHaveLength(1);
+    const edge = rows[0];
+    // Each endpoint carries its own widening...
+    expect([...(edge?.subject_origins ?? [])].sort()).toEqual(['personal', 'work']);
+    expect([...(edge?.object_origins ?? [])].sort()).toEqual(['legal', 'personal']);
+    // ...and the edge carries BOTH, which is what the immutable-origin trigger
+    // demands: an edge narrower than either endpoint is refused.
+    expect([...(edge?.edge_origins ?? [])].sort()).toEqual(['legal', 'personal', 'work']);
+    // And it points at the successors, not at the rows they replaced.
+    expect(edge?.subject).toBe('Marcus Fell');
+    expect(edge?.object).toBe('Kettle Works');
   }, TEST_TIMEOUT_MS);
 
   test('edges follow the widened entity and carry the wider union', async () => {
