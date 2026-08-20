@@ -718,6 +718,69 @@ describe('a page the model cannot summarise does not stop the cycle', () => {
     },
     SETUP_TIMEOUT_MS,
   );
+
+  test(
+    'a reasoning model that thinks and never answers costs one page, not the pass',
+    async () => {
+      // **Measured on the live synopsis seat, which is a reasoning model.** Its
+      // `max_tokens` has to cover the trace AND the answer; when it does not,
+      // the provider returns HTTP 200 with `content: null` and the whole budget
+      // spent on `reasoning`. Nineteen calls in a row answered and the twentieth
+      // did this.
+      //
+      // The gateway names that `reasoning_only_output` — correctly, and then
+      // `stopFor` folded it in with a dead provider, so ONE unlucky sample
+      // stopped the phase and every page behind it. On the brain it happened to,
+      // a cycle produced 48 summaries out of 3,400 and reported
+      // `phase_failed at synopsis / model_unavailable`, which sent every reader
+      // looking for an outage that was not there.
+      //
+      // It is the page's outcome: the provider answered, about this request, and
+      // the next page gets a fresh sample.
+      const PAGES = 3;
+      await seedBrain(PAGES);
+
+      let call = 0;
+      const { gateway, transport } = createGateway({
+        chat: {
+          ...SCRIPT,
+          synopsis: () => {
+            call += 1;
+            // The middle page only. The pages either side must be summarised,
+            // which is what separates "skipped one" from "gave up".
+            return call === 2
+              ? { text: '', reasoning: 'Okay, let me think about this thread. The user wants…' }
+              : JSON.stringify({ summary: 'A thread about a hire.' });
+          },
+        },
+      });
+      const run = await openRun(tenant.sql, {
+        trigger: 'time_ceiling',
+        tier: 'paid',
+        now: new Date(),
+        estimateMicroUsd: NO_SPEND,
+      });
+
+      const outcome = await runSynopsisPhase({
+        sql: tenant.sql,
+        gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        runId: run.run.runId,
+        now: new Date(),
+        budget: uncappedBudget('synopsis'),
+      });
+
+      // The phase COMPLETED, so every phase behind it is still reached.
+      expect(outcome.stopped).toBeNull();
+      // Every page was offered — the pass was not cut short at the second.
+      expect(transport.callsFor('synopsis').length).toBe(PAGES);
+      // Two summarised, one passed over and counted rather than swallowed.
+      expect(outcome.applied).toBe(PAGES - 1);
+      expect(outcome.skippedItems).toBe(1);
+    },
+    SETUP_TIMEOUT_MS,
+  );
 });
 
 // ---------------------------------------------------------------------------

@@ -83,7 +83,17 @@ export interface ScriptedTransport extends ModelTransport {
   callsFor(op: ModelOp): readonly TransportRequest[];
 }
 
-export type ChatScript = (request: TransportRequest) => string;
+/**
+ * A scripted chat reply.
+ *
+ * A bare string is the answer. The object form is how a **reasoning** seat's
+ * failure shape is expressed: `@cf/nvidia/nemotron-3-120b-a12b` and two of its
+ * siblings return a trace beside a null answer when `maxOutputTokens` is too
+ * tight to think and answer, and that shape is not reachable from a string.
+ */
+export type ChatScript = (
+  request: TransportRequest,
+) => string | { readonly text: string; readonly reasoning?: string };
 
 export interface ScriptOptions {
   /** Per-op chat replies. An op with no entry answers `{}`. */
@@ -143,9 +153,14 @@ export function createScriptedTransport(options: ScriptOptions = {}): ScriptedTr
       }
 
       const script = options.chat?.[request.op];
-      const text = script === undefined ? '{}' : script(request);
+      const scripted = script === undefined ? '{}' : script(request);
+      const reply = typeof scripted === 'string' ? { text: scripted } : scripted;
       return Promise.resolve({
-        output: { kind: 'chat', text },
+        output: {
+          kind: 'chat',
+          text: reply.text,
+          ...(reply.reasoning === undefined ? {} : { reasoning: reply.reasoning }),
+        },
         usage: { inputTokens: Math.ceil(request.input.user.length / 4), outputTokens },
       });
     },

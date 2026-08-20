@@ -83,7 +83,7 @@ async function seedLopsided(options: {
   readonly groups: number;
 }): Promise<void> {
   const { sql } = tenant;
-  const pages: Array<{ pageId: string; chunkIds: string[] }> = [];
+  const pages: Array<Awaited<ReturnType<typeof seedPage>>> = [];
   for (let index = 0; index < options.pages; index++) {
     pages.push(
       await seedPage(sql, {

@@ -301,6 +301,24 @@ export function stopFor(result: Extract<GatewayResult, { ok: false }>): PhaseFai
       return { stop: 'input_rejected', durable: true };
     }
   }
+  // **A model that answered, uselessly, about THIS request.** The provider
+  // returned 200 and billed for it; what came back was a reasoning trace with no
+  // answer, or nothing at all. Neither is an outage — the next request gets a
+  // fresh sample, and measured against the synopsis seat nineteen calls in a row
+  // answered and the twentieth spent its whole ceiling thinking. Folded into
+  // `model_unavailable` these stopped the phase, so one unlucky page held every
+  // page behind it and a cycle managed 48 summaries out of 3,400 before it died.
+  // That is the freeze rung 21 removed for an unreadable ANSWER, arriving
+  // through the shape one layer up.
+  //
+  // So they are the item's outcome: skipped, counted in `skippedItems`, offered
+  // again next cycle. The systemic reading is not lost, it moves to where it
+  // belongs — a phase whose WHOLE candidate set skips, cycle after cycle, is a
+  // seat whose output ceiling is too tight, which `PhaseOutcome.skippedItems`
+  // already exists to say and which no single response can prove.
+  if (result.reason === 'reasoning_only_output' || result.reason === 'empty_output') {
+    return { stop: 'bad_output', durable: true };
+  }
   // Everything else: a provider that was down, a network that dropped, a key
   // that would not resolve, a scope that was denied, a model nobody priced. Each
   // has a remedy, none of them is the page's, and every one of them would meet

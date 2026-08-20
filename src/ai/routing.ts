@@ -398,21 +398,44 @@ const HOSTED_ROUTES: RoutingProfile = {
     maxOutputTokens: 1_024,
     unpinnable: UNPINNABLE_UNIFIED_GEMINI,
   },
+  /** The same reasoning seat, and the same arithmetic — see `synopsis` below. */
   salience: {
     op: 'salience',
     alias: '@cf/nvidia/nemotron-3-120b-a12b',
     id: '@cf/nvidia/nemotron-3-120b-a12b',
     provider: 'cloudflare',
     pinnedOn: PIN_DATE,
-    maxOutputTokens: 1_024,
+    maxOutputTokens: 2_048,
   },
+  /**
+   * **2,048, and the number is a measurement rather than a preference.**
+   *
+   * This seat is a reasoning model: its `max_tokens` has to cover the trace AND
+   * the answer, and at 512 it routinely spent the lot thinking and returned
+   * `content: null` — the shape the gateway names `reasoning_only_output`.
+   * Measured against the live seat with a summary-shaped prompt: nineteen calls
+   * in a row answered and the twentieth returned a trace with no answer, at a
+   * summary that itself costs 76–87 completion tokens. So the ceiling was not
+   * tight for the answer, it was tight for the thinking in front of it, which is
+   * a cost no caller here can see or shorten.
+   *
+   * The consequence was not a slow phase. Until the same change, that reason
+   * stopped the synopsis phase outright, so a 5% chance per page of an unlucky
+   * sample truncated the pass — one real cycle managed 48 summaries out of 3,400
+   * before it stopped. Both halves are fixed: the ceiling makes the shape rare,
+   * and `stopFor` makes it the page's outcome rather than the phase's when it
+   * still happens.
+   *
+   * A ceiling is not a spend — it is the most this call may return, and the
+   * measured answers use a fraction of it.
+   */
   synopsis: {
     op: 'synopsis',
     alias: '@cf/nvidia/nemotron-3-120b-a12b',
     id: '@cf/nvidia/nemotron-3-120b-a12b',
     provider: 'cloudflare',
     pinnedOn: PIN_DATE,
-    maxOutputTokens: 512,
+    maxOutputTokens: 2_048,
   },
   /**
    * The screenshot specialist, in place of Cloudflare's hosted llama-3.2-vision.

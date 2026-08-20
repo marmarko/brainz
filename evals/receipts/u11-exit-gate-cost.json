@@ -60,16 +60,16 @@
     "salience": {
       "model_id": "@cf/nvidia/nemotron-3-120b-a12b",
       "input_tokens": 24000,
-      "output_tokens": 1024,
-      "micro_usd": 13536,
-      "usd": 0.013536
+      "output_tokens": 2048,
+      "micro_usd": 15072,
+      "usd": 0.015072
     },
     "synopsis": {
       "model_id": "@cf/nvidia/nemotron-3-120b-a12b",
       "input_tokens": 12000,
-      "output_tokens": 12288,
-      "micro_usd": 24432,
-      "usd": 0.024432
+      "output_tokens": 49152,
+      "micro_usd": 79728,
+      "usd": 0.079728
     },
     "vision": {
       "model_id": "@cf/moondream/moondream3.1-9B-A2B",
@@ -86,6 +86,6 @@
       "usd": 0.185056
     }
   },
-  "total_micro_usd": 1019500,
-  "total_usd": 1.0195
+  "total_micro_usd": 1076332,
+  "total_usd": 1.076332
 }
