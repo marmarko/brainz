@@ -549,10 +549,25 @@ export async function collectBriefing(
 
   // The layer. One row, and it is the authority on whether the model tier has
   // ever completed — see the header on why this is not a card count.
+  // **`finished_at IS NOT NULL` is a RETURN clock, not a completion clock, and
+  // this row is the debt counter's anchor.** Rung 23 made every cycle close its
+  // run on the way out — the fix that stopped one failed phase stranding a
+  // sibling's checkpoint forever — so from that rung a `phase_failed` cycle has
+  // a `finished_at` like any other. Read alone it made `layer.at` (documented as
+  // "when that cycle finished") and `layer.tier` ("the most recent COMPLETED
+  // cycle's tier") point at a cycle that completed nothing, which silently moved
+  // the anchor every failure and re-tiered the layer off a run that did no model
+  // work.
+  //
+  // The stop reason is what still says the cycle finished, so it is what this
+  // filters on — the same predicate `src/web/coverage.ts` uses for the same
+  // reason. `dreamt` is kept in the disjunct because a run that reached the model
+  // tier did the work this row exists to report, whatever stopped it afterwards.
   const runRows = (await sql.unsafe(
     `SELECT tier, dreamt, finished_at
        FROM consolidation_run
       WHERE finished_at IS NOT NULL
+        AND (stop_reason IN ('complete', 'free_tier') OR dreamt)
       ORDER BY finished_at DESC, run_id DESC
       LIMIT 1`,
     [],
