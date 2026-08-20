@@ -67,6 +67,7 @@ import {
   ENTITY_KINDS,
   type CoverageView,
 } from '../../src/web/coverage.ts';
+import { cycleFreshnessOf } from '../../src/control/cycle-staleness.ts';
 import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../src/schema/vector-index.ts';
 import {
@@ -139,6 +140,132 @@ const VIEW: CoverageView = {
   openReview: null,
   windowDays: 7,
 };
+
+/** One row of `consolidation_run`, in the order the writer wrote them. */
+type RunRow = NonNullable<CoverageView['latestCycle']>;
+
+/**
+ * A view the real reader could have returned, built from the rows it reads.
+ *
+ * **Why a builder and not a literal.** Three of `CoverageView`'s fields —
+ * `latestCycle`, `lastCompletedAt` and `cycleFreshness` — are not independent
+ * inputs. `readCoverage` derives all three from the same `consolidation_run`
+ * rows, so most combinations of them describe no database. A spread over a base
+ * literal produces those combinations silently and abundantly: every fixture
+ * below used to override `latestCycle` and inherit `cycleFreshness: 'uncycled'`
+ * from the base, which says *no cycle has ever run* over a row saying one just
+ * did; one asserted `stale` with no completion to be stale since; one gave a
+ * `phase_failed` run a `lastCompletedAt` equal to its own `finished_at`, which
+ * is exactly the reading rung 23 made wrong and `6b8ad62` fixed. Each of those
+ * tests passed. None of them was about a page any user could ever see.
+ *
+ * That is the same sin the comment below diagnoses in the test IT replaced —
+ * "its fixture invented a row shape the writer never produced" — recommitted one
+ * layer up, in the fixture written to be correct across the rung. A literal
+ * cannot be defended against it, because the compiler is happy with every
+ * incoherent combination and the reviewer has to hold the derivation in their
+ * head. So the fixture takes the ROWS and runs the derivations, which is the one
+ * shape that cannot drift from the reader: if `readCoverage` changes how a view
+ * is derived, this either changes with it or these tests stop compiling.
+ */
+function viewFrom(
+  runs: readonly RunRow[],
+  counts: Partial<Omit<CoverageView, 'latestCycle' | 'lastCompletedAt' | 'cycleFreshness' | 'everDreamt'>> = {},
+): CoverageView {
+  // `ORDER BY run_id DESC LIMIT 1` — the newest row, open or closed.
+  const latestCycle = runs.length === 0 ? null : (runs[runs.length - 1] ?? null);
+
+  // The anchor's predicate, restated: closed AND (a completing reason OR the
+  // legacy `dreamt` arm). Never `finishedAt !== null` alone — since rung 23 that
+  // is a return clock, which is the bug this fixture exists to stop faking.
+  const completions = runs
+    .filter(
+      (run) =>
+        run.finishedAt !== null &&
+        (run.stopReason === 'complete' || run.stopReason === 'free_tier' || run.dreamt),
+    )
+    .map((run) => run.finishedAt as string)
+    .sort();
+  const lastCompletedAt = completions.at(-1) ?? null;
+
+  const everDreamt = runs.some((run) => run.finishedAt !== null && run.dreamt);
+  const cyclingSince = runs.map((run) => run.startedAt).sort()[0] ?? null;
+
+  const cycleFreshness = cycleFreshnessOf({
+    completion:
+      latestCycle === null
+        ? undefined
+        : {
+            lastCompleteCycleAt: lastCompletedAt === null ? null : new Date(lastCompletedAt),
+            latestStopReason: latestCycle.stopReason,
+          },
+    cyclingSince: cyclingSince === null ? null : new Date(cyclingSince),
+    now: AT,
+  }).state;
+
+  const view: CoverageView = {
+    ...VIEW,
+    ...counts,
+    latestCycle,
+    lastCompletedAt,
+    cycleFreshness,
+    everDreamt,
+  };
+
+  // Two invariants the reader guarantees and a hand-written `counts` can still
+  // break, checked here so a fixture cannot quietly describe no database.
+  //
+  //  * the backlog is counted from the anchor, and a null anchor is `-infinity`,
+  //    so a brain with no completion is behind by every document it holds;
+  //  * the two open counts are asked for only when the model tier has completed,
+  //    so on a brain where it has not they are absent rather than zero.
+  if (lastCompletedAt === null && view.documentsSinceLastCycle !== view.documents) {
+    throw new Error('unproducible: no completion, so every document is behind');
+  }
+  if (!everDreamt && (view.openContradictions !== null || view.openReview !== null)) {
+    throw new Error('unproducible: the open counts are asked only after the model tier completes');
+  }
+  return view;
+}
+
+/** A cycle that ran the whole pipeline and closed. The anchor-bearing shape. */
+function completed(startedAt: string, finishedAt: string): RunRow {
+  return {
+    tier: 'paid',
+    dreamt: true,
+    stopReason: 'complete',
+    stoppedPhase: null,
+    stoppedPhaseCode: null,
+    startedAt,
+    finishedAt,
+  };
+}
+
+/**
+ * A cycle that stopped short.
+ *
+ * `finishedAt` is a parameter rather than a constant because BOTH shapes are
+ * real and the page has to be right on both: a pre-rung-23 fleet left a stopped
+ * run open, and every fleet since closes it. Rows written by the older writer
+ * are still in production databases until the next cycle closes them.
+ */
+function stopped(
+  reason: NonNullable<RunRow['stopReason']>,
+  startedAt: string,
+  finishedAt: string | null,
+  phase: RunRow['stoppedPhase'] = null,
+  code: RunRow['stoppedPhaseCode'] = null,
+): RunRow {
+  return {
+    tier: 'paid',
+    dreamt: false,
+    stopReason: reason,
+    stoppedPhase: phase,
+    stoppedPhaseCode: code,
+    startedAt,
+    finishedAt,
+  };
+}
 
 function fakePort(options: { readonly throws?: boolean; readonly view?: CoverageView } = {}): CoveragePort {
   return {
@@ -361,8 +488,7 @@ describe('the coverage view is reachable and gated by the session', () => {
 describe('a thin brain reads as thin rather than as a small truth', () => {
   test('an empty brain says nothing has arrived, and does not read as broken', async () => {
     const cookie = await signedIn();
-    const empty: CoverageView = {
-      ...VIEW,
+    const empty = viewFrom([], {
       sources: [],
       documents: 0,
       documentsThisWeek: 0,
@@ -371,7 +497,7 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
       entities: 0,
       edges: 0,
       entityTypes: [],
-    };
+    });
     const page = await (await app({ view: empty })(get(COVERAGE, cookie))).text();
     expect(page).toContain('Nothing has reached this brain yet');
     // And no derived section at all. Three zeroes under "what it made of them"
@@ -415,9 +541,10 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
     // and nothing on this row separates them. The old copy picked the flattering
     // one and stated it as fact.
     const cookie = await signedIn();
-    const open: CoverageView = {
-      ...VIEW,
-      latestCycle: {
+    // One run, open, nothing banked. No completion anywhere, so the brain is
+    // behind by every document it holds — which `viewFrom` enforces.
+    const open = viewFrom([
+      {
         tier: 'paid',
         dreamt: false,
         stopReason: null,
@@ -426,7 +553,7 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
         startedAt: '2026-08-16T08:55:00.000Z',
         finishedAt: null,
       },
-    };
+    ]);
     const page = await (await app({ view: open })(get(COVERAGE, cookie))).text();
     expect(page).toContain('2026-08-16T08:55:00.000Z');
     expect(page).toContain('nothing has been recorded against it');
@@ -442,20 +569,13 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
     // THE case. An open run carrying `phase_failed at extract` is the frozen
     // brain, and it rendered as "A cycle is running now."
     const cookie = await signedIn();
-    const frozen: CoverageView = {
-      ...VIEW,
-      latestCycle: {
-        tier: 'paid',
-        dreamt: false,
-        stopReason: 'phase_failed',
-        stoppedPhase: 'extract',
-        stoppedPhaseCode: 'model_unavailable',
-        startedAt: '2026-08-15T02:00:00.000Z',
-        finishedAt: null,
-      },
-      lastCompletedAt: '2026-08-10T00:05:00.000Z',
-      documentsSinceLastCycle: 1800,
-    };
+    const frozen = viewFrom(
+      [
+        completed('2026-08-10T00:00:00.000Z', '2026-08-10T00:05:00.000Z'),
+        stopped('phase_failed', '2026-08-15T02:00:00.000Z', null, 'extract', 'model_unavailable'),
+      ],
+      { documentsSinceLastCycle: 1800 },
+    );
     const page = await (await app({ view: frozen })(get(COVERAGE, cookie))).text();
     expect(page).toContain('has not closed');
     expect(page).toContain('extract');
@@ -474,21 +594,24 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
     // a different sentence from `free_tier`, and the schema refuses to let the
     // two vocabularies blur.
     const cookie = await signedIn();
-    const stopped: CoverageView = {
-      ...VIEW,
-      latestCycle: {
-        tier: 'paid',
-        dreamt: false,
-        stopReason: 'phase_failed',
-        stoppedPhase: 'extract',
-        stoppedPhaseCode: 'model_unavailable',
-        startedAt: '2026-08-15T02:00:00.000Z',
-        finishedAt: '2026-08-15T02:04:00.000Z',
-      },
-      lastCompletedAt: '2026-08-15T02:04:00.000Z',
-      documentsSinceLastCycle: 1800,
-    };
-    const page = await (await app({ view: stopped })(get(COVERAGE, cookie))).text();
+    // `lastCompletedAt` is the EARLIER run's, never this one's. A `phase_failed`
+    // cycle writes `finished_at` from rung 23 on, and reading that as the
+    // completion is the bug `6b8ad62` fixed — a fixture that sets the two equal
+    // is asserting against the reading the fix removed.
+    const closed = viewFrom(
+      [
+        completed('2026-08-15T01:00:00.000Z', '2026-08-15T01:20:00.000Z'),
+        stopped(
+          'phase_failed',
+          '2026-08-15T02:00:00.000Z',
+          '2026-08-15T02:04:00.000Z',
+          'extract',
+          'model_unavailable',
+        ),
+      ],
+      { documentsSinceLastCycle: 1800 },
+    );
+    const page = await (await app({ view: closed })(get(COVERAGE, cookie))).text();
     expect(page).toContain('Your last cycle finished');
     expect(page).toContain('extract');
     expect(page).toContain('model_unavailable');
@@ -502,20 +625,10 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
     // documents have piled up since. It must not borrow the vocabulary of a
     // cycle that stopped, or the two become one undifferentiated alarm.
     const cookie = await signedIn();
-    const behind: CoverageView = {
-      ...VIEW,
-      latestCycle: {
-        tier: 'paid',
-        dreamt: true,
-        stopReason: 'complete',
-        stoppedPhase: null,
-        stoppedPhaseCode: null,
-        startedAt: '2026-08-15T02:00:00.000Z',
-        finishedAt: '2026-08-15T02:40:00.000Z',
-      },
-      lastCompletedAt: '2026-08-15T02:40:00.000Z',
-      documentsSinceLastCycle: 900,
-    };
+    const behind = viewFrom(
+      [completed('2026-08-15T02:00:00.000Z', '2026-08-15T02:40:00.000Z')],
+      { documentsSinceLastCycle: 900, openContradictions: 3, openReview: 1 },
+    );
     const page = await (await app({ view: behind })(get(COVERAGE, cookie))).text();
     expect(page).toContain('ran the whole pipeline');
     expect(page).toContain('900');
@@ -542,29 +655,27 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
 
   test('cycles that keep stopping with no completion for days say so as a duration', async () => {
     const cookie = await signedIn();
-    const frozen: CoverageView = {
-      ...VIEW,
-      latestCycle: {
-        tier: 'paid',
-        dreamt: false,
-        stopReason: 'phase_failed',
-        stoppedPhase: 'extract',
-        stoppedPhaseCode: 'model_unavailable',
-        startedAt: '2026-08-15T02:00:00.000Z',
-        finishedAt: null,
-      },
-      lastCompletedAt: '2026-08-09T00:05:00.000Z',
-      cycleFreshness: 'stale',
-      documentsSinceLastCycle: 1800,
-    };
+    const frozen = viewFrom(
+      [
+        completed('2026-08-09T00:00:00.000Z', '2026-08-09T00:05:00.000Z'),
+        stopped('phase_failed', '2026-08-15T02:00:00.000Z', null, 'extract', 'model_unavailable'),
+      ],
+      { documentsSinceLastCycle: 1800 },
+    );
+    expect(frozen.cycleFreshness).toBe('stale');
     const page = await (await app({ view: frozen })(get(COVERAGE, cookie))).text();
     // The newest cycle's own reason still renders — this row is in addition to
     // it, not instead of it.
     expect(page).toContain('has not closed');
     expect(page).toContain('extract');
     // And the sentence that separates a hiccup from a freeze.
-    expect(page).toContain('stopping short for longer than');
+    expect(page).toContain('stopping before the end for longer');
     expect(page).toContain('2026-08-09T00:05:00.000Z');
+    // **The claim this row used to make and could not keep.** A cycle stops
+    // BETWEEN phases, so everything that ran before the stop committed; saying
+    // the counts are frozen at the anchor is false on three of the reasons that
+    // reach here, printed directly above the counts that disprove it.
+    expect(page).not.toContain('have not moved since then');
     // Cycles ARE running. Borrowing the vocabulary of a brain nothing has
     // scheduled would send the reader to the wrong place.
     expect(page).not.toContain('No cycle has finished on this brain');
@@ -575,24 +686,17 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
     // ordinary day is a page whose warnings stop being read, which is how a week
     // of silence happens in the first place.
     const cookie = await signedIn();
-    const slipping: CoverageView = {
-      ...VIEW,
-      latestCycle: {
-        tier: 'paid',
-        dreamt: false,
-        stopReason: 'out_of_time',
-        stoppedPhase: null,
-        stoppedPhaseCode: null,
-        startedAt: '2026-08-16T02:00:00.000Z',
-        finishedAt: null,
-      },
-      lastCompletedAt: '2026-08-15T22:00:00.000Z',
-      cycleFreshness: 'slipping',
-      documentsSinceLastCycle: 40,
-    };
+    const slipping = viewFrom(
+      [
+        completed('2026-08-15T21:30:00.000Z', '2026-08-15T22:00:00.000Z'),
+        stopped('out_of_time', '2026-08-16T02:00:00.000Z', null),
+      ],
+      { documentsSinceLastCycle: 40 },
+    );
+    expect(slipping.cycleFreshness).toBe('slipping');
     const page = await (await app({ view: slipping })(get(COVERAGE, cookie))).text();
     expect(page).toContain('ran out of the time one attempt is given');
-    expect(page).not.toContain('stopping short for longer than');
+    expect(page).not.toContain('stopping before the end for longer');
     expect(page).not.toContain('No cycle has ever run all the way through');
     expect(page).not.toContain('No cycle has finished on this brain');
   });
@@ -603,24 +707,15 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
     // is behind" for both would send every reader to the same wrong place half
     // the time.
     const cookie = await signedIn();
-    const unattended: CoverageView = {
-      ...VIEW,
-      latestCycle: {
-        tier: 'paid',
-        dreamt: true,
-        stopReason: 'complete',
-        stoppedPhase: null,
-        stoppedPhaseCode: null,
-        startedAt: '2026-08-09T02:00:00.000Z',
-        finishedAt: '2026-08-09T02:40:00.000Z',
-      },
-      lastCompletedAt: '2026-08-09T02:40:00.000Z',
-      cycleFreshness: 'unattended',
-    };
+    const unattended = viewFrom([completed('2026-08-09T02:00:00.000Z', '2026-08-09T02:40:00.000Z')], {
+      openContradictions: 0,
+      openReview: 0,
+    });
+    expect(unattended.cycleFreshness).toBe('unattended');
     const page = await (await app({ view: unattended })(get(COVERAGE, cookie))).text();
     expect(page).toContain('No cycle has finished on this brain since');
     expect(page).toContain('nothing here to point at');
-    expect(page).not.toContain('stopping short for longer than');
+    expect(page).not.toContain('stopping before the end for longer');
   });
 
   test('a crash loop that never banks a reason does not contradict itself', async () => {
@@ -632,20 +727,22 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
     // on the surface whose own rule is to state what it observes and never
     // assert what it cannot verify.
     const cookie = await signedIn();
-    const crashing: CoverageView = {
-      ...VIEW,
-      latestCycle: {
-        tier: 'paid',
-        dreamt: false,
-        stopReason: null,
-        stoppedPhase: null,
-        stoppedPhaseCode: null,
-        startedAt: '2026-08-16T08:55:00.000Z',
-        finishedAt: null,
-      },
-      lastCompletedAt: '2026-08-07T00:05:00.000Z',
-      cycleFreshness: 'unattended',
-    };
+    const crashing = viewFrom(
+      [
+        completed('2026-08-07T00:00:00.000Z', '2026-08-07T00:05:00.000Z'),
+        {
+          tier: 'paid',
+          dreamt: false,
+          stopReason: null,
+          stoppedPhase: null,
+          stoppedPhaseCode: null,
+          startedAt: '2026-08-16T08:55:00.000Z',
+          finishedAt: null,
+        },
+      ],
+      { openContradictions: 0, openReview: 0 },
+    );
+    expect(crashing.cycleFreshness).toBe('unattended');
     const page = await (await app({ view: crashing })(get(COVERAGE, cookie))).text();
     // Both sentences render, and both are true of this row.
     expect(page).toContain('nothing has been recorded against it');
@@ -657,42 +754,29 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
 
   test('a brain that has never once finished a cycle is told that, not that it stopped', async () => {
     const cookie = await signedIn();
-    const never: CoverageView = {
-      ...VIEW,
-      latestCycle: {
-        tier: 'paid',
-        dreamt: false,
-        stopReason: 'budget_exhausted',
-        stoppedPhase: null,
-        stoppedPhaseCode: null,
-        startedAt: '2026-08-16T02:00:00.000Z',
-        finishedAt: null,
-      },
-      lastCompletedAt: null,
-      cycleFreshness: 'never_completed',
-    };
+    // Two runs, because `never_completed` is a DURATION and the clock is the
+    // first run's `started_at`. One run started this morning is `starting`, not
+    // `never_completed` — the old literal asserted a state its own row could not
+    // reach.
+    const never = viewFrom([
+      stopped('budget_exhausted', '2026-08-10T02:00:00.000Z', '2026-08-10T02:30:00.000Z'),
+      stopped('budget_exhausted', '2026-08-16T02:00:00.000Z', null),
+    ]);
+    expect(never.cycleFreshness).toBe('never_completed');
     const page = await (await app({ view: never })(get(COVERAGE, cookie))).text();
     expect(page).toContain('No cycle has ever run all the way through');
-    expect(page).not.toContain('stopping short for longer than');
+    expect(page).not.toContain('stopping before the end for longer');
   });
 
   test('the freeze row never names anything a user wrote', async () => {
     // This page's whole rule. The row added here is a sentence plus one instant,
     // and it is rendered on the page most likely to be screenshotted.
     const cookie = await signedIn();
-    const frozen: CoverageView = {
-      ...VIEW,
-      latestCycle: {
-        tier: 'paid',
-        dreamt: false,
-        stopReason: 'phase_failed',
-        stoppedPhase: 'extract',
-        stoppedPhaseCode: 'model_unavailable',
-        startedAt: '2026-08-15T02:00:00.000Z',
-        finishedAt: null,
-      },
-      cycleFreshness: 'stale',
-    };
+    const frozen = viewFrom([
+      completed('2026-08-09T00:00:00.000Z', '2026-08-09T00:05:00.000Z'),
+      stopped('phase_failed', '2026-08-15T02:00:00.000Z', null, 'extract', 'model_unavailable'),
+    ]);
+    expect(frozen.cycleFreshness).toBe('stale');
     const page = await (await app({ view: frozen })(get(COVERAGE, cookie))).text();
     expect(page).not.toContain(SECRET_TITLE);
     expect(page).not.toContain(SECRET_STATEMENT);
@@ -969,6 +1053,56 @@ describe('the port that is actually wired', () => {
         { type: 'person', count: 2 },
       ]);
       expect(view.edges).toBe(1);
+    },
+    120_000,
+  );
+
+  test(
+    'a stopped cycle closes its run and must not become the backlog’s anchor',
+    async () => {
+      // **The receipt for the whole fixture rewrite, taken from the real
+      // reader.** Rung 23 closes the run on every exit, so a `phase_failed`
+      // cycle writes `finished_at` exactly like a completed one. Anchoring the
+      // backlog on that column alone resets "how much has piled up" to zero on
+      // every cycle of a permanently frozen brain — which is the state this page
+      // exists to make visible, rendering as caught up.
+      //
+      // **This is the primary arm; the older case below it is the legacy one.**
+      // The gate has two: `stop_reason IN ('complete','free_tier')` and `OR
+      // dreamt`, which covers completed rows written before the reason was
+      // always set. `a cycle that stopped short does not move the backlog
+      // anchor` drives a NULL-reason `dreamt` row, so deleting the reason arm
+      // leaves it green. This one drives `complete`, so deleting the reason arm
+      // turns it red. Neither is redundant with the other; a single case would
+      // pin half the predicate.
+      //
+      // Two runs and four documents say it in numbers a fixture cannot fake:
+      // the completion is old, three documents arrived after it, and the newest
+      // run is a stop that closed AFTER all of them. With the reason gate the
+      // anchor stays on the completion and the backlog is 3; without it the
+      // anchor jumps to the failed run and the backlog is 0 and the paragraph
+      // disappears.
+      await insertRun({ finishedAt: '2026-08-10T00:05:00.000Z', dreamt: true, stopReason: 'complete' });
+      await insertPage({ createdAt: '2026-08-11T00:00:00.000Z' });
+      await insertPage({ createdAt: '2026-08-12T00:00:00.000Z' });
+      await insertPage({ createdAt: '2026-08-13T00:00:00.000Z' });
+      await insertRun({
+        finishedAt: '2026-08-14T02:04:00.000Z',
+        dreamt: false,
+        stopReason: 'phase_failed',
+        stoppedPhase: 'extract',
+        stoppedPhaseCode: 'model_unavailable',
+      });
+
+      const view = await coveragePort(withTenant).read({ tenantId: TENANT });
+
+      expect(view.lastCompletedAt).toBe('2026-08-10T00:05:00.000Z');
+      expect(view.documentsSinceLastCycle).toBe(3);
+      // The newest run is still the one whose sentence renders — the anchor and
+      // the latest cycle are two different reads of the same table, and only one
+      // of them is gated on the reason.
+      expect(view.latestCycle?.stopReason).toBe('phase_failed');
+      expect(view.latestCycle?.finishedAt).toBe('2026-08-14T02:04:00.000Z');
     },
     120_000,
   );

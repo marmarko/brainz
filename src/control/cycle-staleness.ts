@@ -8,9 +8,8 @@
  * missed it, and because it is the third instance of one class of mistake:
  *
  *   * A cycle that stops short is deliberately **not** thrown on. It banks its
- *     reason, leaves the run open so the next cycle resumes into it, and
- *     *returns* (`src/worker/consolidate/cycle.ts` — "a cycle that ran out of
- *     time completes the job"). So the handler returns normally.
+ *     reason, closes its run, and *returns* (`src/worker/consolidate/cycle.ts`
+ *     — "One exit, for every reason"). So the handler returns normally.
  *   * A handler that returns is settled by `queue.complete()`, which stamps
  *     `control.tenant.last_cycle_at` and `next_due_at` in the same transaction
  *     as `state = 'done', failure_code = NULL` (`src/worker/queue.ts`). The
@@ -21,12 +20,13 @@
  *     on the live control plane during the freeze, the frozen brain's
  *     `last_cycle_at` was *fresher* than a healthy canary's.
  *
- * Only one thing stood still: the instant a cycle last *completed*. That is
- * written by `finishRun` and by nothing else, and `finishRun` is called on
- * exactly two of the six stop reasons (`cycle.ts`: `complete` and `free_tier`
- * close the run; `budget_exhausted`, `phase_failed`, `cancelled` and
- * `out_of_time` take `recordProgress` and leave it open). Every other clock in
- * the system advances on a stopped cycle.
+ * Only one thing stood still: the instant a cycle last *completed*. Every other
+ * clock in the system advances on a stopped cycle, and that includes
+ * `finished_at` — since rung 23 a cycle closes its run on **every** exit
+ * (`cycle.ts`, one `finishRun` call site under "One exit, for every reason"), so
+ * the column that used to be written only by a completion is now written by all
+ * six stop reasons. The completion clock is `finished_at` **gated by the
+ * reason**, and the gate is the whole of it.
  *
  * So this module reads that and only that, and {@link CycleCompletionState} is
  * deliberately too narrow to carry a return time — it has no `lastCycleAt` and
@@ -36,12 +36,15 @@
  * return {@link CycleFreshness} `'stale'`. See below.)
  *
  * **`stop_reason IN ('complete','free_tier')` is the completion predicate, not
- * `finished_at IS NOT NULL`.** They agree today because `finishRun` is the only
- * writer of `finished_at`. They stop agreeing the moment somebody closes the run
- * on every exit — which has already been tried once and reverted, because
- * closing it made four stop reasons unreachable. A rule anchored on
- * `finished_at` would silently revert to the trap class above on the day that
- * lands again; a rule anchored on the reason cannot.
+ * `finished_at IS NOT NULL`.** The two are **already** non-equivalent, and this
+ * is the correction that matters most in this header: they agreed only while
+ * `finishRun` ran on two of the six reasons, and rung 23 ended that. A rule
+ * anchored on `finished_at` today does not *risk* the trap class above — it IS
+ * the trap class, and it has already been found live twice, in the coverage
+ * page's backlog anchor and in the briefing assembler's debt anchor, each
+ * resetting "how much has piled up" to roughly zero on every failed cycle of a
+ * permanently frozen brain. Anything reading this column for completion is
+ * wrong until it carries the reason with it.
  *
  * **The rule is a cross-product, not a severity ladder.** Two independent facts
  * decide it: what the *latest* cycle did, and how long ago the *last completion*
@@ -97,10 +100,12 @@ export const CYCLE_PERIOD_SECONDS = 24 * 60 * 60;
  *
  * **Three periods for `stale`, and the number is set by the widest *healthy* gap
  * between completions rather than by the cadence.** A first consolidation of a
- * large brain legitimately stops on `out_of_time` and resumes into the same open
- * run, and because `defaultSettle` is outcome-blind that chain reschedules at
- * the full ceiling each time — so a brain that is genuinely converging can go
- * two ceilings without a completion and be perfectly well. Three is past
+ * large brain legitimately stops on `out_of_time`, and the next cycle picks up
+ * where it left off — not through the run, which is closed, but through the
+ * per-row consideration stamps rung 22 put on the work itself. Because
+ * `defaultSettle` is outcome-blind that chain reschedules at the full ceiling
+ * each time, so a brain that is genuinely converging can go two ceilings without
+ * a completion and be perfectly well. Three is past
  * anything that has been observed to converge, and the freeze this rule is
  * written for had been running for days by the time anybody looked.
  *
@@ -156,8 +161,22 @@ export function firstCompletionGraceSeconds(): number {
  *    it is the sentence that tells a user their spend cap is holding their
  *    brain.
  *  * `stale` — no completion inside its window, and the latest cycle stopped
- *    short. **The incident.** Cycles are running constantly, every job succeeds,
- *    and nothing has finished for days.
+ *    short for a reason the brain did not choose. **The incident.** Cycles are
+ *    running constantly, every job succeeds, and nothing has finished for days.
+ *  * `capped` — the same clock reading as `stale`, and a different fact: the
+ *    latest cycle stopped because **the owner's own spend cap was reached**.
+ *    Split out because the cap is a 30-day ROLLING figure (`tier.ts` passes
+ *    `max(0, cap − spent)` over the window in `gateway.ts`), not a per-cycle
+ *    allowance — so a cap reached on day 3 stops every cycle for the remaining
+ *    ~24 days, and folding that into `stale` renders a brain doing exactly what
+ *    it was configured to do as a multi-day emergency, every day, for most of
+ *    the billing window. That is the shape an owner mutes, and a muted surface
+ *    is how the freeze this module exists for ran for days. It is **not
+ *    alarming** and it is **not silent**: the coverage page states it and names
+ *    the remedy. The argument is the one `free_tier` already won one tier
+ *    down — a plan working as configured is not a failure — and the reason it
+ *    could not simply be folded INTO `free_tier` is that a free cycle closes
+ *    `complete` while a capped one genuinely leaves model work undone.
  *  * `unattended` — the latest cycle completed (or banked nothing), and that was
  *    long enough ago that nothing has consolidated this brain since. The
  *    scheduler's own failure rather than the brain's.
@@ -180,6 +199,7 @@ export type CycleFreshness =
   | 'current'
   | 'slipping'
   | 'stale'
+  | 'capped'
   | 'unattended'
   | 'never_completed'
   | 'starting'
@@ -235,7 +255,16 @@ export interface CycleFreshnessReport {
   readonly staleAfterSeconds: number;
 }
 
-/** The readings an operator is paged for. `slipping` is deliberately not one. */
+/**
+ * The readings an operator is paged for.
+ *
+ * `slipping` is deliberately not one, and neither is `capped`: a cap the owner
+ * set is not a fleet fault, and paging on one teaches an operator to mute the
+ * page that also carries the freeze. `capped` is still rendered to the owner,
+ * who is the only party who can act on it — see `freezeNote` in
+ * `src/web/pages.ts`, and note that "not alarming" there means "not red", never
+ * "not shown".
+ */
 const ALARMING: ReadonlySet<CycleFreshness> = new Set<CycleFreshness>([
   'stale',
   'unattended',
@@ -331,9 +360,18 @@ export function cycleFreshnessOf(input: CycleFreshnessInput): CycleFreshnessRepo
   }
 
   // The newest cycle stopped short and said so. Whether that is an ordinary
-  // resume — the next cycle picks up the open run — or the freeze is decided by
-  // the completion clock and by nothing else.
-  return report(since > staleAfter ? 'stale' : 'slipping', lastCompleteCycleAt);
+  // pass that will be resumed by the next one, or the freeze, is decided by the
+  // completion clock and by nothing else.
+  if (since <= staleAfter) return report('slipping', lastCompleteCycleAt);
+
+  // Past the window, and the reason now decides which of two different things
+  // this is. A cap is the owner's instruction being obeyed; everything else is
+  // the brain failing to finish. They read identically on every clock, which is
+  // exactly why the reason has to be consulted here rather than inferred later.
+  return report(
+    latestStopReason === 'budget_exhausted' ? 'capped' : 'stale',
+    lastCompleteCycleAt,
+  );
 }
 
 /**
@@ -442,7 +480,10 @@ export function fleetCycleVerdict(states: Iterable<CycleFreshness>): FleetCycleV
   let verdict: FleetCycleVerdict = 'ok';
   for (const state of states) {
     if (isAlarming(state)) return 'stalled';
-    if (state === 'slipping') verdict = 'degraded';
+    // `capped` warns rather than pages: an operator wants to know a brain has
+    // been sitting at its ceiling for most of a window — that is a conversation
+    // with its owner — but it is not an incident and must not read as one.
+    if (state === 'slipping' || state === 'capped') verdict = 'degraded';
   }
   return verdict;
 }

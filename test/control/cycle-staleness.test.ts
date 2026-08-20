@@ -123,16 +123,46 @@ describe('the frozen brain', () => {
     expect(fleetCycleVerdict(fleet)).toBe('stalled');
   });
 
-  test('every non-completing stop reason reaches it, not just the one that happened', () => {
-    // The freeze was `phase_failed`. A spend cap that fires every cycle, an
-    // attempt clock that runs out every cycle, and a cancellation loop are the
-    // same failure to a reader of this brain: nothing is finishing.
-    for (const reason of ['budget_exhausted', 'phase_failed', 'cancelled', 'out_of_time'] as const) {
+  test('every stop the brain did not choose reaches it, not just the one that happened', () => {
+    // The freeze was `phase_failed`. An attempt clock that runs out every cycle
+    // and a cancellation loop are the same failure to a reader of this brain:
+    // nothing is finishing, and nothing about it was asked for.
+    for (const reason of ['phase_failed', 'cancelled', 'out_of_time'] as const) {
       const report = cycleFreshnessOf(
         brain({ latestStopReason: reason, lastCompleteCycleAt: ago(6 * DAY) }),
       );
       expect(report.state).toBe('stale');
     }
+  });
+
+  test('a spend cap is not a freeze, however long it has been held', () => {
+    // The one reason above that the OWNER chose. The cap is a rolling 30-day
+    // figure, so a cap reached on day 3 stops every cycle for the remaining ~24
+    // — folding that into `stale` paints a brain doing exactly what it was
+    // configured to do as a multi-day emergency for most of the billing window,
+    // which is the alarm somebody mutes. Not alarming, and not silent: it has
+    // its own reading, its own sentence on the coverage page, and it warns the
+    // fleet rather than paging it.
+    const report = cycleFreshnessOf(
+      brain({ latestStopReason: 'budget_exhausted', lastCompleteCycleAt: ago(26 * DAY) }),
+    );
+    expect(report.state).toBe('capped');
+    expect(isAlarming(report.state)).toBe(false);
+    expect(fleetCycleVerdict(['current', report.state])).toBe('degraded');
+    // And it is still measured against the same clock it would have been judged
+    // by — the split is the reason, never a second threshold.
+    expect(report.lastCompleteCycleAt).toEqual(ago(26 * DAY));
+  });
+
+  test('a cap inside the window is still only slipping, the same as any other stop', () => {
+    // The split happens at the far end only. One capped cycle over a healthy
+    // completion is the ordinary Tuesday `slipping` exists for, and giving the
+    // cap its own reading there would mean two names for one state.
+    expect(
+      cycleFreshnessOf(
+        brain({ latestStopReason: 'budget_exhausted', lastCompleteCycleAt: ago(6 * HOUR) }),
+      ).state,
+    ).toBe('slipping');
   });
 
   test('the threshold is stated in the report rather than left to be guessed', () => {
@@ -177,10 +207,11 @@ describe('quiet when healthy, which is the half that keeps it read', () => {
   });
 
   test('a resume chain inside two ceilings is still only slipping', () => {
-    // A first consolidation of a large brain stops on `out_of_time` and resumes
-    // into the same open run, and because the settle path is outcome-blind that
-    // chain reschedules at the full ceiling each time. Two ceilings of that is a
-    // brain converging, not a brain frozen.
+    // A first consolidation of a large brain stops on `out_of_time`, and the
+    // next cycle picks up where it left off through the per-row consideration
+    // stamps rather than through the run, which closed. Because the settle path
+    // is outcome-blind that chain reschedules at the full ceiling each time. Two
+    // ceilings of that is a brain converging, not a brain frozen.
     const report = cycleFreshnessOf(
       brain({ latestStopReason: 'out_of_time', lastCompleteCycleAt: ago(2 * DAY) }),
     );

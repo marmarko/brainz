@@ -1138,9 +1138,12 @@ and no spend cap fired; there was more to do than fitted.`;
  *     page names both and picks neither rather than choosing the flattering one;
  *   * **closed** — it finished, and the reason says how.
  *
- * Reading the pair is also what makes this correct across rung 22, which closes
+ * Reading the pair is also what makes this correct across rung 23, which closes
  * a run on every exit: the shapes move between branches as the writer changes,
- * and rows written on both sides of that change still render as themselves. No
+ * and rows written on both sides of that change still render as themselves —
+ * the first branch below is now reached only by rows a pre-rung-23 fleet left
+ * behind, and it is kept because those rows are still in production databases
+ * until the next cycle closes them. No
  * branch here claims what a *next* cycle will do — that is a fact about a worker
  * this page cannot see, and it is the class of promise the surface exists to
  * stop making.
@@ -1192,7 +1195,14 @@ does not guess between them — either way the numbers below are from before it 
  * week of silence happens.
  */
 function freezeNote(view: CoverageView): string {
-  if (!isAlarming(view.cycleFreshness)) return '';
+  // `capped` is rendered here and is deliberately NOT in `isAlarming`. The two
+  // are different questions: `isAlarming` decides whether a fleet operator is
+  // paged, and nobody should be paged because an owner's cap did what they set
+  // it to do. The owner is the one party who can act on it, so they are told —
+  // in the quiet voice, which is the difference between "not red" and "not
+  // shown". Reading the cap as silence is how a brain sits still for most of a
+  // billing window while its owner believes it is working.
+  if (!isAlarming(view.cycleFreshness) && view.cycleFreshness !== 'capped') return '';
 
   const since =
     view.lastCompletedAt === null
@@ -1206,9 +1216,36 @@ function freezeNote(view: CoverageView): string {
       // The incident's own cell. Cycles ARE running — saying "nothing has run"
       // here would be false and would send the reader looking in the wrong
       // place.
-      return `\n<p class="problem">Cycles have been running and stopping short for longer than that
-is normally worth waiting out. The last one that finished was ${since ?? 'not recorded'}, so the
-numbers below have not moved since then, however much has arrived.</p>`;
+      //
+      // **"The numbers below have not moved since then" used to close this
+      // sentence, and it was false for most of the reasons that reach here.** A
+      // cycle stops BETWEEN phases, and every phase that finished before the
+      // stop committed its work (`cycle.ts`: "committed work plus a cursor is
+      // progress"; the model phases bank theirs in the content). So on an
+      // `out_of_time` or a `cancelled` brain the counts below climb daily while
+      // the red paragraph claimed they were frozen — the page's own docstring
+      // forbids exactly that, on the alarming path, to the one reader most
+      // likely to check the sentence against the number directly beneath it.
+      //
+      // What replaces it is true of all three reasons that reach this cell
+      // rather than branching into a guess per reason: the phases that ran did
+      // commit, and the phases after the stop were never reached. Which phase
+      // and which code is already named by `cycleSentence` immediately above,
+      // so this row does not repeat it — this row is the DURATION.
+      return `\n<p class="problem">Cycles have been running and stopping before the end for longer
+than that is normally worth waiting out. The last one that finished was ${since ?? 'not recorded'}.
+Each of those cycles kept whatever it got through before it stopped, so the numbers below are not
+frozen at that date — but nothing has reached the end of the pipeline since, and whatever the phases
+after the stop would have produced is not here.</p>`;
+    case 'capped':
+      // Same clock as `stale`, different fact, and a quiet class rather than a
+      // red one. The cap is the owner's own instruction; what they need is the
+      // one thing that is genuinely surprising about it — that it is a rolling
+      // 30-day figure, so it does not reset at the next cycle, or tomorrow.
+      return `\n<p class="note">Your cycles have been stopping because this brain's spend cap is
+reached. The last one that finished was ${since ?? 'not recorded'}. The cap is a rolling 30-day
+figure rather than an allowance per cycle, so it stays reached until enough of the window passes or
+you raise it — until then each cycle does the free work and stops before the paid part.</p>`;
     case 'never_completed':
       // Deliberately not the same sentence. "It stopped finishing" and "it has
       // never once finished" send a reader to different places, and only one of
