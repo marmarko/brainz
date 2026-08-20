@@ -316,7 +316,15 @@ export function stopFor(result: Extract<GatewayResult, { ok: false }>): PhaseFai
   // belongs — a phase whose WHOLE candidate set skips, cycle after cycle, is a
   // seat whose output ceiling is too tight, which `PhaseOutcome.skippedItems`
   // already exists to say and which no single response can prove.
-  if (result.reason === 'reasoning_only_output' || result.reason === 'empty_output') {
+  // A reply cut off at the ceiling is about THIS request too — a smaller batch
+  // or a wider ceiling is the remedy, and the next item gets its own reply. What
+  // it must never be is a success: for a whole-batch phase this returns without
+  // stamping anything, which is exactly the point.
+  if (
+    result.reason === 'reasoning_only_output' ||
+    result.reason === 'empty_output' ||
+    result.reason === 'output_truncated'
+  ) {
     return { stop: 'bad_output', durable: true };
   }
   // Everything else: a provider that was down, a network that dropped, a key

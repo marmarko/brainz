@@ -255,6 +255,21 @@ export type ModelOutput =
        * content. Nothing puts it in a metering record.
        */
       readonly reasoning?: string;
+      /**
+       * The model stopped because it hit its output ceiling, not because it had
+       * finished. `finish_reason: 'length'` on the OpenAI-compatible wire.
+       *
+       * Carried because a truncated answer is not a short answer: it is the
+       * beginning of one, and every caller here parses what comes back as if it
+       * were whole. The extraction phase is the case that matters — it sends a
+       * batch and stamps every chunk in it as considered on a readable reply, so
+       * a reply cut off at the ceiling stamps the chunks whose facts never got
+       * emitted, and their claims are lost until somebody bumps a version nobody
+       * knows to bump. Truncation that breaks the JSON is already caught by the
+       * parse; truncation that happens to close the array is not, and that is
+       * the one this exists for.
+       */
+      readonly truncated?: boolean;
     }
   | { readonly kind: 'embedding'; readonly vectors: ReadonlyArray<readonly number[]> }
   | { readonly kind: 'rerank'; readonly scores: readonly number[] };
@@ -485,6 +500,18 @@ export type GatewayFailureReason =
    * go looking for an outage.
    */
   | 'reasoning_only_output'
+  /**
+   * A chat model stopped at its output ceiling with the answer unfinished.
+   *
+   * Its own reason rather than a success, because every caller parses the reply
+   * as a whole answer and two of them then record that the work is done: the
+   * extraction phase stamps every chunk in a batch as considered, so a reply cut
+   * off part-way stamps chunks whose facts were never emitted and loses them
+   * silently and permanently. A reader diagnosing this should raise
+   * `maxOutputTokens` or shrink the batch — not retry, which produces the same
+   * cut in the same place.
+   */
+  | 'output_truncated'
   /** A chat model billed for tokens and returned neither an answer nor a
    * reasoning trace — the shape the vision seat returns today. Separated from
    * the case above because the remedies are not the same one. */
@@ -799,7 +826,11 @@ export function createModelGateway(options: ModelGatewayOptions): ModelGateway {
         // Whitespace counts as nothing. Every consumer trims before deciding
         // whether it got an answer, so a model that returns a newline would
         // otherwise pass this guard and fail theirs — silently, one layer down.
-        if (response.output.text.trim().length === 0) {
+        // Checked before the empty-answer tests: a truncated reply usually has
+        // plenty of text, and it is the text that must not be trusted.
+        if (response.output.truncated === true) {
+          outcome = 'output_truncated';
+        } else if (response.output.text.trim().length === 0) {
           if ((response.output.reasoning ?? '').trim().length > 0) {
             // A trace and no answer. Never a designed empty answer, whatever
             // the op: a model that thought about the image and then said
@@ -1062,9 +1093,18 @@ function parseOutput(request: TransportRequest, body: UnknownRecord): ModelOutpu
     // goes — what was missing is that neither is a success.
     const text = typeof content === 'string' ? content : '';
     const reasoning = readReasoning(message);
-    return reasoning === undefined
-      ? { kind: 'chat', text }
-      : { kind: 'chat', text, reasoning };
+    // `length` is the OpenAI-compatible spelling; `MAX_TOKENS` is what the
+    // Gemini-family seats report through the same field. Anything else — `stop`,
+    // `tool_calls`, absent — is a model that finished for its own reasons.
+    const finish = first?.['finish_reason'];
+    const truncated =
+      typeof finish === 'string' && (finish === 'length' || finish === 'MAX_TOKENS');
+    return {
+      kind: 'chat',
+      text,
+      ...(reasoning === undefined ? {} : { reasoning }),
+      ...(truncated ? { truncated: true } : {}),
+    };
   }
   if (request.kind === 'embedding') {
     // Two shapes, because the two paths disagree about more than usage. The

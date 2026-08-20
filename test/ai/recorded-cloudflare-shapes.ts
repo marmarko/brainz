@@ -379,3 +379,47 @@ export const QWEN_EMBEDDING_COMPAT_UNMETERED = {
   data: [{ object: 'embedding', embedding: [-0.014760761521756649, 0.0037299322895705700], index: 0 }],
   model: '@cf/qwen/qwen3-embedding-0.6b',
 } as const;
+
+/**
+ * A reply cut off at the output ceiling.
+ *
+ * `finish_reason: 'length'` is the OpenAI-compatible spelling and the one every
+ * Cloudflare seat uses; `MAX_TOKENS` is what the Gemini family reports through
+ * the same field, and `extract` routes there — a reader that knew only the first
+ * would trust every truncated Gemini answer.
+ *
+ * The content is deliberately WELL-FORMED-LOOKING and short of the answer: JSON
+ * that fails to parse is already caught downstream, and the case that needed
+ * naming is the reply that parses and is missing most of what was asked for.
+ */
+export const GLM_TRUNCATED = {
+  id: 'id-1786911857900',
+  object: 'chat.completion',
+  created: 1786911858,
+  model: '@cf/zai-org/glm-5.2',
+  choices: [
+    {
+      finish_reason: 'length',
+      index: 0,
+      logprobs: null,
+      message: { content: '{"facts":[{"statement":"a"},{"statement":"b"}', role: 'assistant' },
+    },
+  ],
+  usage: { prompt_tokens: 4000, completion_tokens: 4096, total_tokens: 8096 },
+} as const;
+
+/** The same cut, spelled the way the Gemini-family seats spell it. */
+export const GEMINI_TRUNCATED = {
+  id: 'id-1786911860999',
+  object: 'chat.completion',
+  created: 1786911861,
+  model: 'google/gemini-3.5-flash-lite',
+  choices: [
+    {
+      finish_reason: 'MAX_TOKENS',
+      index: 0,
+      message: { content: '{"facts":[{"statement":"a"}', role: 'assistant' },
+    },
+  ],
+  usage: { prompt_tokens: 4000, completion_tokens: 4096, total_tokens: 8096 },
+} as const;

@@ -94,6 +94,30 @@ describe('an empty answer from a reasoning model is its own outcome', () => {
     expect(result).toMatchObject({ ok: false, reason: 'reasoning_only_output' });
   });
 
+  test('an answer cut off at the output ceiling is `output_truncated`', async () => {
+    // **A truncated reply is the beginning of an answer, and every caller here
+    // parses what comes back as if it were whole.** The extraction phase is why
+    // this cannot be a success: it sends a batch and stamps every chunk in it as
+    // considered on a readable reply, so a reply cut off part-way stamps chunks
+    // whose facts were never emitted, and those claims are lost until somebody
+    // bumps a version nobody knows to bump.
+    //
+    // Truncation that breaks the JSON is already caught by the parse. This is
+    // the other half — plenty of text, well-formed, and short of the answer.
+    const { gateway } = gatewayOver({
+      output: { kind: 'chat', text: '{"facts":[{"statement":"a"},', truncated: true },
+      usage: { inputTokens: 4_000, outputTokens: 4_096 },
+    });
+    const result = await gateway.call({
+      op: 'extract',
+      tenantId: ALICE,
+      caller,
+      budget: createBudget({ label: 'phase', capMicroUsd: null }),
+      input: { kind: 'chat', user: 'extract from these chunks' },
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'output_truncated' });
+  });
+
   test('an empty answer with no reasoning at all is `empty_output`', async () => {
     // Distinct from the one above because the remedies differ: one is a ceiling
     // too low, the other is a model producing nothing at all.

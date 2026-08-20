@@ -53,6 +53,8 @@ import {
 import {
   GEMINI_PASSTHROUGH,
   GLM_ANSWERED,
+  GLM_TRUNCATED,
+  GEMINI_TRUNCATED,
   GLM_REASONING_ONLY,
   LLAVA_ANSWERED,
   MOONDREAM_EMPTY,
@@ -422,6 +424,46 @@ describe('cached input tokens bill at the cached rate', () => {
 // ---------------------------------------------------------------------------
 // 4. The Unified Billing transport.
 // ---------------------------------------------------------------------------
+
+describe('a reply cut off at the ceiling is not an answer', () => {
+  // **The silent loss this closes.** `runExtractPhase` sends a batch and stamps
+  // every chunk in it as considered the moment the reply parses. A reply that
+  // stopped at `maxOutputTokens` carries facts for the first few chunks and
+  // nothing for the rest — so the rest are stamped, their claims are never
+  // extracted, and nothing anywhere reports it. Truncation that breaks the JSON
+  // is caught by the parse; this is the half that is not.
+  test('finish_reason `length` marks the output truncated', async () => {
+    const { fetchImpl } = recordingFetch(GLM_TRUNCATED);
+    const transport = createCloudflareUnifiedTransport({ accountId: ACCOUNT, fetchImpl });
+    const response = await transport.invoke(baseRequest);
+    expect(response.output.kind).toBe('chat');
+    expect((response.output as { truncated?: boolean }).truncated).toBe(true);
+  });
+
+  test('the Gemini spelling `MAX_TOKENS` is read the same way', async () => {
+    // `extract` routes to this seat, so a reader that knew only `length` would
+    // trust every truncated answer on the phase that stamps its inputs.
+    const { fetchImpl } = recordingFetch(GEMINI_TRUNCATED);
+    const transport = createCloudflareUnifiedTransport({ accountId: ACCOUNT, fetchImpl });
+    const response = await transport.invoke({
+      ...baseRequest,
+      op: 'extract',
+      modelId: 'google/gemini-3.5-flash-lite',
+      metadata: { ...baseRequest.metadata, op: 'extract' },
+    });
+    expect((response.output as { truncated?: boolean }).truncated).toBe(true);
+  });
+
+  test('a normal answer is not marked truncated', async () => {
+    // The other half, and the one that would make this a nuisance if it were
+    // wrong: `finish_reason: 'stop'` must stay a plain success.
+    const { fetchImpl } = recordingFetch(GLM_ANSWERED);
+    const transport = createCloudflareUnifiedTransport({ accountId: ACCOUNT, fetchImpl });
+    const response = await transport.invoke(baseRequest);
+    expect((response.output as { truncated?: boolean }).truncated).toBeUndefined();
+    expect((response.output as { text: string }).text).toBe('ok');
+  });
+});
 
 describe('the unified transport speaks the three path shapes', () => {
   test('it is the api.cloudflare.com account endpoint, not the gateway proxy', () => {
