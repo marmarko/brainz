@@ -28,6 +28,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 
 import { HOSTED_PROFILE, IMAGE_INPUT_TOKENS, routeFor } from '../../src/ai/routing.ts';
 import { acceptMedia, type AcceptMediaDeps } from '../../src/core/media/accept.ts';
+import { TransportError } from '../../src/ai/gateway.ts';
 import { runTranscribePhase } from '../../src/core/media/ocr-phase.ts';
 import { runConsolidationCycle } from '../../src/worker/consolidate/cycle.ts';
 import { estimateCycle, measureWorkload } from '../../src/worker/consolidate/estimate.ts';
@@ -372,6 +373,9 @@ describe('what a stop leaves behind', () => {
 
   test(
     'a payload that is not there stops the phase instead of marking the row done',
+    // Nothing has been read yet when the miss happens, so a dead object store
+    // and one absent object are the same observation. See the sibling case for
+    // what changes once the store has answered for itself.
     async () => {
       const payloads = createPayloadStore();
       const attachmentId = await accept(payloads, {
@@ -402,6 +406,107 @@ describe('what a stop leaves behind', () => {
   );
 
   test(
+    'one image the provider will never accept does not hold the queue behind it',
+    async () => {
+      // **The freeze, reached through the other queue.** This is the cycle's
+      // second per-item model loop, and until now every failure stopped it — so
+      // one image the model refuses outright held every attachment behind it, on
+      // every cycle, forever. `selectPendingAttachments` orders by
+      // `attachment_id` and a refused image keeps `ocr_text` NULL, so the bad
+      // one is offered first again next cycle and the good one is never reached.
+      // That is the shape `runSynopsisPhase` was rewritten to end.
+      const payloads = createPayloadStore();
+      const bad = await accept(payloads, {
+        mediaType: 'image/png',
+        bytes: new Uint8Array([...screenshotBytes(), 1]),
+        externalId: 'drive:enormous',
+      });
+      const good = await accept(payloads, {
+        mediaType: 'image/png',
+        bytes: new Uint8Array([...screenshotBytes(), 2]),
+        externalId: 'drive:ordinary',
+      });
+
+      // 413 on the first image only. A durable status — the provider read this
+      // request and refused THIS request — and the second call is answered
+      // normally, which is what separates one bad image from a dead provider.
+      const harness = createGateway({
+        vision: (_request, index) => {
+          if (index === 0) throw new TransportError('payload too large', 413);
+          return WIFI;
+        },
+      });
+
+      const outcome = await runTranscribePhase({
+        sql: tenant.sql,
+        gateway: harness.gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        budget: uncappedBudget(),
+        runId: '1',
+        now: new Date(),
+        payloads: payloads.reader,
+      });
+
+      // The phase COMPLETED. Every later phase in the cycle is reached.
+      expect(outcome.stopped).toBeNull();
+      // Both were offered, one was read, one was passed over and said so.
+      expect(outcome.items).toBe(2);
+      expect(outcome.applied).toBe(1);
+      expect(outcome.skippedItems).toBe(1);
+      // The good image behind the bad one is transcribed rather than starved.
+      expect(await ocrTextOf(good)).toBe(WIFI);
+      // And the refused one is queued, not retired: `ocr_text` stays NULL, so it
+      // is offered again — a payload too large today is one a wider seat accepts
+      // tomorrow, and none of that is the image’s owner’s fault.
+      expect(await ocrTextOf(bad)).toBeNull();
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a provider that is down stops the phase at the first attachment, not the last',
+    async () => {
+      // The other side of the same line, and the one that must not regress into
+      // a skip. A 503 is no verdict on any image: every remaining attachment
+      // meets it identically, so the first is the whole of the evidence. Skipping
+      // instead would walk a whole queue into a dead provider one paid call at a
+      // time and then report a pass that read nothing as a completed phase.
+      const payloads = createPayloadStore();
+      for (const name of ['a', 'b', 'c']) {
+        await accept(payloads, {
+          mediaType: 'image/png',
+          bytes: new Uint8Array([...screenshotBytes(), name.charCodeAt(0)]),
+          externalId: `drive:${name}`,
+        });
+      }
+      const harness = createGateway({
+        vision: () => {
+          throw new TransportError('service unavailable', 503);
+        },
+      });
+
+      const outcome = await runTranscribePhase({
+        sql: tenant.sql,
+        gateway: harness.gateway,
+        tenantId: TENANT,
+        caller: CALLER,
+        budget: uncappedBudget(),
+        runId: '1',
+        now: new Date(),
+        payloads: payloads.reader,
+      });
+
+      expect(outcome.stopped).toBe('model_unavailable');
+      expect(outcome.skippedItems).toBe(0);
+      // One call, not three: the phase stopped at the first refusal rather than
+      // paying to rediscover the same outage on every attachment it holds.
+      expect(harness.transport.callsFor('vision').length).toBe(1);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
     'a failed write leaves the attachment queued rather than marked transcribed',
     async () => {
       const payloads = createPayloadStore();
@@ -414,6 +519,13 @@ describe('what a stop leaves behind', () => {
       // The ordering under test is page-first: if `ocr_text` were written before
       // the page, this attachment would now be marked done with nothing to show
       // for it, and no later cycle would ever look at it again.
+      //
+      // **This case used to assert `stopped` was non-null, and that assertion is
+      // now the opposite of the contract.** A write path that refuses THIS
+      // transcript is this attachment's outcome, not the phase's — stopping on
+      // it held every attachment behind it, on every cycle. It is skipped and
+      // counted instead, and everything the test is actually about (the
+      // ordering, and the row staying queued) is unchanged and asserted below.
       const harness = createGateway({ vision: () => WIFI });
 
       const settings = (await tenant.sql`
@@ -437,8 +549,12 @@ describe('what a stop leaves behind', () => {
 
         // The model was called and paid for; the write did not land.
         expect(harness.transport.callsFor('vision').length).toBe(1);
-        expect(outcome.stopped).not.toBeNull();
+        expect(outcome.stopped).toBeNull();
         expect(outcome.applied).toBe(0);
+        // Counted rather than swallowed: a pass that transcribed nothing because
+        // every attachment was refused must not read like a brain with nothing
+        // left to do.
+        expect(outcome.skippedItems).toBe(1);
         expect(await ocrTextOf(attachmentId)).toBeNull();
         expect(await countRows(tenant.sql, 'page', `external_ref = 'attachment:${attachmentId}'`)).toBe(0);
       } finally {

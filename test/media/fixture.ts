@@ -135,7 +135,16 @@ export function createMediaTransport(options: MediaTransportOptions = {}): Media
 
       const index = visionCalls;
       if (request.op === 'vision') visionCalls += 1;
-      const text = options.vision === undefined ? '' : options.vision(request, index);
+      let text: string;
+      try {
+        text = options.vision === undefined ? '' : options.vision(request, index);
+      } catch (error) {
+        // A script may refuse ONE call rather than the whole op. `failOn` is
+        // per-op and cannot express "this image, and not the next one" — which
+        // is the only shape that can tell a per-item skip from a phase stop, so
+        // a loop that draws that line cannot be tested without it.
+        return Promise.reject(error);
+      }
       return Promise.resolve({
         output: { kind: 'chat', text },
         usage: { inputTokens: 1_200, outputTokens },

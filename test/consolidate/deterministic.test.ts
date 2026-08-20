@@ -517,6 +517,69 @@ describe('deterministic salience', () => {
     },
     SETUP_TIMEOUT_MS,
   );
+
+  test(
+    'a page the model has scored is left alone, however many cycles run after it',
+    async () => {
+      // **The clobber, and it is what made the paid phase free of charge to
+      // everybody except the payer.** `salience_refine` overwrites this score
+      // and stamps `model_refined`. That cost nothing while the phase re-scored
+      // its whole candidate set every cycle — this pass wrote first, the model
+      // wrote second, and the model's answer stood. Rung 22 gave the phase a
+      // consideration stamp, so it scores a page once ever; from that rung on an
+      // unconditional deterministic pass erased the model's judgement on the
+      // very next cycle and every cycle after, permanently, on every page.
+      //
+      // Two pages, one of them model-scored, and a second pass over both.
+      const { sql } = tenant;
+      const refined = await seedPage(sql, {
+        origin: 'personal:mail',
+        sourceType: 'email',
+        title: 'Verdant thread',
+        body: 'Ronan Whitfield joined Verdant Systems. Verdant Systems is based in Trieste.',
+        createdAt: '2026-04-02T00:00:00Z',
+      });
+      const plain = await seedPage(sql, {
+        origin: 'personal:mail',
+        sourceType: 'email',
+        title: 'lunch',
+        body: 'ok',
+        createdAt: '2026-04-02T00:00:00Z',
+      });
+
+      await computeDeterministicSalience(sql, { now: new Date('2026-04-03T00:00:00Z') });
+
+      // The model's verdict, written exactly as `runSalienceRefinePhase` writes
+      // it: a score far from anything the arithmetic above would produce for a
+      // page this thin, so a clobber cannot hide inside a coincidence.
+      await sql`
+        UPDATE page
+           SET salience = 0.99, salience_source = 'model_refined',
+               salience_at = ${new Date('2026-04-03T01:00:00Z')}
+         WHERE page_id = ${refined.pageId}::bigint
+      `;
+
+      // The next cycle. Same phase, same corpus, one day later.
+      const second = await computeDeterministicSalience(sql, {
+        now: new Date('2026-04-04T00:00:00Z'),
+      });
+
+      const rows = (await sql`
+        SELECT page_id::text AS page_id, salience, salience_source FROM page
+      `) as Array<{ page_id: string; salience: number; salience_source: string }>;
+      const byId = new Map(rows.map((row) => [row.page_id, row]));
+
+      // Untouched: still the model's number, still stamped as the model's.
+      expect(byId.get(refined.pageId)?.salience_source).toBe('model_refined');
+      expect(byId.get(refined.pageId)?.salience).toBeCloseTo(0.99, 5);
+      // And the page the model never saw is re-scored as it always was — the
+      // clause narrows this phase, it does not switch it off.
+      expect(byId.get(plain.pageId)?.salience_source).toBe('deterministic');
+      // Counted honestly: one page scored, not two.
+      expect(second.scored).toBe(1);
+    },
+    SETUP_TIMEOUT_MS,
+  );
 });
 
 describe('embedding-space clustering', () => {

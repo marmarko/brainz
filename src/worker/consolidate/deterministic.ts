@@ -763,12 +763,37 @@ function clamp01(value: number): number {
  * it rather than living on a different scale.
  *
  * **It walks in batches on a keyset, and that is the whole of why the cycle
- * fits its attempt.** The scoring arithmetic is unchanged — every page is still
- * scored on every pass, because the recency term decays with wall clock and a
+ * fits its attempt.** The scoring arithmetic is unchanged — every page it scores
+ * is scored on every pass, because the recency term decays with wall clock and a
  * "changed since last time" filter would leave a year-old page carrying a
  * year-old score. What changed is the shape: one read and one write per
  * {@link SALIENCE_BATCH} pages instead of two statements per page. That is the
  * 11,217-round-trip phase that was fifteen minutes on its own, in twenty-four.
+ *
+ * **It does not touch a page the model has already scored, and that clause is
+ * newer than it looks.** `salience_refine` overwrites this score and stamps
+ * `salience_source = 'model_refined'`; the note on that phase says the
+ * deterministic pass "runs first in every cycle, so the previous value is one
+ * phase old rather than lost". That was true while the model re-scored the whole
+ * candidate set every cycle. Rung 22 gave the phase a consideration stamp, so it
+ * now scores a page **once, ever** — and this pass, running first and
+ * unconditionally, overwrote that score on the next cycle and every cycle after.
+ * Measured over three cycles on four pages: `model_refined` on all four
+ * throughout, before; after, `model_refined` on the first cycle and
+ * `deterministic` on all four permanently thereafter. The paid phase's answers
+ * survived less than one cycle, which is a ranking change — salience orders the
+ * extraction candidate set and drives budget truncation — that was carried in as
+ * a cost-only one.
+ *
+ * **What the clause costs, stated rather than buried.** A model-scored page
+ * stops decaying with recency: its score is the model's judgement of the page,
+ * frozen at the moment it was made. That is a real loss and it is the smaller
+ * one. The alternative is not "the model's score plus decay" — it is the model's
+ * score being discarded within a day of being paid for, permanently, on every
+ * page, which makes the whole phase a recurring invoice for nothing. When a
+ * refresh IS wanted, the designed lever is the one rung 22 built: bump
+ * `CONSIDERATION_VERSION.salience_refine` and every page becomes a candidate
+ * again, once.
  */
 export async function computeDeterministicSalience(
   sql: SQL,
@@ -802,6 +827,7 @@ export async function computeDeterministicSalience(
            ON f.page_id = p.page_id
           AND f.deleted_at IS NULL AND f.quarantined_at IS NULL AND f.superseded_by IS NULL
         WHERE p.deleted_at IS NULL AND p.quarantined_at IS NULL
+          AND p.salience_source IS DISTINCT FROM 'model_refined'
           AND p.page_id > $1::bigint
         GROUP BY p.page_id, p.source_type, p.created_at
         ORDER BY p.page_id

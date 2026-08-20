@@ -30,6 +30,7 @@
  * staleness invalidated something — rather than by reordering the plan's phases.
  */
 
+import type { GatewayResult } from '../../ai/gateway.ts';
 import type { ModelOp } from '../../ai/routing.ts';
 
 /** The free half. Every one of these is countable SQL and shared write-path code. */
@@ -240,4 +241,70 @@ export function assertPhaseOrder(order: readonly CyclePhase[] = CYCLE_PHASES): v
   if (findings.length > 0) {
     throw new Error(`the consolidation cycle's phase order is not runnable:\n  ${findings.join('\n  ')}`);
   }
+}
+
+/**
+ * The provider statuses that mean "this request, not this moment".
+ *
+ * 400 malformed, 413 too large, 422 unprocessable: three ways of saying the
+ * thing we sent is not something this model will accept, and sending it again
+ * gets the same answer for as long as the request is the same. Every other
+ * status is deliberately absent, and two absences are worth naming because they
+ * are the ones a wider rule would have swept in:
+ *
+ *   * **429 and 408** are 4xx and are not durable. A rate limit is the fleet's
+ *     pace, and a request timeout is work that started. Charging either to a
+ *     page would let one busy hour blame a shelf of perfectly good documents.
+ *   * **401/403** say the credential is wrong, which is a configuration remedy.
+ *     The page is blameless and every page would fail identically.
+ *
+ * The gateway keeps this number and nothing else — deliberately, so a provider
+ * that echoes the request in its error body cannot write the user's words into
+ * a log — which is exactly why the number has to be carried rather than
+ * collapsed here. `control.connector_health` learned the same lesson: the
+ * provider's status beside the failure code named a ten-hour outage's cause in
+ * one cycle, after months of an undifferentiated `provider_error`.
+ */
+export const DURABLE_PROVIDER_STATUSES: ReadonlySet<number> = new Set([400, 413, 422]);
+
+/**
+ * A phase stop, and whether the request itself is what was refused.
+ *
+ * `durable` is the fact `stopFor` used to throw away, and it is what a per-item
+ * loop needs in order to know **whose** failure it is holding: a durable refusal
+ * is the provider's verdict on this one request, and everything else is the
+ * provider, the credential or the configuration, which the next item will meet
+ * identically. That is the whole of the stop/skip decision in
+ * {@link runSynopsisPhase} — no counting, because a fact that is true of every
+ * remaining item is already complete at the first one.
+ */
+export interface PhaseFailure {
+  readonly stop: PhaseStop;
+  /**
+   * True only when re-sending the same input would be refused the same way.
+   *
+   * Fail-closed, and the two mistakes are priced very differently. Calling a
+   * durable refusal transient stops a phase that could have skipped one page and
+   * kept going — recoverable, loud, and on the run record. Calling a transient
+   * durable makes an outage read as a per-item outcome, so the phase would walk
+   * a whole candidate set into a dead provider, complete, close the run and bank
+   * a checkpoint saying it was paid for.
+   */
+  readonly durable: boolean;
+}
+
+/** How a gateway refusal maps onto a phase stop. Budget is its own reason. */
+export function stopFor(result: Extract<GatewayResult, { ok: false }>): PhaseFailure {
+  if (result.reason === 'budget_exhausted') return { stop: 'budget_exhausted', durable: false };
+  if (result.reason === 'transport_failed' && result.providerStatus !== null) {
+    if (DURABLE_PROVIDER_STATUSES.has(result.providerStatus)) {
+      return { stop: 'input_rejected', durable: true };
+    }
+  }
+  // Everything else: a provider that was down, a network that dropped, a key
+  // that would not resolve, a scope that was denied, a model nobody priced. Each
+  // has a remedy, none of them is the page's, and every one of them would meet
+  // the next page in exactly the same way — which is what makes them the phase's
+  // failure rather than an item's.
+  return { stop: 'model_unavailable', durable: false };
 }

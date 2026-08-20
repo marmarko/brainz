@@ -38,10 +38,46 @@
  *     and nothing anywhere fails. The empty string is the honest record of
  *     "read, and there was nothing there"; the raw payload is still preserved,
  *     so a better extractor re-derives from the original rather than from this.
- *  3. **A payload that is not there stops the phase.** It is not a budget
- *     problem and not a model problem, and skipping it silently would leave an
- *     attachment that can never be transcribed sitting at the head of the queue
- *     forever. The stop is typed so an operator can tell it from the other two.
+ *  3. **A payload that is not there stops the phase — until the store has
+ *     proved it is up.** A missing object is two different facts wearing one
+ *     shape: the object store is unreachable and every attachment will meet it
+ *     identically, or this one object is gone and nothing else is wrong. Read
+ *     first, they are indistinguishable, so the phase stops. Once any read in
+ *     the same pass has succeeded the store has answered for itself, and a miss
+ *     after that is the item's own. The stop is typed so an operator can tell it
+ *     from the other two.
+ *
+ * **One bad attachment does not stop the ones behind it.** This is the cycle's
+ * second per-item model loop, and it drew the line in the wrong place for as
+ * long as it had one: every failure stopped the phase, so a single image the
+ * provider will never accept — a 413 on something enormous, a 400 on a shape the
+ * model refuses — held every attachment behind it, on every cycle, forever. That
+ * is exactly the freeze `runSynopsisPhase` was rewritten to end, reached through
+ * the other queue, and `skippedItems: 0` on this phase's outcome said so in the
+ * open for as long as it was true.
+ *
+ * The line is `stopFor`'s `durable` bit and it is shared with the synopsis loop
+ * rather than restated (`phases.ts`). **Durable** means the provider read this
+ * request and refused THIS request: the item's outcome, so it is skipped,
+ * counted, and offered again next cycle. **Not durable** means no verdict was
+ * ever reached — the provider was down, the socket died, the key would not
+ * resolve — and every remaining attachment meets that identically, so the first
+ * one is the whole of the evidence and the phase stops. A misrouted seat
+ * (`bad_output` from a chat op answering with an embedding) is configuration
+ * rather than content and stops for the same reason.
+ *
+ * **What a skip costs, and the follow-up it is owed.** `ocr_text` stays NULL, so
+ * a skipped attachment returns next cycle: one wasted call per unreadable
+ * attachment per cycle, the standing price the synopsis loop also pays. The
+ * residual it does not close is starvation rather than freeze — {@link
+ * DEFAULT_LIMIT} attachments the model always refuses, sitting at the head of an
+ * `attachment_id` ordering, would fill every batch and the good attachments
+ * behind them would never be reached. The synopsis loop closes that with rung
+ * 21's refusal counter and a quarantine at two strikes; the same shape is owed
+ * here (`attachment.transcription_refusals`, a count and a code, never an
+ * excerpt) and is deliberately not built in the same change as the line above.
+ * Until it lands the phase completes, every later phase is reached, and the
+ * failure is bounded to this queue.
  *
  * **The image is untrusted content.** A screenshot can contain a sentence
  * addressed to the model. The system prompt says transcribe rather than obey,
@@ -53,8 +89,9 @@
 import type { SQL } from 'bun';
 
 import { IMAGE_INPUT_TOKENS } from '../../ai/routing.ts';
-import type { ModelPhaseDeps, PhaseOutcome, PhaseStop } from '../../worker/consolidate/model-phases.ts';
-import { PHASE_OP } from '../../worker/consolidate/phases.ts';
+import type { ModelPhaseDeps, PhaseOutcome } from '../../worker/consolidate/model-phases.ts';
+import type { PhaseStop } from '../../worker/consolidate/phases.ts';
+import { PHASE_OP, stopFor } from '../../worker/consolidate/phases.ts';
 import { ingestDocument } from '../write/write-path.ts';
 import { PDF_MEDIA_TYPE, normalizeMediaType, transcriptRefFor } from './accept.ts';
 import { extractPdfTextLayer } from './pdf-text.ts';
@@ -138,6 +175,8 @@ interface Progress {
   applied: number;
   logged: number;
   calls: number;
+  /** Items this pass passed over — a subset of `logged`. See the header. */
+  skipped: number;
 }
 
 function outcomeOf(
@@ -152,13 +191,14 @@ function outcomeOf(
     applied: progress.applied,
     queued: 0,
     logged: progress.logged,
-    // Zero, and not because this phase has nothing to skip: it is the cycle's
-    // other per-item loop and it still stops on its first bad item. The synopsis
-    // phase's skip-and-complete has not been carried here, because a payload
-    // that is not in object storage is a storage or credential fault that meets
-    // every remaining attachment identically — the systemic side of the same
-    // line — and because `ocr_text` staying NULL already brings the item back.
-    skippedItems: 0,
+    // The attachments this pass passed over rather than the zero that stood
+    // here while every failure stopped the phase. It is counted apart from
+    // `logged` for the reason `PhaseOutcome` gives: the phase now COMPLETES
+    // through these, so nothing in `stopped` will mention them, and a pass that
+    // transcribed nothing because every attachment was refused would otherwise
+    // be indistinguishable on the run record from a brain with nothing left to
+    // read.
+    skippedItems: progress.skipped,
     // The budget's own figure, not the chat calls' sum: the transcript's page
     // pays for its embedding out of this same phase budget, and reporting only
     // the vision calls would under-report what the phase spent.
@@ -179,12 +219,24 @@ async function transcribeOne(
   item: PendingAttachment,
   bytes: Uint8Array,
   progress: Progress,
-): Promise<{ readonly text: string | null; readonly stop: PhaseStop | null }> {
+): Promise<{
+  readonly text: string | null;
+  readonly stop: PhaseStop | null;
+  /**
+   * Whether the stop is this attachment's own.
+   *
+   * Carried rather than inferred at the call site, for the reason `PhaseFailure`
+   * gives: the two mistakes are priced very differently, and only the gateway's
+   * own answer separates "this image will never be accepted" from "nothing is
+   * being accepted right now". Meaningless when `stop` is null.
+   */
+  readonly durable: boolean;
+}> {
   if (normalizeMediaType(item.mediaType) === PDF_MEDIA_TYPE) {
     const layer = extractPdfTextLayer(bytes);
     // The cheap path. `null` is "no text layer" and sends the page to the model;
     // a string is the document's own text and costs nothing at all.
-    if (layer !== null) return { text: layer, stop: null };
+    if (layer !== null) return { text: layer, stop: null, durable: false };
   }
 
   const answer = await deps.gateway.call({
@@ -201,16 +253,22 @@ async function transcribeOne(
   });
 
   if (!answer.ok) {
-    return {
-      text: null,
-      stop: answer.reason === 'budget_exhausted' ? 'budget_exhausted' : 'model_unavailable',
-    };
+    // The seam, shared with the synopsis loop rather than re-derived here: a
+    // budget stop is its own reason and never durable, a 400/413/422 is this
+    // request being refused, and everything else is the provider, the network or
+    // the credential — which the next attachment would meet identically.
+    return { text: null, ...stopFor(answer) };
   }
   progress.calls += 1;
-  if (answer.output.kind !== 'chat') return { text: null, stop: 'bad_output' };
+  // A chat op that answered with an embedding is the routing table pointing at
+  // the wrong seat: a fact about the configuration rather than about this image,
+  // and it would meet every remaining attachment the same way. Never durable, so
+  // the phase stops at once rather than walking the whole queue past a misrouted
+  // seat one paid call at a time.
+  if (answer.output.kind !== 'chat') return { text: null, stop: 'bad_output', durable: false };
 
   const text = answer.output.text.trim();
-  return { text: text.length === 0 ? null : text, stop: null };
+  return { text: text.length === 0 ? null : text, stop: null, durable: false };
 }
 
 /**
@@ -224,7 +282,7 @@ async function materialiseTranscript(
   deps: ModelPhaseDeps,
   item: PendingAttachment,
   text: string,
-): Promise<PhaseStop | null> {
+): Promise<{ readonly stop: PhaseStop | null; readonly durable: boolean }> {
   const receipt = await ingestDocument(
     {
       sql: deps.sql,
@@ -254,15 +312,24 @@ async function materialiseTranscript(
   if (!('ok' in receipt) || receipt.ok !== true) {
     const failure = receipt as { readonly reason: string; readonly detail?: string };
     if (failure.reason === 'embed_failed') {
-      return failure.detail === 'budget_exhausted' ? 'budget_exhausted' : 'model_unavailable';
+      // The embedder, not this transcript. A cap and an outage both meet every
+      // remaining attachment identically, so neither is the item's.
+      return {
+        stop: failure.detail === 'budget_exhausted' ? 'budget_exhausted' : 'model_unavailable',
+        durable: false,
+      };
     }
     // A document the write path refused for any other reason is, from this
-    // phase's side, an answer it could not use.
-    return 'bad_output';
+    // phase's side, an answer it could not use — and it is **this transcript's**
+    // outcome rather than the phase's: the refusal is about the text that came
+    // back for this one image, and the next attachment's text is a different
+    // question. Stopping here let one screenshot the write path would not accept
+    // hold every attachment behind it.
+    return { stop: 'bad_output', durable: true };
   }
 
   await markRead(deps.sql, item.attachmentId, text);
-  return null;
+  return { stop: null, durable: false };
 }
 
 /** `''` is "read, nothing there"; a string is the transcript. Never NULL again. */
@@ -279,7 +346,7 @@ export async function runTranscribePhase(deps: ModelPhaseDeps): Promise<PhaseOut
   const pending = await selectPendingAttachments(deps.sql, {
     limit: deps.limit ?? DEFAULT_LIMIT,
   });
-  const progress: Progress = { applied: 0, logged: 0, calls: 0 };
+  const progress: Progress = { applied: 0, logged: 0, calls: 0, skipped: 0 };
   if (pending.length === 0) return outcomeOf(deps, 0, progress, null);
 
   const payloads = deps.payloads;
@@ -288,6 +355,11 @@ export async function runTranscribePhase(deps: ModelPhaseDeps): Promise<PhaseOut
     // brain that never transcribes anything and never says so.
     return outcomeOf(deps, pending.length, progress, 'payload_unavailable');
   }
+
+  // Successful payload reads this pass. The object store's own answer about
+  // whether it is up, which is the fact the miss branch below needs and cannot
+  // get from the miss itself.
+  let reads = 0;
 
   for (const item of pending) {
     // The other per-item model loop in the cycle, and it stops on the attempt's
@@ -299,10 +371,32 @@ export async function runTranscribePhase(deps: ModelPhaseDeps): Promise<PhaseOut
       return outcomeOf(deps, pending.length, progress, 'out_of_time');
     }
     const stored = await payloads.read(item.objectKey);
-    if (stored === null) return outcomeOf(deps, pending.length, progress, 'payload_unavailable');
+    if (stored === null) {
+      // The header's third rule. With nothing read yet this pass, a miss and a
+      // dead object store are the same observation, so the phase stops rather
+      // than marching a whole queue past a store that is down. Once any read has
+      // succeeded the store has answered for itself and this is one absent
+      // object — the item's own outcome, and not a reason to hold up the rest.
+      if (reads === 0) return outcomeOf(deps, pending.length, progress, 'payload_unavailable');
+      progress.logged += 1;
+      progress.skipped += 1;
+      continue;
+    }
+    reads += 1;
 
     const read = await transcribeOne(deps, item, stored.bytes, progress);
-    if (read.stop !== null) return outcomeOf(deps, pending.length, progress, read.stop);
+    if (read.stop !== null) {
+      // Not durable: no verdict was reached on this request, and none will be
+      // reached on the next one either. The phase stops at the first, which is
+      // the whole of the evidence.
+      if (!read.durable) return outcomeOf(deps, pending.length, progress, read.stop);
+      // Durable: the provider read this image and refused it. One attachment's
+      // outcome. It stays NULL in `ocr_text`, so it is offered again next cycle
+      // — the standing price named in the header.
+      progress.logged += 1;
+      progress.skipped += 1;
+      continue;
+    }
 
     if (read.text === null) {
       // Read, and there was nothing written on it. Recorded so it is not paid
@@ -312,8 +406,13 @@ export async function runTranscribePhase(deps: ModelPhaseDeps): Promise<PhaseOut
       continue;
     }
 
-    const stop = await materialiseTranscript(deps, item, read.text);
-    if (stop !== null) return outcomeOf(deps, pending.length, progress, stop);
+    const written = await materialiseTranscript(deps, item, read.text);
+    if (written.stop !== null) {
+      if (!written.durable) return outcomeOf(deps, pending.length, progress, written.stop);
+      progress.logged += 1;
+      progress.skipped += 1;
+      continue;
+    }
     progress.applied += 1;
   }
 
