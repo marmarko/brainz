@@ -46,12 +46,19 @@
  * every resume. One unusable page out of 5,608 pinned a brain at 167 facts.
  *
  * So the per-item loop skips the item and **completes**. `stopped: null` even
- * when every page it was given was skipped, because "the phase stopped" is
- * precisely what holds the run open in front of every other phase, and a phase
- * that reported a failure whenever `applied === 0` put the freeze back the
- * moment the unreadable pages were all that was left — which is the state the
- * candidate set converges to, since a skipped page writes nothing and is offered
- * again next cycle.
+ * when every page it was given was skipped, because a phase that reported a
+ * failure whenever `applied === 0` put the freeze back the moment the unreadable
+ * pages were all that was left — which is the state the candidate set converges
+ * to, since a skipped page writes nothing and is offered again next cycle.
+ *
+ * Rung 23 broke the same chain at its third link: a cycle that stops now closes
+ * its run anyway, so a stopped phase can no longer strand another phase's
+ * checkpoint. Both fixes stay, and neither makes the other redundant. This one
+ * is about **the cycle finishing its work** — a brain whose contradiction and
+ * salience phases are never reached because page four is unreadable is a brain
+ * doing a fraction of what it is for, whatever the run record says. That one is
+ * about the cycle **ending**, which is what makes the failure survivable rather
+ * than permanent.
  *
  * The unreadable page therefore stays a candidate forever and costs one model
  * call a cycle. That price is small, permanent and bounded by the phase's own
@@ -798,7 +805,9 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
       // scope was denied, we were rate-limited. Every remaining page meets that
       // identically, so the first one is the whole of the evidence — counting to
       // three would only buy two more calls into the same wall — and the phase
-      // stops, which keeps the run open for a cycle that can finish the work.
+      // stops rather than walking a whole candidate set into a dead provider.
+      // The pages it did not reach are still unsummarised, so the next cycle
+      // selects exactly them; nothing is owed to a run that stayed open.
       if (!answer.durable) return outcome(answer.stop);
       // Durable: the provider read the request and refused THIS request, a
       // 400/413/422. That is one page's outcome. It is skipped, counted, and
@@ -863,13 +872,13 @@ export async function runSynopsisPhase(deps: ModelPhaseDeps): Promise<PhaseOutco
   //
   // This is the line the whole redesign turns on, and it looks wrong until the
   // chain behind it is read. `stopped` is not a report card; it is what makes
-  // the cycle stop, which leaves the run open, which strands every other model
-  // phase's checkpoint behind it. An earlier version returned the last failure
+  // the cycle stop, and a cycle that stops here never reaches the contradiction
+  // and salience phases at all. An earlier version returned the last failure
   // whenever `applied === 0` — reasonable-sounding, and it put the freeze back
   // exactly when it mattered: a skipped page is offered again next cycle, so the
   // candidate set converges onto the unreadable ones, and the pass where they
-  // are all that is left is a pass that applied nothing. `extract` stayed
-  // skipped and the fact count stayed flat, which is the incident.
+  // are all that is left is a pass that applied nothing. Every later phase then
+  // stopped being reached, cycle after cycle, which is the incident.
   //
   // A pass that summarised nothing is not thereby hidden. `items`, `logged` and
   // `skippedItems` are on this outcome and reach the fleet's cycle log, and the

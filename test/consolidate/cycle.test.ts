@@ -196,9 +196,30 @@ describe('a full cycle', () => {
   );
 });
 
-describe('checkpoints — the next cycle does not re-pay', () => {
+/**
+ * Where a run ends, and what the next cycle inherits from it.
+ *
+ * **A cycle that returns closes its run, whatever stopped it.** This block used
+ * to assert the opposite for the three "there is work left" reasons — the run
+ * stayed open so the next cycle could resume into it and skip the model phases
+ * already paid for — and that is the mechanism that froze a production brain at
+ * 167 facts: one page drew a provider 500, the phase stopped, the cycle stopped,
+ * the run stayed open, and `extract`'s checkpoint stood in front of every later
+ * cycle forever. `run-closure.test.ts` is that incident as a permanent
+ * assertion.
+ *
+ * The money property survives, and it moved to where it belongs. A checkpoint is
+ * for a cycle that was **killed** — one that wrote nothing, because nothing ran
+ * to write it — and `convergence.test.ts` holds that case. What a *returned*
+ * cycle costs the next one is settled by each phase's own candidate query: all
+ * six now re-select only work nobody has done, `transcribe` and `synopsis` from
+ * the content and the other four from rung 22's consideration stamp. Closing the
+ * run costs nothing, which is exactly what this block measures — the phase that
+ * finished is not called again, and it is not a checkpoint that spared it.
+ */
+describe('a cycle that returns closes its run, and the next one is a new pass', () => {
   test(
-    'a cycle stopped by an unavailable provider resumes without re-calling what it finished',
+    'a cycle stopped by an unavailable provider leaves nothing open behind it',
     async () => {
       await seedSmallBrain();
 
@@ -213,11 +234,12 @@ describe('checkpoints — the next cycle does not re-pay', () => {
 
       expect(first.dreamt).toBe(false);
       expect(first.stopReason).toBe('phase_failed');
-      const extractCallsFirst = failing.transport.callsFor('extract').length;
-      expect(extractCallsFirst).toBeGreaterThan(0);
+      expect(failing.transport.callsFor('extract').length).toBeGreaterThan(0);
 
-      // The run is still open, so the checkpoint has something to resume into.
-      expect(await countRows(tenant.sql, 'consolidation_run', 'finished_at IS NULL')).toBe(1);
+      // **The line.** The cycle knew what stopped it and said so, which is a
+      // finished pass — not an attempt somebody else has to come back to.
+      expect(await countRows(tenant.sql, 'consolidation_run', 'finished_at IS NULL')).toBe(0);
+      expect(await countRows(tenant.sql, 'consolidation_checkpoint')).toBe(0);
 
       const healthy = createGateway({ chat: FULL_SCRIPT });
       const second = await runConsolidationCycle(
@@ -225,19 +247,26 @@ describe('checkpoints — the next cycle does not re-pay', () => {
         { trigger: 'time_ceiling', tier: 'paid', now: new Date() },
       );
 
-      expect(second.resumed).toBe(true);
-      expect(second.runId).toBe(first.runId);
+      expect(second.resumed).toBe(false);
+      expect(second.runId).not.toBe(first.runId);
       expect(second.dreamt).toBe(true);
       expect(second.stopReason).toBe('complete');
 
-      // The whole point: extraction was banked, so the second run never asked
-      // for it again.
+      // **The two halves of what closing the run costs, and it is nothing.**
+      //
+      // Not one phase was skipped — there is no checkpoint left to skip one
+      // with, and that is the freeze gone. And `extract` was still not called a
+      // second time: it ran to completion in the first cycle, stamped the chunks
+      // it considered, and found nothing to do in this one. That is the
+      // difference rung 22 makes and it is the whole reason this block could
+      // stop asserting the opposite. Before it, this line read
+      // `toBeGreaterThan(0)` and meant a second invoice for an unchanged corpus.
+      expect(second.phases.every((phase) => phase.skipped === null)).toBe(true);
       expect(healthy.transport.callsFor('extract').length).toBe(0);
-      const extractPhase = second.phases.find((phase) => phase.phase === 'extract');
-      expect(extractPhase?.ran).toBe(false);
-      expect(extractPhase?.skipped).toBe('checkpointed');
 
-      // ...and enrich, which failed, did run this time.
+      // ...and enrich, which never got an answer, is owed and does run. A phase
+      // the provider refused stamped nothing, so its work is still outstanding —
+      // which is the direction the marker has to be wrong in if it is wrong.
       expect(healthy.transport.callsFor('enrich').length).toBeGreaterThan(0);
     },
     SETUP_TIMEOUT_MS,
@@ -405,25 +434,41 @@ describe('the run record names the phase the cycle stopped in', () => {
       );
       expect(first.stoppedPhase).toEqual({ phase: 'enrich', code: 'model_unavailable' });
 
-      // **The stale-attribution case, and the reason both writers set the pair
-      // unconditionally.** The run stays open across attempts and the same row
-      // is rewritten; a writer that only wrote the columns when it had something
-      // to say would leave this cycle's success sitting under the previous
-      // attempt's failure, and the row would name a phase that did not stop
-      // anything.
+      // **The stale-attribution case, and the reason the writer sets the pair
+      // unconditionally.** A cycle that succeeds must not leave a row naming a
+      // phase that stopped nothing. Since rung 23 each cycle owns its own row,
+      // so the guard has two halves and both matter: the failed pass KEEPS its
+      // diagnosis — closing a run is not the place to erase why it stopped —
+      // and the pass that follows carries none.
       const healthy = createGateway({ chat: FULL_SCRIPT });
       const second = await runConsolidationCycle(
         { sql: tenant.sql, gateway: healthy.gateway, tenantId: TENANT, caller: CALLER },
         { trigger: 'time_ceiling', tier: 'paid', now: new Date() },
       );
 
-      expect(second.runId).toBe(first.runId);
+      expect(second.runId).not.toBe(first.runId);
       expect(second.stopReason).toBe('complete');
       expect(second.stoppedPhase).toBeNull();
 
+      const stopped = (await tenant.sql`
+        SELECT dreamt, stop_reason, stopped_phase, stopped_phase_code
+          FROM consolidation_run WHERE run_id = ${first.runId}::bigint
+      `) as Array<{
+        dreamt: boolean;
+        stop_reason: string;
+        stopped_phase: string | null;
+        stopped_phase_code: string | null;
+      }>;
+      expect(stopped[0]).toEqual({
+        dreamt: false,
+        stop_reason: 'phase_failed',
+        stopped_phase: 'enrich',
+        stopped_phase_code: 'model_unavailable',
+      });
+
       const rows = (await tenant.sql`
         SELECT dreamt, stopped_phase, stopped_phase_code
-          FROM consolidation_run WHERE run_id = ${first.runId}::bigint
+          FROM consolidation_run WHERE run_id = ${second.runId}::bigint
       `) as Array<{ dreamt: boolean; stopped_phase: string | null; stopped_phase_code: string | null }>;
       expect(rows[0]).toEqual({ dreamt: true, stopped_phase: null, stopped_phase_code: null });
     },

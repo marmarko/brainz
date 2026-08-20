@@ -1,0 +1,96 @@
+-- ===========================================================================
+-- brainz tenant schema — rung 23, a run that cannot outlive its cycle
+--
+-- One nullable column, and it exists because of a measured incident that four
+-- previous rungs each fixed one link of and left standing.
+--
+-- A brain of 5,608 pages sat at 167 facts for hours, reporting the same line
+-- every cycle:
+--
+--     phase_failed {phase:'synopsis', code:'model_unavailable'} extractCallsSoFar=1
+--
+-- `extract` had been called once, ever. Nothing was wrong with extraction. One
+-- page's synopsis drew a provider 500 — systemic rather than that page's fault,
+-- so the phase is right to stop on it — the cycle stopped, and a cycle that
+-- stopped short wrote its record WITHOUT `finished_at`. That null is what the
+-- next cycle adopts, and a model phase holding a checkpoint against an adopted
+-- run is skipped. So extraction, banked by the first cycle, was skipped by every
+-- cycle after it, permanently, because of one page.
+--
+-- ---------------------------------------------------------------------------
+-- **The line this column draws.**
+--
+-- `finished_at IS NULL` used to mean two different things at once: "a cycle
+-- decided to stop and left work behind" and "a cycle was killed and never got to
+-- write anything". The first is now impossible — a cycle that RETURNS closes its
+-- run whatever stopped it, because it reached a state it can describe and its
+-- pass is over. So an open run means exactly one thing, and it is KTD11's word
+-- read literally: a **killed** cycle, which never re-pays for model calls
+-- because the next cycle adopts its run and honours its checkpoints.
+--
+-- ---------------------------------------------------------------------------
+-- **Why this rung comes second, and could not have come first.**
+--
+-- Closing the run on every exit was built once without rung 22 and reverted,
+-- because on its own it trades one freeze for a worse one. Measured on the same
+-- brain, the same budget, and a clock advanced by real work:
+--
+--     closure alone     out_of_time ×5                    synopsis calls 0
+--     the old behaviour out_of_time, …, complete          synopsis calls 6
+--
+-- The old code escaped precisely BECAUSE the open run carried `extract`'s
+-- checkpoint forward. With the run closed and nothing else changed, `extract`
+-- was re-paid every cycle and the four phases behind it were never reached at
+-- all. The mechanism that closure deletes was what reachability depended on.
+--
+-- Rung 22 is what makes it free. Four of the six model phases could not say what
+-- they had already looked at — `extract`, `enrich`, `contradiction` and
+-- `salience_refine` selected the top N by salience or by id with no clause about
+-- work already done — so a per-RUN checkpoint was the only record of their
+-- progress anywhere, and a per-run record cannot be kept without keeping the
+-- run. With a consideration stamp on the row each of them consumes, all six
+-- phases re-select only work nobody has done, and closing the run costs what it
+-- has always cost `transcribe` and `synopsis`: nothing.
+--
+-- `resumed_at` is what bounds that adoption to once. Without it the freeze is
+-- reachable through a second door: a worker that dies at the same phase every
+-- time — an OOM on one enormous page, a lane restarting on a loop — never
+-- returns, so its run never closes, so the banked phase is skipped on every
+-- cycle forever. That is the same absorbing state with a different cause. A run
+-- that has already been adopted is debris rather than a resume point: the next
+-- cycle closes it, opens its own, and pays for the phase again. One free ride
+-- per killed cycle, and forward progress guaranteed after it.
+--
+-- It is stamped at the moment of adoption rather than when the adopting cycle
+-- finishes, and by a conditional UPDATE (`WHERE resumed_at IS NULL`) rather than
+-- a read followed by a write. Both halves matter: a cycle killed *during* its
+-- own adoption has still spent the ride, and two workers racing the same open
+-- run cannot both win it.
+--
+-- ---------------------------------------------------------------------------
+-- **Why a column and not an inference.**
+--
+-- The alternatives were tried on paper and each one re-opens something. Bounding
+-- adoption by the run's age turns "was this cycle killed" into "was this cycle
+-- killed recently", which loses the protection whenever the next scheduled cycle
+-- is an hour later — the normal case. Closing the adopted run at adoption time
+-- and re-pointing its checkpoints at the new run just moves the unbounded chain
+-- one row along. Counting adoptions needs state too, and one is the only number
+-- the argument above supports.
+--
+-- Nullable, with no backfill, and that is deliberate: NULL means "never
+-- adopted", so the run this incident left open in production stays adoptable
+-- exactly once. The brain heals itself on its second cycle after this rung —
+-- nobody re-pays for the extraction that is already banked, and no operator
+-- touches a row — and it heals whether or not the provider is still failing,
+-- which is the property the previous fix did not have.
+--
+-- No CHECK pairs it with `started_at`. The two timestamps are written by
+-- different workers from their own clocks, and a constraint that turns clock
+-- skew into a refused cycle would be this rung's own version of the failure it
+-- is here to end.
+-- ===========================================================================
+
+ALTER TABLE consolidation_run ADD COLUMN resumed_at timestamptz;
+
+COMMENT ON COLUMN consolidation_run.resumed_at IS 'operational — when a later cycle adopted this run, or NULL if none ever did. Only a run whose cycle never returned is adoptable, and only once: the stamp is what stops a worker that dies at the same phase every time from skipping a paid phase forever.';
