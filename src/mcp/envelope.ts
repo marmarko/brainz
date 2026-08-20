@@ -577,7 +577,13 @@ const NOTICE_LINES: readonly (readonly [DegradedReason, string])[] = [
   ],
   [
     'embedding_backlog',
-    'Some of what is indexed here is not searchable by meaning yet, so this answer may have missed things — that backlog clears on its own.',
+    // **No "clears on its own".** That is the same promise the behind-line made
+    // and had to lose: this surface reads grant-fenced counts and cannot see
+    // whether an embedder is running, wedged, or refusing every batch — which it
+    // was, for ten hours, while a backlog sat still. Saying what is observably
+    // true costs the reader nothing; promising a recovery this code cannot
+    // verify is how a stalled brain reassures its owner.
+    'Some of what is indexed here is not searchable by meaning yet, so this answer leans on keyword matching and may have missed things.',
   ],
   [
     'query_too_complex',
