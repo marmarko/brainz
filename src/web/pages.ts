@@ -1195,10 +1195,10 @@ function freezeNote(view: CoverageView): string {
   if (!isAlarming(view.cycleFreshness)) return '';
 
   const since =
-    view.lastCompleteCycleAt === null
+    view.lastCompletedAt === null
       ? null
-      : `<time datetime="${escapeHtml(view.lastCompleteCycleAt)}">${escapeHtml(
-          view.lastCompleteCycleAt,
+      : `<time datetime="${escapeHtml(view.lastCompletedAt)}">${escapeHtml(
+          view.lastCompletedAt,
         )}</time>`;
 
   switch (view.cycleFreshness) {
@@ -1217,9 +1217,19 @@ numbers below have not moved since then, however much has arrived.</p>`;
 have sent is stored and searchable; the numbers below are what the cycles that stopped managed to
 produce before they stopped.</p>`;
     case 'unattended':
-      return `\n<p class="problem">Nothing has consolidated this brain since ${
+      // **"No cycle has run at all" is what this said first, and it is exactly
+      // the assertion this page forbids itself.** Two shapes reach `unattended`:
+      // a newest cycle that completed long ago (nothing has run since), and a
+      // newest cycle that banked no reason at all — a cycle in flight, or one
+      // killed before it could write. In the second, `cycleSentence` renders "a
+      // cycle opened X and nothing has been recorded against it" immediately
+      // above this row, so the two sentences contradicted each other on the same
+      // screen. What is true in both is that nothing has *finished*, and that
+      // the newest cycle is not pointing at anything.
+      return `\n<p class="problem">No cycle has finished on this brain since ${
         since ?? 'before its records begin'
-      }. Nothing here is reporting a failure — no cycle has run at all.</p>`;
+      }. The newest one is not reporting a failure, so there is nothing here to point at — which is a
+different shape from a cycle that stops and says why.</p>`;
     default:
       // `isAlarming` is a closed set and the three cases above are it. A reading
       // added there and not here renders nothing rather than a guess.

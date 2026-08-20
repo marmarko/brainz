@@ -125,7 +125,6 @@ const VIEW: CoverageView = {
   documentsThisWeek: 210,
   latestCycle: null,
   lastCompletedAt: null,
-  lastCompleteCycleAt: null,
   cycleFreshness: 'uncycled',
   documentsSinceLastCycle: 4102,
   everDreamt: false,
@@ -555,7 +554,6 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
         finishedAt: null,
       },
       lastCompletedAt: '2026-08-09T00:05:00.000Z',
-      lastCompleteCycleAt: '2026-08-09T00:05:00.000Z',
       cycleFreshness: 'stale',
       documentsSinceLastCycle: 1800,
     };
@@ -567,9 +565,9 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
     // And the sentence that separates a hiccup from a freeze.
     expect(page).toContain('stopping short for longer than');
     expect(page).toContain('2026-08-09T00:05:00.000Z');
-    // Cycles ARE running. Saying nothing has run would send the reader to the
-    // wrong place.
-    expect(page).not.toContain('no cycle has run at all');
+    // Cycles ARE running. Borrowing the vocabulary of a brain nothing has
+    // scheduled would send the reader to the wrong place.
+    expect(page).not.toContain('No cycle has finished on this brain');
   });
 
   test('one stopped cycle over a healthy completion says nothing extra', async () => {
@@ -589,7 +587,6 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
         finishedAt: null,
       },
       lastCompletedAt: '2026-08-15T22:00:00.000Z',
-      lastCompleteCycleAt: '2026-08-15T22:00:00.000Z',
       cycleFreshness: 'slipping',
       documentsSinceLastCycle: 40,
     };
@@ -597,7 +594,7 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
     expect(page).toContain('ran out of the time one attempt is given');
     expect(page).not.toContain('stopping short for longer than');
     expect(page).not.toContain('No cycle has ever run all the way through');
-    expect(page).not.toContain('no cycle has run at all');
+    expect(page).not.toContain('No cycle has finished on this brain');
   });
 
   test('a brain nothing has consolidated is a different sentence from one that keeps stopping', async () => {
@@ -618,13 +615,44 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
         finishedAt: '2026-08-09T02:40:00.000Z',
       },
       lastCompletedAt: '2026-08-09T02:40:00.000Z',
-      lastCompleteCycleAt: '2026-08-09T02:40:00.000Z',
       cycleFreshness: 'unattended',
     };
     const page = await (await app({ view: unattended })(get(COVERAGE, cookie))).text();
-    expect(page).toContain('Nothing has consolidated this brain since');
-    expect(page).toContain('no cycle has run at all');
+    expect(page).toContain('No cycle has finished on this brain since');
+    expect(page).toContain('nothing here to point at');
     expect(page).not.toContain('stopping short for longer than');
+  });
+
+  test('a crash loop that never banks a reason does not contradict itself', async () => {
+    // The shape that caught the first draft of this row. An open run with a NULL
+    // stop reason and an ancient completion reaches `unattended` — and
+    // `cycleSentence` renders "a cycle opened X and nothing has been recorded
+    // against it" directly above. The first copy answered that with "no cycle
+    // has run at all", so the page asserted two opposite things on one screen,
+    // on the surface whose own rule is to state what it observes and never
+    // assert what it cannot verify.
+    const cookie = await signedIn();
+    const crashing: CoverageView = {
+      ...VIEW,
+      latestCycle: {
+        tier: 'paid',
+        dreamt: false,
+        stopReason: null,
+        stoppedPhase: null,
+        stoppedPhaseCode: null,
+        startedAt: '2026-08-16T08:55:00.000Z',
+        finishedAt: null,
+      },
+      lastCompletedAt: '2026-08-07T00:05:00.000Z',
+      cycleFreshness: 'unattended',
+    };
+    const page = await (await app({ view: crashing })(get(COVERAGE, cookie))).text();
+    // Both sentences render, and both are true of this row.
+    expect(page).toContain('nothing has been recorded against it');
+    expect(page).toContain('No cycle has finished on this brain since');
+    expect(page).toContain('2026-08-07T00:05:00.000Z');
+    // The claim that was false here.
+    expect(page).not.toContain('no cycle has run at all');
   });
 
   test('a brain that has never once finished a cycle is told that, not that it stopped', async () => {
@@ -641,7 +669,6 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
         finishedAt: null,
       },
       lastCompletedAt: null,
-      lastCompleteCycleAt: null,
       cycleFreshness: 'never_completed',
     };
     const page = await (await app({ view: never })(get(COVERAGE, cookie))).text();
@@ -664,7 +691,6 @@ describe('a thin brain reads as thin rather than as a small truth', () => {
         startedAt: '2026-08-15T02:00:00.000Z',
         finishedAt: null,
       },
-      lastCompleteCycleAt: '2026-08-09T00:05:00.000Z',
       cycleFreshness: 'stale',
     };
     const page = await (await app({ view: frozen })(get(COVERAGE, cookie))).text();
@@ -981,6 +1007,55 @@ describe('the port that is actually wired', () => {
       // Structurally zero for a brain with no model layer: absent, not zero.
       expect(view.openContradictions).toBeNull();
       expect(view.openReview).toBeNull();
+    },
+    120_000,
+  );
+
+  test(
+    'a cycle that stopped short does not move the backlog anchor, however it was written',
+    async () => {
+      // **The clock that changed meaning underneath this page.** Until rung 23,
+      // a cycle that stopped short left its run open, so `finished_at IS NOT
+      // NULL` and "a cycle completed" were the same question. Rung 23 closes the
+      // run on every exit — a returning cycle has finished its pass whatever
+      // stopped it — and from then on `finished_at` says a cycle came *back*.
+      //
+      // Anchored on it, this page would have told the owner of a permanently
+      // frozen brain that nothing was piling up, every day, because the anchor
+      // moved forward with each failure. That is the `last_cycle_at` mistake one
+      // table over, and this is the case that refuses it.
+      await insertRun({ finishedAt: '2026-08-10T00:05:00.000Z', dreamt: true });
+      await insertPage({ createdAt: '2026-08-11T00:00:00.000Z' });
+      await insertPage({ createdAt: '2026-08-12T00:00:00.000Z' });
+      // The stopped cycle, closed the way rung 23's writer closes it.
+      await insertRun({
+        finishedAt: '2026-08-13T00:05:00.000Z',
+        dreamt: false,
+        stopReason: 'phase_failed',
+      });
+
+      const view = await coveragePort(withTenant).read({ tenantId: TENANT });
+      expect(view.lastCompletedAt).toBe('2026-08-10T00:05:00.000Z');
+      expect(view.documentsSinceLastCycle).toBe(2);
+      // And the reading built on that clock sees the stop for what it is.
+      expect(view.latestCycle?.stopReason).toBe('phase_failed');
+    },
+    120_000,
+  );
+
+  test(
+    'a free-tier cycle is a completion, not a brain that finished nothing',
+    async () => {
+      // `finishRun` closes a `free_tier` run exactly as it closes `complete`:
+      // the cycle did everything the plan asks of it. Excluding it would put
+      // every free brain permanently behind its own backlog and permanently
+      // `stale` on the reading beside it.
+      await insertRun({ finishedAt: '2026-08-10T00:05:00.000Z', stopReason: 'free_tier', tier: 'free' });
+      await insertPage({ createdAt: '2026-08-11T00:00:00.000Z' });
+
+      const view = await coveragePort(withTenant).read({ tenantId: TENANT });
+      expect(view.lastCompletedAt).toBe('2026-08-10T00:05:00.000Z');
+      expect(view.documentsSinceLastCycle).toBe(1);
     },
     120_000,
   );

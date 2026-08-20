@@ -295,15 +295,15 @@ export interface CoverageView {
   readonly documentsThisWeek: number;
   /** The most recent run, finished or not. `null` before the first cycle. */
   readonly latestCycle: CoverageCycle | null;
-  /** When the last **closed** run finished — the backlog's anchor. */
-  readonly lastCompletedAt: string | null;
   /**
-   * When a cycle last actually *completed*: the newest `finished_at` over runs
-   * whose `stop_reason` closed them. Equal to {@link lastCompletedAt} today and
-   * predicated differently on purpose — see `readCoverage`, and
-   * `src/control/cycle-staleness.ts` for why the distinction is the whole rule.
+   * When a cycle last **completed** — the backlog's anchor, and the clock the
+   * staleness reading is judged against.
+   *
+   * Decided by the run's own `stop_reason`, never by `finished_at` alone: from
+   * rung 23 every returning cycle closes its run, so `finished_at` says a cycle
+   * came back rather than that it finished. `readCoverage` carries the argument.
    */
-  readonly lastCompleteCycleAt: string | null;
+  readonly lastCompletedAt: string | null;
   /**
    * Whether this brain is *finishing* its cycles.
    *
@@ -432,15 +432,20 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
   // about nobody, which is the inference `briefing/assemble.ts` refuses for the
   // same reason.
   //
-  // **`last_complete_cycle_at` is a second clock beside `last_completed_at`, and
-  // the duplication is deliberate.** They are equal today, because `finishRun`
-  // is the only writer of `finished_at`. They stop being equal the day somebody
-  // closes the run on every exit — which has been tried once and reverted — and
-  // on that day a reading anchored on `finished_at` starts calling a brain that
-  // has finished nothing "freshly consolidated". The display anchor may take
-  // that risk; the one the staleness rule is judged on may not, so it is
-  // predicated on the two stop reasons that actually close a run
-  // (`src/control/cycle-staleness.ts` states the argument in full).
+  // **`finished_at IS NOT NULL` is NOT the completion test, and rung 23 is why.**
+  // It used to be equivalent: only `finishRun` wrote that column, and only two of
+  // the six stop reasons reached it. Rung 23 closes the run on **every** exit —
+  // a cycle that returns has finished its pass whatever stopped it, and leaving
+  // the run open was what let one page's provider 500 skip extraction forever.
+  // The consequence here is exact: from that rung on, `finished_at` is a RETURN
+  // clock. Anchoring the backlog on it would reset "how much has piled up" to
+  // roughly zero on every cycle of a permanently frozen brain — the same class of
+  // mistake as reading `control.tenant.last_cycle_at`, one table over.
+  //
+  // So the predicate is the reason. `dreamt` is ORed in for the legacy rows the
+  // schema still permits: a completed run written before `stop_reason` was always
+  // set carries NULL there, and the `dreamt_runs_completed` CHECK guarantees
+  // `dreamt` implies `complete`. No stopped cycle satisfies either arm.
   //
   // `cycling_since` is the first run's start: how long this brain has been
   // consolidating without ever finishing, which is the only clock that separates
@@ -449,9 +454,8 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
     `SELECT
        (SELECT finished_at FROM consolidation_run
          WHERE finished_at IS NOT NULL
+           AND (stop_reason IN ('complete', 'free_tier') OR dreamt)
          ORDER BY finished_at DESC, run_id DESC LIMIT 1) AS last_completed_at,
-       (SELECT max(finished_at) FROM consolidation_run
-         WHERE stop_reason IN ('complete', 'free_tier')) AS last_complete_cycle_at,
        (SELECT min(started_at) FROM consolidation_run) AS cycling_since,
        EXISTS (SELECT 1 FROM consolidation_run WHERE finished_at IS NOT NULL AND dreamt) AS ever_dreamt,
        (SELECT count(*) FROM fact
@@ -460,7 +464,6 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
     [],
   )) as Array<{
     last_completed_at: Date | string | null;
-    last_complete_cycle_at: Date | string | null;
     cycling_since: Date | string | null;
     ever_dreamt: boolean;
     facts: number;
@@ -468,14 +471,12 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
   }>;
   const scalars = scalarRows[0] ?? {
     last_completed_at: null,
-    last_complete_cycle_at: null,
     cycling_since: null,
     ever_dreamt: false,
     facts: 0,
     edges: 0,
   };
   const lastCompletedAt = isoOf(scalars.last_completed_at);
-  const lastCompleteCycleAt = isoOf(scalars.last_complete_cycle_at);
 
   // The staleness reading, from the completion clock and the newest run's own
   // claim. This page is the only surface in the system that can compute it: the
@@ -486,8 +487,7 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
       latestCycle === null
         ? undefined
         : {
-            lastCompleteCycleAt:
-              lastCompleteCycleAt === null ? null : new Date(lastCompleteCycleAt),
+            lastCompleteCycleAt: lastCompletedAt === null ? null : new Date(lastCompletedAt),
             latestStopReason: latestCycle.stopReason,
           },
     cyclingSince: scalars.cycling_since === null ? null : new Date(isoOf(scalars.cycling_since) ?? 0),
@@ -539,7 +539,6 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
     documentsThisWeek: sources.reduce((total, source) => total + source.thisWeek, 0),
     latestCycle,
     lastCompletedAt,
-    lastCompleteCycleAt,
     cycleFreshness,
     documentsSinceLastCycle: behindRows[0]?.behind ?? 0,
     everDreamt: scalars.ever_dreamt,
