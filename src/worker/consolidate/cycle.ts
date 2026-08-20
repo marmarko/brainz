@@ -392,6 +392,13 @@ export async function runConsolidationCycle(
    * phase — and a scan of the records after the loop would happily name it.
    */
   let stoppedPhase: PhaseAttribution | null = null;
+  /**
+   * The first model phase to fail for a reason that is its own seat's rather
+   * than the cycle's. Kept apart from `stop` so the loop can carry on: it
+   * becomes the run's reason at the end if nothing worse stopped the cycle
+   * outright. See the model-phase branch below.
+   */
+  let failure: PhaseAttribution | null = null;
 
   for (const phase of CYCLE_PHASES) {
     if (stop !== 'complete') {
@@ -591,14 +598,34 @@ export async function runConsolidationCycle(
       // attempt starts where this one stopped without a row to say so.
       stop = attempt.stop() ?? 'out_of_time';
       if (stop === 'out_of_time') stoppedPhase = { phase, code: 'out_of_time' };
-    } else {
-      stop = outcome.stopped === 'budget_exhausted' ? 'budget_exhausted' : 'phase_failed';
-      // **The line the whole rung is for.** `phase_failed` covers three codes
-      // that want three different responses — a provider that went away, a
-      // provider that answered with something this code cannot read, and a
-      // stored payload that was not there — and until this was written down they
-      // were one word on the run record.
+    } else if (outcome.stopped === 'budget_exhausted') {
+      // The cap is the CYCLE's, shared by every phase, so the first phase to
+      // meet it has met it for all of them.
+      stop = 'budget_exhausted';
       stoppedPhase = { phase, code: outcome.stopped };
+    } else {
+      // **A seat's failure is not the cycle's, and the six phases do not share a
+      // seat.** `phase_failed` covers three codes that want three different
+      // responses — a provider that went away, a provider that answered with
+      // something this code cannot read, and a stored payload that was not
+      // there — and until rung 20 they were one word on the run record.
+      //
+      // What was still true after that rung is that any of them ended the CYCLE.
+      // On the hosted profile these six phases route to four different models
+      // across two providers, so `extract`'s seat being unreachable said nothing
+      // whatever about `synopsis`'s — and yet one transient blip on the
+      // extraction seat forfeited every summary, card, conflict and score the
+      // cycle had left to produce. Measured: a cycle died 4.7 minutes in at
+      // `extract / model_unavailable` with 2,824 pages waiting for a phase whose
+      // model was answering normally the whole time.
+      //
+      // So the failure is recorded and the loop goes on. The run still reports
+      // `phase_failed` and still names the FIRST phase to fail, which is the
+      // diagnosis; what changes is that the phases behind it get their own
+      // chance to succeed or to fail for their own reasons. The bound on what
+      // that can waste is one refused call per remaining phase, which a dead
+      // provider answers immediately and does not bill for.
+      failure ??= { phase, code: outcome.stopped };
     }
 
     phases.push({
@@ -610,6 +637,16 @@ export async function runConsolidationCycle(
       spentMicroUsd: outcome.spentMicroUsd,
       stopped: outcome.stopped,
     });
+  }
+
+  // A cycle that reached the end of the pipeline with a phase failure behind it
+  // reports the failure, not `complete`: something the owner is paying for did
+  // not happen, and `dreamt` must stay false so no completion clock advances on
+  // it. The attribution is the FIRST failure, because that is the one nothing
+  // else explains.
+  if (stop === 'complete' && failure !== null) {
+    stop = 'phase_failed';
+    stoppedPhase = failure;
   }
 
   const stopReason: StopReason =

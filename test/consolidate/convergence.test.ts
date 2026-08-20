@@ -720,6 +720,61 @@ describe('a page the model cannot summarise does not stop the cycle', () => {
   );
 
   test(
+    'one seat being unreachable does not forfeit the phases that use another',
+    async () => {
+      // **Six model phases, four models, two providers — and until this, any one
+      // of them failing ended the cycle.** `extract` routes to a Gemini seat and
+      // `synopsis` to a Nemotron one, so the extraction seat being unreachable
+      // said nothing whatever about the summariser's. Measured on the live
+      // brain: a cycle died 4.7 minutes in at `extract / model_unavailable` with
+      // 2,824 pages waiting for a phase whose model was answering normally
+      // throughout, and the whole cycle's summaries were forfeited to a blip on
+      // a model they never call.
+      const PAGES = 3;
+      await seedBrain(PAGES);
+
+      const { gateway } = createGateway({
+        chat: SCRIPT,
+        // Only the extraction seat is down. Everything else answers.
+        failOn: 'extract',
+        failWith: new TransportError('service unavailable', 503),
+      });
+
+      const result = await runConsolidationCycle(
+        { sql: tenant.sql, gateway, tenantId: TENANT, caller: CALLER },
+        {
+          trigger: 'time_ceiling',
+          tier: 'paid',
+          capMicroUsd: null,
+          now: new Date('2026-03-01T00:00:00Z'),
+        },
+      );
+
+      const model = (name: string) => result.phases.find((phase) => phase.phase === name);
+
+      // Extraction failed, and the run says so — naming the phase whose seat it
+      // was, which is the diagnosis.
+      expect(model('extract')?.stopped).toBe('model_unavailable');
+      expect(result.stopReason).toBe('phase_failed');
+      expect(result.stoppedPhase).toEqual({ phase: 'extract', code: 'model_unavailable' });
+
+      // **And the phases behind it ran anyway.** This is the assertion the file
+      // exists for: before it, every one of these read `not_reached`.
+      expect(model('synopsis')?.ran).toBe(true);
+      expect(model('synopsis')?.stopped).toBeNull();
+      expect(model('contradiction')?.ran).toBe(true);
+      expect(model('salience_refine')?.ran).toBe(true);
+      // The summaries the old behaviour threw away.
+      expect(await summaryPages()).toBe(PAGES);
+
+      // Nothing claims the cycle went well: a failed phase means the model tier
+      // did not do everything it was paid to, so no completion clock may move.
+      expect(result.dreamt).toBe(false);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
     'a reasoning model that thinks and never answers costs one page, not the pass',
     async () => {
       // **Measured on the live synopsis seat, which is a reasoning model.** Its
