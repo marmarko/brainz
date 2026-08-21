@@ -645,11 +645,40 @@ export async function runEnrichPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome
     for (const row of rows_) evidenceByEntity.set(row.entity_id, row.evidence);
   }
 
-  const entities = candidates.map((entity) => ({
-    ...entity,
-    evidence: evidenceByEntity.get(entity.entity_id) ?? [],
-  }));
+  // **An entity the corpus says nothing about is not sent to the model.**
+  //
+  // Without this the phase asked for a summary of an entity whose evidence
+  // array was empty, and the model answered the only way it honestly could:
+  // *"Entity listed without additional context in the evidence."* Three such
+  // cards existed on the founder's brain, two of them approved through the
+  // review queue, all of them written from nothing at the paid tier.
+  //
+  // The batch is bounded by {@link DEFAULT_LIMIT} rather than by how much the
+  // brain actually knows, so this is not a rounding error: every unevidenced
+  // row took a slot in the prompt away from one that had something to say. It
+  // became sharper the day the evidence join was word-bounded — a name below
+  // {@link ENRICH_NAME_FLOOR}, and any name the corpus states only inside
+  // longer words, now returns an honestly empty array where the wildcard used
+  // to return spurious matches and hide the problem.
+  //
+  // They are still **marked considered**, on the same argument the whole-batch
+  // marker below is written on: the phase has decided about them at this
+  // version, and a marker that only followed a model call would offer the same
+  // silent entities again every cycle while the ones behind them waited.
+  const withEvidence: Array<(typeof candidates)[number] & { evidence: string[] }> = [];
+  const unevidenced: string[] = [];
+  for (const candidate of candidates) {
+    const evidence = evidenceByEntity.get(candidate.entity_id) ?? [];
+    if (evidence.length === 0) {
+      unevidenced.push(candidate.entity_id);
+      continue;
+    }
+    withEvidence.push({ ...candidate, evidence });
+  }
+  if (unevidenced.length > 0) await markConsidered(deps.sql, phase, unevidenced, version);
+  if (withEvidence.length === 0) return { ...empty(phase), items: unevidenced.length };
 
+  const entities = withEvidence;
   const byName = new Map(entities.map((entity) => [entity.canonical_name, entity]));
   const prompt = buildEnrichPrompt({
     entities: entities.map((entity) => ({
@@ -719,7 +748,7 @@ export async function runEnrichPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome
 
   return {
     phase,
-    items: entities.length,
+    items: entities.length + unevidenced.length,
     applied,
     queued,
     logged,

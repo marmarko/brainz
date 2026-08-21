@@ -300,14 +300,79 @@ describe('3 — the confidence gate', () => {
   );
 
   test(
+    'an entity the corpus says nothing about is never sent to the model',
+    async () => {
+      const { sql } = tenant;
+      // The shape that produced three cards reading "Entity listed without
+      // additional context in the evidence." on the founder's brain, two of
+      // them approved through the review queue. The model answered honestly;
+      // it should not have been asked.
+      await sql`
+        INSERT INTO entity (canonical_name, entity_type, origin_contexts)
+        VALUES ('Nobody Mentions This', 'organization', ARRAY['personal:mail'])`;
+
+      let called = 0;
+      const { gateway } = createGateway({
+        chat: {
+          enrich: () => {
+            called += 1;
+            return JSON.stringify({
+              cards: [
+                { entity: 'Nobody Mentions This', summary: 'Nothing is known.', confidence: 0.9 },
+              ],
+            });
+          },
+        },
+      });
+      const run = await openRun(sql, {
+        trigger: 'time_ceiling',
+        tier: 'paid',
+        now: new Date(),
+        estimateMicroUsd: 0,
+      });
+
+      const outcome = await runEnrichPhase({
+        sql, gateway, tenantId: TENANT, caller: CALLER,
+        runId: run.run.runId, now: new Date(), budget: uncappedBudget('enrich'),
+      });
+
+      expect(called).toBe(0);
+      expect(outcome.modelCalls).toBe(0);
+      expect(outcome.spentMicroUsd).toBe(0);
+      expect(await countRows(sql, 'entity_card')).toBe(0);
+      // Counted as looked at, so an operator reading `items` is not told the
+      // phase idled...
+      expect(outcome.items).toBe(1);
+      // ...and marked considered, so it does not come back next cycle and take
+      // the slot again from an entity that has something to say.
+      const considered = (await sql`
+        SELECT enrich_considered_version AS v FROM entity
+         WHERE canonical_name = ${'Nobody Mentions This'}`) as Array<{ v: number | null }>;
+      expect(considered[0]?.v).not.toBeNull();
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
     'a 0.9-confidence card is applied, so the queue branch is not the only one that works',
     async () => {
       const { sql } = tenant;
-      await seedPage(sql, {
+      const page = await seedPage(sql, {
         origin: 'personal:mail',
         sourceType: 'email',
         title: 'intro',
         body: 'Ronan Whitfield joined Verdant Systems.',
+      });
+      // The evidence the phase gathers comes from `fact`, not from page bodies,
+      // and an entity the corpus states nothing about is no longer sent to the
+      // model at all. This test is about the *confidence gate*, so it seeds the
+      // sentence that makes the entity worth asking about.
+      await seedFact(sql, {
+        statement: 'Ronan Whitfield joined Verdant Systems.',
+        origins: ['personal:mail'],
+        pageId: page.pageId,
+        chunkIds: page.chunkIds,
+        confidence: 0.8,
       });
       await sql`
         INSERT INTO entity (canonical_name, entity_type, origin_contexts)
