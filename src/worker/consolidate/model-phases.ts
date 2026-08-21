@@ -316,6 +316,49 @@ function text(row: Record<string, unknown>, key: string): string | null {
 }
 
 /**
+ * A row id the model echoed back, as the string the caller keyed its map with.
+ *
+ * **This exists because {@link text} was doing the job and could not.** Every
+ * phase that asks the model about many rows at once hands out ids and matches
+ * the answers back by them, and the id is a `bigint` rendered into the prompt as
+ * a string. What comes back is JSON, and **whether an id returns as `"1344"` or
+ * as `1344` is the seat's choice, not ours** — the same prompt gets both from
+ * different models, and neither is wrong.
+ *
+ * `text` refuses a number, correctly: for `statement`, `summary` or `topic` a
+ * number means the model did not answer the question. Applied to an id it meant
+ * something else, and the two failures it produced were not the same shape:
+ *
+ *   * `salience_refine` compares the id against a `known` set and counts a miss
+ *     as `logged`, so **every score was silently discarded** while the phase
+ *     reported success and `markConsidered` retired the whole batch. Measured on
+ *     the live seat, which returns `{"page_id":1344,"salience":0.6}`: 186 pages
+ *     marked considered, 25 ever scored. A brain could run this phase for its
+ *     whole life and never receive a single model score.
+ *   * `extract` and `contradiction` fall back rather than drop — extract to
+ *     `candidates[0]`, so a numeric id would attribute every fact in the batch
+ *     to the batch's first chunk. Worse than dropping, and invisible.
+ *
+ * Both are the same defect, and it bit only where it bit because the seats
+ * differ: the reasoning seat behind `salience` emits numeric ids, the Gemini
+ * seat behind `extract` and `contradiction` quotes them. That is a fact about
+ * this quarter's routing table and not a property anything guarantees, which is
+ * why the fix is here rather than in a prompt.
+ *
+ * **Only a safe, non-negative integer is admitted.** A `bigint` past 2^53 has
+ * already lost precision by the time `JSON.parse` hands it over, so accepting it
+ * would key the lookup with a *different* id — and a float or a negative is not
+ * an id at all. A refusal here is still a miss the caller counts; nothing is
+ * applied on a guess.
+ */
+function identifier(row: Record<string, unknown>, key: string): string | null {
+  const value = row[key];
+  if (typeof value === 'string') return value.trim().length > 0 ? value.trim() : null;
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return String(value);
+  return null;
+}
+
+/**
  * A confidence the model reported, or `null`.
  *
  * `null` rather than a default, and the default it is refusing is the dangerous
@@ -369,7 +412,7 @@ export async function runExtractPhase(deps: ModelPhaseDeps): Promise<PhaseOutcom
 
   for (const row of facts) {
     const statement = text(row, 'statement');
-    const chunkId = text(row, 'chunk_id');
+    const chunkId = identifier(row, 'chunk_id');
     const score = confidence(row);
     if (statement === null || score === null) {
       logged += 1;
@@ -928,8 +971,8 @@ export async function runContradictionPhase(deps: ModelPhaseDeps): Promise<Phase
   let logged = 0;
 
   for (const row of conflicts) {
-    const leftId = text(row, 'left');
-    const rightId = text(row, 'right');
+    const leftId = identifier(row, 'left');
+    const rightId = identifier(row, 'right');
     const kind = text(row, 'kind') ?? 'value_conflict';
     const score = confidence(row);
     const left = leftId === null ? undefined : byId.get(leftId);
@@ -1047,7 +1090,7 @@ export async function runSalienceRefinePhase(deps: ModelPhaseDeps): Promise<Phas
   let logged = 0;
 
   for (const row of scores) {
-    const pageId = text(row, 'page_id');
+    const pageId = identifier(row, 'page_id');
     const value = row['salience'];
     if (pageId === null || !known.has(pageId) || typeof value !== 'number' || !Number.isFinite(value)) {
       logged += 1;

@@ -107,7 +107,24 @@ export const CONSIDERATION_VERSION: ConsiderationVersions = Object.freeze({
   extract: 1,
   enrich: 1,
   contradiction: 1,
-  salience_refine: 1,
+  /**
+   * **2 because version 1's answers were never applied.**
+   *
+   * This phase reads the model's scores back by page id, and until the commit
+   * that carries this bump it read them with a helper that refused a JSON
+   * number. The seat behind `salience` returns `{"page_id":1344,...}` — a
+   * number — so every score was counted as unusable and discarded, while the
+   * phase reported success and stamped its whole batch considered. On the brain
+   * this was found on: 186 pages marked, 25 ever scored.
+   *
+   * So this is the case the door was built for, and it is the cleanest form of
+   * it: the previous answers are not merely stale, they were never written. A
+   * page stamped at 1 carries a deterministic score and a marker saying it has
+   * had its turn, and without this bump it would keep both for the life of the
+   * brain. Only this phase moves — `extract` and `contradiction` route to a seat
+   * that quotes its ids, so their version-1 answers are real and are kept.
+   */
+  salience_refine: 2,
 });
 
 /**
