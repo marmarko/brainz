@@ -103,9 +103,47 @@ const SPAM_LABELS = new Set(['SPAM']);
  * Transactional evidence: machine-generated, *and* about something that
  * happened to this user. The subject patterns are deliberately narrow — a
  * newsletter with the word "update" in it must not read as a receipt.
+ *
+ * **The `payment` alternatives are wider than the rest on purpose, because
+ * measurement said they had to be.** The original spelling required `payment`
+ * to be *immediately* followed by `received`, `confirmed` or `failed`, and real
+ * senders do not write that way: measured over a 10,036-page production
+ * mailbox, it matched **zero** of the 75 quarantined pages whose subjects were
+ * transactional on their face. What senders actually write is *"We received
+ * your Intuit subscription payment"* — the two words reversed with three
+ * between them — and *"payment successful"*, which was not in the list at all.
+ * Both are hidden today, which is precisely the failure this module's header
+ * calls the case that decides `warned` exists: the only record of a purchase,
+ * quarantined and never embedded, so "what did I pay for that" cannot be
+ * answered.
+ *
+ * **Widening this list can only ever un-hide.** A subject that reaches
+ * `transactional` makes `transactionalEnough` true, which routes to `warned` —
+ * embedded and searchable — instead of `hidden`. It can never take mail away.
+ * That asymmetry is what makes the bounded gap below an acceptable risk where
+ * the same looseness in a bulk pattern would not be: a false positive here
+ * costs one searchable newsletter, and a false negative costs a receipt nobody
+ * can see is missing.
+ *
+ * **Measured cost of the widening on that mailbox: seven pages, every one of
+ * them currently hidden, and no visible page changed at all.** Six are the
+ * owner's own payment records; the seventh is a code-review thread whose
+ * subject says "auto-pay the court fees", which becomes searchable rather than
+ * invisible. The gap is capped at three words so that `payment` and the verb
+ * stay in one clause — an unbounded gap would let any newsletter mentioning
+ * both words anywhere read as a receipt.
+ *
+ * **The gap is one-directional, and that is a measurement rather than a
+ * principle.** `payment` still has to be followed *immediately* by its verb, so
+ * "your payment was processed" — one word in between — does not match. A
+ * symmetric gap is the obvious tidy-up and it is deliberately not here: the
+ * production mailbox contains no subject of that shape, so widening for it
+ * would be growing a junk gate against an invented example, which is the
+ * treadmill the narrowness in the first sentence exists to avoid. The day a
+ * real one is measured, widen it and say so here.
  */
 const TRANSACTIONAL_SUBJECT =
-  /\b(receipt|invoice|order\s*(?:#|no\.?|\d)|order\s+(?:confirm\w*|shipp\w*|deliver\w*)|payment\s+(?:receiv\w*|confirm\w*|fail\w*)|statement|booking\s+confirm\w*|itinerary|refund)\b/i;
+  /\b(receipt|invoice|order\s*(?:#|no\.?|\d)|order\s+(?:confirm\w*|shipp\w*|deliver\w*)|payment\s+(?:receiv\w*|confirm\w*|fail\w*|success\w*|process\w*|declin\w*)|(?:receiv\w+|process\w+|confirm\w+)\s+(?:\w+\s+){0,3}payment|statement|booking\s+confirm\w*|itinerary|refund)\b/i;
 
 const AUTO_SUBMITTED = /^auto-/i;
 

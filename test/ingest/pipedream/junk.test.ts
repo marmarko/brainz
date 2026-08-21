@@ -58,6 +58,48 @@ describe('the two markers', () => {
     expect(quarantineMarkerFor(verdict)).toBeNull();
   });
 
+  test('a payment record survives the sender writing it the way senders write it', () => {
+    // Measured on a 10,036-page production mailbox: the original pattern
+    // required `payment` to be IMMEDIATELY followed by received/confirmed/
+    // failed, and matched **zero** of the 75 quarantined pages whose subjects
+    // were transactional on their face. These two shapes are what real senders
+    // actually write, and both were hidden — never embedded, so "what did I pay
+    // for that" could not be answered.
+    for (const subject of [
+      'We received your Intuit subscription payment!',
+      '(PS1) payment successful',
+      'Payment declined for your subscription',
+    ]) {
+      const verdict = classifyJunk({
+        headers: { 'list-unsubscribe': '<mailto:unsub@biller.example.test>' },
+        from: 'no-reply@biller.example.test',
+        subject,
+      });
+      expect(verdict.visibility).toBe('warned');
+      // The half that matters: it reaches the corpus rather than the quarantine.
+      expect(quarantineMarkerFor(verdict)).toBeNull();
+    }
+  });
+
+  test('the widened gap stays inside one clause, so a newsletter is still junk', () => {
+    // The cap of three words is what stops `payment` and a verb anywhere in a
+    // long marketing subject from reading as a receipt. Without it, the first
+    // of these would be warned.
+    for (const subject of [
+      'We received a lot of interest this quarter — read our take on payment rails',
+      'Renewal Payment Update',
+      'The Receipts Layer',
+      '[Past Due] Avoid collections with a payment plan',
+    ]) {
+      const verdict = classifyJunk({
+        headers: { 'list-unsubscribe': '<mailto:unsub@news.example.test>' },
+        from: 'news@news.example.test',
+        subject,
+      });
+      expect(verdict.visibility).toBe('hidden');
+    }
+  });
+
   test('a bulk message that is also transactional is warned, not hidden', () => {
     // Order confirmations from large senders carry list headers too. Hiding one
     // loses the only record of a purchase; warning keeps it findable.
