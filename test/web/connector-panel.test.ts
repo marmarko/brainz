@@ -71,13 +71,16 @@ function panel(
   return statusFor(source, hist, link, record, NOW);
 }
 
-/** The page a browser gets for one source, rendered from its status. */
+/**
+ * The page a browser gets for one source, rendered from its status.
+ *
+ * `kind: 'connectors'` rather than `'dashboard'`: the panel moved to its own
+ * page. Nothing else in these assertions changed, which is the point — the
+ * render moved, the policy did not.
+ */
 function dashboard(status: ConnectorStatus): string {
   return renderPage({
-    kind: 'dashboard',
-    tier: 'internal',
-    status: 'ready',
-    tenantId: 'alice',
+    kind: 'connectors',
     connectorsAvailable: true,
     connectors: [status],
   });

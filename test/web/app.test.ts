@@ -517,8 +517,11 @@ describe('a deployment with no connector vendor', () => {
   test('the dashboard does not offer a button whose route answers 501', async () => {
     await reset();
     const cookie = await signedIn('paid');
-    const page = await (await app({ connectors: false })(get('/dashboard', { cookie }))).text();
-    const offered = await (await app()(get('/dashboard', { cookie }))).text();
+    // The panel lives on its own page now; the assertion is unchanged.
+    const page = await (
+      await app({ connectors: false })(get('/dashboard?view=connectors', { cookie }))
+    ).text();
+    const offered = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     // Whatever the page says about connectors, the two renders must differ:
     // a paid tenant on a vendor-less deployment is not a tenant with connectors.
     expect(page).not.toBe(offered);
@@ -1736,7 +1739,7 @@ describe('the dashboard offers a control per connector, not a list of words', ()
   test('every source has a form whose action is the route that connects it', async () => {
     await reset();
     const cookie = await signedIn('paid');
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
 
     const connectors = formsOn(page).filter((f) => f.action === '/api/connectors');
     // One per source, and each names its own source in a field rather than
@@ -1974,7 +1977,7 @@ describe('the tier gate stays, and it is the control that is absent', () => {
   test('a free account is offered no connector control at all', async () => {
     await reset();
     const cookie = await signedIn('free');
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
 
     // Not "different copy" — no control. A button that 402s is the dead
     // affordance this whole change exists to remove.
@@ -2011,7 +2014,7 @@ describe('the status beside each source says only what this brain can know', () 
   test('with nothing connected it says so', async () => {
     await reset();
     const cookie = await signedIn('paid');
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).toContain('Not connected');
   });
 
@@ -2026,7 +2029,7 @@ describe('the status beside each source says only what this brain can know', () 
     await reset();
     const cookie = await signedIn('paid');
     await attachSource('gmail');
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).toContain('The first check has not run yet');
     expect([...page.matchAll(/Not connected/g)].length).toBe(2);
   });
@@ -2053,7 +2056,7 @@ describe('the status beside each source says only what this brain can know', () 
   test('the panel does not tell the user that coming back here is pointless', async () => {
     await reset();
     const cookie = await signedIn('paid');
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).not.toContain('nothing tells this page about it');
     expect(page).toContain('You do not have to come back here after authorizing');
   });
@@ -2062,7 +2065,7 @@ describe('the status beside each source says only what this brain can know', () 
     await reset();
     const cookie = await signedIn('paid');
     await markConnectPending(controlSql, { tenantId: TENANT, source: 'gmail', now: new Date() });
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).toContain('You started connecting this');
   });
 
@@ -2073,7 +2076,7 @@ describe('the status beside each source says only what this brain can know', () 
     await controlSql`
       INSERT INTO control.job (job_id, tenant_id, kind, target, state, trigger_reason, run_at, created_at, updated_at)
       VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'gmail', 'due', 'connector_cadence', ${AT}, ${AT}, ${AT})`;
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).toContain('A check is queued or running now');
   });
 
@@ -2103,7 +2106,7 @@ describe('the status beside each source says only what this brain can know', () 
                                run_at, created_at, updated_at, finished_at, dead_lettered_at, failure_code)
       VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'drive', 'dead', 'connector_cadence',
               ${AT}, ${AT}, ${AT}, ${AT}, ${AT}, 'handler_error')`;
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).toContain('no longer being polled');
     expect(page).not.toContain('handler_error');
     expect(page).toContain('Nothing recorded why');
@@ -2126,7 +2129,7 @@ describe('the status beside each source says only what this brain can know', () 
       VALUES (${TENANT}, 'drive'::control.connector_health_source, ${AT},
               'failed'::control.connector_run_outcome,
               'auth_expired'::control.connector_ingest_failure)`;
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).toContain('The provider stopped accepting our access');
     expect(page).toContain('Disconnecting and connecting again is the fix');
     expect(page).not.toContain('handler_error');
@@ -2147,7 +2150,7 @@ describe('the status beside each source says only what this brain can know', () 
                                run_at, created_at, updated_at, finished_at, dead_lettered_at, failure_code)
       VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'drive', 'dead', 'connector_cadence',
               ${AT}, ${AT}, ${AT}, ${AT}, ${AT}, 'handler_error')`;
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).not.toContain('handler_error');
     expect([...page.matchAll(/Not connected/g)].length).toBe(3);
   });
@@ -2172,7 +2175,7 @@ describe('the status beside each source says only what this brain can know', () 
                                run_at, created_at, updated_at, finished_at)
       VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'drive', 'done', 'connector_cadence',
               ${AT}, ${AT}, ${AT}, ${new Date(AT.getTime() + 60_000)})`;
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).not.toContain('handler_error');
     expect(page).toContain('Last checked');
   });
@@ -2222,7 +2225,7 @@ describe('the status beside each source says only what this brain can know', () 
     await attachSource('drive');
     await deadLane('drive', { attempts: 12, maxAttempts: 12 });
 
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).toContain('no longer being polled');
     expect(page).toContain('value="retry"');
     // The control writes, so it cannot be reachable by anything that follows an
@@ -2239,7 +2242,7 @@ describe('the status beside each source says only what this brain can know', () 
     // the user's rather than a button's.
     await deadLane('drive', { attempts: 1, maxAttempts: 12 });
 
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).toContain('we can no longer read it');
     expect(page).not.toContain('value="retry"');
   });
@@ -2289,7 +2292,7 @@ describe('the status beside each source says only what this brain can know', () 
                                run_at, created_at, updated_at, finished_at)
       VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'calendar', 'discarded', 'connector_cadence',
               ${AT}, ${AT}, ${AT}, ${AT})`;
-    const page = await (await app()(get('/dashboard', { cookie }))).text();
+    const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     // Three sources, and calendar is back to the state it was in before it was
     // ever connected.
     expect([...page.matchAll(/Not connected/g)].length).toBe(3);

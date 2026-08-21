@@ -34,6 +34,7 @@ import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../src/schema/vector-index.ts';
 import { MENTION_NAME_FLOOR, OUTBOUND_EDGE_CEILING, lookupEntity } from '../../src/web/entity.ts';
 import { ENTITY_PATH, renderPage } from '../../src/web/pages.ts';
+import { ENTITY_HEADERS } from '../../src/web/app.ts';
 import {
   connect as connectTenant,
   dropFixtureDatabase,
@@ -83,6 +84,22 @@ describe('the steady state is a form and a refusal', () => {
     const page = renderPage({ kind: 'entity', available: false, lookup: null });
     expect(page).toContain('cannot read your brain');
     expect(page).toContain('which is a different');
+  });
+
+  test('the lookup page sends no referrer-policy, because it would null the Origin', () => {
+    // **A production bug, pinned.** Under `Referrer-Policy: no-referrer` a
+    // browser sets the `Origin` header of a NON-GET request to the literal
+    // `null` — Fetch's "append a request Origin header" step switches on the
+    // referrer policy and `no-referrer` is the arm that nulls it. This page's
+    // whole interaction is a same-origin form POST, and `sameOriginRefusal`
+    // compares that header against this origin, so the stricter header refused
+    // every lookup with "this request came from another origin".
+    //
+    // Asserted on the handler's header set rather than the markup, because that
+    // is where the mistake was and where it would come back: somebody adding
+    // "the stricter statement for the one page that renders a third party" is a
+    // very reasonable-looking change.
+    expect(ENTITY_HEADERS).toEqual({ 'cache-control': 'no-store' });
   });
 
   test('the path is idle by construction — it names no subject', () => {

@@ -633,7 +633,7 @@ describe('an authorization the user never came back from becomes a connection', 
       // The user finishes at Google. This side is told nothing.
       attachedAccounts = [`${tenant}-gmail`];
 
-      const dashboard = await fetch(`${sealed.url}/dashboard`, { headers: { cookie } });
+      const dashboard = await fetch(`${sealed.url}/dashboard?view=connectors`, { headers: { cookie } });
       const page = await dashboard.text();
 
       // The process asked the vendor, on the render, under this tenant's own
@@ -669,8 +669,8 @@ describe('an authorization the user never came back from becomes a connection', 
       await connectOn(cookie);
       attachedAccounts = [`${tenant}-gmail`];
 
-      await fetch(`${sealed.url}/dashboard`, { headers: { cookie } });
-      await fetch(`${sealed.url}/dashboard`, { headers: { cookie } });
+      await fetch(`${sealed.url}/dashboard?view=connectors`, { headers: { cookie } });
+      await fetch(`${sealed.url}/dashboard?view=connectors`, { headers: { cookie } });
 
       // Once. After adoption the link is no longer pending, so an ordinary
       // dashboard render costs one control-plane query and no vendor traffic —
@@ -686,7 +686,7 @@ describe('an authorization the user never came back from becomes a connection', 
       const cookie = await signUpOn('quiet@example.com');
       await grantOn(await tenantId());
 
-      await fetch(`${sealed.url}/dashboard`, { headers: { cookie } });
+      await fetch(`${sealed.url}/dashboard?view=connectors`, { headers: { cookie } });
 
       expect(vendor.calls.filter((call) => call.path.endsWith('/accounts'))).toEqual([]);
     },
@@ -710,7 +710,7 @@ describe('an authorization the user never came back from becomes a connection', 
         body: JSON.stringify({ source: 'gmail' }),
       });
 
-      const page = await (await fetch(`${sealed.url}/dashboard`, { headers: { cookie } })).text();
+      const page = await (await fetch(`${sealed.url}/dashboard?view=connectors`, { headers: { cookie } })).text();
 
       expect(await linkRow(tenant)).toEqual({ state: null, pending: false });
       expect(page).toContain('Not connected');

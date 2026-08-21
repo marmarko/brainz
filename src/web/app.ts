@@ -646,6 +646,15 @@ export const FTS_LANGUAGE_CHOICES: readonly { readonly value: string; readonly l
  * request forged through one takes; there is no way to tell them apart, and the
  * safe reading of "I cannot tell" is no.
  */
+/**
+ * The response headers the lookup page carries.
+ *
+ * Exported so `test/web/entity-route.test.ts` can pin the ABSENCE of a
+ * `referrer-policy` — see the note at `renderEntityLookup` for the production
+ * bug that absence fixes.
+ */
+export const ENTITY_HEADERS: Readonly<Record<string, string>> = { 'cache-control': 'no-store' };
+
 export function sameOriginRefusal(request: Request, origin: string): string | null {
   if (!STATE_CHANGING.has(request.method)) return null;
   const presented = request.headers.get('origin');
@@ -980,6 +989,7 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       if (view === 'settings') return renderSettings(session);
       // Idle: renders the form and opens no tenant database.
       if (view === 'entity') return renderEntityLookup(session, null);
+      if (view === 'connectors') return renderConnectors(session);
       return renderDashboard(session);
     }
     if (path === '/brain') return renderBrainSetup(session);
@@ -2293,19 +2303,7 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       // turn somebody's dashboard into a 500. The worker's tick reconciles the
       // same link on its own schedule, so the loss is latency rather than the
       // connection.
-      if (connectorsAvailable && deps.reconciler !== undefined) {
-        try {
-          await deps.reconciler.run({ now: now(), tenantId });
-        } catch (error) {
-          process.stderr.write(
-            `${JSON.stringify({
-              event: 'connector_reconcile_failed',
-              tenant: tenantId,
-              message: error instanceof Error ? error.message : String(error),
-            })}\n`,
-          );
-        }
-      }
+
       // Only asked for when there is a panel to put it in: a gated account is
       // rendered no control and no status, so reading for it would be a
       // control-plane round trip whose answer nothing displays.
@@ -2515,6 +2513,59 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     }
 
     /**
+     * Where mail and files come in from.
+     *
+     * Split off the dashboard, so the connector state that used to be a section
+     * there is now the whole page. The gate and the statuses are resolved
+     * exactly as `renderDashboard` resolved them — this moved the render, not
+     * the policy.
+     */
+    async function renderConnectors(session: Session): Promise<Response> {
+      const subscription = await subscriptionOf(deps.sql, session.accountId);
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return seeOther(BRAIN_SETUP_PATH);
+      const tier = await effectiveTierOf(deps.controlSql, tenantId, subscription.tier);
+      const available = deps.connectors !== undefined && connectorGate(tier) === null;
+      // **The reconcile moved here with the panel, and it had to.** It is what
+      // makes a user who DID come back see their connection immediately rather
+      // than waiting for the worker fleet's half-hourly wake — and this page's
+      // own copy promises exactly that: "loading this page asks about any
+      // connect you have started". Left on the dashboard it would have made
+      // that sentence false the moment the panel moved off it.
+      if (available && deps.reconciler !== undefined) {
+        try {
+          await deps.reconciler.run({ now: now(), tenantId });
+        } catch (error) {
+          process.stderr.write(
+            `${JSON.stringify({
+              event: 'connector_reconcile_failed',
+              tenant: tenantId,
+              message: error instanceof Error ? error.message : String(error),
+            })}\n`,
+          );
+        }
+      }
+      // Resolved exactly as `renderDashboard` resolved it: this change moved
+      // the render, not the policy. Only asked for when there is a panel to put
+      // it in — a gated account is rendered no control and no status.
+      const statuses = available
+        ? await connectorStatuses(deps.controlSql, {
+            tenantId,
+            sources: CONNECTOR_SOURCES,
+            links: await readConnectorLinks(deps.controlSql, { tenantId, now: now() }),
+            now: now(),
+          })
+        : [];
+      return html(
+        renderPage({
+          kind: 'connectors',
+          connectorsAvailable: available,
+          connectors: statuses,
+        }),
+      );
+    }
+
+    /**
      * One named subject.
      *
      * **The idle branch returns before `tenantOf`.** With no name submitted the
@@ -2529,7 +2580,19 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
      * construction rather than by care.
      */
     async function renderEntityLookup(session: Session, name: string | null): Promise<Response> {
-      const chrome = { 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' };
+      // **`no-store` only, and the header that came off is worth a sentence.**
+      // Under `Referrer-Policy: no-referrer` a browser sets the `Origin` header
+      // of a non-GET request to the literal `null` — Fetch's "append a request
+      // Origin header" step switches on the referrer policy and `no-referrer`
+      // is the arm that nulls it. This page's whole interaction is a same-origin
+      // form POST and `sameOriginRefusal` compares that header against this
+      // origin, so the stricter header refused every lookup with "this request
+      // came from another origin". Found in production on the first real search.
+      //
+      // Nothing is lost: the global default is already `same-origin`, which
+      // keeps the referrer off every other origin — and the URL carries no
+      // subject anyway, which is why this page posts rather than gets.
+      const chrome = ENTITY_HEADERS;
       if (deps.entityLookup === undefined) {
         return html(renderPage({ kind: 'entity', available: false, lookup: null }), 501);
       }

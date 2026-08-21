@@ -166,13 +166,10 @@ function dashboardFor(overrides: Partial<ConnectorStatus>): string {
     ...overrides,
   };
   return renderPage({
-    kind: 'dashboard',
-    tier: 'paid',
-    status: 'ready',
-    tenantId: 't-1',
-    connectorsAvailable: true,
-    connectors: [status],
-  });
+      kind: 'connectors',
+      connectorsAvailable: true,
+      connectors: [status],
+    });
 }
 
 describe('the fleet’s own credential is not the user’s grant', () => {

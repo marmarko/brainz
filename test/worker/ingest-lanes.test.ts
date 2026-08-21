@@ -445,16 +445,14 @@ describe('a failed poll is diagnosable', () => {
     });
   }
 
-  /** The page a browser gets, rendered from those statuses. */
+  /**
+   * The page a browser gets, rendered from those statuses.
+   *
+   * `kind: 'connectors'`: the panel moved off the dashboard onto its own page.
+   * Every assertion below is unchanged — the render moved, the copy did not.
+   */
   function dashboard(connectors: readonly ConnectorStatus[]): string {
-    return renderPage({
-      kind: 'dashboard',
-      tier: 'internal',
-      status: 'ready',
-      tenantId: TENANT,
-      connectorsAvailable: true,
-      connectors,
-    });
+    return renderPage({ kind: 'connectors', connectorsAvailable: true, connectors });
   }
 
   test(

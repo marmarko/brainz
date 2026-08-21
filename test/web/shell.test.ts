@@ -193,7 +193,14 @@ describe('settings carries what the dashboard shed, and repairs one of it', () =
     expect(page).toContain('nothing');
   });
 
-  test('the dashboard kept connected accounts, because four sentences point at it', () => {
-    expect(dashboard()).toContain('<h2>Connected accounts</h2>');
+  test('connected accounts moved to their own page, and the copy moved with them', () => {
+    // The sidebar design had kept this on the dashboard, on the argument that
+    // four other sentences named the dashboard as its location. Moving it means
+    // moving those too — otherwise the argument's own warning comes true.
+    expect(dashboard()).not.toContain('<h2>Connected accounts</h2>');
+    expect(dashboard()).toContain('Where your mail and files come from');
+    const page = renderPage({ kind: 'connectors', connectorsAvailable: true, connectors: [] });
+    expect(page).toContain('<h1>Connected accounts</h1>');
+    expect(page).toContain('aria-current="page"');
   });
 });

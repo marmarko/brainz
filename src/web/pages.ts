@@ -109,6 +109,9 @@ export const SETTINGS_PATH = '/dashboard?view=settings';
 /** Where the rail's lookup row points. Idle by construction: it names no subject. */
 export const ENTITY_PATH = '/dashboard?view=entity';
 
+/** Where the rail's connected-accounts row points. Not `CONNECTORS_PATH`, which is the API. */
+export const SOURCES_PATH = '/dashboard?view=connectors';
+
 export type Page =
   | {
       readonly kind: 'login';
@@ -331,6 +334,20 @@ export type Page =
     }
   | {
       /**
+       * Where mail and files come in from.
+       *
+       * Split off the dashboard on the owner's instruction. The sidebar design
+       * had kept it there on the argument that four other sentences named the
+       * dashboard as its location — so those four sentences moved in this same
+       * change rather than being left pointing at a page that no longer holds
+       * it, which is the failure that argument was warning about.
+       */
+      readonly kind: 'connectors';
+      readonly connectorsAvailable: boolean;
+      readonly connectors: readonly ConnectorStatus[];
+    }
+  | {
+      /**
        * Account configuration, split off the dashboard.
        *
        * The three sections here — a write-only key form, the spend window and
@@ -470,6 +487,8 @@ const ICON_WORKING =
   '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/></svg>';
 const ICON_WAITING =
   '<svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>';
+const ICON_SOURCES = // mailbox
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 17a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9.5C2 7 4 5 6.5 5H18c2.2 0 4 1.8 4 4v8Z"/><path d="M6 8h4"/><path d="M6 12h.01"/><path d="M16 19v-2a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2"/></svg>';
 const ICON_ASSISTANT =
   '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5"/><path d="M15 8V2"/><path d="M17 8a1 1 0 0 1 1 1v4a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1z"/><path d="M9 8V2"/></svg>';
 const ICON_UNDO =
@@ -490,7 +509,8 @@ type NavKey =
   | 'connect'
   | 'retractions'
   | 'settings'
-  | 'entity';
+  | 'entity'
+  | 'connectors';
 
 /**
  * What chrome a page gets: a rail with one row lit, a rail with none lit, or no
@@ -532,6 +552,7 @@ const PAGE_CHROME: Readonly<Record<Page['kind'], Chrome>> = {
   retractions: 'retractions',
   settings: 'settings',
   entity: 'entity',
+  connectors: 'connectors',
   connector_claim: 'blank',
   connector_confirm_disconnect: 'blank',
   connector_disconnected: 'blank',
@@ -581,6 +602,7 @@ const RAIL_GROUPS: readonly {
   {
     caption: 'Your account',
     rows: [
+      { key: 'connectors', href: SOURCES_PATH, label: 'Connected accounts', icon: ICON_SOURCES },
       { key: 'connect', href: '/connect', label: 'Your assistant', icon: ICON_ASSISTANT },
       { key: 'retractions', href: '/retractions', label: 'What you can undo', icon: ICON_UNDO },
       { key: 'settings', href: SETTINGS_PATH, label: 'Settings', icon: ICON_SETTINGS },
@@ -1171,20 +1193,6 @@ that is a separate step, on purpose.</p>`,
       // **And the gated render carries no control at all.** Not a disabled one,
       // not a differently-worded one: a form whose route answers 402 or 501 is
       // the dead affordance the whole panel exists to stop being.
-      const connectors = page.connectorsAvailable
-        ? `<ul class="sources">${page.connectors.map(connectorRow).join('')}</ul>
-<p class="note">Connecting opens a consent screen at the connector vendor. The link it gives you is a
-capability — anyone who has it can attach their account to this brain — so it expires in ten minutes
-and works once. It is shown on one page, once, and is not stored anywhere you can go back to.</p>
-<p class="note">You do not have to come back here after authorizing. The consent happens at the connector
-vendor and the vendor does not report it, so this brain goes and asks — loading this page asks about
-any connect you have started, and it asks again on its own within about half an hour. Authorize and
-return here and the source reads as connected straight away; authorize and close the tab and it
-appears by itself.</p>`
-        : `<p>Connected accounts are on the paid plan. Each connected mailbox carries a monthly fee from the
-connector vendor whether or not the brain is used, which the free plan cannot carry.</p>
-<p class="note">Chat exports and folder imports are included on every plan and need no connection at all.</p>`;
-
       // **The five in-body links are gone, and the rail is why.** They were this
       // page's menu; keeping both would be the same menu rendered twice, three
       // rows apart. The rail emits byte-identical hrefs, which is what keeps the
@@ -1201,8 +1209,7 @@ connector vendor whether or not the brain is used, which the free plan cannot ca
 <p>Plan: <strong>${escapeHtml(page.tier)}</strong> (${escapeHtml(page.status)})${
           page.tenantId === null ? '' : ` &middot; brain <code>${escapeHtml(page.tenantId)}</code>`
         }</p>
-<h2>Connected accounts</h2>
-${connectors}`,
+<p class="note"><a href="${escapeHtml(SOURCES_PATH)}">Where your mail and files come from &rarr;</a></p>`,
         page.kind,
       );
     }
@@ -1211,6 +1218,31 @@ ${connectors}`,
      * Account configuration. Three sections that were crowding the dashboard,
      * and one of them repaired on the way.
      */
+    case 'connectors': {
+      const connectors = page.connectorsAvailable
+        ? `<ul class="sources">${page.connectors.map(connectorRow).join('')}</ul>
+<p class="note">Connecting opens a consent screen at the connector vendor. The link it gives you is a
+capability — anyone who has it can attach their account to this brain — so it expires in ten minutes
+and works once. It is shown on one page, once, and is not stored anywhere you can go back to.</p>
+<p class="note">You do not have to come back here after authorizing. The consent happens at the connector
+vendor and the vendor does not report it, so this brain goes and asks — loading this page asks about
+any connect you have started, and it asks again on its own within about half an hour. Authorize and
+return here and the source reads as connected straight away; authorize and close the tab and it
+appears by itself.</p>`
+        : `<p>Connected accounts are on the paid plan. Each connected mailbox carries a monthly fee from the
+connector vendor whether or not the brain is used, which the free plan cannot carry.</p>
+<p class="note">Chat exports and folder imports are included on every plan and need no connection at all.</p>`;
+
+      return shell(
+        'Connected accounts — brainz',
+        `<h1>Connected accounts</h1>
+<p class="note">Where your mail and files come in from. This is the operational state of ingest —
+whether each source is arriving — rather than a setting you change.</p>
+${connectors}`,
+        page.kind,
+      );
+    }
+
     case 'entity':
       return entityPage(page);
 
@@ -2275,8 +2307,8 @@ ${back}`,
 <p class="problem">Your brain could not be reached just now. That is most often a database waking up
 after a quiet spell — loading this page again in a few seconds is usually the whole remedy.</p>
 <p class="note">Nothing has been lost and nothing has stopped: what arrives while this page cannot be
-drawn still arrives. Your plan, your connected accounts and everything else on your dashboard are
-unaffected.</p>
+drawn still arrives. Your plan, your connected accounts and everything else on this
+dashboard are unaffected.</p>
 ${back}`,
       page.kind,
     );
@@ -2304,7 +2336,7 @@ ${back}`,
 <p class="note">This is the clock the rest of this page is read against: a step with a large number
 waiting under a document that arrived months ago is a different thing from the same number under one
 that arrived this morning. <a href="${escapeHtml(COVERAGE_PATH)}">What came from where &rarr;</a>
-&middot; <a href="/dashboard">Connected accounts &rarr;</a></p>`;
+&middot; <a href="${escapeHtml(SOURCES_PATH)}">Connected accounts &rarr;</a></p>`;
 
   // The deterministic-stop shape: a section-level line, not six rows. When the
   // cycle stopped in a phase that is not one of these six, every row here is
@@ -2480,8 +2512,8 @@ ${back}`,
 <p class="problem">Your brain could not be reached just now. That is most often a database waking up
 after a quiet spell — loading this page again in a few seconds is usually the whole remedy.</p>
 <p class="note">Nothing has been lost and nothing has stopped: what arrives while this page cannot be
-drawn still arrives. Your plan, your connected accounts and everything else on your dashboard are
-unaffected.</p>
+drawn still arrives. Your plan, your connected accounts and everything else on this
+dashboard are unaffected.</p>
 ${back}`,
       page.kind,
     );
@@ -2599,7 +2631,7 @@ ${rule}
 ${sources}
 <p class="note">Documents, not passages: counting every passage of a large brain is a scan of the
 biggest table it has, and this is a page load. If a source has stopped arriving, the connected
-accounts panel on your dashboard is where the reason is.</p>
+accounts page is where the reason is.</p>
 <h2>Consolidation</h2>
 ${
       view.latestCycle === null ? cold : `<p>${cycleSentence(view.latestCycle, page.tier)}</p>`
