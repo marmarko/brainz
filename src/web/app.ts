@@ -80,7 +80,7 @@ import { connectorStatuses } from './connector-panel.ts';
 import type { CoverageView } from './coverage.ts';
 import type { ProcessingView } from './processing.ts';
 import type { ReviewView } from './review.ts';
-import type { EntityLookup } from './entity.ts';
+import type { EntityLookup, Roster } from './entity.ts';
 import { BRAIN_SETUP_PATH, REVIEW_PATH, renderPage } from './pages.ts';
 
 export const SESSION_COOKIE = 'bz_session';
@@ -415,6 +415,7 @@ export interface ReviewPort {
  */
 export interface EntityLookupPort {
   read(request: { readonly tenantId: string; readonly name: string }): Promise<EntityLookup>;
+  list(request: { readonly tenantId: string; readonly page: number }): Promise<Roster>;
 }
 
 export interface ConnectorVendor {
@@ -988,7 +989,12 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       if (view === 'review') return renderReview(session);
       if (view === 'settings') return renderSettings(session);
       // Idle: renders the form and opens no tenant database.
-      if (view === 'entity') return renderEntityLookup(session, null);
+      if (view === 'entity') {
+        // A page number in the query string carries nothing about anybody, so
+        // paging is a GET. Opening a subject still posts their name in a body.
+        const asked = Number.parseInt(url.searchParams.get('page') ?? '0', 10);
+        return renderEntityLookup(session, null, Number.isNaN(asked) ? 0 : asked);
+      }
       if (view === 'connectors') return renderConnectors(session);
       return renderDashboard(session);
     }
@@ -2579,7 +2585,11 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
      * reason is a code and a timestamp, not a subject line" has to hold by
      * construction rather than by care.
      */
-    async function renderEntityLookup(session: Session, name: string | null): Promise<Response> {
+    async function renderEntityLookup(
+      session: Session,
+      name: string | null,
+      page = 0,
+    ): Promise<Response> {
       // **`no-store` only, and the header that came off is worth a sentence.**
       // Under `Referrer-Policy: no-referrer` a browser sets the `Origin` header
       // of a non-GET request to the literal `null` — Fetch's "append a request
@@ -2596,11 +2606,28 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       if (deps.entityLookup === undefined) {
         return html(renderPage({ kind: 'entity', available: false, lookup: null }), 501);
       }
-      if (name === null || name.trim().length === 0) {
-        return html(renderPage({ kind: 'entity', available: true, lookup: { status: 'idle' } }), 200, chrome);
-      }
       const tenantId = await tenantOf(session.accountId);
       if (tenantId === null) return seeOther(BRAIN_SETUP_PATH);
+
+      // No name submitted: the roster, one page of it. This is where the page
+      // stopped being resting-empty — see `entity.ts`'s header for the argument
+      // that was overruled and what still stands.
+      if (name === null || name.trim().length === 0) {
+        let roster: EntityLookup;
+        try {
+          roster = { status: 'browsing', roster: await deps.entityLookup.list({ tenantId, page }) };
+        } catch (error) {
+          process.stderr.write(
+            `${JSON.stringify({
+              event: 'entity_roster_unreadable',
+              tenant: tenantId,
+              code: (error as { code?: string }).code ?? 'unknown',
+            })}\n`,
+          );
+          return html(renderPage({ kind: 'entity', available: true, lookup: null }), 200, chrome);
+        }
+        return html(renderPage({ kind: 'entity', available: true, lookup: roster }), 200, chrome);
+      }
 
       let lookup: EntityLookup;
       try {

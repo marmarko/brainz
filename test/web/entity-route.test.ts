@@ -32,7 +32,12 @@ import type { SQL } from 'bun';
 import { textArrayLiteral } from '../../src/core/write/pg-values.ts';
 import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../src/schema/vector-index.ts';
-import { MENTION_NAME_FLOOR, OUTBOUND_EDGE_CEILING, lookupEntity } from '../../src/web/entity.ts';
+import {
+  MENTION_NAME_FLOOR,
+  OUTBOUND_EDGE_CEILING,
+  listEntities,
+  lookupEntity,
+} from '../../src/web/entity.ts';
 import { ENTITY_PATH, renderPage } from '../../src/web/pages.ts';
 import { ENTITY_HEADERS } from '../../src/web/app.ts';
 import {
@@ -49,20 +54,68 @@ const VECTOR = `[${new Array(EMBEDDING_DIMENSIONS).fill(0).join(',')}]`;
 // The render, and the absences.
 // ---------------------------------------------------------------------------
 
-describe('the steady state is a form and a refusal', () => {
-  test('idle names nobody and offers no list', () => {
-    const page = renderPage({ kind: 'entity', available: true, lookup: { status: 'idle' } });
-    expect(page).toContain('Nothing is shown until you type a name');
-    expect(page).toContain('there is no list to browse');
-    expect(page).toContain('name="view" value="entity"');
-    // The whole argument for this page over a roster.
+/**
+ * **These two tests used to assert the opposite, and that is the point.** This
+ * page shipped as a resting-empty lookup on `coverage.ts`'s refusal of a roster;
+ * the owner asked for the list twice and it now renders one. `entity.ts`'s
+ * header records the reversal. What is asserted here is what survived it: the
+ * list carries names and types and nothing else, and opening a subject still
+ * posts rather than gets.
+ */
+describe('the roster shows who, and only who', () => {
+  const ROSTER = {
+    status: 'browsing' as const,
+    roster: {
+      entries: [
+        { name: 'Acme', truncated: false, type: 'organization' as const, hasCard: true },
+        { name: 'Priya Raman', truncated: false, type: 'person' as const, hasCard: false },
+      ],
+      total: 2,
+      page: 0,
+      pages: 1,
+    },
+  };
+
+  test('it lists names and types, and nothing the brain says about them', () => {
+    const page = renderPage({ kind: 'entity', available: true, lookup: ROSTER });
+    expect(page).toContain('Acme');
+    expect(page).toContain('Priya Raman');
+    expect(page).toContain('has a summary');
+    expect(page).toContain('no summary yet');
+    // The line the detail view is on the other side of.
+    expect(page).toContain('names and types only');
+    // And the warning that is more load-bearing now than when it was written
+    // for a one-subject page.
     expect(page).toContain('not safe to screenshot');
   });
 
-  test('the form posts, because a GET writes every subject into browser history', () => {
-    const page = renderPage({ kind: 'entity', available: true, lookup: { status: 'idle' } });
-    expect(page).toContain('<form method="post" action="/dashboard">');
+  test('a row is a form, so no name is written into browser history', () => {
+    const page = renderPage({ kind: 'entity', available: true, lookup: ROSTER });
+    // A link would carry the name in a query string, into history and URL-bar
+    // autocomplete, which sync across devices and outlive the session.
+    expect(page).toContain('<input type="hidden" name="name" value="Priya Raman">');
+    expect(page).not.toContain('href="/dashboard?view=entity&amp;name=');
     expect(page).not.toContain('method="get"');
+  });
+
+  test('paging is a GET, because a page number is not a name', () => {
+    const page = renderPage({
+      kind: 'entity',
+      available: true,
+      lookup: { status: 'browsing', roster: { ...ROSTER.roster, total: 60, page: 1, pages: 3 } },
+    });
+    expect(page).toContain('page=0');
+    expect(page).toContain('page=2');
+    expect(page).toContain('page 2 of 3');
+  });
+
+  test('an empty brain says so rather than rendering an empty list', () => {
+    const page = renderPage({
+      kind: 'entity',
+      available: true,
+      lookup: { status: 'browsing', roster: { entries: [], total: 0, page: 0, pages: 1 } },
+    });
+    expect(page).toContain('does not know about anybody yet');
   });
 
   test('a miss offers no suggestions, which would be a roster one typo at a time', () => {
@@ -158,6 +211,43 @@ describe('the read that is actually wired', () => {
       [statement, VECTOR, textArrayLiteral([WORK])],
     );
   }
+
+  test('the roster pages, alphabetically, with a stable total', async () => {
+    for (const name of ['Zeta', 'alpha', 'Mid']) await entity(name);
+    const first = await listEntities(sql, 0);
+    expect(first.total).toBe(3);
+    expect(first.pages).toBe(1);
+    // `lower()` ordering, so case does not scatter the list.
+    expect(first.entries.map((e) => e.name)).toEqual(['alpha', 'Mid', 'Zeta']);
+  });
+
+  test('a page past the end lands on the last one rather than rendering empty', async () => {
+    await entity('Only');
+    const far = await listEntities(sql, 99);
+    expect(far.page).toBe(0);
+    expect(far.entries.length).toBe(1);
+  });
+
+  test('a soft-deleted entity is not in the roster', async () => {
+    await entity('Visible');
+    await entity('Gone', 'person', true);
+    const page = await listEntities(sql, 0);
+    expect(page.total).toBe(1);
+    expect(page.entries.map((e) => e.name)).toEqual(['Visible']);
+  });
+
+  test('the roster reports whether a summary exists, never its text', async () => {
+    const id = await entity('Priya Raman');
+    await sql.unsafe(
+      `INSERT INTO entity_card (entity_id, summary, trust_level, derivation, confidence, origin_contexts)
+       VALUES ($1::bigint, 'Leads the renewal desk.', 'model_inferred', 'model_derived', 0.9, $2::text[])`,
+      [id, textArrayLiteral([WORK])],
+    );
+    const page = await listEntities(sql, 0);
+    expect(page.entries[0]?.hasCard).toBe(true);
+    // A boolean crosses, the prose does not.
+    expect(JSON.stringify(page)).not.toContain('renewal desk');
+  });
 
   test('an exact name resolves; a near miss does not', async () => {
     await entity('Priya Raman');

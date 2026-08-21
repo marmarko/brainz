@@ -34,7 +34,7 @@ import {
   type ProcessingView,
 } from './processing.ts';
 import type { Proposal, ReviewView } from './review.ts';
-import type { EntityLookup, Subject } from './entity.ts';
+import type { EntityLookup, Roster, Subject } from './entity.ts';
 
 /**
  * Where a signed-in account with no brain is offered one.
@@ -2094,6 +2094,64 @@ ${mentions}`;
  * the **steady state renders nothing**: with no name submitted this is a form
  * and a refusal, and there is no branch anywhere that lists who the brain knows.
  */
+/**
+ * One page of the roster.
+ *
+ * **Each row is a form, not a link, and that is the one thing left protecting
+ * the address book.** A link would carry the subject's name in the query
+ * string, into browser history and URL-bar autocomplete — which sync across
+ * devices and outlive the session. The page shows names to whoever is looking
+ * at it; it does not write them somewhere the owner cannot clear. Paging is a
+ * GET because a page number is not a name.
+ */
+function roster(view: Roster): string {
+  if (view.total === 0) {
+    return `<p>Your brain does not know about anybody yet.</p>
+<p class="note">People and companies appear here once a consolidation cycle has read enough to name
+them. <a href="${escapeHtml(PROCESSING_PATH)}">What your brain is working on &rarr;</a></p>`;
+  }
+
+  const rows = view.entries
+    .map(
+      (entry) => `  <li>
+    <form method="post" action="/dashboard">
+      <input type="hidden" name="view" value="entity">
+      <input type="hidden" name="name" value="${escapeHtml(entry.name)}">
+      <button type="submit">${escapeHtml(entry.name)}${entry.truncated ? '&hellip;' : ''}</button>
+    </form>
+    <p class="note">${escapeHtml(entry.type)}${
+      entry.hasCard ? ' &middot; has a summary' : ' &middot; no summary yet'
+    }</p>
+  </li>`,
+    )
+    .join('\n');
+
+  // Page numbers only: `?page=` carries nothing about anybody.
+  const back =
+    view.page > 0
+      ? `<a href="${escapeHtml(ENTITY_PATH)}&amp;page=${escapeHtml(String(view.page - 1))}">&larr; Previous</a>`
+      : '';
+  const next =
+    view.page < view.pages - 1
+      ? `<a href="${escapeHtml(ENTITY_PATH)}&amp;page=${escapeHtml(String(view.page + 1))}">Next &rarr;</a>`
+      : '';
+  const paging =
+    view.pages <= 1
+      ? ''
+      : `<p class="note">${back}${back !== '' && next !== '' ? ' &middot; ' : ''}${next}${
+          back === '' && next === '' ? '' : ' &middot; '
+        }page ${escapeHtml(String(view.page + 1))} of ${escapeHtml(String(view.pages))}</p>`;
+
+  return `<p>${count(view.total, 'person or company', 'people and companies')}, in alphabetical order.</p>
+<ul class="sources">
+${rows}
+</ul>
+${paging}
+<p class="note">This list is names and types only. What your brain actually says about somebody —
+its summary, what it connects them to, how often they come up — is on their own page, one click
+away.</p>`;
+}
+
 function entityPage(page: Extract<Page, { kind: 'entity' }>): string {
   const title = 'Look up a person or company — brainz';
   const back = '<p><a href="/dashboard">Back to your dashboard</a></p>';
@@ -2137,10 +2195,8 @@ ${back}`,
 
   const lookup = page.lookup;
   const answer =
-    lookup.status === 'idle'
-      ? `<p class="note">Nothing is shown until you type a name, and there is no list to browse — this
-page will only ever show you one person or company at a time. The counts are on
-<a href="${escapeHtml(COVERAGE_PATH)}">what your brain knows</a>.</p>`
+    lookup.status === 'browsing'
+      ? roster(lookup.roster)
       : lookup.status === 'not_found'
         ? `<p>Nothing in your brain answers to that name.</p>
 <p class="note">This looks for an exact match and will not guess. Two things it could mean: your

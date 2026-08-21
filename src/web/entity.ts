@@ -1,15 +1,13 @@
 /**
- * One named subject, as the owner's own record of them — the read behind
+ * The people and companies a brain holds — the read behind
  * `/dashboard?view=entity`.
  *
  * ===========================================================================
- * THE PAGE THIS IS NOT, AND WHY THAT REFUSAL IS THE DESIGN
+ * THIS PAGE WAS REFUSED, AND THEN ASKED FOR AGAIN. BOTH ARE RECORDED.
  * ===========================================================================
  *
- * The owner asked for a page listing the people, companies, facts and
- * relationships their brain knows about. **That page is not built, and this one
- * exists instead.** `src/web/coverage.ts` refuses the roster in four numbered
- * arguments; the second is the one that decides it:
+ * `src/web/coverage.ts` refuses a roster of the brain's entities in four
+ * numbered arguments, and the second is the sharpest:
  *
  *   *"A count survives being screenshotted into a support thread, cast to a
  *   meeting-room display and left open on a desk; a list of forty names does
@@ -17,43 +15,37 @@
  *   is in the user's mail anyway while this page would be the only artifact
  *   that renders their whole address book in one screenful."*
  *
- * At the measured size that is not a risk, it is a description: this brain holds
- * **53 entities**, so "the list" and "one screenful" are the same object and
- * there is no page size at which the harm goes away.
+ * This module shipped first as a **resting-empty lookup** on exactly that
+ * argument: one subject, named by the owner, nothing until they typed. The
+ * owner then asked for the list, twice, with pagination. **That is their call
+ * to make — it is their brain and their data — and this file now serves it.**
  *
- * ===========================================================================
- * WHAT MAKES A LOOKUP DIFFERENT FROM A ROSTER, MECHANICALLY
- * ===========================================================================
+ * The argument is not deleted, because it was not wrong. It is recorded, along
+ * with what changed:
  *
- * `?view=review` crosses the same privacy line and licenses itself on four
- * properties: navigated to, holds only what is undecided, **steady state
- * empty**, and every row a question the system asked. A roster scores one of
- * four. This page reaches the third by a different mechanism — with no name
- * submitted it renders **nothing at all**, and opens no tenant database — and
- * replaces the second with *only the one subject the owner supplied*.
+ *   * **The harm is real and is now accepted rather than avoided.** At the
+ *     measured size — 53 entities — "the list" and "one screenful" are close to
+ *     the same object, and paginating at {@link ROSTER_PAGE} does not change
+ *     that much. Anyone who can see this page can see who the brain knows.
+ *   * **What the page can still honestly do is warn.** The rule paragraph names
+ *     the risk in the reader's own words — *this one is about somebody: it is
+ *     not safe to screenshot* — instead of implying a safety the page no longer
+ *     has. That sentence was written for the lookup and is more load-bearing
+ *     now, not less.
+ *   * **The mitigations that survive are the ones that cost nothing.** The list
+ *     carries names and types and nothing else: no card text, no statements, no
+ *     edges, no mention counts. Detail stays one deliberate click away, and the
+ *     per-subject reads are unchanged. So a glance at this page reveals the
+ *     address book; it does not reveal what the brain says about anybody in it.
+ *   * **Navigation stays a POST.** A page number in the URL leaks nothing, so
+ *     paging is a GET — but opening a subject still posts their name in a body
+ *     rather than a query string, because browser history and URL-bar
+ *     autocomplete sync across devices and outlive the session. The page shows
+ *     names to whoever is looking at it; it does not write them into an
+ *     artifact the owner cannot clear.
  *
- * That substitution is only true if a found render does not emit names the
- * querent did not supply, which is what shapes three of the six statements:
- *
- *   * **Outbound edges name their neighbour; inbound edges are counted.** An
- *     edge whose *subject* is the queried entity is a property of it — *works
- *     at Acme* — few and about the person asked for. An edge whose *object* is
- *     the queried entity is a membership list of other people: `works_at` is
- *     seeded with inverse `employs`, so the owner's employer accumulates inbound
- *     rows and rendering them by name is a colleague roster. Inbound therefore
- *     renders as *"21 people work here"* — a count and a closed-vocabulary code
- *     from a registry whose own COMMENT reads "no user content".
- *   * **The outbound ceiling is 8, and the arithmetic is the bound.** A ceiling
- *     of 25 would sit *above* this brain's 27 edges, and a bound that cannot
- *     bind is a formality — which is this module's own reason for refusing the
- *     roster. Eight is above the honest maximum for a real subject and below the
- *     26 people a roster would reach.
- *   * **The mention census renders counts and never statements.** A statement is
- *     mail prose and routinely names several parties, and nothing in a
- *     word-boundary predicate bounds how many *other* people a matched sentence
- *     names. Twenty-five of them is more third-party names in one screenful than
- *     the roster this module refuses — and the highest-yield query is the most
- *     natural first one anybody types: their own name, or their employer.
+ * If the roster is ever reconsidered, the thing to re-read is `coverage.ts`'s
+ * four arguments, not this paragraph.
  *
  * ===========================================================================
  * THE HONEST LIMIT OF THE CENSUS, WHICH THE PAGE STATES RATHER THAN HIDES
@@ -61,13 +53,27 @@
  *
  * **There is no fact-to-entity link in this schema.** `fact` carries `page_id`
  * and `origin_contexts` and nothing that reaches an entity; every entity-to-fact
- * path in the codebase is a text scan. So this counts *live sentences whose text
- * contains this name* — not everything the brain knows about them, and, for a
- * common name, possibly a sentence about somebody else. A caption reading "what
- * your brain knows about X" over a text match would attribute other people's
- * statements to X with no way for the owner to tell. A census with the caveat
- * printed beside it is the honest version of the same information, and it is
- * what lets the number reconcile with coverage's own fact count.
+ * path in the codebase is a text scan. So the mention census counts *live
+ * sentences whose text contains this name* — not everything the brain knows
+ * about them, and, for a common name, possibly a sentence about somebody else.
+ * A caption reading "what your brain knows about X" over a text match would
+ * attribute other people's statements to X with no way for the owner to tell.
+ *
+ * ===========================================================================
+ * WHAT STILL SHAPES THE PER-SUBJECT READ
+ * ===========================================================================
+ *
+ *   * **Outbound edges name their neighbour; inbound edges are counted.** An
+ *     edge whose *object* is the queried entity is a membership list of other
+ *     people: `works_at` is seeded with inverse `employs`, so an employer
+ *     accumulates inbound rows and naming them is a colleague roster nested
+ *     inside a subject page. Inbound renders as *"21 people work here"* — a
+ *     count and a code from a registry whose own COMMENT reads "no user
+ *     content".
+ *   * **The census renders counts and never statements.** A statement is mail
+ *     prose that routinely names several parties, and nothing in a
+ *     word-boundary predicate bounds how many *other* people a matched sentence
+ *     names.
  *
  * ===========================================================================
  * WHAT IS DELIBERATELY NOT FENCED, AND WHY THAT IS A DECISION
@@ -78,16 +84,9 @@
  * rows whose origins are a *subset* of the severed one, deliberately, because
  * the `@>` alternative "would tombstone every mixed row: the user disconnects
  * work and loses their shared history with everyone they know through both
- * accounts." A mixed card genuinely carries surviving evidence. Review went
- * stricter only because `review_queue` is swept by nothing at all; that reason
- * does not carry here. A page that withheld mixed rows would be the only
- * surface in the product saying "nothing is known about this person" while the
- * assistant answers happily.
- *
- * **Aliases are not origin-filtered either**, unlike the `entity` tool's subset
- * fence — that fence exists because a caller may hold only one half of the
- * brain, and this caller is the account holder who holds both. Recorded so the
- * omission reads as a decision.
+ * accounts." A page that withheld mixed rows would be the only surface in the
+ * product saying "nothing is known about this person" while the assistant
+ * answers happily.
  *
  * **`entity` is joined live behind every alias, slug and edge touch.**
  * `entity_alias` and `entity_slug` carry no `deleted_at` at all and hold the
@@ -97,9 +96,7 @@
  * the counted arm as much as the named one: severance writes no `deleted_at` on
  * `entity_edge`, relying on both endpoints being tombstoned and the row leaving
  * at purge by cascade. Between severance and purge an edge is live with a dead
- * endpoint, so the named arm would render a severed relationship with two names
- * on it and the counted arm would inflate *"employs: 21"* with a tombstoned
- * person. Subject erasure hard-deletes edges, so only severance produces that
+ * endpoint. Subject erasure hard-deletes edges, so only severance produces that
  * state — which is exactly why it survives casual testing.
  */
 
@@ -140,6 +137,25 @@ export const MENTION_NAME_FLOOR = 3;
 
 /** Above this the census is skipped with a sentence: a pathological name is a per-row comparand across every live fact. */
 export const MENTION_NAME_CEILING = 200;
+
+/**
+ * Subjects listed per page of the roster.
+ *
+ * **Offset paging rather than keyset, and the reason is what a cursor would
+ * have to carry.** A keyset cursor over an alphabetical list is a NAME, and it
+ * would ride in the query string into browser history and URL-bar
+ * autocomplete — the one artifact this page still refuses to write. A page
+ * number carries nothing. The cost of offset is deep-page scanning, and at this
+ * corpus size (53 entities, three pages) it is not a cost; the row to watch is
+ * this one, and the remedy if a brain ever holds tens of thousands of entities
+ * is a keyset cursor over `entity_id` — opaque, and not a name.
+ *
+ * The honest wart: offset drifts if a consolidation cycle inserts an entity
+ * between two page loads, so a row can be seen twice or missed. On a corpus
+ * that changes a few times an hour that is a smaller harm than a name in the
+ * address bar.
+ */
+export const ROSTER_PAGE = 25;
 
 export interface Subject {
   readonly name: string;
@@ -182,8 +198,24 @@ export interface Subject {
     | { readonly kind: 'name_too_long' };
 }
 
+export interface RosterEntry {
+  readonly name: string;
+  readonly truncated: boolean;
+  readonly type: EntityKind;
+  /** Whether the brain has written a summary. A boolean, never the text. */
+  readonly hasCard: boolean;
+}
+
+export interface Roster {
+  readonly entries: readonly RosterEntry[];
+  readonly total: number;
+  /** Zero-based, as it arrives from the query string. */
+  readonly page: number;
+  readonly pages: number;
+}
+
 export type EntityLookup =
-  | { readonly status: 'idle' }
+  | { readonly status: 'browsing'; readonly roster: Roster }
   | { readonly status: 'not_found' }
   | { readonly status: 'ambiguous' }
   | { readonly status: 'found'; readonly subject: Subject };
@@ -202,6 +234,54 @@ function isoOf(value: Date | string | null): string {
  * but the third rung is `lower(canonical_name) = ''` against a column with no
  * non-empty CHECK.
  */
+/**
+ * One page of the roster.
+ *
+ * **Names and types and one boolean, and nothing else.** No card text, no
+ * statements, no edges, no counts per subject: a glance at this page reveals
+ * who the brain knows, which is what the owner asked for, and does not reveal
+ * what it says about any of them. That is the line the detail view is on the
+ * other side of, one deliberate click away.
+ */
+export async function listEntities(sql: SQL, page: number): Promise<Roster> {
+  const at = Number.isFinite(page) && page > 0 ? Math.floor(page) : 0;
+
+  const totals = (await sql.unsafe(
+    `SELECT count(*)::int AS n FROM entity WHERE deleted_at IS NULL`,
+    [],
+  )) as Array<{ n: number }>;
+  const total = totals[0]?.n ?? 0;
+  const pages = Math.max(1, Math.ceil(total / ROSTER_PAGE));
+  const bounded = Math.min(at, pages - 1);
+
+  const rows = (await sql.unsafe(
+    `SELECT left(e.canonical_name, $1::int)    AS name,
+            length(e.canonical_name) > $1::int AS truncated,
+            e.entity_type,
+            EXISTS (
+              SELECT 1 FROM entity_card c
+               WHERE c.entity_id = e.entity_id AND c.deleted_at IS NULL
+            ) AS has_card
+       FROM entity e
+      WHERE e.deleted_at IS NULL
+      ORDER BY lower(e.canonical_name), e.entity_id
+      LIMIT $2::int OFFSET $3::int`,
+    [NAME_CHARACTERS, ROSTER_PAGE, bounded * ROSTER_PAGE],
+  )) as Array<{ name: string; truncated: boolean; entity_type: EntityKind; has_card: boolean }>;
+
+  return {
+    entries: rows.map((row) => ({
+      name: row.name,
+      truncated: row.truncated,
+      type: row.entity_type,
+      hasCard: row.has_card,
+    })),
+    total,
+    page: bounded,
+    pages,
+  };
+}
+
 export async function lookupEntity(sql: SQL, name: string): Promise<EntityLookup> {
   const key = normalize(name);
   if (key.length === 0) return { status: 'not_found' };

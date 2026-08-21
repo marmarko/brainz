@@ -90,7 +90,7 @@ import { createPipedreamConnectorVendor } from './connectors.ts';
 import { readCoverage } from './coverage.ts';
 import { readProcessing } from './processing.ts';
 import { decideConflict, decideProposal, readReview, undoProposal } from './review.ts';
-import { lookupEntity } from './entity.ts';
+import { listEntities, lookupEntity } from './entity.ts';
 import {
   openConnectorClient,
   openControlPlane,
@@ -694,6 +694,7 @@ export function reviewPort(withTenant: TenantWork): ReviewPort {
 export function entityLookupPort(withTenant: TenantWork): EntityLookupPort {
   return {
     read: (request) => withTenant(request.tenantId, (sql) => lookupEntity(sql, request.name)),
+    list: (request) => withTenant(request.tenantId, (sql) => listEntities(sql, request.page)),
   };
 }
 
