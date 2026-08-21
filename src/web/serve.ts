@@ -35,6 +35,8 @@
 
 import { SQL } from 'bun';
 
+import { createTenantConnections } from '../mcp/tenant-db.ts';
+
 import {
   createWebApp,
   type ConnectorVendor,
@@ -81,7 +83,7 @@ import {
   newTenantId,
   type BrainProvisioner,
 } from '../control/provisioner.ts';
-import { controlPlaneIdentity, fleetIdentity, isValidTenantId } from '../control/secrets.ts';
+import { controlPlaneIdentity, isValidTenantId } from '../control/secrets.ts';
 import { createTenantStorage } from '../control/storage.ts';
 import { createPipedreamConnectorVendor } from './connectors.ts';
 import { readCoverage } from './coverage.ts';
@@ -122,7 +124,8 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
   // brain" has one implementation rather than two that can drift on the
   // question R11 cares about — which identity resolves the namespace, and where
   // the tenant id came from.
-  const withTenant = tenantDatabases(secrets);
+  const tenants = tenantDatabases(secrets);
+  const withTenant = tenants.withTenant;
 
   // Read once and passed to both halves of the substrate decision: `0` — the
   // shipped default, and U2's synchronous behaviour — is what makes the vendor
@@ -221,6 +224,9 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
     port: bound,
     async stop() {
       await http.stop(true);
+      // Before the two control-plane handles: these are the ones held open
+      // across requests, so they are the ones a shutdown has to give back.
+      await tenants.close();
       await sql.close();
       await controlSql.close();
     },
@@ -262,11 +268,32 @@ function writeOnlyProviderKeys(secrets: FleetSecrets): ProviderKeyWriter {
  * `src/worker/serve.ts` satisfies when it opens a tenant's database to
  * consolidate it, by the same construction.
  *
- * **A connection per call, closed in a `finally`.** Severance and subject
- * erasure are rare, user-initiated requests rather than loops, so a pool held
- * open for them would be a connection per tenant this process has ever acted
- * for — and the per-tenant LRU those handles come out of is the reason
- * `worker/serve.ts` honours `close`.
+ * **A bounded, expiring cache rather than a connection per call, and the
+ * paragraph this replaces is worth keeping in view.** It read: *"Severance and
+ * subject erasure are rare, user-initiated requests rather than loops, so a pool
+ * held open for them would be a connection per tenant this process has ever
+ * acted for."* That was true of the two callers it was written for, and it
+ * stopped being true when `coveragePort`, the processing read and `reviewPort`
+ * inherited the same seam. Those are **page loads**, and a review decision is
+ * two of them — the POST, then the `303`'s re-render — each paying a fresh TCP
+ * handshake plus TLS plus SCRAM before its first statement. This repo's own
+ * probe measured that setup at 37ms + 39ms, before the query.
+ *
+ * The objection in that paragraph is answered rather than ignored, and by
+ * reusing the accessor the MCP fleet already has instead of inventing a second
+ * one: `createTenantConnections` bounds the cache two ways. Its **LRU ceiling**
+ * is the direct answer to "a connection per tenant this process has ever acted
+ * for", and its **TTL is a security bound rather than a performance one** — a
+ * cached connection that outlives a revoked secret is a revocation that did not
+ * happen, so an entry expires on an absolute deadline from its resolve whether
+ * or not it is busy.
+ *
+ * Two knobs differ from the MCP fleet's defaults, and the reason is the shape of
+ * this fleet rather than taste. The MCP fleet is addressed per tenant by a
+ * Durable Object, so one instance serves roughly one brain; **this app is
+ * `web-singleton` and serves every brain in the deployment from one container**.
+ * So the ceiling is lower and each handle is narrower — a page render issues a
+ * handful of statements in sequence and never a batch.
  *
  * **One resolver, two ports.** This was inside `severancePort` until
  * {@link subjectErasurePort} needed the same thing. Two copies of "resolve a
@@ -278,25 +305,46 @@ interface TenantWork {
   <T>(tenantId: string, work: (sql: SQL) => Promise<T>): Promise<T>;
 }
 
-function tenantDatabases(secrets: FleetSecrets): TenantWork {
-  return async function withTenant<T>(tenantId: string, work: (sql: SQL) => Promise<T>): Promise<T> {
-    const resolved = await secrets.store.resolve(fleetIdentity(tenantId), tenantId);
-    if (!resolved.ok) {
-      // Thrown rather than reported as a refusal: "this brain's connection
-      // string is unresolvable" is an outage, and answering the user `400
-      // not_confirmed` for it would send them round the confirmation again
-      // forever. The entrypoint's error boundary turns it into a generic 500
-      // and writes the reason to stderr, where an operator is.
-      throw new Error(
-        `no resolvable connection secret for ${tenantId} (${resolved.reason}); this process cannot reach that brain`,
-      );
-    }
-    const sql = new SQL(resolved.secret.connectionString, { max: 2 });
-    try {
-      return await work(sql);
-    } finally {
-      await sql.close();
-    }
+/** One handle per brain, expiring; see the note above for both bounds. */
+export const WEB_MAX_TENANT_CONNECTIONS = 32;
+
+/** Statements per page render are sequential, so a page needs no batch width. */
+export const WEB_TENANT_POOL_WIDTH = 2;
+
+function tenantDatabases(secrets: FleetSecrets): {
+  readonly withTenant: TenantWork;
+  close(): Promise<void>;
+} {
+  const connections = createTenantConnections({
+    secrets: secrets.store,
+    now: () => Date.now(),
+    open: (connectionString) => new SQL(connectionString, { max: WEB_TENANT_POOL_WIDTH }),
+    maxEntries: WEB_MAX_TENANT_CONNECTIONS,
+  });
+
+  return {
+    withTenant: async function withTenant<T>(
+      tenantId: string,
+      work: (sql: SQL) => Promise<T>,
+    ): Promise<T> {
+      const opened = await connections.open(tenantId);
+      if (!opened.ok) {
+        // Thrown rather than reported as a refusal: "this brain's connection
+        // string is unresolvable" is an outage, and answering the user `400
+        // not_confirmed` for it would send them round the confirmation again
+        // forever. The entrypoint's error boundary turns it into a generic 500
+        // and writes the reason to stderr, where an operator is.
+        throw new Error(
+          `no resolvable connection secret for ${tenantId} (${opened.reason}); this process cannot reach that brain`,
+        );
+      }
+      // **No `finally { close() }`, and its absence is the change.** The handle
+      // belongs to the cache, which closes it on eviction or expiry. Closing it
+      // here would evict a live entry out from under the next request and put
+      // the accessor back to one dial per call with extra steps.
+      return work(opened.connection.sql);
+    },
+    close: () => connections.close(),
   };
 }
 
