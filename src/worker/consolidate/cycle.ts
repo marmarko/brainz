@@ -502,6 +502,7 @@ export async function runConsolidationCycle(
       const outcome = await runDeterministicPhase(deps.sql, phase, {
         now: options.now,
         attempt: prefix,
+        runId: run.runId,
         ...(options.batch === undefined ? {} : { batch: options.batch }),
       });
 
@@ -740,6 +741,12 @@ export async function runDeterministicPhase(
     readonly now: Date;
     readonly attempt: AttemptBudget;
     /**
+     * The run these phases belong to, so a review row a phase enqueues carries
+     * the provenance every other queued row does. Absent in the tests that call
+     * one phase directly, which is why it is nullable rather than required.
+     */
+    readonly runId?: string;
+    /**
      * The keyset batch the walking phases take per read/write pair. Absent
      * leaves each phase at its own tuned constant; see {@link CycleOptions}.
      */
@@ -788,8 +795,11 @@ export async function runDeterministicPhase(
       return { items: result.staled, done: true };
     }
     case 'entity_merge': {
-      const result = await mergeEntitiesByRule(sql, { budget });
-      return { items: result.merged, done: result.done };
+      const result = await mergeEntitiesByRule(sql, { budget, runId: options.runId ?? null });
+      // Proposals count as items: a cycle that merged nothing and asked the
+      // owner two questions did something, and a phase reporting zero would say
+      // it did not.
+      return { items: result.merged + result.proposed, done: result.done };
     }
     case 'salience': {
       const result = await computeDeterministicSalience(sql, { now, budget, ...batched });

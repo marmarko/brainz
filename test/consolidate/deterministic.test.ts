@@ -570,6 +570,65 @@ describe('rule-based entity merge', () => {
     },
     SETUP_TIMEOUT_MS,
   );
+
+  test(
+    'the same company under two corporate designators becomes a question, not a merge',
+    async () => {
+      const { sql } = tenant;
+      await sql.unsafe(`
+        INSERT INTO entity (canonical_name, entity_type, origin_contexts) VALUES
+          ('Google Inc', 'organization', ARRAY['personal:mail']),
+          ('Google LLC', 'organization', ARRAY['work:files']),
+          ('Google Play', 'person', ARRAY['personal:mail']),
+          ('Morgan Stanley', 'organization', ARRAY['personal:mail']),
+          ('Morgan Wealth Management', 'organization', ARRAY['personal:mail']),
+          ('X', 'person', ARRAY['personal:mail']),
+          ('X Corp', 'organization', ARRAY['personal:mail']);
+      `);
+
+      const first = await mergeEntitiesByRule(sql);
+      // No rule collapses them — the names differ, so the bucket key differs.
+      expect(first.merged).toBe(0);
+      expect(first.proposed).toBe(1);
+
+      const queued = (await sql`
+        SELECT kind, target_ref, proposal, confidence::float8 AS confidence, state
+          FROM review_queue WHERE kind = 'entity_merge'
+      `) as Array<{
+        kind: string;
+        target_ref: string;
+        proposal: string;
+        confidence: number;
+        state: string;
+      }>;
+      expect(queued).toHaveLength(1);
+      expect(queued[0]?.proposal).toContain('Google Inc');
+      expect(queued[0]?.proposal).toContain('Google LLC');
+      expect(queued[0]?.confidence).toBeCloseTo(0.75);
+      expect(queued[0]?.state).toBe('open');
+      // `Google Play` shares no core with either; `Morgan Wealth Management` is
+      // not `Morgan Stanley` with a designator taken off; and `X`/`X Corp` are
+      // the same thing typed two ways, which no same-type rule may propose.
+      expect(queued[0]?.proposal).not.toContain('Google Play');
+
+      // Idempotent across cycles, keyed on the names rather than the ids.
+      const second = await mergeEntitiesByRule(sql);
+      expect(second.proposed).toBe(0);
+      expect(await countRows(sql, 'review_queue', `kind = 'entity_merge'`)).toBe(1);
+
+      // And a dismissal stays dismissed — which is why the diff reads every
+      // state and not just the open ones.
+      await sql`
+        UPDATE review_queue
+           SET state = 'dismissed', closed_by = 'user_out_of_band', closed_at = now()
+         WHERE kind = 'entity_merge'
+      `;
+      const third = await mergeEntitiesByRule(sql);
+      expect(third.proposed).toBe(0);
+      expect(await countRows(sql, 'review_queue', `kind = 'entity_merge'`)).toBe(1);
+    },
+    SETUP_TIMEOUT_MS,
+  );
 });
 
 describe('deterministic salience', () => {

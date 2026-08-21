@@ -627,6 +627,187 @@ export async function markStaleness(
 
 export interface MergeResult {
   readonly merged: number;
+  /** Merge proposals newly enqueued for the owner to decide. */
+  readonly proposed: number;
+}
+
+/**
+ * Corporate designators, stripped to compare what a name is *of*.
+ *
+ * `Google Inc` and `Google LLC` are two normalize keys, two slugs, two entities
+ * and — because {@link mergeEntitiesByRule} buckets on the key itself — two
+ * entities forever. No rule will ever collapse them, so the only honest move is
+ * to say so and let the owner decide.
+ */
+const CORPORATE_DESIGNATORS: ReadonlySet<string> = new Set([
+  'inc', 'inc.', 'llc', 'llp', 'ltd', 'ltd.', 'limited', 'corp', 'corp.',
+  'corporation', 'co', 'co.', 'company', 'plc', 'gmbh', 'ag', 'sa', 's.a.',
+  'nv', 'bv', 'ab', 'oy', 'pty', 'group', 'holdings', 'bank', 'bancorp',
+  'sarl', 'kk',
+]);
+
+/** Confidence a designator-stripped identity is proposed at. R12's review band. */
+const MERGE_PROPOSAL_CONFIDENCE = 0.75;
+
+/**
+ * How many merge proposals one cycle may add.
+ *
+ * Deliberately far below `REVIEW_CEILING`, which is what the review listing
+ * shows. This is the one review kind with **no apply path** — the queue renders
+ * it with a sentence saying so instead of a button — so a proposer allowed to
+ * fill the page would push every `entity_card` proposal, the only kind that can
+ * actually be applied, off it.
+ */
+const ENTITY_MERGE_PROPOSAL_CEILING = 12;
+
+/**
+ * Two live entities that are the same thing under different corporate
+ * designators, offered to the owner as a decision.
+ *
+ * **One rule, and the reason it is one.** `core(name)` is the normalize key with
+ * trailing {@link CORPORATE_DESIGNATORS} removed; two live rows sharing a
+ * non-empty core of at least two characters, with **equal `entity_type`** and
+ * differing full keys, get a proposal. On the production brain that is exactly
+ * two: `Google Inc`/`Google LLC` and `JPMorgan Chase`/`JPMorgan Chase Bank`. It
+ * emits nothing for `Morgan Stanley`/`Morgan Wealth Management`, `Google
+ * Inc`/`Google Play`, `JPMorgan Chase`/`Chase Payment Solutions` or
+ * `Every`/`Everyone`.
+ *
+ * **A prefix-containment rule was specified and rejected.** It emits only the
+ * four Anthem pairs, every one of them cross-type — `Anthem` is a `person`,
+ * `Anthem HP` an `organization` — which {@link mergeEntitiesByRule}'s bucket key
+ * can never collapse, so with no apply path the owner's only possible action
+ * would be dismissal. It also decomposes one six-row clustering decision into
+ * four pairwise ones while giving two of the rows no proposal at all. That is a
+ * decision for a human looking at a roster, not four queue rows. The same-type
+ * predicate is why `X`/`X Corp` emits nothing either.
+ *
+ * **Read, diff, insert — rather than `enqueueReview` per candidate.**
+ * `enqueueReview` ends `if (id === undefined) throw`, so a `WHERE NOT EXISTS`
+ * insert that correctly writes nothing — which is every cycle after the first —
+ * would *throw*, and the phase loop has no `catch`: it would escape the cycle,
+ * leave the run open, and charge an attempt against a ladder that dead-letters
+ * after five. It would also scan: `review_queue`'s only index is partial on
+ * `state='open'`, and this diff has to consider dismissed rows too or every
+ * dismissal comes straight back.
+ *
+ * **The idempotence key is the sorted pair of canonical names, never entity
+ * ids.** `widenEntityOrigins` mints a *new* `entity_id` and tombstones the
+ * predecessor whenever a second connector meets a corpus the brain already
+ * knows, so an id-keyed proposal would re-enqueue everything the owner had
+ * already dismissed, under a new keeper.
+ */
+export async function proposeEntityMerges(sql: SQL, runId: string | null): Promise<number> {
+  const rows = (await sql`
+    SELECT entity_id::text AS entity_id, canonical_name, entity_type, origin_contexts
+      FROM entity WHERE deleted_at IS NULL ORDER BY entity_id
+  `) as Array<{
+    entity_id: string;
+    canonical_name: string;
+    entity_type: string;
+    origin_contexts: string[];
+  }>;
+
+  const byCore = new Map<string, typeof rows>();
+  for (const row of rows) {
+    const core = designatorStrippedCore(row.canonical_name);
+    if (core.length < 2) continue;
+    const bucket = byCore.get(`${core}|${row.entity_type}`) ?? [];
+    bucket.push(row);
+    byCore.set(`${core}|${row.entity_type}`, bucket);
+  }
+
+  const candidates: Array<{ key: string; left: (typeof rows)[number]; right: (typeof rows)[number] }> =
+    [];
+  for (const bucket of byCore.values()) {
+    if (bucket.length < 2) continue;
+    const distinct = [...new Map(bucket.map((row) => [normalize(row.canonical_name), row])).values()];
+    if (distinct.length < 2) continue;
+    // Sorted by name so the pair key is stable whichever order the rows came in.
+    const ordered = [...distinct].sort((a, b) =>
+      normalize(a.canonical_name).localeCompare(normalize(b.canonical_name)),
+    );
+    for (let i = 0; i < ordered.length - 1; i += 1) {
+      const left = ordered[i];
+      const right = ordered[i + 1];
+      if (left === undefined || right === undefined) continue;
+      candidates.push({
+        key: mergeProposalKey(left.canonical_name, right.canonical_name),
+        left,
+        right,
+      });
+    }
+  }
+  if (candidates.length === 0) return 0;
+
+  // Every state, because a dismissed proposal must stay dismissed.
+  const existing = (await sql`
+    SELECT proposal FROM review_queue WHERE kind = 'entity_merge'
+  `) as Array<{ proposal: string }>;
+  const seen = new Set(existing.map((row) => proposalKeyOf(row.proposal)));
+
+  const fresh = candidates
+    .filter((candidate) => !seen.has(candidate.key))
+    .slice(0, ENTITY_MERGE_PROPOSAL_CEILING);
+  if (fresh.length === 0) return 0;
+
+  await sql.unsafe(
+    `INSERT INTO review_queue (kind, target_ref, proposal, confidence, run_id, origin_contexts)
+     SELECT 'entity_merge', u.target_ref, u.proposal, $4::numeric, $5::bigint, u.origins::text[]
+       FROM unnest($1::text[], $2::text[], $3::text[]) AS u(target_ref, proposal, origins)`,
+    [
+      textArrayLiteral(
+        fresh.map(
+          (candidate) =>
+            `entity:${
+              BigInt(candidate.left.entity_id) <= BigInt(candidate.right.entity_id)
+                ? candidate.left.entity_id
+                : candidate.right.entity_id
+            }`,
+        ),
+      ),
+      textArrayLiteral(fresh.map((candidate) => mergeProposalText(candidate.key))),
+      textArrayLiteral(
+        fresh.map((candidate) =>
+          textArrayLiteral(
+            [...new Set([...candidate.left.origin_contexts, ...candidate.right.origin_contexts])].sort(),
+          ),
+        ),
+      ),
+      MERGE_PROPOSAL_CONFIDENCE,
+      runId,
+    ],
+  );
+  return fresh.length;
+}
+
+/** The normalize key with trailing corporate designators taken off it. */
+function designatorStrippedCore(name: string): string {
+  const parts = normalize(name).split(' ').filter((part) => part.length > 0);
+  while (parts.length > 1 && CORPORATE_DESIGNATORS.has(parts[parts.length - 1] ?? '')) parts.pop();
+  return parts.join(' ');
+}
+
+/** The two names, sorted, which is the identity a proposal is deduplicated on. */
+function mergeProposalKey(left: string, right: string): string {
+  return [left, right].sort((a, b) => normalize(a).localeCompare(normalize(b))).join(' \u2194 ');
+}
+
+/**
+ * The sentence the owner reads.
+ *
+ * The key is embedded verbatim so {@link proposalKeyOf} can read it back without
+ * a column: `review_queue` has no idempotence key of its own and adding one is a
+ * schema rung, which this does not need.
+ */
+function mergeProposalText(key: string): string {
+  return `These look like the same thing under two names: ${key}. Merging them is not something your brain will do on its own \u2014 the two rows have different names, so no rule will ever collapse them.`;
+}
+
+/** The pair key back out of a stored proposal sentence. */
+function proposalKeyOf(proposal: string): string {
+  const match = /two names: (.+?)\. Merging/u.exec(proposal);
+  return match?.[1] ?? proposal;
 }
 
 /**
@@ -645,9 +826,17 @@ export interface MergeResult {
  */
 export async function mergeEntitiesByRule(
   sql: SQL,
-  options: { readonly budget?: AttemptBudget } = {},
+  options: { readonly budget?: AttemptBudget; readonly runId?: string | null } = {},
 ): Promise<MergeResult & PhaseProgress> {
   const budget = options.budget ?? unboundedAttempt();
+
+  // **Proposals first, off their own read, before the merge loop.** Not at the
+  // end: the loop below returns from inside itself whenever `budget.stop()`
+  // fires, so a trailing proposer would never run on exactly the cycles a large
+  // brain is having. And not off the loop's read either, because by then this
+  // call may have tombstoned a row the proposal would name.
+  const proposed = await proposeEntityMerges(sql, options.runId ?? null);
+
   const rows = (await sql`
     SELECT entity_id::text AS entity_id, canonical_name, entity_type, origin_contexts
       FROM entity WHERE deleted_at IS NULL ORDER BY entity_id
@@ -742,10 +931,10 @@ export async function mergeEntitiesByRule(
     // it is gone from the next attempt's `deleted_at IS NULL` read and the group
     // comes back one row shorter. The prefix shrinks, so a clean stop here costs
     // one whole-set read and cannot starve the phase.
-    if (budget.stop() !== null) return { merged, ...RESTARTS };
+    if (budget.stop() !== null) return { merged, proposed, ...RESTARTS };
   }
 
-  return { merged, ...FINISHED };
+  return { merged, proposed, ...FINISHED };
 }
 
 // ---------------------------------------------------------------------------
