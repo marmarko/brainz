@@ -141,6 +141,14 @@ const VIEW: CoverageView = {
   windowDays: 7,
   edgeKinds: [{ kind: 'works_at', count: 27 }],
   entitiesWithCard: 48,
+  declinedNames: {
+    names: 3,
+    bySignal: [
+      { signal: 'calendar_word', count: 2 },
+      { signal: 'function_words_only', count: 1 },
+    ],
+    sampled: 1000,
+  },
 };
 
 /** One row of `consolidation_run`, in the order the writer wrote them. */

@@ -2652,6 +2652,29 @@ ${view.entityTypes
 ${count(view.openReview, 'proposal', 'proposals')} are open.
 <a href="${escapeHtml(REVIEW_PATH)}">Decide them &rarr;</a></p>`;
 
+  // **The fence, made visible.** Your brain will not create a person called
+  // `Here` because a sentence began with the word, and this is where it says how
+  // often that happened. It is on the page rather than in a log for the reason
+  // the rest of this page exists: a gate nobody can see is indistinguishable
+  // from a brain that quietly stopped knowing things, and the one number that
+  // tells them apart is the vocabulary's own hit count. If a rule here is firing
+  // on names the reader recognises as real, that is the signal to loosen it.
+  const declined =
+    view.declinedNames.names === 0
+      ? ''
+      : `\n<p class="note">${count(
+          view.declinedNames.names,
+          'name was not made into an entity',
+          'names were not made into entities',
+        )} because it did not look like one &mdash; ${view.declinedNames.bySignal
+          .map(
+            (signal) =>
+              `${escapeHtml(String(signal.count))} <code>${escapeHtml(signal.signal)}</code>`,
+          )
+          .join(' &middot; ')} &mdash; across the ${escapeHtml(
+          String(view.declinedNames.sampled),
+        )} most recent facts.</p>`;
+
   // A brain with nothing in it is rendered without the derived section at all.
   // Three zeroes under a heading reading "what it made of them" is a small
   // number presented as a truth about a pipeline that has had nothing to do —
@@ -2677,7 +2700,7 @@ ${
     )}. <a href="${escapeHtml(ENTITY_PATH)}">Look one of them up &rarr;</a></p>
 <p class="note">These are what the brain derived from your documents, and they are the numbers to
 read next to the document count above: a large pile of documents with very few facts under it means
-consolidation is behind, not that there was nothing in them.</p>${types}${open}`;
+consolidation is behind, not that there was nothing in them.</p>${types}${declined}${open}`;
 
   return shell(
     'What your brain knows — brainz',

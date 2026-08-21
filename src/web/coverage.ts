@@ -153,6 +153,9 @@
 import type { SQL } from 'bun';
 
 import { cycleFreshnessOf, type CycleFreshness } from '../control/cycle-staleness.ts';
+import { admitEntityName, corpusEvidence } from '../core/write/entity-admission.ts';
+import { extractFromStatement } from '../core/write/extract.ts';
+import { impliedEdges } from '../core/write/links.ts';
 
 /** How far back "recently" reaches. One number, so the page and the query agree. */
 export const COVERAGE_WINDOW_DAYS = 7;
@@ -368,7 +371,70 @@ export interface CoverageView {
    * says nothing about whether the brain has anything to say about them.
    */
   readonly entitiesWithCard: number;
+  /**
+   * What the admission fence would decline, over a bounded sample of the live
+   * statements — and the sample size, printed beside it.
+   *
+   * A fence nobody can see is a brain that quietly stops knowing things. This
+   * runs the same {@link admitEntityName} over the same kind of input the phase
+   * does, so it cannot drift from the phase's behaviour; it is computed on read
+   * and writes nothing.
+   */
+  readonly declinedNames: DeclinedNames;
   readonly windowDays: number;
+}
+
+export interface DeclinedNames {
+  /** Distinct names refused across the sample. */
+  readonly names: number;
+  /** Which rules did the refusing, most-fired first. */
+  readonly bySignal: readonly { readonly signal: string; readonly count: number }[];
+  /** Live statements examined. */
+  readonly sampled: number;
+}
+
+/**
+ * Live statements the declined-names panel reads.
+ *
+ * Bounded because this is a page render rather than a phase, and printed on the
+ * page because a number computed over a sample that the reader cannot see the
+ * size of is not a number they can act on.
+ */
+const COVERAGE_DECLINE_SAMPLE = 1000;
+
+/**
+ * What the fence would decline across a set of statements.
+ *
+ * The endpoints are re-projected exactly as `reconcileAllEdges` projects them —
+ * `extractFromStatement` then `impliedEdges` — rather than by matching capitals
+ * directly, because it is the *endpoints* the phase would try to create, and
+ * the difference between those two readings is most of the noise.
+ */
+function declineOf(statements: readonly string[]): DeclinedNames {
+  const evidence = corpusEvidence(statements);
+  const refused = new Map<string, readonly string[]>();
+  for (const statement of statements) {
+    const extracted = extractFromStatement(statement);
+    if (extracted === null) continue;
+    for (const implied of impliedEdges([extracted])) {
+      for (const end of [implied.subject, implied.object]) {
+        if (refused.has(end.name)) continue;
+        const verdict = admitEntityName(end.name, evidence);
+        if (verdict.verdict === 'refuse') refused.set(end.name, verdict.signals);
+      }
+    }
+  }
+  const counts = new Map<string, number>();
+  for (const signals of refused.values()) {
+    for (const signal of signals) counts.set(signal, (counts.get(signal) ?? 0) + 1);
+  }
+  return {
+    names: refused.size,
+    bySignal: [...counts]
+      .map(([signal, count]) => ({ signal, count }))
+      .sort((left, right) => right.count - left.count || left.signal.localeCompare(right.signal)),
+    sampled: statements.length,
+  };
 }
 
 /** Bun's SQL returns `timestamptz` as a `Date`; a `text` cast would return a string. */
@@ -534,6 +600,17 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
   )) as Array<{ edge_type: string; n: number }>;
   const edgeKinds = edgeRows.map((row) => ({ kind: row.edge_type, count: row.n }));
 
+  // The fence, run on read over the newest statements. Newest rather than a
+  // random sample: what an owner wants to know is whether the vocabulary is
+  // still right for the mail arriving now.
+  const declineRows = (await sql.unsafe(
+    `SELECT statement FROM fact
+      WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL
+      ORDER BY fact_id DESC LIMIT $1`,
+    [COVERAGE_DECLINE_SAMPLE],
+  )) as Array<{ statement: string }>;
+  const declinedNames = declineOf(declineRows.map((row) => row.statement));
+
   const cycleFreshness = cycleFreshnessOf({
     completion:
       latestCycle === null
@@ -599,6 +676,7 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
     edges: scalars.edges,
     edgeKinds,
     entitiesWithCard: scalars.entities_with_card,
+    declinedNames,
     entityTypes,
     openContradictions,
     openReview,

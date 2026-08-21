@@ -887,11 +887,22 @@ the top every attempt — because at current phase costs it is seconds:
 | phase | shape of its cost | measured |
 |---|---|---|
 | `dedup` | one read, plus one write per collapse | — |
-| `link_reconcile` | one batched name resolution per **500 names** + one diff write per **500 edges**, so per **pass** — **plus an unbatched widen sequence (~5 + 2·degree round trips) for every entity whose origin set grows in that pass** | 7 cold / 4 warm on a 240-fact fixture, down from 8.42 per live fact. A second connector's first pass over a corpus the brain already knows costs `5·entities + 4·edges` and is the one shape that still overruns an attempt |
+| `link_reconcile` | one batched name resolution per **500 names** + one diff write per **500 edges**, so per **pass** — **plus an unbatched widen sequence (~5 + 2·degree round trips) for every entity whose origin set grows in that pass**, and **one in-memory tokenising pass over every live fact, twice per cycle** for the admission fence's corpus door (no round trips; see the note below the table) | 7 cold / 4 warm on a 240-fact fixture, down from 8.42 per live fact. A second connector's first pass over a corpus the brain already knows costs `5·entities + 4·edges` and is the one shape that still overruns an attempt |
 | `staleness` | one read per batch of superseded pages | — |
 | `entity_merge` | one read, plus a few writes per merge | — |
 | `salience` | one read + one write per **500 pages** | 24 round trips on that brain, down from 11,217 |
 | `cluster` | one probe per unassigned chunk, one transaction per 100 seeds | down from five round trips per seed |
+
+**The fence's clock, named because it is not the one a reader would guess.**
+`reconcileAllEdges` is the only deterministic phase that consults
+`budget.cancelled()` rather than `budget.stop()`, and `shareOfAttempt` applies
+the `DETERMINISTIC_ATTEMPT_SHARE` ceiling to `stop()` only — so this phase's time
+is charged against the **model tier's** half of the attempt. The corpus door adds
+one tokenising pass over strings the phase has already read, twice per cycle
+(`link_reconcile`, then the `staleness` fix point), and zero round trips: low
+tens of milliseconds at a couple of thousand facts, against 7 round trips and two
+full fact reads. It is written down here because a future change that made that
+pass superlinear would come out of `extract` and `enrich` silently.
 
 `link_reconcile` is the row to watch, because it is the one phase that does not
 stop on the clock: its desired edge set has to be complete before anything is

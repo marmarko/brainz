@@ -102,6 +102,7 @@ import type { StoredPayloadReader } from '../../core/media/accept.ts';
 import { runTranscribePhase } from '../../core/media/ocr-phase.ts';
 import { embeddingSeatFor } from '../../ai/routing.ts';
 import { documentEncoding, embedTexts, vectorLiteral } from '../../core/write/embed.ts';
+import { nameMatchPattern } from '../../core/search/name-match.ts';
 import { textArrayLiteral } from '../../core/write/pg-values.ts';
 import { seatColumnSql } from '../../schema/embedding-seat.ts';
 import {
@@ -207,6 +208,19 @@ export interface ModelPhaseDeps {
 }
 
 const DEFAULT_LIMIT = 200;
+
+/**
+ * The shortest canonical name `enrich` will gather evidence for.
+ *
+ * {@link nameMatchPattern}'s docstring requires every caller to bring its own
+ * floor, because no pattern can repair a one- or two-character form: it is a
+ * substring rather than a name. `src/mcp/reads.ts` and
+ * `src/core/briefing/assemble.ts` carry the same 3. An entity below it gets an
+ * empty evidence array and the model is asked to write a card from nothing,
+ * which is the honest input — it used to be asked to write one from every
+ * statement in the brain containing those two letters.
+ */
+const ENRICH_NAME_FLOOR = 3;
 
 function empty(phase: ModelPhase, stopped: PhaseStop | null = null): PhaseOutcome {
   return {
@@ -576,15 +590,8 @@ export async function runEnrichPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome
   const limit = deps.limit ?? DEFAULT_LIMIT;
   const version = (deps.consideration ?? CONSIDERATION_VERSION).enrich;
 
-  const entities = (await deps.sql`
-    SELECT e.entity_id::text AS entity_id, e.canonical_name, e.entity_type, e.origin_contexts,
-           coalesce(
-             (SELECT array_agg(f.statement ORDER BY f.fact_id)
-                FROM fact f
-               WHERE f.deleted_at IS NULL AND f.quarantined_at IS NULL AND f.superseded_by IS NULL
-                 AND f.statement ILIKE '%' || e.canonical_name || '%'),
-             ARRAY[]::text[]
-           ) AS evidence
+  const candidates = (await deps.sql`
+    SELECT e.entity_id::text AS entity_id, e.canonical_name, e.entity_type, e.origin_contexts
       FROM entity e
      WHERE e.deleted_at IS NULL
        -- The phase's durability, and the reason a stopped cycle no longer costs
@@ -598,10 +605,50 @@ export async function runEnrichPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome
     canonical_name: string;
     entity_type: string;
     origin_contexts: string[];
-    evidence: string[];
   }>;
 
-  if (entities.length === 0) return empty(phase);
+  if (candidates.length === 0) return empty(phase);
+
+  // **The evidence join, word-bounded, in a second statement rather than a
+  // correlated `ILIKE '%' || canonical_name || '%'`.**
+  //
+  // The wildcard this replaces is the bug `src/mcp/reads.ts` documents having
+  // fixed on its own side: `%al%` reaches the person called Al through `legal`,
+  // `renewal` and `Alberta`. Here it cost money rather than relevance — an
+  // entity called `X`, `Here` or `That` pulled hundreds of unrelated statements
+  // into a **paid** prompt and then had a summary written out of them, on a
+  // brain that had 26 such rows. `nameMatchPattern` is the shared
+  // implementation and {@link ENRICH_NAME_FLOOR} is the length floor its
+  // docstring requires of every caller.
+  //
+  // It is a second round trip and deliberately so: the pattern has to be built
+  // per name in TypeScript to be *bound* rather than interpolated, and a
+  // per-entity query would have been `limit` of them. This is one, whatever
+  // `limit` is.
+  const matchable = candidates.filter(
+    (entity) => entity.canonical_name.trim().length >= ENRICH_NAME_FLOOR,
+  );
+  const evidenceByEntity = new Map<string, string[]>();
+  if (matchable.length > 0) {
+    const rows_ = (await deps.sql.unsafe(
+      `SELECT u.entity_id, array_agg(f.statement ORDER BY f.fact_id) AS evidence
+         FROM unnest($1::text[], $2::text[]) AS u(entity_id, pattern)
+         JOIN fact f
+           ON f.deleted_at IS NULL AND f.quarantined_at IS NULL AND f.superseded_by IS NULL
+          AND f.statement ~* u.pattern
+        GROUP BY u.entity_id`,
+      [
+        textArrayLiteral(matchable.map((entity) => entity.entity_id)),
+        textArrayLiteral(matchable.map((entity) => nameMatchPattern(entity.canonical_name))),
+      ],
+    )) as Array<{ entity_id: string; evidence: string[] }>;
+    for (const row of rows_) evidenceByEntity.set(row.entity_id, row.evidence);
+  }
+
+  const entities = candidates.map((entity) => ({
+    ...entity,
+    evidence: evidenceByEntity.get(entity.entity_id) ?? [],
+  }));
 
   const byName = new Map(entities.map((entity) => [entity.canonical_name, entity]));
   const prompt = buildEnrichPrompt({

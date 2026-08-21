@@ -13,7 +13,10 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
-import { resolveOrCreateEntity } from '../../src/core/write/links.ts';
+import {
+  resolveOrCreateEntities,
+  resolveOrCreateEntity,
+} from '../../src/core/write/links.ts';
 import { slugify } from '../../src/core/write/normalize.ts';
 import {
   clusterByEmbedding,
@@ -357,6 +360,111 @@ describe('link reconciliation', () => {
       expect(again.added).toBe(0);
       expect(again.removed).toBe(0);
       expect(await countRows(sql, 'entity', 'deleted_at IS NOT NULL')).toBe(1);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
+    'a sentence-initial capital does not become a person, and its object still does',
+    async () => {
+      const { sql } = tenant;
+      // The exact shape that produced an entity called `Here`: a model-written
+      // statement whose first word is a discourse marker sitting in the subject
+      // slot of a `works_at` rule, which types it `person`.
+      const page = await seedPage(sql, {
+        origin: 'personal:mail',
+        sourceType: 'email',
+        title: 'thread',
+        body: 'Here is the contact at Capital One. Marcus Fell founded Kettle Works.',
+      });
+      for (const statement of [
+        'Here is the contact at Capital One.',
+        'Marcus Fell founded Kettle Works.',
+      ]) {
+        await seedFact(sql, {
+          statement,
+          origins: ['personal:mail'],
+          pageId: page.pageId,
+          chunkIds: page.chunkIds,
+          confidence: 0.8,
+        });
+      }
+
+      const result = await reconcileAllEdges(sql, { taxonomyVersion: 1 });
+      expect(result.refused).toBe(1);
+      expect(result.refusedBySignal).toEqual({ function_words_only: 1 });
+
+      const names = (await sql`
+        SELECT canonical_name FROM entity WHERE deleted_at IS NULL ORDER BY canonical_name
+      `) as Array<{ canonical_name: string }>;
+      const created = names.map((row) => row.canonical_name);
+      expect(created).not.toContain('Here');
+      // **The accepted orphan.** `Capital One` is real and is created, and the
+      // edge that would have connected it to `Here` is simply not in the desired
+      // set. An entity with no edges is a row the roster shows; an employer the
+      // brain silently declined to record is not.
+      expect(created).toContain('Capital One');
+      expect(created).toContain('Marcus Fell');
+      expect(created).toContain('Kettle Works');
+      expect(result.added).toBe(1);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
+    'the fence never removes an edge whose endpoint already exists',
+    async () => {
+      const { sql } = tenant;
+      // The removal-safety pin, and the reason the fence is consulted *after*
+      // resolution. A brain that already holds a row called `Here` — however it
+      // got there — keeps it and keeps its graph. The failure this forecloses is
+      // the invisible one: a vocabulary that grew to include a word some real
+      // employer is named after would otherwise tombstone that employer's edges
+      // on every cycle, forever, with nothing logged and nothing thrown.
+      const page = await seedPage(sql, {
+        origin: 'personal:mail',
+        sourceType: 'email',
+        title: 'thread',
+        body: 'Here is part of Capital One.',
+      });
+      await seedFact(sql, {
+        statement: 'Here is part of Capital One.',
+        origins: ['personal:mail'],
+        pageId: page.pageId,
+        chunkIds: page.chunkIds,
+        confidence: 0.8,
+      });
+      // Created through the ordinary resolver rather than a raw INSERT, because
+      // an entity is its row *plus* its slug and alias vocabulary — a bare row
+      // is invisible to the resolution ladder and would prove nothing here.
+      await resolveOrCreateEntities(sql, [
+        { name: 'Here', type: 'person', origins: ['personal:mail'], taxonomyVersion: 1 },
+        {
+          name: 'Capital One',
+          type: 'organization',
+          origins: ['personal:mail'],
+          taxonomyVersion: 1,
+        },
+      ]);
+
+      const result = await reconcileAllEdges(sql, { taxonomyVersion: 1 });
+      expect(result.refused).toBe(0);
+      expect(result.removed).toBe(0);
+      expect(result.added).toBe(1);
+
+      const live = (await sql`
+        SELECT s.canonical_name AS subject, o.canonical_name AS object
+          FROM entity_edge e
+          JOIN entity s ON s.entity_id = e.subject_entity_id
+          JOIN entity o ON o.entity_id = e.object_entity_id
+         WHERE e.deleted_at IS NULL
+      `) as Array<{ subject: string; object: string }>;
+      expect(live).toEqual([{ subject: 'Here', object: 'Capital One' }]);
+
+      // And it is stable: a second pass does not change its mind either.
+      const again = await reconcileAllEdges(sql, { taxonomyVersion: 1 });
+      expect(again.removed).toBe(0);
+      expect(again.refused).toBe(0);
     },
     SETUP_TIMEOUT_MS,
   );

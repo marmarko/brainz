@@ -22,12 +22,14 @@
 
 import { describe, expect, test } from 'bun:test';
 
-import { RULE_FAMILIES } from '../../../evals/fixtures/extraction.ts';
+import { FACTS } from '../../../evals/fixtures/brain.ts';
+import { FACT_RULES, RULE_FAMILIES } from '../../../evals/fixtures/extraction.ts';
 import { chunkDocument } from '../../../src/core/write/chunker.ts';
 import {
   DETERMINISTIC_RULE_FAMILIES,
   extractFacts,
   extractFromStatement,
+  namesAwayFromSentenceStart,
   splitSentences,
 } from '../../../src/core/write/extract.ts';
 import { normalize } from '../../../src/core/write/normalize.ts';
@@ -170,5 +172,119 @@ describe('sentence splitting keeps the text it splits', () => {
     for (const piece of splitSentences(source)) {
       expect(source.slice(piece.start, piece.start + piece.text.length)).toBe(piece.text);
     }
+  });
+});
+
+/**
+ * The gold key, graded against the extractor that is supposed to satisfy it.
+ *
+ * `evals/extraction.ts` counts fixture labels and never calls the extractor, so
+ * `FACT_RULES` — the key U6 was written against — has never been checked against
+ * U6's output. This closes the narrow half of that gap, and the narrowness is
+ * the point.
+ *
+ * **What this can and cannot ask.** A gold `statement` is the canonical
+ * paraphrase of a fact, not the sentence it was extracted from: `f-sam-works-
+ * verdant` is labelled `role_copula_sentence` because the *document* says
+ * "Samantha Okonkwo is Head of Engineering at Verdant Loom", while its statement
+ * reads "works at", which no deterministic rule matches. Ten rows are like that,
+ * and a test asserting the extractor reproduces its family from the paraphrase
+ * would be grading the wrong text. So the question asked here is the one that is
+ * actually answerable: **when the extractor does fire on a gold statement, does
+ * it agree with the key?**
+ *
+ * **Four rows disagree, from two unrelated causes**, and finding the second is
+ * the argument for the test existing at all.
+ *
+ * Two are the extractor being wrong: `ROLE` is `[a-z][a-z ]{2,40}?`, which
+ * matches the word `part`, so `role_copula` intercepts every copula spelling of
+ * `part_of` before `relation_verb` ever sees it — and re-asserts it as
+ * `works_at`, whose subject slot is typed `person`. That is why a production
+ * brain holds `Android` and `Google Play` as *people*.
+ *
+ * Two are the **key** being wrong: `f-tessellate-invested-*` are labelled
+ * `model_only`, meaning the free tier is expected to miss them, and the free
+ * tier reads them fine — `invested in` joined `RELATION_VERBS` after the key was
+ * written. The eval has been crediting the model with recall the deterministic
+ * half already had.
+ *
+ * All four are `test.failing` rather than deleted: rule order is documented
+ * specification and reordering it changes the `(subject, topic)` supersession
+ * key that dedup and reconciliation recompute by re-extraction, so the fix is
+ * its own commit. On the day it lands these start *passing*, which fails a
+ * `test.failing` and forces the two fixture labels to be corrected in that same
+ * commit — which is what makes this a tracked defect rather than a memory.
+ */
+describe('the gold key agrees with the extractor where the extractor fires', () => {
+  const KNOWN_WRONG = new Set([
+    // `role_copula` shadows `part_of` — see the header.
+    'f-saltmarsh-part-of-verdant',
+    'f-windbreak-part-of-northwind',
+    // A stale label, in the opposite direction: `invested in` joined
+    // `RELATION_VERBS` after the key was written, so two facts the key reserves
+    // for the model are ones the free tier can already read. Correcting them is
+    // a change to a scored baseline and belongs in the commit that re-scores it,
+    // not in a fence.
+    'f-tessellate-invested-verdant',
+    'f-tessellate-invested-brackish',
+  ]);
+
+  for (const fact of FACTS) {
+    const expected = FACT_RULES[fact.id];
+    if (expected === undefined) continue;
+    const wrong = KNOWN_WRONG.has(fact.id);
+    // A statement no rule matches is the paraphrase case above, not a
+    // disagreement — except for the row labelled `model_only` that fires anyway,
+    // which is the disagreement.
+    if (!wrong && extractFromStatement(fact.statement) === null) continue;
+    (wrong ? test.failing : test)(`${fact.id} is ${expected}`, () => {
+      const extracted = extractFromStatement(fact.statement);
+      if (expected === 'model_only') {
+        expect(extracted).toBeNull();
+        return;
+      }
+      expect(extracted?.family).toBe(expected);
+    });
+  }
+});
+
+/**
+ * The two surfaces the admission fence borrows from this module.
+ */
+describe('names, and where in a sentence they sat', () => {
+  test('a trailing unbalanced quote is not part of the name', () => {
+    // The class is unbalanced quotes, not possessives: `NAME` starts `[A-Z]`, so
+    // an opening quote is never captured while the closing one is. Three rows in
+    // a production brain are spelled this way and nothing renames an entity.
+    expect(extractFromStatement("'AI Systems' is a partner of Anthem.")?.subject).toBe(
+      'AI Systems',
+    );
+  });
+
+  test('an apostrophe inside a name still is', () => {
+    expect(extractFromStatement("Ronan O'Brien joined Verdant Systems.")?.subject).toBe(
+      "Ronan O'Brien",
+    );
+    expect(extractFromStatement('Ronan O\u2019Brien joined Verdant Systems.')?.subject).toBe(
+      'Ronan O\u2019Brien',
+    );
+  });
+
+  test('a capital a sentence gave away for free is not a name it earned', () => {
+    expect(namesAwayFromSentenceStart('Here is the contact at Capital One.')).toEqual([
+      'Capital One',
+    ]);
+  });
+
+  test('the same word mid-sentence is', () => {
+    expect(namesAwayFromSentenceStart('The listing went to Indeed.')).toEqual(['Indeed']);
+  });
+
+  test('every sentence gets its own opening, including the second', () => {
+    // `Capital One` opens the second sentence and is therefore not evidence of
+    // anything, exactly as `Acme Inc` would not be if it opened the first.
+    expect(
+      namesAwayFromSentenceStart('Acme Inc replied. Capital One did not answer Marcus Fell.'),
+    ).toEqual(['Marcus Fell']);
   });
 });

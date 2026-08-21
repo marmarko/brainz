@@ -34,6 +34,7 @@
 
 import type { SQL } from 'bun';
 
+import { admitEntityName, corpusEvidence, type NameEvidence } from './entity-admission.ts';
 import { extractFromStatement, type ExtractedFact, type Predicate } from './extract.ts';
 import { normalize, slugify } from './normalize.ts';
 import { numericArrayLiteral, textArrayLiteral } from './pg-values.ts';
@@ -499,7 +500,17 @@ interface WantedName {
 export async function resolveOrCreateEntities(
   db: SQL,
   requests: readonly ResolveEntityRequest[],
-): Promise<Map<string, EntityRow>> {
+): Promise<Map<string, EntityRow>>;
+export async function resolveOrCreateEntities(
+  db: SQL,
+  requests: readonly ResolveEntityRequest[],
+  admission: EntityAdmission,
+): Promise<GatedEntities>;
+export async function resolveOrCreateEntities(
+  db: SQL,
+  requests: readonly ResolveEntityRequest[],
+  admission?: EntityAdmission,
+): Promise<Map<string, EntityRow> | GatedEntities> {
   const wanted = new Map<string, WantedName>();
   for (const request of requests) {
     const key = normalize(request.name);
@@ -519,11 +530,31 @@ export async function resolveOrCreateEntities(
       aliasOrigins: [...new Set(request.origins)].sort(),
     });
   }
-  if (wanted.size === 0) return new Map();
+  if (wanted.size === 0) return admission === undefined ? new Map() : { entities: new Map(), refused: [] };
 
   const resolved = new Map<string, EntityRow>(
     await findEntitiesByName(db, [...wanted.values()].map((name) => name.name)),
   );
+
+  // ------------------------------------------------------------------
+  // 1a. The admission fence — creations only, and only when asked for.
+  // ------------------------------------------------------------------
+  //
+  // Placed here and nowhere else: after resolution, before the slug fold. A
+  // name that already resolves is never asked about, which is what makes the
+  // fence unable to remove anything — see `entity-admission.ts`'s header for
+  // why that property is the whole design rather than a nicety.
+  const refused: RefusedName[] = [];
+  if (admission !== undefined) {
+    for (const [key, name] of wanted) {
+      if (resolved.has(key)) continue;
+      const verdict = admitEntityName(name.name, admission.evidence);
+      if (verdict.verdict === 'admit') continue;
+      refused.push({ name: name.name, signals: verdict.signals });
+      wanted.delete(key);
+    }
+    if (wanted.size === 0) return { entities: resolved, refused };
+  }
 
   // ------------------------------------------------------------------
   // 2. Widen, once per entity.
@@ -621,7 +652,7 @@ export async function resolveOrCreateEntities(
 
   await allocateSlugs(db, born);
   await plantAliases(db, wanted, resolved);
-  return resolved;
+  return admission === undefined ? resolved : { entities: resolved, refused };
 }
 
 /**
@@ -760,6 +791,39 @@ async function plantAliases(
 }
 
 /**
+ * Opting {@link resolveOrCreateEntities} into the admission fence.
+ *
+ * Optional, and its absence is the compatibility contract: with no `admission`
+ * the function behaves exactly as it did before the fence existed, which is
+ * what lets {@link resolveOrCreateEntity} and every test that predates this
+ * stay honest. The invariant that replaces it: **every path in `src/` that
+ * creates an entity from extracted text passes `admission`.**
+ */
+export interface EntityAdmission {
+  /**
+   * The corpus door. Absent is the strict reading — the write path has one page
+   * in hand rather than a corpus, so it gets the strict one.
+   */
+  readonly evidence?: NameEvidence;
+}
+
+/** A name the fence declined to create, with the rules that fired. */
+export interface RefusedName {
+  readonly name: string;
+  readonly signals: readonly string[];
+}
+
+export interface GatedEntities {
+  readonly entities: Map<string, EntityRow>;
+  /**
+   * Refusals, so a fence nobody can see does not become a brain that quietly
+   * stops knowing things. Folded into `link_reconcile`'s log line and counted
+   * on `/coverage`.
+   */
+  readonly refused: readonly RefusedName[];
+}
+
+/**
  * The entity a name refers to, creating it if the brain has not seen it.
  *
  * Every path leaves the same three things true: the entity exists, its origin
@@ -767,6 +831,14 @@ async function plantAliases(
  * in its alias vocabulary. A batch of one, so that the write path and
  * consolidation cannot disagree about what a name resolves to — see
  * {@link resolveOrCreateEntities}.
+ *
+ * **It has no callers in `src/` any more**, and it is kept deliberately: it is
+ * the documented batch-of-one, it is what several tests are written against,
+ * and it is the compatibility pin that keeps the two-argument form of
+ * {@link resolveOrCreateEntities} honest. The invariant it must not be used to
+ * break: **every path in `src/` that creates an entity from extracted text
+ * passes `admission`.** This one does not, so nothing in `src/` may call it on
+ * a name that came out of the extractor.
  */
 export async function resolveOrCreateEntity(
   db: SQL,
@@ -925,6 +997,24 @@ export interface ReconcileResult {
   readonly added: number;
   readonly removed: number;
   readonly kept: number;
+  /** Names the admission fence declined to create on this pass. */
+  readonly refused: number;
+  /** Which rules did the declining, so the vocabulary is auditable from a log line. */
+  readonly refusedBySignal: Readonly<Record<string, number>>;
+}
+
+/** Folds a refusal list into the two counters {@link ReconcileResult} carries. */
+export function countRefusals(refused: readonly RefusedName[]): {
+  refused: number;
+  refusedBySignal: Record<string, number>;
+} {
+  const refusedBySignal: Record<string, number> = {};
+  for (const row of refused) {
+    for (const signal of row.signals) {
+      refusedBySignal[signal] = (refusedBySignal[signal] ?? 0) + 1;
+    }
+  }
+  return { refused: refused.length, refusedBySignal };
 }
 
 /**
@@ -938,27 +1028,48 @@ export async function reconcileEdges(db: SQL, request: ReconcileRequest): Promis
   const desired = new Map<string, ResolvedEdge>();
   request.onPhase?.('resolve_entities');
 
-  for (const implied of impliedEdges(request.facts)) {
-    const subject = await resolveOrCreateEntity(db, {
-      name: implied.subject.name,
-      type: implied.subject.type,
-      origins: request.origins,
-      taxonomyVersion: request.taxonomyVersion,
-    });
-    const object = await resolveOrCreateEntity(db, {
-      name: implied.object.name,
-      type: implied.object.type,
-      origins: request.origins,
-      taxonomyVersion: request.taxonomyVersion,
-    });
+  // One batched, gated resolution for the whole page rather than two round
+  // trips per implied edge. Two dividends: the fence reaches the write path,
+  // and the cost shape `docs/deploy.md` complains about — `2 x (2..6)` per
+  // edge — collapses to the batch `resolveOrCreateEntities` was written for.
+  const implied = impliedEdges(request.facts);
+  const evidence = corpusEvidence([
+    ...request.facts.map((fact) => fact.statement),
+    ...request.previousStatements,
+  ]);
+  const { entities, refused } = await resolveOrCreateEntities(
+    db,
+    implied.flatMap((edge) => [
+      {
+        name: edge.subject.name,
+        type: edge.subject.type,
+        origins: request.origins,
+        taxonomyVersion: request.taxonomyVersion,
+      },
+      {
+        name: edge.object.name,
+        type: edge.object.type,
+        origins: request.origins,
+        taxonomyVersion: request.taxonomyVersion,
+      },
+    ]),
+    { evidence },
+  );
+
+  for (const edge of implied) {
+    const subject = entities.get(normalize(edge.subject.name));
+    const object = entities.get(normalize(edge.object.name));
+    // An endpoint the fence refused takes its edge with it. Nothing is removed
+    // by this: an edge whose endpoint does not exist never existed either.
+    if (subject === undefined || object === undefined) continue;
     // The schema refuses a self-loop; two surface forms of one thing resolving
     // to the same entity is the ordinary way one is reached.
     if (subject.entityId === object.entityId) continue;
     const resolved: ResolvedEdge = {
       subjectId: subject.entityId,
       objectId: object.entityId,
-      edgeType: implied.edgeType,
-      confidence: implied.confidence,
+      edgeType: edge.edgeType,
+      confidence: edge.confidence,
       origins: union(subject.originContexts, object.originContexts),
     };
     desired.set(edgeKey(resolved), resolved);
@@ -1024,5 +1135,5 @@ export async function reconcileEdges(db: SQL, request: ReconcileRequest): Promis
     else kept += 1;
   }
 
-  return { added, removed, kept };
+  return { added, removed, kept, ...countRefusals(refused) };
 }

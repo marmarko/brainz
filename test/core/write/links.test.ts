@@ -29,6 +29,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 
 import type { SQL } from 'bun';
 
+import { corpusEvidence } from '../../../src/core/write/entity-admission.ts';
 import {
   findEntityByName,
   reconcileEdges,
@@ -667,5 +668,106 @@ describe('editing a page removes the edges it no longer states', () => {
     await reset();
     await write({ origin: 'personal', ref: 'self-1', body: 'Kettle Works acquired Kettle Works.' });
     expect(await liveEdges()).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+});
+
+/**
+ * The fence, at the one place it is consulted.
+ *
+ * The property that matters more than any refusal it makes: **it is asked only
+ * about names that do not already resolve.** Everything the design claims about
+ * removal safety follows from that placement and nothing else, so it is pinned
+ * directly rather than inferred from a phase's output.
+ */
+describe('the admission fence gates creations and only creations', () => {
+  test('a name that does not look like one is never created, and takes its edge with it', async () => {
+    await reset();
+    await write({
+      origin: 'personal',
+      ref: 'gate-1',
+      body: 'Here is the contact at Capital One. Marcus Fell founded Kettle Works.',
+    });
+
+    const names = (await tenant.sql`
+      SELECT canonical_name FROM entity WHERE deleted_at IS NULL ORDER BY canonical_name
+    `) as Array<{ canonical_name: string }>;
+    const created = names.map((row) => row.canonical_name);
+
+    // The junk subject is absent...
+    expect(created).not.toContain('Here');
+    // ...and the real object of that same sentence is present, uncreated edge
+    // and all. A gate that dropped `Capital One` too would be trading one
+    // invisible failure for a worse one.
+    expect(created).toContain('Capital One');
+    expect(created).toContain('Marcus Fell');
+    expect(created).toContain('Kettle Works');
+
+    // The clean sentence keeps its edge; the gated one has none to keep.
+    expect(await liveEdges()).toEqual([
+      { subject: 'Marcus Fell', object: 'Kettle Works', type: 'related_to' },
+    ]);
+  }, TEST_TIMEOUT_MS);
+
+  test('a name that already exists is never gated, whatever it is called', async () => {
+    await reset();
+    // The crown property. `Here` is created directly, out of band — which is
+    // what any of the six other paths into this table amounts to — and then the
+    // page that would have been refused is written.
+    const seeded = await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Here', type: 'organization', origins: ['personal'], taxonomyVersion: 1 },
+    ]);
+    expect(seeded.size).toBe(1);
+
+    const { entities, refused } = await resolveOrCreateEntities(
+      tenant.sql,
+      [
+        { name: 'Here', type: 'organization', origins: ['personal'], taxonomyVersion: 1 },
+        { name: 'There', type: 'organization', origins: ['personal'], taxonomyVersion: 1 },
+      ],
+      {},
+    );
+    // Resolved, returned, untouched.
+    expect(entities.get('here')).toBeDefined();
+    // And the one that did NOT already exist is the one refused.
+    expect(entities.get('there')).toBeUndefined();
+    expect(refused.map((row) => row.name)).toEqual(['There']);
+    expect(refused[0]?.signals).toEqual(['function_words_only']);
+  }, TEST_TIMEOUT_MS);
+
+  test('without an admission argument it behaves exactly as it did before the fence', async () => {
+    await reset();
+    // The compatibility contract, executable: the two-argument form is what
+    // `resolveOrCreateEntity` and every test that predates the fence call, and
+    // it must still create a name the fence would refuse.
+    const resolved = await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Here', type: 'organization', origins: ['personal'], taxonomyVersion: 1 },
+    ]);
+    expect(resolved.get('here')).toBeDefined();
+    expect(resolved).toBeInstanceOf(Map);
+  }, TEST_TIMEOUT_MS);
+
+  test('the corpus can vouch for a name the strict reading refuses', async () => {
+    await reset();
+    const { entities: strict } = await resolveOrCreateEntities(
+      tenant.sql,
+      [{ name: 'Indeed', type: 'organization', origins: ['personal'], taxonomyVersion: 1 }],
+      {},
+    );
+    expect(strict.get('indeed')).toBeUndefined();
+
+    // Two statements naming it away from a sentence opening — which is the
+    // corpus asserting the name is real rather than a discourse adverb.
+    const { entities: vouched, refused } = await resolveOrCreateEntities(
+      tenant.sql,
+      [{ name: 'Indeed', type: 'organization', origins: ['personal'], taxonomyVersion: 1 }],
+      {
+        evidence: corpusEvidence([
+          'Payroll runs through Indeed each month.',
+          'The listing went to Indeed.',
+        ]),
+      },
+    );
+    expect(refused).toEqual([]);
+    expect(vouched.get('indeed')).toBeDefined();
   }, TEST_TIMEOUT_MS);
 });

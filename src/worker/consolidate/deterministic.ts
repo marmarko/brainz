@@ -79,8 +79,10 @@ import type { SQL } from 'bun';
 
 import { RECENCY_HALF_LIFE_DAYS, SOURCE_TYPE_PRIOR } from '../../core/search/boosts.ts';
 import type { SourceType } from '../../core/search/types.ts';
+import { corpusEvidence } from '../../core/write/entity-admission.ts';
 import { extractFromStatement } from '../../core/write/extract.ts';
 import {
+  countRefusals,
   impliedEdges,
   resolveOrCreateEntities,
   type EntityType,
@@ -224,6 +226,10 @@ export interface ReconcileResult {
   readonly added: number;
   readonly removed: number;
   readonly kept: number;
+  /** Names the admission fence declined to create on this pass. */
+  readonly refused: number;
+  /** Which rules did the declining, so the vocabulary is auditable from a log line. */
+  readonly refusedBySignal: Readonly<Record<string, number>>;
 }
 
 const SYMMETRIC_EDGE_TYPES: ReadonlySet<string> = new Set(['related_to']);
@@ -307,10 +313,29 @@ export async function reconcileAllEdges(
   options: { readonly taxonomyVersion: number; readonly budget?: AttemptBudget },
 ): Promise<ReconcileResult & PhaseProgress> {
   const budget = options.budget ?? unboundedAttempt();
-  const nothingDone = { added: 0, removed: 0, kept: 0, ...RESTARTS };
+  const nothingDone = {
+    added: 0,
+    removed: 0,
+    kept: 0,
+    refused: 0,
+    refusedBySignal: {},
+    ...RESTARTS,
+  };
   const facts = (await sql.unsafe(`
     SELECT statement, origin_contexts FROM fact WHERE ${LIVE_FACT} ORDER BY fact_id
   `)) as Array<{ statement: string; origin_contexts: string[] }>;
+
+  // **No derivation predicate here, and it was measured rather than assumed.**
+  // This pass reads model-written prose as well as parsed assertions, which is
+  // what produced entities called `Here` and `Thursday` — and the one-line
+  // remedy (`AND derivation = 'ingested'`) was counterfactualled against the
+  // production corpus before being refused: it keeps only 0.537 of the distinct
+  // endpoints and 0.460 of the projected edges, and among what it drops are the
+  // owner's own name, a colleague's, and `Fair Isaac Corporation`. The
+  // model-derived half carries real recall, so the fence below is the
+  // instrument and the filter is not. Re-run the counterfactual before
+  // re-litigating this.
+  const evidence = corpusEvidence(facts.map((fact) => fact.statement));
 
   // The projection, computed entirely in memory. Every name the pass will need
   // is knowable here, which is what makes resolving them as a set possible at
@@ -362,14 +387,16 @@ export async function reconcileAllEdges(
   // edge the brain has, with an unfenced write, on its way out.
   if (budget.cancelled() !== null) return nothingDone;
 
-  const entities = await resolveOrCreateEntities(sql, endpoints);
+  const { entities, refused } = await resolveOrCreateEntities(sql, endpoints, { evidence });
 
   const desired = new Map<string, DesiredEdge>();
   for (const edge of projected) {
     const subject = entities.get(edge.subject);
     const object = entities.get(edge.object);
-    // Unreachable: a name that resolves to nothing throws inside the resolver,
-    // exactly as it did when the endpoints were resolved one at a time.
+    // The refusal path. A name the fence declined has no row, so its edge is
+    // not in the desired set — and cannot be *removed* from the live set
+    // either, because an endpoint that already exists always resolves and is
+    // therefore never gated. See `entity-admission.ts`.
     if (subject === undefined || object === undefined) continue;
     if (subject.entityId === object.entityId) continue;
     // **The origins come from the entity rows the pass settled on**, which is
@@ -471,7 +498,7 @@ export async function reconcileAllEdges(
     }
   }
 
-  return { added, removed, kept, ...FINISHED };
+  return { added, removed, kept, ...countRefusals(refused), ...FINISHED };
 }
 
 // ---------------------------------------------------------------------------

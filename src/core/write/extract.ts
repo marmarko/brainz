@@ -198,9 +198,19 @@ const CURRENCY = String.raw`(?:€|\$|£|euros?|dollars?|pounds?|usd|eur|gbp)`;
  * it survives the normalizer, which folds punctuation shapes but does not
  * delete them. The cost is that "Acme Inc." is filed as "Acme Inc", which is
  * the same decision on both the write and the read side and so matches.
+ *
+ * **The trailing class also takes an unbalanced quote, and the class is
+ * unbalanced quotes rather than possessives.** `NAME` starts `[A-Z]`, so an
+ * opening `'` is never captured while the closing one is: *"'AI Systems' is a
+ * partner of Anthem."* yielded the subject `AI Systems'`, and `School Wrap
+ * Party'` is a quoted phrase rather than a genitive. Somebody looking here for
+ * an apostrophe-`s` rule will not find one. The curly form is stripped here and
+ * deliberately **not** removed from `NAME`'s own character class, because
+ * `normalize` folds U+2019 to ASCII precisely so `O’Brien` and `O'Brien`
+ * co-resolve — an apostrophe inside a name is part of it.
  */
 function cleanName(surface: string): string {
-  return surface.replace(/[\s.,;:!?]+$/u, '').replace(/\s+/gu, ' ').trim();
+  return surface.replace(/[\s.,;:!?'’]+$/u, '').replace(/\s+/gu, ' ').trim();
 }
 
 interface Rule {
@@ -348,6 +358,35 @@ const RULES: readonly Rule[] = [
     },
   },
 ];
+
+/**
+ * Every `NAME`-shaped run in `text` that does **not** start at a sentence
+ * opening.
+ *
+ * The one signal that separates a capital a name earned from a capital a
+ * sentence gave it for free. `Here is the contact at Capital One.` yields
+ * `Capital One` and not `Here`; the same sentence with the words reordered
+ * would yield both, which is the corpus saying something different.
+ *
+ * It lives here rather than in {@link ../write/entity-admission.ts} because it
+ * needs this module's own `NAME` and `splitSentences`, and a second copy of
+ * `NAME` is exactly the two-ladders failure this module's header warns about:
+ * it would agree today and disagree silently after one edit.
+ */
+export function namesAwayFromSentenceStart(text: string): string[] {
+  const found: string[] = [];
+  for (const sentence of splitSentences(text)) {
+    const opening = sentence.text.search(/\S/);
+    if (opening < 0) continue;
+    const pattern = new RegExp(NAME, 'gu');
+    for (const match of sentence.text.matchAll(pattern)) {
+      if (match.index === undefined || match.index <= opening) continue;
+      const name = cleanName(match[0]);
+      if (name.length > 0) found.push(name);
+    }
+  }
+  return found;
+}
 
 /**
  * The whole rule engine over one sentence, and the entry point reconciliation
