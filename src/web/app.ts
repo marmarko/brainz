@@ -80,6 +80,7 @@ import { connectorStatuses } from './connector-panel.ts';
 import type { CoverageView } from './coverage.ts';
 import type { ProcessingView } from './processing.ts';
 import type { ReviewView } from './review.ts';
+import type { EntityLookup } from './entity.ts';
 import { BRAIN_SETUP_PATH, REVIEW_PATH, renderPage } from './pages.ts';
 
 export const SESSION_COOKIE = 'bz_session';
@@ -392,6 +393,30 @@ export interface ReviewPort {
   >;
 }
 
+/**
+ * One named subject, as the owner's own record of them.
+ *
+ * **A sibling port rather than a method on `CoveragePort`, and that interface's
+ * own docstring is the argument against doing it that way — so it is answered
+ * rather than cited.** It refuses a second port because a declared field can go
+ * unsupplied while a method cannot. What it also says is that what keeps
+ * `?view=coverage` safe is *the type*: every field a number, an instant, or a
+ * string from a CHECK. A name-bearing method destroys that property, and a port
+ * whose methods sit on both sides of the privacy line has no safety property
+ * left to state. So the discriminator is the line, not the count —
+ * `readProcessing` is counts and belongs there; this crosses, so it is a
+ * sibling, exactly as `ReviewPort` is. The risk that argument names is closed by
+ * an executable guard instead: `test/web/port-supply.test.ts` fails the build
+ * when a declared port has no supplier.
+ *
+ * Absent renders the explanation rather than an empty result: "nothing is known
+ * about this person" and "this deployment cannot read your brain" are two
+ * different sentences, and this is the page built to say which is true.
+ */
+export interface EntityLookupPort {
+  read(request: { readonly tenantId: string; readonly name: string }): Promise<EntityLookup>;
+}
+
 export interface ConnectorVendor {
   mintClaimUrl(request: {
     readonly tenantId: string;
@@ -509,6 +534,8 @@ export interface WebAppDeps {
    * this repository shipped an unsupplied port three times.
    */
   readonly review?: ReviewPort;
+  /** One named subject. Supplied unconditionally by `src/web/serve.ts`. */
+  readonly entityLookup?: EntityLookupPort;
   /** The Stripe endpoint signing secret, resolved from the secret store. */
   readonly stripeWebhookSecret: string;
   /** Set for an operator deployment; absent disables `/admin` entirely. */
@@ -933,11 +960,26 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     // waking one because its owner asked is defensible where waking one because
     // they logged in is not.
     if (path === '/' || path === '/dashboard') {
+      // **The lookup posts rather than gets, and that is a deliberate
+      // divergence.** A GET form writes every subject the owner ever looks up
+      // into browser history and URL-bar autocomplete, which syncs across their
+      // devices — after ten lookups, typing the dashboard URL renders ten names
+      // in one dropdown. That is the artifact coverage.ts refuses, manufactured
+      // outside the product by the product's own form, and `no-store` does not
+      // clear it.
+      if (request.method === 'POST') {
+        const form = await body(request);
+        if (form['view'] === 'entity') {
+          return renderEntityLookup(session, typeof form['name'] === 'string' ? form['name'] : null);
+        }
+      }
       const view = url.searchParams.get('view');
       if (view === 'coverage') return renderCoverage(session);
       if (view === 'processing') return renderProcessing(session);
       if (view === 'review') return renderReview(session);
       if (view === 'settings') return renderSettings(session);
+      // Idle: renders the form and opens no tenant database.
+      if (view === 'entity') return renderEntityLookup(session, null);
       return renderDashboard(session);
     }
     if (path === '/brain') return renderBrainSetup(session);
@@ -2470,6 +2512,47 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         intent: intent as (typeof verdicts)[number],
       });
       return afterForm(request, REVIEW_PATH, {}) ?? json(resolved, resolved.ok ? 200 : 409);
+    }
+
+    /**
+     * One named subject.
+     *
+     * **The idle branch returns before `tenantOf`.** With no name submitted the
+     * handler renders the form and never asks the port, which is what preserves
+     * the ruling that a default render opens no tenant database — waking a
+     * suspended brain because its owner asked is defensible, waking one because
+     * they navigated is not.
+     *
+     * The stderr line names a SQLSTATE and nothing else: every statement behind
+     * this page reads `canonical_name`, `alias` and `summary`, so "a failure
+     * reason is a code and a timestamp, not a subject line" has to hold by
+     * construction rather than by care.
+     */
+    async function renderEntityLookup(session: Session, name: string | null): Promise<Response> {
+      const chrome = { 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' };
+      if (deps.entityLookup === undefined) {
+        return html(renderPage({ kind: 'entity', available: false, lookup: null }), 501);
+      }
+      if (name === null || name.trim().length === 0) {
+        return html(renderPage({ kind: 'entity', available: true, lookup: { status: 'idle' } }), 200, chrome);
+      }
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return seeOther(BRAIN_SETUP_PATH);
+
+      let lookup: EntityLookup;
+      try {
+        lookup = await deps.entityLookup.read({ tenantId, name });
+      } catch (error) {
+        process.stderr.write(
+          `${JSON.stringify({
+            event: 'entity_lookup_unreadable',
+            tenant: tenantId,
+            code: (error as { code?: string }).code ?? 'unknown',
+          })}\n`,
+        );
+        return html(renderPage({ kind: 'entity', available: true, lookup: null }), 200, chrome);
+      }
+      return html(renderPage({ kind: 'entity', available: true, lookup }), 200, chrome);
     }
 
     /**

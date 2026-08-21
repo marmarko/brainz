@@ -66,7 +66,7 @@ import {
   CYCLE_STOP_REASONS,
   ENTITY_KINDS,
   type CoverageView,
-} from '../../src/web/coverage.ts';
+  EDGE_KINDS,} from '../../src/web/coverage.ts';
 import { cycleFreshnessOf } from '../../src/control/cycle-staleness.ts';
 import { ACTIVE_EMBEDDING_SEAT } from '../../src/schema/embedding-seat.ts';
 import { EMBEDDING_DIMENSIONS } from '../../src/schema/vector-index.ts';
@@ -139,6 +139,8 @@ const VIEW: CoverageView = {
   openContradictions: null,
   openReview: null,
   windowDays: 7,
+  edgeKinds: [{ kind: 'works_at', count: 27 }],
+  entitiesWithCard: 48,
 };
 
 /** One row of `consolidation_run`, in the order the writer wrote them. */
@@ -907,6 +909,18 @@ describe('the page shows counts, codes and instants — and nothing else', () =>
 // ---------------------------------------------------------------------------
 // 4. The composition. The real port, against a real brain.
 // ---------------------------------------------------------------------------
+
+describe('the edge vocabulary this page restates is the one the schema seeds', () => {
+  test('EDGE_KINDS equals the seeded registry, in both directions', async () => {
+    const rows = (await brainSql.unsafe(
+      `SELECT edge_type FROM edge_type ORDER BY edge_type`,
+    )) as Array<{ edge_type: string }>;
+    // Both directions: a value seeded and not restated renders as a raw code on
+    // the page, and a value restated and not seeded is one a foreign key makes
+    // unreachable. The entity-type histogram is pinned the same way.
+    expect(rows.map((row) => row.edge_type).sort()).toEqual([...EDGE_KINDS].sort());
+  });
+});
 
 describe('the port that is actually wired', () => {
   /** One tenant, one connection — the shape `tenantDatabases` produces. */

@@ -28,6 +28,7 @@
 import type { SQL } from 'bun';
 
 import { fenceEntity, fenceRow, fenceScalar, visibleOrigins, type Grant } from '../core/search/fence.ts';
+import { nameMatchPattern } from '../core/search/name-match.ts';
 // The shared normalizer, reached through the read side's re-export — the same
 // function objects `write/links.ts` files aliases with, never a second copy.
 // `test/core/search/normalize.test.ts` asserts that identity across the seam.
@@ -404,6 +405,25 @@ export interface EntityCard {
   readonly type: string;
   readonly aliases: readonly string[];
   /**
+   * What the brain wrote about this entity, or `null` if it has not.
+   *
+   * **This is the enrichment phase's output, and until this field existed
+   * nothing could read it.** `enrich` pays a model call per entity to write a
+   * card; every other reference to `entity_card` in `src/` outside the
+   * lifecycle sweeps is a `count(*)`. So a brain could hold 48 summaries and
+   * answer "what do you know about Alice" without one of them — which is what a
+   * production brain was doing when this was found.
+   *
+   * `null` rather than an empty string: "the brain has not written one" and "it
+   * wrote nothing" are different sentences, and the second is not a state the
+   * schema permits — `entity_card_summary_is_not_empty` refuses it.
+   */
+  readonly summary: {
+    readonly text: string;
+    readonly trustLevel: string;
+    readonly writtenAt: string;
+  } | null;
+  /**
    * The origins **this grant holds** for the entity, never its whole union.
    *
    * An entity is fenced on *intersect* (`fence.ts`), so a shared name resolves
@@ -592,18 +612,46 @@ export async function entityCard(sql: SQL, grant: Grant, name: string): Promise<
     [row.entity_id, grantLiteral],
   )) as Array<{ alias: string }>;
 
-  const facts = (await sql.unsafe(
-    `SELECT fact_id::text AS fact_id, statement, origin_contexts
-       FROM fact
-      WHERE deleted_at IS NULL
-        AND quarantined_at IS NULL
-        AND superseded_by IS NULL
-        AND origin_contexts <@ $2::text[]
-        AND statement ILIKE '%' || $1 || '%'
-      ORDER BY created_at DESC
-      LIMIT 10`,
-    [row.canonical_name, grantLiteral],
-  )) as Array<{ fact_id: string; statement: string; origin_contexts: string[] }>;
+  // **The card this entity's own enrichment phase wrote, which nothing has ever
+  // read.** `enrich` pays a model call per entity to produce a summary, and
+  // every reference to `entity_card` in `src/` outside the lifecycle sweeps is
+  // a `count(*)` — so on a brain holding 48 of them, no surface could return
+  // one. The tool that answers "what do you know about Alice" is where it
+  // belongs. Subset-fenced like the aliases above: a card is a synthesis of its
+  // inputs, so a grant holding only some of them must not read it.
+  const cards = (await sql.unsafe(
+    `SELECT c.summary, c.trust_level, c.created_at
+       FROM entity_card c
+      WHERE c.entity_id = $1::bigint
+        AND c.deleted_at IS NULL
+        AND c.origin_contexts <@ $2::text[]
+      LIMIT 1`,
+    [row.entity_id, grantLiteral],
+  )) as Array<{ summary: string; trust_level: string; created_at: string | Date }>;
+  const card = cards[0];
+
+  // **Word-bounded, not `ILIKE '%name%'`.** The wildcard this replaces matched
+  // `al` inside `legal`, `renewal` and `Alberta`, so a short canonical name
+  // returned a page of statements about other people under this entity's
+  // heading. `nameMatchPattern` is the rule the erasure sweep already uses, and
+  // the length floor is the one the briefing ships on the same join: below three
+  // characters a name is a substring, and `canonical_name` carries no non-empty
+  // CHECK, so an empty one would match every live fact.
+  const matchable = row.canonical_name.trim().length >= 3;
+  const facts = !matchable
+    ? []
+    : ((await sql.unsafe(
+        `SELECT fact_id::text AS fact_id, statement, origin_contexts
+           FROM fact
+          WHERE deleted_at IS NULL
+            AND quarantined_at IS NULL
+            AND superseded_by IS NULL
+            AND origin_contexts <@ $2::text[]
+            AND statement ~* $1
+          ORDER BY created_at DESC
+          LIMIT 10`,
+        [nameMatchPattern(row.canonical_name.trim()), grantLiteral],
+      )) as Array<{ fact_id: string; statement: string; origin_contexts: string[] }>);
 
   return {
     status: 'ok',
@@ -612,6 +660,12 @@ export async function entityCard(sql: SQL, grant: Grant, name: string): Promise<
       name: row.canonical_name,
       type: row.entity_type,
       aliases: aliases.map((a) => a.alias),
+      // `null` when the brain has not written one, which is a different
+      // sentence from an empty summary and is rendered as one.
+      summary:
+        card === undefined
+          ? null
+          : { text: card.summary, trustLevel: card.trust_level, writtenAt: isoOf(card.created_at) },
       // Intersected, for the reason `fence.ts:visibleOrigins` argues at length:
       // the aliases above were fenced because an alias is a spelling an outside
       // sender chose, and the origin union is the same disclosure with the

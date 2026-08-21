@@ -139,6 +139,8 @@
 import { createHash } from 'node:crypto';
 import type { SQL } from 'bun';
 
+import { nameMatchPattern } from '../search/name-match.ts';
+
 import { docKeyFor } from '../export/reconstruct.ts';
 import { normalize, slugify } from '../write/normalize.ts';
 import { textArrayLiteral } from '../write/pg-values.ts';
@@ -287,7 +289,7 @@ export async function previewSubjectErasure(
     ),
   ];
 
-  const patterns = surfaceForms.map(formToPattern);
+  const patterns = surfaceForms.map(nameMatchPattern);
   const matches = await matchingPages(sql, entityIds, patterns);
   const rows = await matchingRows(sql, matches, patterns);
   const removed = await countRemoved(sql, entityIds, matches, rows);
@@ -868,18 +870,4 @@ function shape(row: Record<string, number> | undefined): SubjectCounts {
  *      reading {@link SubjectErasurePreview.rows}, and one that matches too
  *      little is an erasure that silently did not happen.
  */
-function formToPattern(form: string): string {
-  const head = isWordCharacter(form.charAt(0)) ? '\\m' : '';
-  const tail = isWordCharacter(form.charAt(form.length - 1)) ? '\\M' : '';
-  return `${head}${escapeRegex(form)}${tail}`;
-}
 
-/** The POSIX ARE metacharacters, and nothing else. */
-function escapeRegex(value: string): string {
-  return value.replace(/[\\^$.|?*+()[\]{}]/g, (character) => `\\${character}`);
-}
-
-/** ASCII only, so the fallback is the wide direction rather than the silent one. */
-function isWordCharacter(character: string): boolean {
-  return /[A-Za-z0-9_]/.test(character);
-}

@@ -192,6 +192,32 @@ export const ENTITY_KINDS = [
 export type EntityKind = (typeof ENTITY_KINDS)[number];
 
 /**
+ * `edge_type`'s seeded registry (`v2-knowledge-core.sql`), restated here for
+ * the reason every vocabulary in this file is: a page must not import the
+ * schema, and a CHECK — here a foreign key to a seeded table — is what a test
+ * asserts the restatement against, in both directions.
+ *
+ * Counts keyed on these are coverage-clean: the registry's own COMMENT reads
+ * "no user content", so a histogram over it is codes and numbers, exactly like
+ * the entity-type one above. It is emphatically NOT the per-origin cross-tab
+ * this file refuses — that refusal is about cells going to one, and a
+ * whole-brain histogram has no origin axis to cross.
+ */
+export const EDGE_KINDS = [
+  'mentions',
+  'mentioned_by',
+  'works_at',
+  'employs',
+  'invested_in',
+  'has_investor',
+  'part_of',
+  'has_part',
+  'related_to',
+] as const;
+
+export type EdgeKind = (typeof EDGE_KINDS)[number];
+
+/**
  * `consolidation_run.stop_reason`'s CHECK, as rung 19 left it
  * (`v19-cycle-resume.sql:50`, widening `v3-consolidation.sql:109`).
  */
@@ -330,6 +356,18 @@ export interface CoverageView {
   /** `null` — not `0` — when no model tier has run: absent rather than empty. */
   readonly openContradictions: number | null;
   readonly openReview: number | null;
+  /**
+   * Relationships by kind — the direct answer to "what does it know they are
+   * connected to", without naming anybody.
+   */
+  readonly edgeKinds: readonly { readonly kind: string; readonly count: number }[];
+  /**
+   * How many entities carry a summary the brain wrote.
+   *
+   * The number that makes the entity count checkable: "53 people and companies"
+   * says nothing about whether the brain has anything to say about them.
+   */
+  readonly entitiesWithCard: number;
   readonly windowDays: number;
 }
 
@@ -460,7 +498,8 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
        EXISTS (SELECT 1 FROM consolidation_run WHERE finished_at IS NOT NULL AND dreamt) AS ever_dreamt,
        (SELECT count(*) FROM fact
          WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL)::int AS facts,
-       (SELECT count(*) FROM entity_edge WHERE deleted_at IS NULL)::int AS edges`,
+       (SELECT count(*) FROM entity_edge WHERE deleted_at IS NULL)::int AS edges,
+       (SELECT count(*) FROM entity_card WHERE deleted_at IS NULL)::int AS entities_with_card`,
     [],
   )) as Array<{
     last_completed_at: Date | string | null;
@@ -468,6 +507,7 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
     ever_dreamt: boolean;
     facts: number;
     edges: number;
+    entities_with_card: number;
   }>;
   const scalars = scalarRows[0] ?? {
     last_completed_at: null,
@@ -475,6 +515,7 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
     ever_dreamt: false,
     facts: 0,
     edges: 0,
+    entities_with_card: 0,
   };
   const lastCompletedAt = isoOf(scalars.last_completed_at);
 
@@ -482,6 +523,17 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
   // claim. This page is the only surface in the system that can compute it: the
   // pair it needs lives in `consolidation_run`, in this database, and the fleet
   // health surface holds no tenant handle. See the report's own header.
+  // Counts plus closed-vocabulary codes, in the shape the entity-type histogram
+  // already ships. Whole-brain, with no origin axis: the cross-tab this file
+  // refuses is refused because cells go to one, and this has no second axis.
+  const edgeRows = (await sql.unsafe(
+    `SELECT edge_type, count(*)::int AS n
+       FROM entity_edge WHERE deleted_at IS NULL
+      GROUP BY edge_type ORDER BY n DESC, edge_type`,
+    [],
+  )) as Array<{ edge_type: string; n: number }>;
+  const edgeKinds = edgeRows.map((row) => ({ kind: row.edge_type, count: row.n }));
+
   const cycleFreshness = cycleFreshnessOf({
     completion:
       latestCycle === null
@@ -545,6 +597,8 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
     facts: scalars.facts,
     entities: entityTypes.reduce((total, bucket) => total + bucket.count, 0),
     edges: scalars.edges,
+    edgeKinds,
+    entitiesWithCard: scalars.entities_with_card,
     entityTypes,
     openContradictions,
     openReview,

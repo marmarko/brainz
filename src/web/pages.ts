@@ -34,6 +34,7 @@ import {
   type ProcessingView,
 } from './processing.ts';
 import type { Proposal, ReviewView } from './review.ts';
+import type { EntityLookup, Subject } from './entity.ts';
 
 /**
  * Where a signed-in account with no brain is offered one.
@@ -104,6 +105,9 @@ export const REVIEW_PATH = '/dashboard?view=review';
  * enumerates web paths and `/settings` is not one of them.
  */
 export const SETTINGS_PATH = '/dashboard?view=settings';
+
+/** Where the rail's lookup row points. Idle by construction: it names no subject. */
+export const ENTITY_PATH = '/dashboard?view=entity';
 
 export type Page =
   | {
@@ -317,6 +321,16 @@ export type Page =
     }
   | {
       /**
+       * One named subject, and the page the owner asked for instead of a
+       * roster. `available: false` is a deployment with no port; a null lookup
+       * with the port present is a brain that would not open.
+       */
+      readonly kind: 'entity';
+      readonly available: boolean;
+      readonly lookup: EntityLookup | null;
+    }
+  | {
+      /**
        * Account configuration, split off the dashboard.
        *
        * The three sections here — a write-only key form, the spend window and
@@ -460,6 +474,8 @@ const ICON_ASSISTANT =
   '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5"/><path d="M15 8V2"/><path d="M17 8a1 1 0 0 1 1 1v4a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1z"/><path d="M9 8V2"/></svg>';
 const ICON_UNDO =
   '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"/></svg>';
+const ICON_LOOKUP = // search
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg>';
 const ICON_SETTINGS =
   '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5H3"/><path d="M12 19H3"/><path d="M14 3v4"/><path d="M16 17v4"/><path d="M21 12h-9"/><path d="M21 19h-5"/><path d="M21 5h-7"/><path d="M8 10v4"/><path d="M8 12H3"/></svg>';
 const ICON_SIGNOUT =
@@ -473,7 +489,8 @@ type NavKey =
   | 'review'
   | 'connect'
   | 'retractions'
-  | 'settings';
+  | 'settings'
+  | 'entity';
 
 /**
  * What chrome a page gets: a rail with one row lit, a rail with none lit, or no
@@ -514,6 +531,7 @@ const PAGE_CHROME: Readonly<Record<Page['kind'], Chrome>> = {
   connect: 'connect',
   retractions: 'retractions',
   settings: 'settings',
+  entity: 'entity',
   connector_claim: 'blank',
   connector_confirm_disconnect: 'blank',
   connector_disconnected: 'blank',
@@ -557,6 +575,7 @@ const RAIL_GROUPS: readonly {
       { key: 'coverage', href: COVERAGE_PATH, label: 'What it knows', icon: ICON_KNOWS },
       { key: 'processing', href: PROCESSING_PATH, label: 'Working on it', icon: ICON_WORKING },
       { key: 'review', href: REVIEW_PATH, label: 'Waiting on you', icon: ICON_WAITING },
+      { key: 'entity', href: ENTITY_PATH, label: 'Look someone up', icon: ICON_LOOKUP },
     ],
   },
   {
@@ -1192,6 +1211,9 @@ ${connectors}`,
      * Account configuration. Three sections that were crowding the dashboard,
      * and one of them repaired on the way.
      */
+    case 'entity':
+      return entityPage(page);
+
     case 'settings': {
       const providers = page.providers
         .map((provider) => `<option value="${escapeHtml(provider)}">${escapeHtml(provider)}</option>`)
@@ -1914,6 +1936,215 @@ ${verbs}
  * Four renders, `coveragePage`'s, plus an empty state that is the steady state:
  * a brain with nothing waiting is a brain that is working.
  */
+const ALIAS_SOURCE: Readonly<Record<string, string>> = {
+  user: 'you told it this',
+  inferred: 'it worked this out',
+};
+
+/** Edge type codes, as a person would read them. Unknown codes render raw. */
+const EDGE_VERB: Readonly<Record<string, string>> = {
+  works_at: 'Works at',
+  employs: 'people work here',
+  part_of: 'Part of',
+  has_part: 'things are part of this',
+  mentions: 'Mentions',
+  mentioned_by: 'things mention this one',
+  related_to: 'Related to',
+};
+
+function subjectBody(subject: Subject): string {
+  const card =
+    subject.card === null
+      ? `<p class="note">Your brain has not written a summary of this one yet.</p>`
+      : `<p class="note">A model wrote this from your own documents, on ${moment(
+          new Date(subject.card.writtenAt),
+        )}. It was not checked by anyone. &middot; <code>${escapeHtml(
+          subject.card.trustLevel,
+        )}</code></p>
+${quoted(subject.card.summary, subject.card.truncated)}`;
+
+  const aliases =
+    subject.aliases.length === 0
+      ? `<p class="note">It knows them by one spelling only.</p>`
+      : `<ul class="sources">
+${subject.aliases
+  .map(
+    (entry) => `  <li>${quoted(entry.alias, entry.truncated)}
+    <p class="note">${escapeHtml(ALIAS_SOURCE[entry.source] ?? entry.source)}</p>
+  </li>`,
+  )
+  .join('\n')}
+</ul>${
+          subject.aliasesOverflowed
+            ? `<p class="note">${escapeHtml(String(subject.aliases.length))} are shown; there are more.</p>`
+            : ''
+        }`;
+
+  // Outbound names its neighbour; inbound is counted. See the module header for
+  // why that split is the licence rather than a taste.
+  const outbound =
+    subject.outbound.length === 0
+      ? `<p class="note">It has not connected this one to anything yet.</p>`
+      : `<p>${subject.outbound
+          .map(
+            (edge) =>
+              `${escapeHtml(EDGE_VERB[edge.type] ?? edge.type)} ${quoted(
+                edge.otherName,
+                edge.otherTruncated,
+              )}`,
+          )
+          .join(' &middot; ')}</p>${
+          subject.outboundOverflowed
+            ? `<p class="note">${escapeHtml(
+                String(subject.outbound.length),
+              )} are shown; there are more.</p>`
+            : ''
+        }`;
+
+  const inbound =
+    subject.inbound.length === 0
+      ? ''
+      : `<p class="note">${subject.inbound
+          .map(
+            (entry) =>
+              `${escapeHtml(String(entry.count))} ${escapeHtml(EDGE_VERB[entry.type] ?? entry.type)}`,
+          )
+          .join(' &middot; ')}</p>
+<p class="note">Things pointing the other way are counted, not listed: showing them by name would
+put most of the people your brain knows onto one screen, which is the page this dashboard does not
+have.</p>`;
+
+  let mentions: string;
+  if (subject.mentions.kind === 'name_too_short') {
+    mentions = `<p class="note">That name is too short to count sentences by — a two-letter name
+matches most of them.</p>`;
+  } else if (subject.mentions.kind === 'name_too_long') {
+    mentions = `<p class="note">That name is too long to search by.</p>`;
+  } else {
+    const census = subject.mentions;
+    mentions = `<p>${count(census.total, 'of your live sentences mentions', 'of your live sentences mention')}
+this name${
+      census.mostRecentAt === null ? '' : ` &middot; most recently ${moment(new Date(census.mostRecentAt))}`
+    }</p>
+${
+      census.byTrust.length === 0
+        ? ''
+        : `<p class="note">${census.byTrust
+            .map((row) => `${escapeHtml(String(row.count))} <code>${escapeHtml(row.level)}</code>`)
+            .join(' &middot; ')}</p>`
+    }
+<p class="note">Your brain files sentences by document, not by person, so this counts the live
+sentences whose text contains this name — not everything it knows about them, and, if the name is a
+common one, possibly a sentence about somebody else. The sentences themselves are not shown here;
+ask your assistant for those.</p>`;
+  }
+
+  return `<h1>What your brain holds about this name</h1>
+${quoted(subject.name, subject.nameTruncated)}
+<p class="note">Filed as ${escapeHtml(subject.type)}. First seen ${moment(
+    new Date(subject.firstSeenAt),
+  )}. Seen in: ${subject.origins.map((origin) => `<code>${escapeHtml(origin)}</code>`).join(', ')}.</p>
+<h2>What your brain wrote about them</h2>
+${card}
+<h2>Other spellings it knows them by</h2>
+${aliases}
+<h2>What it says they are connected to</h2>
+${outbound}
+${inbound}
+<h2>How often it comes up</h2>
+${mentions}`;
+}
+
+/**
+ * One named subject — the page built instead of the roster the owner asked for.
+ *
+ * `src/web/entity.ts`'s header carries the argument. What matters here is that
+ * the **steady state renders nothing**: with no name submitted this is a form
+ * and a refusal, and there is no branch anywhere that lists who the brain knows.
+ */
+function entityPage(page: Extract<Page, { kind: 'entity' }>): string {
+  const title = 'Look up a person or company — brainz';
+  const back = '<p><a href="/dashboard">Back to your dashboard</a></p>';
+  // Not coverage's pledge, and the last clause is the tell: this is the one page
+  // in the product that is about somebody.
+  const rule = `<p class="note">This page shows what your brain holds about <em>one</em> person or
+company — the one you asked for. There is no page here that lists who your brain knows, and there is
+not going to be. Everything below was written by a model from your own documents. Unlike the other
+pages on this dashboard, this one is about somebody: it is not safe to screenshot.</p>`;
+
+  const form = `<form method="post" action="/dashboard">
+  <input type="hidden" name="view" value="entity">
+  <label for="name">Their name, as you would say it</label>
+  <input id="name" name="name" type="text" autocomplete="off" spellcheck="false">
+  <button type="submit">Look them up</button>
+</form>`;
+
+  if (!page.available) {
+    return shell(
+      title,
+      `<h1>Look up a person or company</h1>
+<p class="problem">This deployment cannot read your brain, so there is nothing to look anything up
+in. An empty answer would read as "nothing is known about this person", which is a different
+sentence and not the true one here.</p>
+${back}`,
+      page.kind,
+    );
+  }
+
+  if (page.lookup === null) {
+    return shell(
+      title,
+      `<h1>Look up a person or company</h1>
+<p class="problem">Your brain could not be reached just now. That is most often a database waking up
+after a quiet spell — asking again in a few seconds is usually the whole remedy.</p>
+${form}
+${back}`,
+      page.kind,
+    );
+  }
+
+  const lookup = page.lookup;
+  const answer =
+    lookup.status === 'idle'
+      ? `<p class="note">Nothing is shown until you type a name, and there is no list to browse — this
+page will only ever show you one person or company at a time. The counts are on
+<a href="${escapeHtml(COVERAGE_PATH)}">what your brain knows</a>.</p>`
+      : lookup.status === 'not_found'
+        ? `<p>Nothing in your brain answers to that name.</p>
+<p class="note">This looks for an exact match and will not guess. Two things it could mean: your
+brain has never seen this person, or it files them under a different spelling — try the name exactly
+as it appears in your mail. There are no suggestions here, deliberately.</p>`
+        : lookup.status === 'ambiguous'
+          ? // No count, no types, no names, and no slug: nothing in the product
+            // ever shows an owner a slug, so offering one is a dead affordance.
+            `<p>More than one person or company in your brain answers to that name.</p>
+<p class="note">Rather than guess which you meant, this page is asking. Try the fuller spelling, or
+the name as it is written on their mail.</p>`
+          : '';
+
+  if (lookup.status === 'found') {
+    return shell(
+      title,
+      `${subjectBody(lookup.subject)}
+${rule}
+<h2>Look up another</h2>
+${form}
+${back}`,
+      page.kind,
+    );
+  }
+
+  return shell(
+    title,
+    `<h1>Look up a person or company</h1>
+${rule}
+${form}
+${answer}
+${back}`,
+    page.kind,
+  );
+}
+
 function reviewPage(page: Extract<Page, { kind: 'review' }>): string {
   const back = '<p><a href="/dashboard">Back to your dashboard</a></p>';
   const title = 'Waiting on you — brainz';
@@ -2344,6 +2575,18 @@ ${count(view.openReview, 'proposal', 'proposals')} are open.
 <p>${count(view.facts, 'fact', 'facts')} &middot;
 ${count(view.entities, 'person, company or thing', 'people, companies and things')} &middot;
 ${count(view.edges, 'stated relationship', 'stated relationships')}</p>
+${
+      view.edgeKinds.length === 0
+        ? ''
+        : `<p class="note">${view.edgeKinds
+            .map((kind) => `${escapeHtml(String(kind.count))} <code>${escapeHtml(kind.kind)}</code>`)
+            .join(' &middot; ')}</p>`
+    }
+<p class="note">${count(
+      view.entitiesWithCard,
+      'of them has a summary your brain wrote',
+      'of them have a summary your brain wrote',
+    )}. <a href="${escapeHtml(ENTITY_PATH)}">Look one of them up &rarr;</a></p>
 <p class="note">These are what the brain derived from your documents, and they are the numbers to
 read next to the document count above: a large pile of documents with very few facts under it means
 consolidation is behind, not that there was nothing in them.</p>${types}${open}`;

@@ -41,6 +41,7 @@ import {
   createWebApp,
   type ConnectorVendor,
   type CoveragePort,
+  type EntityLookupPort,
   type ReviewPort,
   type ProviderKeyWriter,
   type RetractionPort,
@@ -89,6 +90,7 @@ import { createPipedreamConnectorVendor } from './connectors.ts';
 import { readCoverage } from './coverage.ts';
 import { readProcessing } from './processing.ts';
 import { decideConflict, decideProposal, readReview, undoProposal } from './review.ts';
+import { lookupEntity } from './entity.ts';
 import {
   openConnectorClient,
   openControlPlane,
@@ -169,6 +171,7 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
     coverage: coveragePort(withTenant),
     // Supplied in the same change that declares it, for the reason two ports up.
     review: reviewPort(withTenant),
+    entityLookup: entityLookupPort(withTenant),
     provisioner: reportedProvisioner(
       createBrainProvisioner({
         controlSql,
@@ -684,6 +687,13 @@ export function reviewPort(withTenant: TenantWork): ReviewPort {
         }
         return { ok: false, reason: 'not_adjudicable' } as const;
       }),
+  };
+}
+
+/** One named subject, on the same seam and the same clock rule. */
+export function entityLookupPort(withTenant: TenantWork): EntityLookupPort {
+  return {
+    read: (request) => withTenant(request.tenantId, (sql) => lookupEntity(sql, request.name)),
   };
 }
 
