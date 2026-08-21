@@ -889,7 +889,7 @@ the top every attempt — because at current phase costs it is seconds:
 | `dedup` | one read, plus one write per collapse | — |
 | `link_reconcile` | one batched name resolution per **500 names** + one diff write per **500 edges**, so per **pass** — **plus an unbatched widen sequence (~5 + 2·degree round trips) for every entity whose origin set grows in that pass**, and **one in-memory tokenising pass over every live fact, twice per cycle** for the admission fence's corpus door (no round trips; see the note below the table) | 7 cold / 4 warm on a 240-fact fixture, down from 8.42 per live fact. A second connector's first pass over a corpus the brain already knows costs `5·entities + 4·edges` and is the one shape that still overruns an attempt |
 | `staleness` | one read per batch of superseded pages | — |
-| `entity_merge` | one read, plus a few writes per merge | — |
+| `entity_merge` | one whole-entity read + one multi-row insert for the merge proposer, then one read plus a few writes per merge | — |
 | `salience` | one read + one write per **500 pages** | 24 round trips on that brain, down from 11,217 |
 | `cluster` | one probe per unassigned chunk, one transaction per 100 seeds | down from five round trips per seed |
 
