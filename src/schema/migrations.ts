@@ -66,6 +66,7 @@ export const MIGRATIONS: readonly TenantMigration[] = [
   { version: 21, name: 'unreadable-page', file: 'migrations/v21-unreadable-page.sql' },
   { version: 22, name: 'considered', file: 'migrations/v22-considered.sql' },
   { version: 23, name: 'run-closure', file: 'migrations/v23-run-closure.sql' },
+  { version: 24, name: 'review-actor', file: 'migrations/v24-review-actor.sql' },
 ];
 
 /** The version this code applies to a fresh tenant, derived rather than typed twice. */

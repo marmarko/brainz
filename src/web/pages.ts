@@ -28,6 +28,12 @@ import type { ConnectorStatus } from './connector-panel.ts';
  */
 import { isAlarming } from '../control/cycle-staleness.ts';
 import type { CoverageView, EntityKind } from './coverage.ts';
+import {
+  PROCESSING_PHASES,
+  type ProcessingPhase,
+  type ProcessingView,
+} from './processing.ts';
+import type { Proposal, ReviewView } from './review.ts';
 
 /**
  * Where a signed-in account with no brain is offered one.
@@ -72,6 +78,24 @@ export const CONNECTORS_PATH = '/api/connectors';
  * test that follows every link on every page to a route that answers.
  */
 export const COVERAGE_PATH = '/dashboard?view=coverage';
+
+/**
+ * Where the dashboard's processing link points.
+ *
+ * A query parameter for {@link COVERAGE_PATH}'s reason, one constant up:
+ * `src/mcp/edge.ts` enumerates web paths and `/processing` is not one of them,
+ * so a bare literal would 404 in every deployment while passing every test here.
+ */
+export const PROCESSING_PATH = '/dashboard?view=processing';
+
+/**
+ * Where the dashboard's "waiting on you" line points.
+ *
+ * A query parameter for {@link COVERAGE_PATH}'s reason. Named as a constant
+ * because three places use it: the dashboard link, the two form actions'
+ * redirect target, and the test that follows every link on every page.
+ */
+export const REVIEW_PATH = '/dashboard?view=review';
 
 export type Page =
   | {
@@ -250,6 +274,39 @@ export type Page =
       /** The account's effective plan, which decides whether a cold layer is a fault. */
       readonly tier: string;
       readonly view: CoverageView | null;
+    }
+  | {
+      /**
+       * How far each step has got — `coverage`'s sibling, and a sibling rather
+       * than a section because this one opens the tenant database for counters
+       * over `chunk`, `attachment` and `page` that `coverage.ts` deliberately
+       * does not carry: one click pays for one page.
+       *
+       * Three renders for `coverage`'s reasons, and a fourth state inside the
+       * normal one: a free brain renders the section's ABSENCE rather than six
+       * zeroes, because on that plan the six model phases are the plan and not
+       * a fault.
+       */
+      readonly kind: 'processing';
+      readonly available: boolean;
+      readonly reachable: boolean;
+      readonly tier: string;
+      readonly view: ProcessingView | null;
+    }
+  | {
+      /**
+       * What is waiting on a decision.
+       *
+       * The one page in the product that renders a brain-derived sentence, and
+       * `src/web/review.ts`'s header carries the argument for the crossing. The
+       * type is deliberately the module's own: the queries there are what
+       * enforce the caps and the withholdings, so a renderer cannot widen them.
+       */
+      readonly kind: 'review';
+      readonly available: boolean;
+      readonly reachable: boolean;
+      readonly tier: string;
+      readonly view: ReviewView | null;
     };
 
 /** HTML-escape. Five characters, applied to every interpolation without exception. */
@@ -280,6 +337,11 @@ const STYLE = `
   .sources form { display: flex; gap: 0.5rem; }
   .sources button { width: auto; }
   .source-name { font-weight: 600; text-transform: capitalize; }
+  .step-name { font-weight: 600; }
+  .quoted { border-left: 3px solid rgba(127,127,127,0.5); padding: 0.25rem 0 0.25rem 0.75rem; margin: 0.5rem 0; }
+  .verbs { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
+  .verbs form { display: inline; }
+  .verbs button { width: auto; margin-top: 0; }
   .failing { border-left: 3px solid currentColor; padding-left: 0.75rem; }
 `;
 
@@ -836,6 +898,8 @@ connector vendor whether or not the brain is used, which the free plan cannot ca
         }</p>
 <p><a href="/connect">Connect brainz to Claude &rarr;</a></p>
 <p><a href="${COVERAGE_PATH}">What your brain knows &rarr;</a></p>
+<p><a href="${PROCESSING_PATH}">What your brain is working on &rarr;</a></p>
+<p><a href="${REVIEW_PATH}">Waiting on you &rarr;</a></p>
 <p><a href="/retractions">What you can still undo &rarr;</a></p>
 <h2>Connected accounts</h2>
 ${connectors}
@@ -1002,6 +1066,12 @@ claiming more than it told us.</p>
     case 'coverage':
       return coveragePage(page);
 
+    case 'processing':
+      return processingPage(page);
+
+    case 'review':
+      return reviewPage(page);
+
     case 'retractions':
       return shell(
         'What you can undo — brainz',
@@ -1097,8 +1167,8 @@ something going wrong.`;
       return `It stopped early because the spend budget for one cycle ran out.`;
     case 'phase_failed':
       return `It stopped in the <code>${escapeHtml(cycle.stoppedPhase ?? 'unnamed')}</code>
-phase, reporting <code>${escapeHtml(cycle.stoppedPhaseCode ?? 'no code')}</code>. Everything the
-phases before it produced is in the numbers below; nothing after it ran.`;
+phase, reporting <code>${escapeHtml(cycle.stoppedPhaseCode ?? 'no code')}</code>. The steps after it
+were still attempted; whether they got anywhere is not something this run record says.`;
     case 'out_of_time':
       return `It ran out of the time one attempt is given, part way through. Nothing failed
 and no spend cap fired; there was more to do than fitted.`;
@@ -1291,6 +1361,529 @@ different shape from a cycle that stops and says why.</p>`;
  * which is retrieval — it needs a fence, a grant and pagination that this page
  * has none of, and the assistant already is that product.
  */
+/**
+ * What each step is called to a person, and what it works on.
+ *
+ * Keyed on the phase, so a widened vocabulary breaks at compile time rather than
+ * rendering a raw identifier at somebody — the template is `ENTITY_NOUNS`.
+ */
+const PHASE_WORK: Readonly<Record<ProcessingPhase, readonly [string, string, string]>> = {
+  transcribe: ['Reading images and PDFs', 'file', 'files'],
+  extract: ['Reading passages for facts', 'passage', 'passages'],
+  enrich: [
+    'Filling in people and companies',
+    'person, company or thing',
+    'people, companies and things',
+  ],
+  synopsis: ['Summarising documents', 'document', 'documents'],
+  contradiction: ['Checking claims against each other', 'fact', 'facts'],
+  salience_refine: ['Re-scoring what matters', 'document', 'documents'],
+};
+
+/**
+ * The last cycle's recorded spend, in dollars.
+ *
+ * **Read the arithmetic before simplifying it.** `test/ai/price-drift.test.ts`
+ * refuses a numeric literal equal to a canonical price on a line whose raw text
+ * matches its price context, and that pattern includes a bare `$`. `1_000_000`
+ * IS canonical, so `micro / 1_000_000` on the same line as the `$` would be a
+ * finding — and correctly, because the guard cannot tell a unit from a rate.
+ * `10_000` and `100` are in neither set, and neither shares a line with a `$`.
+ *
+ * Below the rounding floor it says so rather than printing `$0.00`, which reads
+ * as free on the page whose job is saying whether the paid half ran at all.
+ */
+function spend(storedMicro: number): string {
+  const hundredths = Math.round(storedMicro / 10_000);
+  if (hundredths === 0) return storedMicro === 0 ? 'nothing' : 'less than a cent';
+  const dollars = hundredths / 100;
+  return `$${escapeHtml(dollars.toFixed(2))}`;
+}
+
+/**
+ * One sentence about what the last cycle did to this step, or nothing.
+ *
+ * `failed_here` says **attempted**, not "still ran" and certainly not "nothing
+ * after it ran": the cycle records only the FIRST durable phase failure and
+ * carries on, so a run in which three phases failed names one and says nothing
+ * about the other two. The run record holds one attribution and the sentence
+ * must not claim more.
+ */
+function standingSentence(
+  standing: string,
+  stoppedPhase: string | null,
+  stoppedPhaseCode: string | null,
+): string {
+  const code = stoppedPhaseCode === null ? 'no code' : stoppedPhaseCode;
+  switch (standing) {
+    case 'stopped_here':
+      return `<p class="note">The last cycle stopped in this step, reporting <code>${escapeHtml(
+        code,
+      )}</code>.</p>`;
+    case 'not_reached':
+      return stoppedPhase === null
+        ? ''
+        : `<p class="note">The last cycle stopped at <code>${escapeHtml(
+            stoppedPhase,
+          )}</code> before it got this far.</p>`;
+    case 'failed_here':
+      return `<p class="note">The last cycle's attempt at this step reported <code>${escapeHtml(
+        code,
+      )}</code>. The steps after it were still attempted.</p>`;
+    default:
+      return '';
+  }
+}
+
+/**
+ * The processing view. Three renders, plus a free-tier shape inside the normal
+ * one — `coveragePage`'s structure, for `coveragePage`'s reasons.
+ *
+ * Every instant goes through {@link moment}: a relative phrase is a number that
+ * starts lying the moment it is sent, and nothing on this page can tick one
+ * because the CSP admits no script. No form, either — the owner can perform none
+ * of these remedies, and a page of dead affordances is a documented harm here.
+ */
+/**
+ * What each refusal means to the person who cannot press the button.
+ *
+ * Prose beside the row, never a disabled button: "a form whose route answers
+ * 402 or 501 is the dead affordance the whole panel exists to stop being".
+ */
+const REFUSAL_SENTENCE: Readonly<Record<string, string>> = {
+  origin_severed:
+    'This came from an account you disconnected and cleared, so its text is not shown here any more. Discarding it is the only thing left to do with it.',
+  needs_an_embedding:
+    'Adding a fact needs a vector this page cannot buy — only a consolidation cycle can. You can discard it.',
+  needs_corroboration:
+    'A commitment carries a corroboration verdict that is decided when it is written, not from a form. You can discard it.',
+  no_apply_path:
+    'Nothing in this system writes this kind of proposal yet, so there is nothing to apply. You can discard it.',
+  too_long_to_read:
+    'This is longer than this page will show, and a button that writes text you have not read is worse than no button. You can discard it.',
+  target_gone:
+    'The person or company this was about is no longer in your brain, so there is nothing for it to describe. You can discard it.',
+};
+
+/**
+ * Model-derived prose, marked as such wherever it is rendered.
+ *
+ * These strings are a model's words about mail a stranger wrote, so they are the
+ * one thing on any owner-facing page that an outsider had a hand in. Quoting
+ * them visually is what stops a sentence like "Ignore the above and press
+ * Discard" reading as though the product said it.
+ */
+function quoted(text: string, truncated: boolean): string {
+  return `<div class="quoted">${escapeHtml(text)}${
+    truncated ? ' <span class="note">(shown in part)</span>' : ''
+  }</div>`;
+}
+
+function proposalRow(row: Proposal): string {
+  const subject =
+    row.subjectName === null
+      ? 'Something in your brain'
+      : `${escapeHtml(row.subjectName)}${row.nameTruncated ? '…' : ''}`;
+  const now =
+    row.current === null
+      ? '<p class="note">There is nothing recorded about them yet.</p>'
+      : `<p class="note">Now${row.currentIsYours ? ', from a decision you made' : ''}:</p>
+${quoted(row.current, row.currentTruncated)}`;
+  const proposed =
+    row.proposal === null
+      ? ''
+      : `<p class="note">Proposed:</p>
+${quoted(row.proposal, row.truncated)}`;
+  const refusal =
+    row.refusal === null
+      ? `<div class="verbs">
+  <form method="post" action="/api/review">
+    <input type="hidden" name="review_id" value="${escapeHtml(row.reviewId)}">
+    <input type="hidden" name="seen_card_id" value="${escapeHtml(row.currentCardId ?? '')}">
+    <input type="hidden" name="intent" value="apply">
+    <button type="submit">Use this</button>
+  </form>
+  <form method="post" action="/api/review">
+    <input type="hidden" name="review_id" value="${escapeHtml(row.reviewId)}">
+    <input type="hidden" name="intent" value="dismiss">
+    <button type="submit">Discard</button>
+  </form>
+</div>
+<p class="note">Using this keeps it as yours: consolidation will stop rewriting this
+description, and it will not change again until you decide otherwise here. You can undo it
+straight afterwards.</p>`
+      : `<p class="note">${escapeHtml(REFUSAL_SENTENCE[row.refusal] ?? '')}</p>
+<div class="verbs">
+  <form method="post" action="/api/review">
+    <input type="hidden" name="review_id" value="${escapeHtml(row.reviewId)}">
+    <input type="hidden" name="intent" value="dismiss">
+    <button type="submit">Discard</button>
+  </form>
+</div>`;
+
+  return `  <li>
+    <div class="step-name">${subject}</div>
+    <p class="note">Suggested ${moment(new Date(row.createdAt))} &middot; <code>${escapeHtml(
+      row.kind,
+    )}</code></p>
+${now}${proposed}${refusal}
+  </li>`;
+}
+
+const CONFLICT_KINDS: Readonly<Record<string, string>> = {
+  value_conflict: 'These two say different things',
+  temporal_conflict: 'These two disagree about when',
+  duplicate: 'These two may be the same thing said twice',
+};
+
+function conflictSide(label: string, side: { statement: string | null; state: string; truncated: boolean }): string {
+  if (side.statement === null) {
+    return `<p class="note">${escapeHtml(label)}: this statement has been removed from your brain,
+so it is not shown.</p>`;
+  }
+  const marked = side.state === 'superseded' ? ' <span class="note">(since replaced)</span>' : '';
+  return `<p class="note">${escapeHtml(label)}:${marked}</p>${quoted(side.statement, side.truncated)}`;
+}
+
+function conflictRow(row: ReviewView['contradictions'][number]): string {
+  const verb = (intent: string, label: string) => `  <form method="post" action="/api/contradictions">
+    <input type="hidden" name="report_id" value="${escapeHtml(row.reportId)}">
+    <input type="hidden" name="intent" value="${escapeHtml(intent)}">
+    <button type="submit">${escapeHtml(label)}</button>
+  </form>`;
+
+  const verbs = row.adjudicable
+    ? `<div class="verbs">
+${verb('left', 'The first is right')}
+${verb('right', 'The second is right')}
+${verb('both', 'Both are right')}
+${verb('neither', 'Neither is right')}
+${verb('dismiss', 'Stop showing me this')}
+</div>
+<p class="note">Recording an answer here writes down what you concluded. It does not delete or
+replace either statement — both stay in your brain and both stay searchable. If you want one
+gone, ask your assistant to forget it; that is undoable for 72 hours.</p>`
+    : `<p class="note">One of these has been removed from your brain, so there is nothing left to
+decide between.</p>
+<div class="verbs">
+${verb('dismiss', 'Stop showing me this')}
+</div>`;
+
+  return `  <li>
+    <div class="step-name">${escapeHtml(CONFLICT_KINDS[row.kind] ?? 'These two may disagree')}</div>
+    <p class="note">Noticed ${moment(new Date(row.detectedAt))}</p>
+${conflictSide('The first', row.left)}
+${conflictSide('The second', row.right)}
+${verbs}
+  </li>`;
+}
+
+/**
+ * The decisions screen.
+ *
+ * Four renders, `coveragePage`'s, plus an empty state that is the steady state:
+ * a brain with nothing waiting is a brain that is working.
+ */
+function reviewPage(page: Extract<Page, { kind: 'review' }>): string {
+  const back = '<p><a href="/dashboard">Back to your dashboard</a></p>';
+  const title = 'Waiting on you — brainz';
+  const rule = `<p class="note">This is the one page that shows you sentences from inside your brain,
+because a decision about a sentence cannot be made without reading it. It shows only what is
+undecided and nothing else — no lists, no search, no browsing. Everything quoted below was written
+by a model from your own documents.</p>`;
+
+  if (!page.available) {
+    return shell(
+      title,
+      `<h1>Waiting on you</h1>
+<p class="problem">This deployment cannot read your brain, so this page cannot tell you what is
+waiting. An empty page would say "nothing is waiting on you", which is the opposite of what is
+true here.</p>
+${back}`,
+    );
+  }
+
+  if (!page.reachable || page.view === null) {
+    return shell(
+      title,
+      `<h1>Waiting on you</h1>
+<p class="problem">Your brain could not be reached just now. That is most often a database waking up
+after a quiet spell — loading this page again in a few seconds is usually the whole remedy.</p>
+<p class="note">Nothing has been lost and nothing has been decided in the meantime.</p>
+${back}`,
+    );
+  }
+
+  const view = page.view;
+
+  if (!view.everDreamt) {
+    return shell(
+      title,
+      `<h1>Waiting on you</h1>
+${rule}
+<p>Your brain has not finished a consolidation cycle yet, so it has not had the chance to find
+anything it needs you for. Nothing is wrong.</p>
+<p class="note"><a href="${escapeHtml(PROCESSING_PATH)}">What your brain is working on &rarr;</a></p>
+${back}`,
+    );
+  }
+
+  const nothing = view.proposals.length === 0 && view.contradictions.length === 0;
+  if (nothing) {
+    return shell(
+      title,
+      `<h1>Waiting on you</h1>
+<p>Nothing is waiting on you. Your brain will put something here when it finds a claim it is not
+confident enough to record on its own, or two things it holds that disagree.</p>
+<p class="note"><a href="${escapeHtml(COVERAGE_PATH)}">What your brain knows &rarr;</a> &middot;
+<a href="${escapeHtml(PROCESSING_PATH)}">What it is working on &rarr;</a></p>
+${back}`,
+    );
+  }
+
+  const proposals =
+    view.proposals.length === 0
+      ? ''
+      : `<h2>Suggestions</h2>
+<p class="note">Your brain was not confident enough to record these on its own, so it is asking. It
+will not act on any of them until you do.</p>
+<ul class="sources">
+${view.proposals.map(proposalRow).join('\n')}
+</ul>${
+          view.proposalsOverflowed
+            ? '<p class="note">Only the newest are shown. Decide some of these and the rest will appear.</p>'
+            : ''
+        }`;
+
+  const conflicts =
+    view.contradictions.length === 0
+      ? ''
+      : `<h2>Disagreements</h2>
+<p class="note">Your brain holds both of these and they do not fit together. Recording which is
+right is a note to yourself and to your assistant; nothing is deleted either way.</p>
+<ul class="sources">
+${view.contradictions.map(conflictRow).join('\n')}
+</ul>${
+          view.contradictionsOverflowed
+            ? '<p class="note">Only the newest are shown. Decide some of these and the rest will appear.</p>'
+            : ''
+        }`;
+
+  return shell(
+    title,
+    `<h1>Waiting on you</h1>
+${rule}
+${proposals}
+${conflicts}
+${back}`,
+  );
+}
+
+function processingPage(page: Extract<Page, { kind: 'processing' }>): string {
+  const back = '<p><a href="/dashboard">Back to your dashboard</a></p>';
+  const title = 'What your brain is working on — brainz';
+  // NOT coverage's sentence. That one promises "counts, codes and times"; this
+  // page also renders a dollar figure, which is none of the three. Copying it
+  // and then printing money under it would understate the page in the one
+  // paragraph whose whole job is being exact.
+  const rule = `<p class="note">This page shows counts, codes, times, and what your last cycle cost.
+It never shows a title, a name, a subject line or a sentence from anything you have stored — not even
+your own. It is meant to be safe to screenshot, to put on a meeting-room screen, and to leave open on
+a desk.</p>`;
+
+  if (!page.available) {
+    return shell(
+      title,
+      `<h1>What your brain is working on</h1>
+<p class="problem">This deployment cannot read your brain, so this page has nothing to measure.
+Six steps all reading "nothing waiting" would be indistinguishable from a brain that has finished everything, which is the opposite of the truth here.</p>
+${back}`,
+    );
+  }
+
+  if (!page.reachable || page.view === null) {
+    return shell(
+      title,
+      `<h1>What your brain is working on</h1>
+<p class="problem">Your brain could not be reached just now. That is most often a database waking up
+after a quiet spell — loading this page again in a few seconds is usually the whole remedy.</p>
+<p class="note">Nothing has been lost and nothing has stopped: what arrives while this page cannot be
+drawn still arrives. Your plan, your connected accounts and everything else on your dashboard are
+unaffected.</p>
+${back}`,
+    );
+  }
+
+  const view = page.view;
+  const cycle = view.latestCycle;
+
+  if (view.lastArrivedAt === null) {
+    return shell(
+      title,
+      `<h1>What your brain is working on</h1>
+${rule}
+<h2>Arriving</h2>
+<p>Nothing has reached this brain yet, so there is nothing for the steps below to work on.</p>
+<p class="note"><a href="${escapeHtml(COVERAGE_PATH)}">What your brain knows &rarr;</a> &middot;
+<a href="/connect">Connect an account &rarr;</a></p>
+${back}`,
+    );
+  }
+
+  const arriving = `<h2>Arriving</h2>
+<p>The most recent document reached this brain ${moment(new Date(view.lastArrivedAt))}.</p>
+<p class="note">This is the clock the rest of this page is read against: a step with a large number
+waiting under a document that arrived months ago is a different thing from the same number under one
+that arrived this morning. <a href="${escapeHtml(COVERAGE_PATH)}">What came from where &rarr;</a>
+&middot; <a href="/dashboard">Connected accounts &rarr;</a></p>`;
+
+  // The deterministic-stop shape: a section-level line, not six rows. When the
+  // cycle stopped in a phase that is not one of these six, every row here is
+  // `not_reached` — correctly — but the NAME is withheld, because telling an
+  // owner they are behind on work that produces nothing they can see is worse
+  // than silence.
+  const stoppedOutside =
+    cycle !== null &&
+    cycle.stoppedPhase !== null &&
+    !(PROCESSING_PHASES as readonly string[]).includes(cycle.stoppedPhase);
+  const prefixNote = stoppedOutside
+    ? `<p class="note">The last cycle ran out before this half of the pipeline began, reporting
+<code>${escapeHtml(cycle?.stoppedPhaseCode ?? 'no code')}</code>. The free half runs first and has a
+share of each cycle; on a large brain it can use all of it.</p>`
+    : '';
+
+  let making: string;
+  if (view.phases === null) {
+    making = `<h2>Making sense of it</h2>
+<p>The steps that turn documents into facts, people and companies are not on the free plan, so this
+page has nothing to measure for them. Everything you send is still stored and searchable, and each
+cycle still runs the free half — de-duplication, linking, staleness, scoring.</p>`;
+  } else {
+    const synopsisWaiting =
+      view.phases.find((entry) => entry.phase === 'synopsis')?.waiting ?? 0;
+    const allRefused =
+      view.refusedWaiting !== null && view.refusedWaiting > 0 && view.refusedWaiting === synopsisWaiting;
+
+    const rows = view.phases
+      .map((entry) => {
+        const [label, one, many] = PHASE_WORK[entry.phase];
+        // Emphasis is position times duration, and neither is re-derived here.
+        // One `out_of_time` cycle is an ordinary Tuesday; the same stop under a
+        // freshness the staleness module calls alarming is the incident. A page
+        // that prints a warning on an ordinary day is a page whose warnings stop
+        // being read.
+        const alarming =
+          (entry.standing !== 'unknown' && isAlarming(view.cycleFreshness)) ||
+          (entry.phase === 'synopsis' && allRefused);
+        const amount =
+          entry.waiting === 0 ? 'Nothing waiting' : `${count(entry.waiting, one, many)} waiting`;
+        const shown = alarming ? `<strong>${amount}</strong>` : amount;
+        // When the cycle stopped in a phase this page does not list, the
+        // section line above carries the claim and no row may name it — the
+        // whole point of withholding it is that the name means nothing to the
+        // reader. Every row here is still `not_reached`, and correctly.
+        const sentence = stoppedOutside
+          ? ''
+          : standingSentence(
+              entry.standing,
+              cycle?.stoppedPhase ?? null,
+              cycle?.stoppedPhaseCode ?? null,
+            );
+        // The pacing note is gated on the step having actually been reached: in
+        // the incident this page was written for, this step is `not_reached` and
+        // its pace is zero a cycle, not "a small fixed batch". It carries no
+        // number, because that is a tuning constant, and it states the rate and
+        // stops — no estimate, no "it will catch up".
+        const pacing =
+          entry.phase === 'salience_refine' && entry.standing === 'unknown' && entry.waiting > 0
+            ? `<p class="note">This step works through a small fixed batch each cycle whatever else is
+happening, so a large number waiting under it is the pace rather than a fault.</p>`
+            : '';
+        const refusal =
+          entry.phase === 'synopsis' && view.refusedWaiting !== null && view.refusedWaiting > 0
+            ? `<p class="note">${escapeHtml(String(view.refusedWaiting))} of those have been sent to
+the summariser and the answer could not be used; the most any one of them has been sent is ${count(view.mostRefusals ?? 0, 'time', 'times')}. Nothing has been dropped — they are still stored,
+still searchable, and still candidates. That count says the answer could not be used. It does not say
+the document is at fault: the same count goes up when a prompt or a model seat is the problem, and
+this page cannot tell those apart.${
+                allRefused
+                  ? ' Every document waiting here is one of them, which is the shape of a step that is not getting through rather than of a few odd documents.'
+                  : ''
+              }</p>`
+            : '';
+        return `  <li${alarming ? ' class="failing"' : ''}>
+    <div class="step-name">${escapeHtml(label)}</div>
+    <p class="note">${shown} &middot; <code>${escapeHtml(entry.phase)}</code></p>
+${sentence}${refusal}${pacing}  </li>`;
+      })
+      .join('\n');
+
+    making = `<h2>Making sense of it</h2>
+${prefixNote}<ul class="sources">
+${rows}
+</ul>
+<p class="note">"Waiting" is what each step would take next, counted the same way the step itself
+selects it. A step with nothing waiting has been through everything currently in this brain; it is
+not a claim that it found something in all of it — a step records a document as looked at whether or
+not anything came of it, and a step that answered thinly about a large batch looks the same from here
+as one that answered well. To read these numbers against the size of the brain, the totals are on
+<a href="${escapeHtml(COVERAGE_PATH)}">what your brain knows</a>.</p>`;
+  }
+
+  let last: string;
+  if (cycle === null) {
+    last = `<h2>The last cycle</h2>
+<p>No cycle has run on this brain yet, so none of these steps has been reached. What you have sent is
+stored and searchable.</p>`;
+  } else if (cycle.finishedAt === null) {
+    last = `<h2>The last cycle</h2>
+<p>A cycle opened ${moment(new Date(cycle.startedAt))} and nothing has been recorded against it yet.
+A cycle that is still running and one that was killed before it could write look the same from here,
+so this page does not guess between them.</p>`;
+  } else {
+    const completion =
+      cycle.dreamt || cycle.stopReason === 'complete' || cycle.stopReason === 'free_tier';
+    // A shortfall is rendered ONLY under a completion, and always with its
+    // cause. Under a completion those are the only two possible causes, so the
+    // sentence is exhaustive; under anything else a bare fraction would sit
+    // beside large waiting counts with no explanation anywhere on the page.
+    const ran = !completion
+      ? ''
+      : cycle.phasesRun === cycle.phasesPlanned
+        ? ' It ran every step of the pipeline.'
+        : ` It ran ${escapeHtml(String(cycle.phasesRun))} of its ${escapeHtml(
+            String(cycle.phasesPlanned),
+          )} steps. The ones it did not run were not skipped over a failure: the free half stops once
+it has used its share of the cycle and starts again from the top next time, and a step an earlier
+attempt of the same cycle already paid for is not paid for twice.`;
+    const calls =
+      cycle.modelCalls === 0
+        ? ' It made no calls to a model.'
+        : ` It made ${count(cycle.modelCalls, 'call', 'calls')} to a model and recorded ${spend(
+            cycle.spentMicroUsd,
+          )} of spend against itself.`;
+    last = `<h2>The last cycle</h2>
+<p>It opened ${moment(new Date(cycle.startedAt))} and closed ${moment(
+      new Date(cycle.finishedAt),
+    )}.${ran}${calls}</p>
+<p class="note">That figure is what the cycle banked against itself, not your bill. A call the
+provider answered and this brain could not use is charged to your account and recorded here as
+nothing, so a cycle that made calls and recorded almost no spend is one of the shapes a step that is
+not getting through takes.</p>
+<p><a href="${escapeHtml(COVERAGE_PATH)}">How long it has been like this &rarr;</a></p>`;
+  }
+
+  return shell(
+    title,
+    `<h1>What your brain is working on</h1>
+${rule}
+${arriving}
+${making}
+${last}
+${back}`,
+  );
+}
+
 function coveragePage(page: Extract<Page, { kind: 'coverage' }>): string {
   const back = '<p><a href="/dashboard">Back to your dashboard</a></p>';
   // The rule, at the top, where somebody deciding whether to screenshot this is.
@@ -1383,9 +1976,21 @@ ${view.entityTypes
   const open =
     view.openContradictions === null || view.openReview === null
       ? ''
-      : `\n<h2>Waiting on you</h2>
+      : view.openContradictions === 0 && view.openReview === 0
+        ? `\n<h2>Waiting on you</h2>
+<p>Nothing is waiting on you.</p>`
+        : // **Not "ask your assistant", which is what this said and what the
+          // database forbids.** `review_queue.closed_by` admits
+          // `user_out_of_band` and `internal` and nothing else, under a header
+          // stating that `agent_mcp` is absent because the assistant holding
+          // `remember` is the assistant reading the attacker's mail. The
+          // assistant can describe these; it cannot close one. Pointing a reader
+          // at the one actor that cannot act was the sentence that made this
+          // whole queue unreachable for as long as it has existed.
+          `\n<h2>Waiting on you</h2>
 <p>${count(view.openContradictions, 'contradiction', 'contradictions')} and
-${count(view.openReview, 'proposal', 'proposals')} are open. Ask your assistant about them.</p>`;
+${count(view.openReview, 'proposal', 'proposals')} are open.
+<a href="${escapeHtml(REVIEW_PATH)}">Decide them &rarr;</a></p>`;
 
   // A brain with nothing in it is rendered without the derived section at all.
   // Three zeroes under a heading reading "what it made of them" is a small
@@ -1415,6 +2020,7 @@ accounts panel on your dashboard is where the reason is.</p>
 ${
       view.latestCycle === null ? cold : `<p>${cycleSentence(view.latestCycle, page.tier)}</p>`
     }${freezeNote(view)}${behind}${derived}
+<p><a href="${escapeHtml(PROCESSING_PATH)}">What your brain is working on &rarr;</a></p>
 ${back}`,
   );
 }

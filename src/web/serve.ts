@@ -39,6 +39,7 @@ import {
   createWebApp,
   type ConnectorVendor,
   type CoveragePort,
+  type ReviewPort,
   type ProviderKeyWriter,
   type RetractionPort,
   type SeverancePort,
@@ -84,6 +85,8 @@ import { controlPlaneIdentity, fleetIdentity, isValidTenantId } from '../control
 import { createTenantStorage } from '../control/storage.ts';
 import { createPipedreamConnectorVendor } from './connectors.ts';
 import { readCoverage } from './coverage.ts';
+import { readProcessing } from './processing.ts';
+import { decideConflict, decideProposal, readReview, undoProposal } from './review.ts';
 import {
   openConnectorClient,
   openControlPlane,
@@ -161,6 +164,8 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
     // a declared port with no supplier, and a route that answers `501` about a
     // count is as unreachable as one that answers `501` about a restore.
     coverage: coveragePort(withTenant),
+    // Supplied in the same change that declares it, for the reason two ports up.
+    review: reviewPort(withTenant),
     provisioner: reportedProvisioner(
       createBrainProvisioner({
         controlSql,
@@ -572,6 +577,68 @@ export function retractionPort(withTenant: TenantWork): RetractionPort {
  * is right for severance and wrong for the one page whose job is explaining
  * state.
  */
+/**
+ * The decisions port, and the one surface in the product that writes
+ * `user_out_of_band`.
+ *
+ * Every method goes through `withTenant`: one connection per call, closed in a
+ * `finally`. R11 is why this is a port at all rather than a handle — the web
+ * app's identity holds no resolve permission on a tenant namespace.
+ *
+ * The SQL lives in `src/web/review.ts` rather than here or in `coverage.ts`,
+ * for the reason `processing.ts` gives: so coverage's statement budget does not
+ * grow with every page that wants a tenant read.
+ */
+export function reviewPort(withTenant: TenantWork): ReviewPort {
+  return {
+    read: (request) => withTenant(request.tenantId, (sql) => readReview(sql)),
+
+    decide: (request) =>
+      withTenant(request.tenantId, async (sql) => {
+        const outcome = await decideProposal(sql, {
+          reviewId: request.reviewId,
+          intent: request.intent,
+          seenCardId: request.seenCardId,
+          now: new Date(),
+        });
+        if (outcome.ok) {
+          return outcome.action === 'applied'
+            ? ({ ok: true, outcome: 'applied', hadPrior: outcome.hadPrior } as const)
+            : ({ ok: true, outcome: 'dismissed' } as const);
+        }
+        // `target_gone` and `already_closed` are OUTCOMES rather than failures:
+        // the row is closed either way and the page has something true to say.
+        if (outcome.reason === 'target_gone') return { ok: true, outcome: 'target_gone' } as const;
+        if (outcome.reason === 'already_closed') {
+          return { ok: true, outcome: 'already_closed' } as const;
+        }
+        return { ok: false, reason: outcome.reason } as const;
+      }),
+
+    undo: (request) =>
+      withTenant(request.tenantId, (sql) => undoProposal(sql, { reviewId: request.reviewId })),
+
+    resolve: (request) =>
+      withTenant(request.tenantId, async (sql) => {
+        const outcome = await decideConflict(sql, {
+          reportId: request.reportId,
+          verdict: request.intent === 'dismiss' ? null : request.intent,
+          now: new Date(),
+        });
+        if (outcome.ok) {
+          return {
+            ok: true,
+            outcome: outcome.action === 'resolved' ? 'recorded' : 'dismissed',
+          } as const;
+        }
+        if (outcome.reason === 'already_closed') {
+          return { ok: true, outcome: 'already_closed' } as const;
+        }
+        return { ok: false, reason: 'not_adjudicable' } as const;
+      }),
+  };
+}
+
 export function coveragePort(withTenant: TenantWork): CoveragePort {
   return {
     read: (request) =>
@@ -580,6 +647,14 @@ export function coveragePort(withTenant: TenantWork): CoveragePort {
       // rendered from one process's clock and windowed by another's is a
       // contradiction nobody can see.
       withTenant(request.tenantId, (sql) => readCoverage(sql, { now: new Date() })),
+    // The sibling read, on the same handle and the same clock rule. This one
+    // windows nothing, but it feeds `cycleFreshnessOf`, so the argument above
+    // carries: a page rendered from one process's clock and judged by another's
+    // is a contradiction nobody looking at it can see.
+    readProcessing: (request) =>
+      withTenant(request.tenantId, (sql) =>
+        readProcessing(sql, { now: new Date(), modelTier: request.modelTier }),
+      ),
   };
 }
 

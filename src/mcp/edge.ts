@@ -166,6 +166,12 @@ const WEB_PATHS: ReadonlySet<string> = new Set([
   '/retractions',
   '/api/retractions',
   '/api/restore',
+  // The decisions screen's two write routes. Enumerated here in the same change
+  // that adds them to `src/web/app.ts`: a path missing from this set is
+  // `unrouted` at the edge, so a route added on one side alone answers 404 in
+  // every deployment while passing every test in the app.
+  '/api/review',
+  '/api/contradictions',
 ]);
 
 /**

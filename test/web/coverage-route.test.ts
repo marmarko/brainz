@@ -276,6 +276,13 @@ function fakePort(options: { readonly throws?: boolean; readonly view?: Coverage
       }
       return Promise.resolve(options.view ?? VIEW);
     },
+    // The sibling read, which this suite does not exercise. It is here because
+    // `CoveragePort` declares it: a method cannot be left unsupplied, which is
+    // the whole reason the processing view is a second method rather than a
+    // second port. `test/web/processing-route.test.ts` is what drives it.
+    readProcessing() {
+      return Promise.reject(new Error('this suite does not exercise the processing view'));
+    },
   };
 }
 

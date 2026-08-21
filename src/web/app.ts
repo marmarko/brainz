@@ -78,7 +78,9 @@ import { CONNECT_STEPS, claudeCodeCommand, connectionStatus, installLink } from 
 import { adminDispatch, createBrainOwnerDirectory } from './admin.ts';
 import { connectorStatuses } from './connector-panel.ts';
 import type { CoverageView } from './coverage.ts';
-import { BRAIN_SETUP_PATH, renderPage } from './pages.ts';
+import type { ProcessingView } from './processing.ts';
+import type { ReviewView } from './review.ts';
+import { BRAIN_SETUP_PATH, REVIEW_PATH, renderPage } from './pages.ts';
 
 export const SESSION_COOKIE = 'bz_session';
 
@@ -304,6 +306,90 @@ export interface RetractionPort {
  */
 export interface CoveragePort {
   read(request: { readonly tenantId: string }): Promise<CoverageView>;
+  /**
+   * The sibling view, on the same handle.
+   *
+   * **A method rather than a second port, and the argument is
+   * `test/web/port-supply.test.ts`'s own.** That test exists because a
+   * *declared* field can go unsupplied — the defect made three times, twice
+   * shipped. A *method* cannot: `coveragePort` is annotated `: CoveragePort` in
+   * `serve.ts` and supplied unconditionally there, so an unimplemented method is
+   * a compile error rather than a `501` somebody discovers in production. A
+   * `ProcessingPort` would add a fresh row to the exact risk class that test was
+   * written to close, and would let a deployment be *half* able to read a brain
+   * — a state with no meaning, since both reads go through one `withTenant`.
+   *
+   * **The cost property is unaffected**, because it is about which handler runs
+   * and not about how many methods an interface has: `renderCoverage` calls
+   * `read`, `renderProcessing` calls `readProcessing`, and neither pays for the
+   * other. The read itself lives in `src/web/processing.ts` so coverage's
+   * statement budget does not grow.
+   *
+   * `modelTier` is the READER's plan, never the newest run's `tier`, and it
+   * decides whether the six phase counters are asked for at all.
+   */
+  readProcessing(request: {
+    readonly tenantId: string;
+    readonly modelTier: 'free' | 'paid';
+  }): Promise<ProcessingView>;
+}
+
+/**
+ * What is waiting on a decision, and the writes that close one.
+ *
+ * **Four methods on one port, never four sibling ports** — `CoveragePort`'s own
+ * argument, one interface up: a declared port field can go unsupplied, while an
+ * unimplemented method is a compile error rather than a `501` somebody discovers
+ * in production.
+ *
+ * Absent renders the explanation rather than an empty queue. "Nothing is waiting
+ * on you" and "this deployment cannot read your brain" are the two states this
+ * page exists to tell apart, and a port-less render would print the first while
+ * meaning the second.
+ */
+export interface ReviewPort {
+  read(request: { readonly tenantId: string }): Promise<ReviewView>;
+
+  decide(request: {
+    readonly tenantId: string;
+    readonly reviewId: string;
+    readonly intent: 'apply' | 'dismiss';
+    /** The live card the LISTING showed, or null when it showed none. */
+    readonly seenCardId: string | null;
+  }): Promise<
+    | { readonly ok: true; readonly outcome: 'applied'; readonly hadPrior: boolean }
+    | { readonly ok: true; readonly outcome: 'dismissed' }
+    | { readonly ok: true; readonly outcome: 'target_gone' }
+    | { readonly ok: true; readonly outcome: 'already_closed' }
+    | {
+        readonly ok: false;
+        readonly reason:
+          | 'no_apply_path'
+          | 'needs_an_embedding'
+          | 'needs_corroboration'
+          | 'origin_severed'
+          | 'too_long_to_read'
+          | 'card_changed';
+      }
+  >;
+
+  /** Everything this needs is derived from the review row. No card id crosses the wire. */
+  undo(request: {
+    readonly tenantId: string;
+    readonly reviewId: string;
+  }): Promise<
+    | { readonly ok: true; readonly restored: boolean }
+    | { readonly ok: false; readonly reason: 'nothing_to_undo' }
+  >;
+
+  resolve(request: {
+    readonly tenantId: string;
+    readonly reportId: string;
+    readonly intent: 'left' | 'right' | 'both' | 'neither' | 'dismiss';
+  }): Promise<
+    | { readonly ok: true; readonly outcome: 'recorded' | 'dismissed' | 'already_closed' }
+    | { readonly ok: false; readonly reason: 'not_adjudicable' }
+  >;
 }
 
 export interface ConnectorVendor {
@@ -416,6 +502,13 @@ export interface WebAppDeps {
    * `test/web/port-supply.test.ts` fails if any port declared here is not.
    */
   readonly coverage?: CoveragePort;
+  /**
+   * What is waiting on a decision. Supplied unconditionally by `src/web/serve.ts`
+   * in the same change that declares it — `test/web/port-supply.test.ts` fails
+   * the build if any port declared here is not, and that test exists because
+   * this repository shipped an unsupplied port three times.
+   */
+  readonly review?: ReviewPort;
   /** The Stripe endpoint signing secret, resolved from the secret store. */
   readonly stripeWebhookSecret: string;
   /** Set for an operator deployment; absent disables `/admin` entirely. */
@@ -799,6 +892,12 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     if (path === '/api/restore' && request.method === 'POST') {
       return handleRestore(request, session);
     }
+    if (path === '/api/review' && request.method === 'POST') {
+      return handleReviewDecision(request, session);
+    }
+    if (path === '/api/contradictions' && request.method === 'POST') {
+      return handleContradiction(request, session);
+    }
 
     // ---- The pages. -------------------------------------------------------
     //
@@ -834,9 +933,11 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
     // waking one because its owner asked is defensible where waking one because
     // they logged in is not.
     if (path === '/' || path === '/dashboard') {
-      return url.searchParams.get('view') === 'coverage'
-        ? renderCoverage(session)
-        : renderDashboard(session);
+      const view = url.searchParams.get('view');
+      if (view === 'coverage') return renderCoverage(session);
+      if (view === 'processing') return renderProcessing(session);
+      if (view === 'review') return renderReview(session);
+      return renderDashboard(session);
     }
     if (path === '/brain') return renderBrainSetup(session);
     if (path === '/connect') return renderConnect(session);
@@ -2249,6 +2350,165 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         );
       }
       return html(renderPage({ kind: 'coverage', available: true, reachable: true, tier, view }));
+    }
+
+    /**
+     * How far each step has got, as a page.
+     *
+     * Four states, exactly `renderCoverage`'s, and the throw is caught for the
+     * same reason: the entrypoint's generic `500` is right for severance and
+     * wrong for the one page whose whole job is explaining state.
+     *
+     * **`modelTier` fails toward showing, not toward blanking.** Anything that
+     * is not literally `'free'` reads as paid — an operator grant resolves
+     * through `effectiveTierOf`, and a brain running on one has real model-phase
+     * backlog. A `=== 'paid' ? 'paid' : 'free'` here would blank the six
+     * counters for exactly the brains an operator is looking at.
+     */
+    /**
+     * What is waiting on a decision, as a page.
+     *
+     * Four states, `renderCoverage`'s, and the catch is caught for its reason.
+     * The one divergence: **the stderr line names a SQLSTATE and a statement
+     * label, never `error.message`.** Coverage copies the message and is
+     * structurally safe doing so because nothing it touches is content. Every
+     * statement behind this page reads `proposal`, `summary` or
+     * `canonical_name`, so "a failure reason is a code and a timestamp, not a
+     * subject line" has to be true here by construction rather than by luck.
+     */
+    async function renderReview(session: Session): Promise<Response> {
+      const subscription = await subscriptionOf(deps.sql, session.accountId);
+      if (deps.review === undefined) {
+        return html(
+          renderPage({
+            kind: 'review',
+            available: false,
+            reachable: false,
+            tier: subscription.tier,
+            view: null,
+          }),
+          501,
+        );
+      }
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return seeOther(BRAIN_SETUP_PATH);
+      const tier = await effectiveTierOf(deps.controlSql, tenantId, subscription.tier);
+
+      let view: ReviewView;
+      try {
+        view = await deps.review.read({ tenantId });
+      } catch (error) {
+        process.stderr.write(
+          `${JSON.stringify({
+            event: 'review_unreadable',
+            tenant: tenantId,
+            code: (error as { code?: string }).code ?? 'unknown',
+          })}\n`,
+        );
+        return html(
+          renderPage({ kind: 'review', available: true, reachable: false, tier, view: null }),
+        );
+      }
+      // `no-store`, because the page renders undecided content and a cached copy
+      // outlives the decision it was drawn for.
+      return html(
+        renderPage({ kind: 'review', available: true, reachable: true, tier, view }),
+        200,
+        { 'cache-control': 'no-store' },
+      );
+    }
+
+    /** One decision about one proposal: apply, dismiss, or undo an apply. */
+    async function handleReviewDecision(request: Request, session: Session): Promise<Response> {
+      if (deps.review === undefined) return json({ ok: false, code: 'unavailable' }, 501);
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return seeOther(BRAIN_SETUP_PATH);
+
+      const fields = await body(request);
+      const reviewId = stringOf(fields, 'review_id');
+      const intent = stringOf(fields, 'intent');
+      if (!/^[0-9]{1,18}$/.test(reviewId)) {
+        return json({ ok: false, code: 'invalid_params' }, 400);
+      }
+
+      if (intent === 'undo') {
+        const undone = await deps.review.undo({ tenantId, reviewId });
+        return afterForm(request, REVIEW_PATH, {}) ?? json(undone, undone.ok ? 200 : 409);
+      }
+      if (intent !== 'apply' && intent !== 'dismiss') {
+        return json({ ok: false, code: 'invalid_params' }, 400);
+      }
+      const seen = stringOf(fields, 'seen_card_id');
+      const decided = await deps.review.decide({
+        tenantId,
+        reviewId,
+        intent,
+        seenCardId: /^[0-9]{1,18}$/.test(seen) ? seen : null,
+      });
+      return afterForm(request, REVIEW_PATH, {}) ?? json(decided, decided.ok ? 200 : 409);
+    }
+
+    /** One verdict about one contradiction. It records, and touches no fact. */
+    async function handleContradiction(request: Request, session: Session): Promise<Response> {
+      if (deps.review === undefined) return json({ ok: false, code: 'unavailable' }, 501);
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return seeOther(BRAIN_SETUP_PATH);
+
+      const fields = await body(request);
+      const reportId = stringOf(fields, 'report_id');
+      const intent = stringOf(fields, 'intent');
+      const verdicts = ['left', 'right', 'both', 'neither', 'dismiss'] as const;
+      if (
+        !/^[0-9]{1,18}$/.test(reportId) ||
+        !(verdicts as readonly string[]).includes(intent)
+      ) {
+        return json({ ok: false, code: 'invalid_params' }, 400);
+      }
+      const resolved = await deps.review.resolve({
+        tenantId,
+        reportId,
+        intent: intent as (typeof verdicts)[number],
+      });
+      return afterForm(request, REVIEW_PATH, {}) ?? json(resolved, resolved.ok ? 200 : 409);
+    }
+
+    async function renderProcessing(session: Session): Promise<Response> {
+      const subscription = await subscriptionOf(deps.sql, session.accountId);
+      if (deps.coverage === undefined) {
+        return html(
+          renderPage({
+            kind: 'processing',
+            available: false,
+            reachable: false,
+            tier: subscription.tier,
+            view: null,
+          }),
+          501,
+        );
+      }
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return seeOther(BRAIN_SETUP_PATH);
+      const tier = await effectiveTierOf(deps.controlSql, tenantId, subscription.tier);
+
+      let view: ProcessingView;
+      try {
+        view = await deps.coverage.readProcessing({
+          tenantId,
+          modelTier: tier === 'free' ? 'free' : 'paid',
+        });
+      } catch (error) {
+        process.stderr.write(
+          `${JSON.stringify({
+            event: 'processing_unreadable',
+            tenant: tenantId,
+            message: error instanceof Error ? error.message : String(error),
+          })}\n`,
+        );
+        return html(
+          renderPage({ kind: 'processing', available: true, reachable: false, tier, view: null }),
+        );
+      }
+      return html(renderPage({ kind: 'processing', available: true, reachable: true, tier, view }));
     }
 
     async function renderConnect(session: Session): Promise<Response> {
