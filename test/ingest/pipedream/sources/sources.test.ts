@@ -20,7 +20,10 @@ import {
   PROVIDER_API_BASE,
   createPipedreamClient,
 } from '../../../../src/ingest/pipedream/client.ts';
-import { createCalendarSource } from '../../../../src/ingest/pipedream/sources/calendar.ts';
+import {
+  CALENDAR_HORIZON_DAYS,
+  createCalendarSource,
+} from '../../../../src/ingest/pipedream/sources/calendar.ts';
 import { createDriveSource } from '../../../../src/ingest/pipedream/sources/drive.ts';
 import { createGmailSource } from '../../../../src/ingest/pipedream/sources/gmail.ts';
 import { externalRefFor } from '../../../../src/ingest/pipedream/sources/types.ts';
@@ -439,6 +442,80 @@ describe('calendar', () => {
       { externalRef: externalRefFor('calendar', 'e2'), reason: 'cancelled' },
     ]);
     expect(outcome.page.nextCursor).toEqual({ kind: 'delta', value: 'sync-2' });
+  });
+
+  test('a backfill asks for a bounded window, not everything after timeMin', async () => {
+    // `singleEvents: true` expands a recurring event into one item per
+    // occurrence. Without a ceiling that is unbounded, and it was not
+    // hypothetical: the founder's brain held 875 calendar pages dated after
+    // 2027, the furthest in 2056, from two weekly meetings.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/events?', { status: 200, body: { items: [], nextSyncToken: 'sync-9' } });
+
+    await createCalendarSource(client(transport), () => NOW).list({
+      ...CONNECTION,
+      mode: 'backfill',
+      cursor: null,
+      since: SINCE,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    const target = proxyTargets(transport)[0] ?? '';
+    const asked = new URL(target);
+    expect(asked.searchParams.get('singleEvents')).toBe('true');
+    expect(asked.searchParams.get('timeMin')).toBe(SINCE.toISOString());
+    // NOW + CALENDAR_HORIZON_DAYS, and nothing further.
+    expect(asked.searchParams.get('timeMax')).toBe(
+      new Date(NOW.getTime() + CALENDAR_HORIZON_DAYS * 86_400_000).toISOString(),
+    );
+  });
+
+  test('a delta enforces the same horizon on the items, because it may not ask for it', async () => {
+    // Measured against the live project: `syncToken` + `timeMax` answers 400.
+    // Google refuses a window on an incremental sync, so the delta branch must
+    // not send one — and must therefore apply it to what comes back.
+    const transport = withToken(createScriptedTransport());
+    const beyond = new Date(NOW.getTime() + (CALENDAR_HORIZON_DAYS + 30) * 86_400_000);
+    const inside = new Date(NOW.getTime() + 10 * 86_400_000);
+    transport.on('/events?', {
+      status: 200,
+      body: {
+        nextSyncToken: 'sync-2',
+        items: [
+          { id: 'near', status: 'confirmed', summary: 'Standup', start: { dateTime: inside.toISOString() } },
+          { id: 'far', status: 'confirmed', summary: 'Standup', start: { dateTime: beyond.toISOString() } },
+          // All-day events carry `date`, not `dateTime` — a birthday thirty
+          // years out arrives in this shape and must be bounded too.
+          { id: 'far-allday', status: 'confirmed', summary: 'Birthday', start: { date: '2056-04-22' } },
+        ],
+      },
+    });
+
+    const outcome = await createCalendarSource(client(transport), () => NOW).list({
+      ...CONNECTION,
+      mode: 'delta',
+      cursor: 'sync-1',
+      since: null,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.items.map((item) => item.externalRef)).toEqual([
+      externalRefFor('calendar', 'near'),
+    ]);
+    // Skipped, not failed and not tombstoned. A failure is retryable and would
+    // hold the cursor on an event that is never going to become wanted; a
+    // tombstone would be permanent, and a delta feed never re-offers an
+    // unchanged event, so the occurrence would never return when it came close.
+    expect(outcome.page.failures).toEqual([]);
+    expect(outcome.page.tombstones).toEqual([]);
+    // And the delta request carried no window, because the vendor refuses one.
+    const asked = new URL(proxyTargets(transport)[0] ?? '');
+    expect(asked.searchParams.get('timeMax')).toBeNull();
+    expect(asked.searchParams.get('syncToken')).toBe('sync-1');
   });
 
   test('an unfinished listing hands back a continuation cursor, not a sync token', async () => {

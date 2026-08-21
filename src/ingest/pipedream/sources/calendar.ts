@@ -43,6 +43,53 @@ import {
 const APP = 'google_calendar' as const;
 const PAGE_SIZE = 250;
 
+/**
+ * How far ahead an event may start and still be worth remembering.
+ *
+ * **`singleEvents: true` expands a recurring event into one item per
+ * occurrence, and a floor without a ceiling expands it forever.** Measured on
+ * the founder's brain before this constant existed: 935 calendar pages, of
+ * which **875 started after 2027 and the furthest was 2056** — a weekly 1:1
+ * contributing 387 instances and another 356, each one chunked, embedded, and
+ * turned into facts by a paid model call. Only about sixty described anything
+ * that had happened. The damage did not stop at the calendar either: those
+ * instances read as sentences like *"…is set for March 5, 2048"*, and that is
+ * where a brain full of months filed as *organizations* came from.
+ *
+ * **400 days, because it keeps exactly one occurrence of an annual event.** A
+ * birthday, an anniversary and a yearly review each survive once, which is what
+ * makes "when is it next" answerable; a 365-day horizon drops the ones that
+ * have just passed and answers "never". Everything above a year is a recurrence
+ * rule the brain can no longer distinguish from a fact.
+ *
+ * **What this deliberately costs**, stated because it is a real gap rather than
+ * a rounding error: a delta feed only reports events that *change*, so an
+ * unchanged occurrence sitting beyond the horizon today is not offered again on
+ * the day it moves inside it. It is picked up when a backfill re-lists the
+ * window — which this source already does whenever Calendar answers `410 GONE`
+ * on an expired sync token. The alternative was worse: tombstoning
+ * beyond-horizon events would remove an occurrence permanently, because nothing
+ * would ever re-offer it.
+ */
+export const CALENDAR_HORIZON_DAYS = 400;
+
+/** The instant past which an event is a recurrence rule rather than a plan. */
+export function calendarHorizon(now: Date): Date {
+  return new Date(now.getTime() + CALENDAR_HORIZON_DAYS * 86_400_000);
+}
+
+/**
+ * When this event starts, or `null` when it says nothing this source can read.
+ *
+ * All-day events carry `start.date` rather than `start.dateTime`; both are read
+ * here so an all-day birthday thirty years out is bounded like everything else.
+ */
+function startsAt(event: Record<string, unknown>): Date | null {
+  const start = asRecord(event.start);
+  if (start === null) return null;
+  return asDate(start.dateTime) ?? asDate(start.date);
+}
+
 /** The one calendar alpha reads. A multi-calendar fan-out is a later rung. */
 const CALENDAR_ID = 'primary';
 
@@ -94,7 +141,15 @@ function readSyncCursor(cursor: string | null): {
   return { pageToken: cursor.slice(0, index) || null, syncToken: cursor.slice(index + 1) || null };
 }
 
-export function createCalendarSource(api: ProviderApi): ProviderSource {
+export function createCalendarSource(
+  api: ProviderApi,
+  /**
+   * The clock the horizon is measured from. Injected for the same reason the
+   * client injects one: a bound relative to `now` is untestable against a fixed
+   * fixture otherwise, and a horizon nothing has watched apply is not a bound.
+   */
+  now: () => Date = () => new Date(),
+): ProviderSource {
   return {
     source: 'calendar',
     sourceType: 'calendar',
@@ -128,6 +183,13 @@ export function createCalendarSource(api: ProviderApi): ProviderSource {
               }
             : {
                 ...(request.since === null ? {} : { timeMin: request.since.toISOString() }),
+                // **The ceiling the expansion never had.** Measured against the
+                // live project: `timeMin`+`timeMax` answers 200, and
+                // `syncToken`+`timeMax` answers **400** — Google refuses a
+                // window on an incremental sync because the token already
+                // encodes one. So the bound goes on the listing here, and the
+                // delta branch enforces the same horizon on the items instead.
+                timeMax: calendarHorizon(now()).toISOString(),
                 ...(request.cursor === null ? {} : { pageToken: request.cursor }),
               }),
         },
@@ -143,6 +205,7 @@ export function createCalendarSource(api: ProviderApi): ProviderSource {
 
       const offered = asArray(body?.items);
       const ceiling = Math.max(0, request.maxItems);
+      const horizon = calendarHorizon(now());
       // Beyond the ceiling is accounted for rather than sliced away: the row is
       // retryable, which holds the cursor, which is what makes the event be
       // offered again instead of dropped.
@@ -178,13 +241,21 @@ export function createCalendarSource(api: ProviderApi): ProviderSource {
           continue;
         }
 
-        const start = asRecord(event.start);
+        // The same horizon the listing asks for, applied to what came back —
+        // because the delta branch is forbidden from asking. Skipped rather
+        // than failed: a failure is retryable and would hold the cursor on an
+        // event that is never going to become wanted, wedging the source. And
+        // skipped rather than tombstoned: a tombstone would be permanent, and a
+        // delta feed never re-offers an unchanged event, so an occurrence
+        // removed at 400 days would never return at 300.
+        const startsAtInstant = startsAt(event);
+        if (startsAtInstant !== null && startsAtInstant.getTime() > horizon.getTime()) continue;
+
         items.push({
           externalRef: externalRefFor('calendar', id),
           title: asString(event.summary),
           body: text,
-          occurredAt:
-            start === null ? null : (asDate(start.dateTime) ?? asDate(start.date)),
+          occurredAt: startsAtInstant,
         });
       }
 
