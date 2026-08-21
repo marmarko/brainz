@@ -82,10 +82,14 @@ CREATE DOMAIN control.connector_health_tenant_id AS varchar(63)
   CONSTRAINT connector_health_tenant_id_is_a_slug
   CHECK (VALUE ~ '^[a-z0-9][a-z0-9-]{0,62}$');
 
--- The same three labels as `control.connector_source`, `control.job_target`'s
--- connector members and `cursor.ts:CONNECTOR_SOURCES`. A fourth added there and
--- not here is a connector whose attempts this table would refuse to record.
-CREATE TYPE control.connector_health_source AS ENUM ('gmail', 'calendar', 'drive');
+-- The same labels, in the same order, as `control.connector_source`,
+-- `control.job_target`'s connector members and `cursor.ts:CONNECTOR_SOURCES`. A
+-- label added there and not here is a connector whose attempts this table would
+-- refuse to record — and `recordConnectorAttempt` swallows its own errors by
+-- design, so the connector would poll happily while the dashboard stayed empty
+-- forever. **Append only**, and a test compares these labels to
+-- `CONNECTOR_SOURCES` as a sequence.
+CREATE TYPE control.connector_health_source AS ENUM ('gmail', 'calendar', 'drive', 'contacts');
 
 -- What the pull itself said it did — `PullResult.outcome` in
 -- `src/ingest/pipedream/pull.ts`, restated. NULL means the attempt produced no

@@ -159,12 +159,13 @@ export interface ClientFailure {
 export type ClientOutcome<T> = { readonly ok: true; readonly value: T } | ClientFailure;
 
 /** Which vendor app a provider request is aimed at. */
-export type ProviderApp = 'gmail' | 'google_calendar' | 'google_drive';
+export type ProviderApp = 'gmail' | 'google_calendar' | 'google_drive' | 'google_contacts';
 
 export const APP_FOR_SOURCE: Readonly<Record<ConnectorSource, ProviderApp>> = {
   gmail: 'gmail',
   calendar: 'google_calendar',
   drive: 'google_drive',
+  contacts: 'google_contacts',
 };
 
 export interface ProviderRequest {
@@ -644,6 +645,11 @@ export const PROVIDER_API_BASE: Readonly<Record<ProviderApp, string>> = {
   gmail: 'https://gmail.googleapis.com',
   google_calendar: 'https://www.googleapis.com',
   google_drive: 'https://www.googleapis.com',
+  // Measured against the live project on 2026-08-21 with the founder's
+  // connected account: `people.googleapis.com` answers 200, and the same path
+  // under `www.googleapis.com` answers **400** — the opposite way round from
+  // Calendar, which is why this table's header says the host is load-bearing.
+  google_contacts: 'https://people.googleapis.com',
 };
 
 /** The absolute upstream URL a provider request names, query and all. */

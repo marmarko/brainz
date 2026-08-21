@@ -83,11 +83,12 @@ CREATE DOMAIN control.connector_tenant_id AS varchar(63)
   CONSTRAINT connector_tenant_id_is_a_slug
   CHECK (VALUE ~ '^[a-z0-9][a-z0-9-]{0,62}$');
 
--- The three alpha connectors, and deliberately the same three labels as
+-- The connectors, and deliberately the same labels in the same order as
 -- `control.job_target`'s connector members and `cursor.ts:CONNECTOR_SOURCES`. A
--- fourth added here and not there is a link whose `ingest_pull` job the database
--- would refuse, discovered on a live tenant.
-CREATE TYPE control.connector_source AS ENUM ('gmail', 'calendar', 'drive');
+-- label added here and not there is a link whose `ingest_pull` job the database
+-- would refuse, discovered on a live tenant. **Append only**: a live plane
+-- learns labels through `ALTER TYPE … ADD VALUE`, which appends.
+CREATE TYPE control.connector_source AS ENUM ('gmail', 'calendar', 'drive', 'contacts');
 
 -- The envelope, in the shape `src/control/sealed.ts` writes:
 --

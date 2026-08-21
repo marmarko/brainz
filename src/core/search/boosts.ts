@@ -61,6 +61,11 @@ export const RECENCY_HALF_LIFE_DAYS: Readonly<Record<SourceType, number>> = {
   note: 60,
   file: 60,
   document: 60,
+  // An address book entry is the slowest-churning surface there is: a person's
+  // name and employer change on the scale of years, and the entry is rewritten
+  // when they do. Nothing writes a page with this type today, so this is the
+  // value it would take rather than one measured on live rows.
+  contact: 180,
 };
 
 /**
@@ -80,6 +85,13 @@ export const SOURCE_TYPE_PRIOR: Readonly<Record<SourceType, number>> = {
   web: 0.0,
   calendar: 0.0,
   chat: -0.1,
+  // **Zero, deliberately.** A contact is a good answer to "what is this
+  // person called" and a poor one to almost anything else, and this table
+  // cannot express that difference — it applies to every query alike. A
+  // positive prior here would let an address book entry outrank the mail that
+  // actually says something, on a corpus where 2,525 such entries would
+  // outnumber the people the brain has ever heard mentioned by fifty to one.
+  contact: 0.0,
 };
 
 /** Trust priors, by the strongest attestation a row carries (KTD5: ranking only). */

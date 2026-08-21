@@ -86,7 +86,7 @@ import { BRAIN_SETUP_PATH, REVIEW_PATH, renderPage } from './pages.ts';
 export const SESSION_COOKIE = 'bz_session';
 
 /** Which connectors the product offers. The closed set the UI iterates. */
-export const CONNECTOR_SOURCES = ['gmail', 'calendar', 'drive'] as const;
+export const CONNECTOR_SOURCES = ['gmail', 'calendar', 'drive', 'contacts'] as const;
 export type ConnectorSourceName = (typeof CONNECTOR_SOURCES)[number];
 
 /** Providers a user may bring a key for (R22). */

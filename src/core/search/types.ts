@@ -32,6 +32,7 @@ export const SOURCE_TYPES = [
   'calendar',
   'transcript',
   'file',
+  'contact',
 ] as const;
 
 export type SourceType = (typeof SOURCE_TYPES)[number];

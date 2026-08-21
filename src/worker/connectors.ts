@@ -92,6 +92,7 @@ import { readPausedSources } from '../ingest/pause.ts';
 import type { ProviderApi } from '../ingest/pipedream/client.ts';
 import { enqueuePullIfDue } from '../ingest/pipedream/pull.ts';
 import { createCalendarSource } from '../ingest/pipedream/sources/calendar.ts';
+import { createContactsSource } from '../ingest/pipedream/sources/contacts.ts';
 import { createDriveSource } from '../ingest/pipedream/sources/drive.ts';
 import { createGmailSource } from '../ingest/pipedream/sources/gmail.ts';
 import type { ProviderSource } from '../ingest/pipedream/sources/types.ts';
@@ -169,6 +170,7 @@ const ADAPTER_FOR: Readonly<Record<ConnectorSource, (api: ProviderApi) => Provid
   gmail: createGmailSource,
   calendar: createCalendarSource,
   drive: createDriveSource,
+  contacts: createContactsSource,
 };
 
 /** Where a tenant's connector states are kept, as this module needs them. */

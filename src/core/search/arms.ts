@@ -86,6 +86,12 @@ export const CHANNEL_BY_SOURCE_TYPE: Readonly<Record<SourceType, Attestation['ch
   note: 'user_curated',
   file: 'user_curated',
   document: 'user_curated',
+  // The owner's own address book, which is the same class as their own notes:
+  // they curated it, and it still corroborates nothing. A contact entry is a
+  // spelling of a name, not an attestation that anything about that person is
+  // true — and anyone who has ever emailed the owner can get themselves into
+  // it, which is exactly the property `user_out_of_band` must not be given to.
+  contact: 'user_curated',
 };
 
 /**

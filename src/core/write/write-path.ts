@@ -64,6 +64,15 @@ export const SOURCE_TYPES = [
   'calendar',
   'transcript',
   'file',
+  /**
+   * A person as an address book states them.
+   *
+   * Present so `SOURCE_TYPE_FOR` can name the contacts lane honestly rather
+   * than filing it under `note`. Nothing writes a page with this type today —
+   * the contacts adapter keeps a dictionary, not documents — which is why it
+   * carries the most conservative ranking constants of the nine.
+   */
+  'contact',
 ] as const;
 
 export type SourceType = (typeof SOURCE_TYPES)[number];

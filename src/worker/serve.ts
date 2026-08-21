@@ -60,6 +60,7 @@ import {
 import { createConsolidateHandler } from './consolidate/cycle.ts';
 import { createExportHandler, enqueueDueExports } from './export.ts';
 import { createPurgeHandler, enqueueDuePurges, purgeEnqueueEnabled } from './purge.ts';
+import { ensureConnectorLabels } from '../control/connector-labels.ts';
 import { ensurePurgeJobKind } from '../control/job-kinds.ts';
 import { createSchemaSweepPorts } from '../control/schema-sweep.ts';
 import {
@@ -157,6 +158,13 @@ export async function startWorkerFleet(
   // `22P02 invalid input value for enum control.job_kind` forever. See
   // `src/control/job-kinds.ts`.
   await ensurePurgeJobKind(controlSql);
+  // Same argument, one connector later: the three enums a connector is worn by
+  // are created once from DDL, so a fourth source reaches new installs and no
+  // live plane. The quiet one is `connector_health_source` — the health
+  // recorder swallows its own errors by design, so an untaught plane produces a
+  // connector that polls fine and a dashboard that never mentions it. See
+  // `src/control/connector-labels.ts`.
+  await ensureConnectorLabels(controlSql);
 
   const queue = createJobQueue({ sql: controlSql });
   const leases = createLeaseChannel({ sql: leaseSql });

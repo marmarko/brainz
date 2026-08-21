@@ -49,6 +49,7 @@ export const JOB_TARGETS = [
   'gmail',
   'calendar',
   'drive',
+  'contacts',
   'chat_export',
   'folder',
 ] as const;
@@ -65,7 +66,7 @@ export const LEGAL_TARGETS: Readonly<Record<JobKind, readonly JobTarget[]>> = {
   export: ['whole_brain'],
   re_embed: ['whole_brain'],
   purge: ['whole_brain'],
-  ingest_pull: ['gmail', 'calendar', 'drive'],
+  ingest_pull: ['gmail', 'calendar', 'drive', 'contacts'],
   import: ['chat_export', 'folder'],
 };
 

@@ -359,13 +359,17 @@ CREATE TYPE control.job_kind AS ENUM (
 -- in a unique index is not a key at all — Postgres holds NULLs distinct, so
 -- every "one open job per tenant" claim would be silently false for the kinds
 -- that left it empty. `whole_brain` is the tenant's brain taken as a whole.
+-- **Appended, never inserted.** A live plane learns a new label through
+-- `ALTER TYPE … ADD VALUE`, which appends; a fresh plane gets this order. The
+-- two only agree if new labels go on the end.
 CREATE TYPE control.job_target AS ENUM (
   'whole_brain',
   'gmail',
   'calendar',
   'drive',
   'chat_export',
-  'folder'
+  'folder',
+  'contacts'
 );
 
 -- `due` is claimable, `running` is leased, and the rest are terminal.
@@ -479,7 +483,7 @@ CREATE TABLE control.job (
     OR (kind = 'export' AND target = 'whole_brain')
     OR (kind = 're_embed' AND target = 'whole_brain')
     OR (kind = 'purge' AND target = 'whole_brain')
-    OR (kind = 'ingest_pull' AND target IN ('gmail', 'calendar', 'drive'))
+    OR (kind = 'ingest_pull' AND target IN ('gmail', 'calendar', 'drive', 'contacts'))
     OR (kind = 'import' AND target IN ('chat_export', 'folder'))
   ),
 

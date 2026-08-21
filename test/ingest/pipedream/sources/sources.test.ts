@@ -24,6 +24,7 @@ import {
   CALENDAR_HORIZON_DAYS,
   createCalendarSource,
 } from '../../../../src/ingest/pipedream/sources/calendar.ts';
+import { createContactsSource } from '../../../../src/ingest/pipedream/sources/contacts.ts';
 import { createDriveSource } from '../../../../src/ingest/pipedream/sources/drive.ts';
 import { createGmailSource } from '../../../../src/ingest/pipedream/sources/gmail.ts';
 import { externalRefFor } from '../../../../src/ingest/pipedream/sources/types.ts';
@@ -1272,5 +1273,112 @@ describe('each adapter names its verified upstream', () => {
     for (const target of targets) {
       expect(target.startsWith('https://www.googleapis.com/drive/v3/')).toBe(true);
     }
+  });
+});
+
+describe('contacts', () => {
+  test('the whole book is walked, because the sync token only arrives on the last page', async () => {
+    // Measured against the live project: a 2,525-contact book is three pages at
+    // pageSize=1000, and page one — which carries a nextPageToken — carries no
+    // sync token at all. An adapter that read a token from the first response
+    // would get undefined, silently fall back to a full re-walk every day, and
+    // never once error. So the walk is tokenless and follows every page token.
+    const transport = withToken(createScriptedTransport());
+    // One rule per page: the fixture's rules are single-use, which is exactly
+    // the shape needed to assert that all three pages are actually asked for.
+    transport.on('/people/me/connections', {
+      status: 200,
+      body: { connections: [{ resourceName: 'people/c1' }], nextPageToken: 'p1' },
+    });
+    transport.on('/people/me/connections', {
+      status: 200,
+      body: { connections: [{ resourceName: 'people/c2' }], nextPageToken: 'p2' },
+    });
+    transport.on('/people/me/connections', {
+      status: 200,
+      body: { connections: [{ resourceName: 'people/c9' }], nextSyncToken: 'sync-1' },
+    });
+
+    const outcome = await createContactsSource(client(transport)).list({
+      ...CONNECTION,
+      mode: 'backfill',
+      cursor: null,
+      since: null,
+      maxItems: 100,
+      now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    const walked = proxyTargets(transport).filter((t) => t.includes('/people/me/connections'));
+    expect(walked).toHaveLength(3);
+    // And each later page carried the token the one before it handed back.
+    expect(walked[1]).toContain('pageToken=p1');
+    expect(walked[2]).toContain('pageToken=p2');
+    // The upstream host is not interchangeable and was measured: the same path
+    // under www.googleapis.com answers 400.
+    expect(proxyTargets(transport)[0] ?? '').toContain('https://people.googleapis.com/v1/people/me/connections');
+  });
+
+  test('it writes no pages, and says so rather than reporting an import it is not attempting', async () => {
+    // The address book holds 2,525 contacts whose overlap with this brain's
+    // corpus is thirteen addresses. It is a dictionary, not a document set.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/people/me/connections', {
+      status: 200,
+      body: {
+        connections: [{ resourceName: 'people/c1', names: [{ displayName: 'Ada' }] }],
+        totalPeople: 2525,
+        nextSyncToken: 'sync-1',
+      },
+    });
+
+    const outcome = await createContactsSource(client(transport)).list({
+      ...CONNECTION, mode: 'backfill', cursor: null, since: null, maxItems: 100, now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.items).toEqual([]);
+    expect(outcome.page.tombstones).toEqual([]);
+    expect(outcome.page.failures).toEqual([]);
+    // `totalPeople` is available and deliberately unused: "importing 0 of
+    // 2,525" would describe an import nobody is attempting.
+    expect(outcome.page.outsideWindow).toBeNull();
+  });
+
+  test('the cursor it returns is a delta, so the gate does not re-price the walk every day', async () => {
+    // `pullModeFor` reads a null cursor — and any non-`delta` kind — as a first
+    // import. A lane returning null would re-enter U8's gate as a backfill every
+    // single day, re-priced and re-approved, for the same three pages.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/people/me/connections', { status: 200, body: { connections: [] } });
+
+    const outcome = await createContactsSource(client(transport)).list({
+      ...CONNECTION, mode: 'backfill', cursor: null, since: null, maxItems: 100, now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.nextCursor?.kind).toBe('delta');
+    // The value carries no provider semantics — there is no sync token here.
+    expect(outcome.page.nextCursor?.value).toBe(NOW.toISOString());
+  });
+
+  test('a failed listing is a failed listing, not a broken contact', async () => {
+    // `itemFailureFor` is deliberately not imported: it classifies the failure
+    // of ONE ITEM inside a listing that succeeded. Mapping a failed listing
+    // through it is how a rate limit becomes "this contact is broken" and the
+    // cursor walks past a page nobody ever read.
+    const transport = withToken(createScriptedTransport());
+    transport.on('/people/me/connections', { status: 429, body: { error: 'slow down' } });
+
+    const outcome = await createContactsSource(client(transport)).list({
+      ...CONNECTION, mode: 'backfill', cursor: null, since: null, maxItems: 100, now: NOW,
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.reason).toBe('rate_limited');
   });
 });

@@ -54,6 +54,7 @@ import {
   ensureConnectorLinkSchema,
 } from '../control/connector-pg.ts';
 import { ensureConnectorHealthSchema } from '../control/connector-health.ts';
+import { ensureConnectorLabels } from '../control/connector-labels.ts';
 import {
   createConnectorReconciler,
   createPipedreamAccountLister,
@@ -148,6 +149,12 @@ export async function startWebApp(env: Environment): Promise<WebProcess> {
   // had ever polled would answer both with `relation does not exist` — which is
   // a 500 on the page whose whole job is to explain a failure.
   await ensureConnectorHealthSchema(controlSql);
+  // And the labels those tables are keyed on. This fleet needs it in its own
+  // right rather than by symmetry: `markConnectPending` runs *here* and casts
+  // `${source}::control.connector_source`, so a web instance booted against an
+  // untaught plane answers the connect button with `22P02` however healthy the
+  // worker is.
+  await ensureConnectorLabels(controlSql);
 
   const handle = createWebApp({
     sql,

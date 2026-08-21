@@ -1733,7 +1733,7 @@ function formsOn(page: string): { action: string; fields: Record<string, string>
   return found;
 }
 
-const SOURCES = ['gmail', 'calendar', 'drive'] as const;
+const SOURCES = ['gmail', 'calendar', 'drive', 'contacts'] as const;
 
 describe('the dashboard offers a control per connector, not a list of words', () => {
   test('every source has a form whose action is the route that connects it', async () => {
@@ -2031,7 +2031,9 @@ describe('the status beside each source says only what this brain can know', () 
     await attachSource('gmail');
     const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).toContain('The first check has not run yet');
-    expect([...page.matchAll(/Not connected/g)].length).toBe(2);
+    // Every source but the one just attached. Derived rather than typed, so a
+    // fifth connector cannot quietly make this assertion describe nothing.
+    expect([...page.matchAll(/Not connected/g)].length).toBe(SOURCES.length - 1);
   });
 
   /**
@@ -2152,7 +2154,8 @@ describe('the status beside each source says only what this brain can know', () 
               ${AT}, ${AT}, ${AT}, ${AT}, ${AT}, 'handler_error')`;
     const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
     expect(page).not.toContain('handler_error');
-    expect([...page.matchAll(/Not connected/g)].length).toBe(3);
+    // Nothing was attached, so every source reads as not connected.
+    expect([...page.matchAll(/Not connected/g)].length).toBe(SOURCES.length);
   });
 
   /**
@@ -2293,9 +2296,9 @@ describe('the status beside each source says only what this brain can know', () 
       VALUES (gen_random_uuid(), ${TENANT}, 'ingest_pull', 'calendar', 'discarded', 'connector_cadence',
               ${AT}, ${AT}, ${AT}, ${AT})`;
     const page = await (await app()(get('/dashboard?view=connectors', { cookie }))).text();
-    // Three sources, and calendar is back to the state it was in before it was
-    // ever connected.
-    expect([...page.matchAll(/Not connected/g)].length).toBe(3);
+    // Nothing was attached, and calendar is back to the state it was in before
+    // it was ever connected — so every source reads as not connected.
+    expect([...page.matchAll(/Not connected/g)].length).toBe(SOURCES.length);
   });
 });
 

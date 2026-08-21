@@ -68,7 +68,12 @@ import type { RawObject, RawStore } from './import/raw.ts';
  * cannot be scheduled, and discovering that at enqueue time is a constraint
  * violation on a live tenant.
  */
-export const CONNECTOR_SOURCES = ['gmail', 'calendar', 'drive'] as const;
+// **Appended, never inserted.** `ALTER TYPE … ADD VALUE` appends, so a live
+// control plane taught a fourth label carries it last; a fresh plane gets the
+// order its DDL declares. `test/control/connector-health.test.ts` compares
+// `control.connector_health_source`'s labels to this array **as a sequence**,
+// so the two orders have to be the same one.
+export const CONNECTOR_SOURCES = ['gmail', 'calendar', 'drive', 'contacts'] as const;
 export type ConnectorSource = (typeof CONNECTOR_SOURCES)[number];
 
 export function isConnectorSource(value: string): value is ConnectorSource {
@@ -80,6 +85,10 @@ export const SOURCE_TYPE_FOR: Readonly<Record<ConnectorSource, SourceType>> = {
   gmail: 'email',
   calendar: 'calendar',
   drive: 'document',
+  // Named honestly rather than filed under `note`. The contacts lane writes no
+  // pages at all, so this labels its ingest-log rows and nothing else — which
+  // is precisely why it must not claim to be a kind of document.
+  contacts: 'contact',
 };
 
 /**
@@ -91,6 +100,12 @@ export const DEFAULT_CADENCE_SECONDS: Readonly<Record<ConnectorSource, number>> 
   gmail: 300,
   calendar: 900,
   drive: 1800,
+  // Daily. An address book is the slowest-changing thing a person connects,
+  // and the walk costs three full pages whatever has changed — the sync token
+  // is measured to arrive only on the last page, so there is no cheap delta to
+  // poll for. Anything under `WAKE_PERIOD_SECONDS` would be clamped upward
+  // anyway and would only buy round trips.
+  contacts: 86_400,
 };
 
 /**

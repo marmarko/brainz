@@ -91,7 +91,7 @@ const JOB_TARGET_SUITS_ITS_KIND = `(
     OR (kind = 'export' AND target = 'whole_brain')
     OR (kind = 're_embed' AND target = 'whole_brain')
     OR (kind = 'purge' AND target = 'whole_brain')
-    OR (kind = 'ingest_pull' AND target IN ('gmail', 'calendar', 'drive'))
+    OR (kind = 'ingest_pull' AND target IN ('gmail', 'calendar', 'drive', 'contacts'))
     OR (kind = 'import' AND target IN ('chat_export', 'folder'))
   )`;
 
