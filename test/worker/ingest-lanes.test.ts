@@ -454,7 +454,6 @@ describe('a failed poll is diagnosable', () => {
       tenantId: TENANT,
       connectorsAvailable: true,
       connectors,
-      providers: [],
     });
   }
 

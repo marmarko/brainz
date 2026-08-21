@@ -377,7 +377,11 @@ describe('the page shows counts, codes, times and one figure — and nothing els
       expect(page).not.toContain('catch up');
       expect(page).not.toContain('next cycle will');
       expect(page).not.toContain('spend cap');
-      expect(page).not.toContain('<form');
+      // Scoped to the page's own content: the app shell carries a sign-out form
+      // on every signed-in page, and the claim here is that THIS PAGE offers no
+      // remedy — not that the chrome has no controls.
+      const content = page.slice(page.indexOf('<main'));
+      expect(content).not.toContain('<form');
     }
   });
 

@@ -97,6 +97,14 @@ export const PROCESSING_PATH = '/dashboard?view=processing';
  */
 export const REVIEW_PATH = '/dashboard?view=review';
 
+/**
+ * Where the rail's Settings row points.
+ *
+ * A query parameter for {@link COVERAGE_PATH}'s reason: `src/mcp/edge.ts`
+ * enumerates web paths and `/settings` is not one of them.
+ */
+export const SETTINGS_PATH = '/dashboard?view=settings';
+
 export type Page =
   | {
       readonly kind: 'login';
@@ -128,7 +136,6 @@ export type Page =
        * affordance this page exists to stop having.
        */
       readonly connectors: readonly ConnectorStatus[];
-      readonly providers: readonly string[];
     }
   | {
       readonly kind: 'connect';
@@ -307,6 +314,27 @@ export type Page =
       readonly reachable: boolean;
       readonly tier: string;
       readonly view: ReviewView | null;
+    }
+  | {
+      /**
+       * Account configuration, split off the dashboard.
+       *
+       * The three sections here — a write-only key form, the spend window and
+       * the export note — are things you *set*, and none of them says anything
+       * about what the brain holds. Connected accounts deliberately did NOT
+       * come with them: that is the operational state of ingest, and four other
+       * pieces of copy in this file point at the dashboard as its location.
+       *
+       * Reads `control.tenant` only, so this page opens no tenant database.
+       */
+      readonly kind: 'settings';
+      readonly providers: readonly string[];
+      /** Absent when no spend row exists — which is not the same as zero. */
+      readonly spend: {
+        readonly windowStartedAt: string;
+        readonly spentMicroUsd: number;
+        readonly capMicroUsd: number | null;
+      } | null;
     };
 
 /** HTML-escape. Five characters, applied to every interpolation without exception. */
@@ -343,14 +371,260 @@ const STYLE = `
   .verbs form { display: inline; }
   .verbs button { width: auto; margin-top: 0; }
   .failing { border-left: 3px solid currentColor; padding-left: 0.75rem; }
+
+  /* The rail. Zero hex colours on purpose: everything is rgba(127,127,127,a),
+     currentColor or a CSS system colour, which is the only reason
+     'color-scheme: light dark' alone gives this app a dark mode. A literal
+     colour here would read as a light-mode bug on a dark browser. */
+  body.app { display: grid; grid-template-columns: 15rem minmax(0, 1fr); max-width: none; margin: 0; padding: 0; }
+  /* 'width: 100%' and 'box-sizing' are load-bearing rather than belt-and-braces:
+     auto inline margins on a grid item suppress 'justify-self: stretch', so
+     without them 'main' is sized fit-content and a short page shrink-wraps and
+     floats — measured, the h1's left edge moves 247px between two navigations.
+     46.5rem rather than 44rem because under border-box a 44rem cap silently
+     shaves the existing measure from 704px to 664px. */
+  body.app > main { width: 100%; box-sizing: border-box; max-width: 46.5rem; margin: 3rem auto; padding: 0 1.25rem; }
+  .skip { position: absolute; left: -9999px; top: 0; z-index: 1; padding: 0.5rem 0.75rem; background: Canvas; color: CanvasText; }
+  /* Only 'left' changes. 'position: static' on focus would make it a grid item
+     and displace the rail into column 2. */
+  .skip:focus { left: 0; }
+  a:focus-visible, button:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+  .rail { align-self: start; position: sticky; top: 0; height: 100vh; height: 100dvh; overflow-y: auto; scrollbar-width: thin;
+    display: flex; flex-direction: column; padding: 1rem 0.75rem; box-sizing: border-box; border-right: 1px solid rgba(127,127,127,0.3); }
+  .rail .brand { font-weight: 600; padding: 0 0.65rem 0.75rem; margin: 0; }
+  .rail ul { list-style: none; margin: 0; padding: 0; }
+  .rail li + li { margin-top: 0.15rem; }
+  .rail a, .rail button { display: flex; align-items: center; gap: 0.65rem; padding: 0.4rem 0.65rem;
+    border-radius: 0.4rem; font-size: 0.95rem; color: inherit; opacity: 0.75; }
+  .rail a { text-decoration: none; border-left: 3px solid transparent; }
+  .rail a:hover, .rail button:hover { background: rgba(127,127,127,0.12); opacity: 1; }
+  .rail a[aria-current="page"] { background: rgba(127,127,127,0.18); opacity: 1; font-weight: 600; border-left-color: currentColor; }
+  .rail svg { width: 1.125rem; height: 1.125rem; flex: 0 0 auto; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .rail .grp { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.6; margin: 0.9rem 0 0.25rem; padding: 0 0.65rem; }
+  .rail .acct { margin-top: auto; padding-top: 0.75rem; border-top: 1px solid rgba(127,127,127,0.3); }
+  /* Cancels the global 'button { margin-top: 1rem }', which would otherwise push
+     sign-out a rem off the bottom of a 'margin-top: auto' group. */
+  .rail button { margin: 0; width: 100%; text-align: left; background: none; border: 0; }
+  @media (max-width: 43.75em) {
+    body.app { grid-template-columns: minmax(0, 1fr); }
+    body.app > main { margin-top: 1.5rem; }
+    .rail { position: static; height: auto; overflow: visible; padding: 0.75rem; border-right: 0; border-bottom: 1px solid rgba(127,127,127,0.3); }
+    .rail ul { display: flex; flex-wrap: wrap; gap: 0.25rem; }
+    .rail li + li { margin-top: 0; }
+    .rail a { border-left: 0; border-bottom: 2px solid transparent; }
+    .rail a[aria-current="page"] { border-bottom-color: currentColor; }
+    .rail .grp { display: none; }
+    .rail .acct { margin-top: 0.5rem; padding-top: 0.5rem; }
+    .rail button { width: auto; }
+  }
+  /* 'body.app { display: block }' is required rather than tidy: a 'display:none'
+     child is not a grid item at all, so hiding the rail alone would leave 'main'
+     the only in-flow item and auto-placement would drop it into COLUMN 1 — every
+     railed page printing as a 335px strip on Letter, measured. That would defeat
+     the reason this block exists, since coverage and processing both advertise
+     themselves as safe to print and screenshot. */
+  @media print { body.app { display: block; } .rail, .skip { display: none; } }
 `;
 
-function shell(title: string, main: string): string {
-  return `<!doctype html>
+
+// ---------------------------------------------------------------------------
+// The rail.
+// ---------------------------------------------------------------------------
+
+/**
+ * Icons, from lucide, with the node markup verbatim and the wrapper stripped.
+ *
+ * **Inline SVG is the only mechanism available.** The policy is
+ * `default-src 'none'` with no `img-src` (`app.ts`), which blocks `<img>`, an
+ * icon font, and a CSS `url(data:…)` background alike. Inline SVG is markup
+ * rather than a fetch, so it is not governed by any of them.
+ *
+ * Every paint attribute lives in `STYLE`'s `.rail svg` rule instead of on each
+ * node — they are SVG *presentation* attributes, so CSS may set them. That is
+ * about 60 bytes saved per icon, and it is why an active row's `currentColor`
+ * reaches its icon with no second rule.
+ *
+ * `aria-hidden` is required rather than tidy: the `<span>` beside it is the
+ * link's accessible name, and without it a screen reader announces the svg as
+ * an image and reads every row twice.
+ */
+const ICON_DASHBOARD =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+const ICON_KNOWS =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 18V5"/><path d="M15 13a4.17 4.17 0 0 1-3-4 4.17 4.17 0 0 1-3 4"/><path d="M17.598 6.5A3 3 0 1 0 12 5a3 3 0 1 0-5.598 1.5"/><path d="M17.997 5.125a4 4 0 0 1 2.526 5.77"/><path d="M18 18a4 4 0 0 0 2-7.464"/><path d="M19.967 17.483A4 4 0 1 1 12 18a4 4 0 1 1-7.967-.517"/><path d="M6 18a4 4 0 0 1-2-7.464"/><path d="M6.003 5.125a4 4 0 0 0-2.526 5.77"/></svg>';
+const ICON_WORKING =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/></svg>';
+const ICON_WAITING =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>';
+const ICON_ASSISTANT =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22v-5"/><path d="M15 8V2"/><path d="M17 8a1 1 0 0 1 1 1v4a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V9a1 1 0 0 1 1-1z"/><path d="M9 8V2"/></svg>';
+const ICON_UNDO =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11"/></svg>';
+const ICON_SETTINGS =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5H3"/><path d="M12 19H3"/><path d="M14 3v4"/><path d="M16 17v4"/><path d="M21 12h-9"/><path d="M21 19h-5"/><path d="M21 5h-7"/><path d="M8 10v4"/><path d="M8 12H3"/></svg>';
+const ICON_SIGNOUT =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/></svg>';
+
+/** A rail row, as a closed set. Never a free string — see {@link shell}. */
+type NavKey =
+  | 'dashboard'
+  | 'coverage'
+  | 'processing'
+  | 'review'
+  | 'connect'
+  | 'retractions'
+  | 'settings';
+
+/**
+ * What chrome a page gets: a rail with one row lit, a rail with none lit, or no
+ * rail at all.
+ *
+ * `'blank'` is not laziness. The five connector and retraction notices are the
+ * outcome of a POST rather than a destination, and marking a row
+ * `aria-current="page"` on one of them would tell a screen reader that a link
+ * points at the page the reader is already on, which is false.
+ */
+type Chrome = NavKey | 'blank' | 'none';
+
+/**
+ * Which row each page lights, and which pages get no rail at all.
+ *
+ * **A `Record` over `Page['kind']` rather than an optional argument**, and the
+ * exhaustiveness is the point: a page added to the union does not compile until
+ * somebody decides where it lives in the menu. An optional parameter would let
+ * a new signed-in page ship chrome-less and silent.
+ *
+ * **`brain_setup` gets no rail, and that is the one place the dead-affordance
+ * rule actually fires here.** It serves an account with no brain, and every
+ * other signed-in render sends such an account straight back to it — so a rail
+ * there is seven rows that all `303` to the page you are already on. A crawler
+ * would not catch it either, because a 303 is not a 404. Only this table can.
+ */
+const PAGE_CHROME: Readonly<Record<Page['kind'], Chrome>> = {
+  login: 'none',
+  signup: 'none',
+  reset_request: 'none',
+  reset_sent: 'none',
+  reset_complete: 'none',
+  brain_setup: 'none',
+  dashboard: 'dashboard',
+  coverage: 'coverage',
+  processing: 'processing',
+  review: 'review',
+  connect: 'connect',
+  retractions: 'retractions',
+  settings: 'settings',
+  connector_claim: 'blank',
+  connector_confirm_disconnect: 'blank',
+  connector_disconnected: 'blank',
+  connector_notice: 'blank',
+  retraction_notice: 'blank',
+};
+
+/**
+ * The rail's rows, in one table rather than seven hand-written blocks, because
+ * the row shape is the thing that must not drift between rows.
+ *
+ * **Every row is badgeless, and the reason is cost rather than privacy.** The
+ * privacy line permits a count on an ambient surface. What forbids it is
+ * `app.ts`'s ruling that the default render opens no tenant database — *"waking
+ * one because its owner asked is defensible where waking one because they
+ * logged in is not."* Every number a badge could carry lives only in the tenant
+ * database, so a badge on **Waiting on you** would wake a suspended brain on
+ * every render of every page in the app, including the two that open no tenant
+ * handle at all today.
+ */
+const RAIL_GROUPS: readonly {
+  readonly caption: string | null;
+  readonly rows: readonly {
+    readonly key: NavKey;
+    readonly href: string;
+    readonly label: string;
+    readonly icon: string;
+  }[];
+}[] = [
+  {
+    caption: null,
+    // **`Dashboard`, not `Overview`.** Nine existing strings in this file call
+    // this page "your dashboard", four of which are the argument for keeping
+    // Connected accounts on it. A rail row named anything else renames the
+    // destination out from under its own copy.
+    rows: [{ key: 'dashboard', href: '/dashboard', label: 'Dashboard', icon: ICON_DASHBOARD }],
+  },
+  {
+    caption: 'Your brain',
+    rows: [
+      { key: 'coverage', href: COVERAGE_PATH, label: 'What it knows', icon: ICON_KNOWS },
+      { key: 'processing', href: PROCESSING_PATH, label: 'Working on it', icon: ICON_WORKING },
+      { key: 'review', href: REVIEW_PATH, label: 'Waiting on you', icon: ICON_WAITING },
+    ],
+  },
+  {
+    caption: 'Your account',
+    rows: [
+      { key: 'connect', href: '/connect', label: 'Your assistant', icon: ICON_ASSISTANT },
+      { key: 'retractions', href: '/retractions', label: 'What you can undo', icon: ICON_UNDO },
+      { key: 'settings', href: SETTINGS_PATH, label: 'Settings', icon: ICON_SETTINGS },
+    ],
+  },
+];
+
+/**
+ * The rail, for a signed-in page.
+ *
+ * **Active is `aria-current="page"` and nothing else** — the accessibility
+ * attribute is also the CSS selector, so there is no `class="active"` beside it
+ * to drift out of step.
+ *
+ * **Sign out is a form, never a link.** `GET /api/logout` is not dispatched at
+ * all, and a link that changes state is fired by a prefetcher, a link scanner
+ * or a chat client unfurling a pasted URL — the rule already written down for
+ * disconnect, one page over.
+ *
+ * **A group caption is a caption, not a row.** The reference makes it a
+ * disclosure button; without script, a row that looks like a control and is not
+ * is exactly the dead affordance this file forbids.
+ */
+function sidebar(active: NavKey | 'blank'): string {
+  const groups = RAIL_GROUPS.map((group) => {
+    const rows = group.rows
+      .map(
+        (row) =>
+          `<li><a href="${escapeHtml(row.href)}"${
+            row.key === active ? ' aria-current="page"' : ''
+          }>${row.icon}<span>${escapeHtml(row.label)}</span></a></li>`,
+      )
+      .join('');
+    const caption = group.caption === null ? '' : `<p class="grp">${escapeHtml(group.caption)}</p>`;
+    return `${caption}<ul>${rows}</ul>`;
+  }).join('');
+  return `<nav class="rail" aria-label="Pages"><p class="brand">brainz</p>${groups}<form class="acct" method="post" action="/api/logout"><button type="submit">${ICON_SIGNOUT}<span>Sign out</span></button></form></nav>`;
+}
+
+/**
+ * **The third parameter is a `Page['kind']`, not a string.** `main` is trusted
+ * pre-escaped HTML and `title` is escaped; a free-string active key
+ * interpolated into an `href` or a class would add a new injection point to the
+ * one function every page in this app goes through. A literal from the union
+ * cannot carry an angle bracket.
+ */
+function shell(title: string, main: string, kind: Page['kind']): string {
+  const chrome = PAGE_CHROME[kind];
+  const head = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escapeHtml(title)}</title><style>${STYLE}</style></head>
+<title>${escapeHtml(title)}</title><style>${STYLE}</style></head>`;
+  // Byte-identical to what this emitted before the rail existed, so the six
+  // chrome-less pages are untouched by the change.
+  if (chrome === 'none') {
+    return `${head}
 <body><main>${main}</main></body></html>`;
+  }
+  // The skip link is first and is not optional: the rail puts seven links and a
+  // button in front of every `<h1>` in the app. `tabindex="-1"` is what makes
+  // the fragment MOVE focus rather than merely scroll to it.
+  return `${head}
+<body class="app"><a class="skip" href="#main">Skip past the menu</a>${sidebar(chrome)}<main id="main" tabindex="-1">${main}</main></body></html>`;
 }
 
 /**
@@ -806,6 +1080,7 @@ ${
   <button type="submit">Sign in</button>
 </form>
 <p class="note"><a href="/password/reset">Forgotten your password?</a> &middot; <a href="/signup">Create an account</a></p>`,
+        page.kind,
       );
 
     case 'signup': {
@@ -826,6 +1101,7 @@ ${languageChoice(page.languages)}
 <p class="note">Building your brain takes about fifteen seconds, and this page will sit still until it
 is done.</p>
 <p class="note"><a href="/login">Already have an account?</a></p>`,
+        page.kind,
       );
     }
 
@@ -840,6 +1116,7 @@ is done.</p>
 <p class="note">We answer the same way whether or not that address has an account here. That is
 deliberate: an endpoint that said "no such account" would tell anyone who asked which addresses are
 registered.</p>`,
+        page.kind,
       );
 
     case 'reset_sent':
@@ -850,6 +1127,7 @@ registered.</p>`,
 minutes.</p>
 <p class="note">Resetting your password signs out every session on every device — including this one.</p>
 <p><a href="/login">Back to sign in</a></p>`,
+        page.kind,
       );
 
     case 'reset_complete':
@@ -863,12 +1141,10 @@ minutes.</p>
 </form>
 <p class="note">This signs out every other session, and it does not confirm your email address —
 that is a separate step, on purpose.</p>`,
+        page.kind,
       );
 
     case 'dashboard': {
-      const providers = page.providers
-        .map((provider) => `<option value="${escapeHtml(provider)}">${escapeHtml(provider)}</option>`)
-        .join('');
       // The gate's copy names the actual reason. "Upgrade for more" tells a user
       // nothing they can act on; a monthly per-connection vendor fee is a fact
       // they can weigh.
@@ -890,19 +1166,64 @@ appears by itself.</p>`
 connector vendor whether or not the brain is used, which the free plan cannot carry.</p>
 <p class="note">Chat exports and folder imports are included on every plan and need no connection at all.</p>`;
 
+      // **The five in-body links are gone, and the rail is why.** They were this
+      // page's menu; keeping both would be the same menu rendered twice, three
+      // rows apart. The rail emits byte-identical hrefs, which is what keeps the
+      // two crawler assertions that name `/retractions` and the coverage path
+      // passing.
+      //
+      // **`<h1>Your dashboard</h1>`, not `brainz`.** The rail's brand already
+      // says brainz an inch above, and nine strings in this file call this page
+      // "your dashboard" — four of them the argument for keeping Connected
+      // accounts here. One destination, one name.
       return shell(
-        'brainz',
-        `<h1>brainz</h1>
+        'Your dashboard — brainz',
+        `<h1>Your dashboard</h1>
 <p>Plan: <strong>${escapeHtml(page.tier)}</strong> (${escapeHtml(page.status)})${
           page.tenantId === null ? '' : ` &middot; brain <code>${escapeHtml(page.tenantId)}</code>`
         }</p>
-<p><a href="/connect">Connect brainz to Claude &rarr;</a></p>
-<p><a href="${COVERAGE_PATH}">What your brain knows &rarr;</a></p>
-<p><a href="${PROCESSING_PATH}">What your brain is working on &rarr;</a></p>
-<p><a href="${REVIEW_PATH}">Waiting on you &rarr;</a></p>
-<p><a href="/retractions">What you can still undo &rarr;</a></p>
 <h2>Connected accounts</h2>
-${connectors}
+${connectors}`,
+        page.kind,
+      );
+    }
+
+    /**
+     * Account configuration. Three sections that were crowding the dashboard,
+     * and one of them repaired on the way.
+     */
+    case 'settings': {
+      const providers = page.providers
+        .map((provider) => `<option value="${escapeHtml(provider)}">${escapeHtml(provider)}</option>`)
+        .join('');
+      // **This block used to read "Loaded from /api/spend" and never loaded.**
+      // The policy carries no `script-src`, so nothing on the page could have
+      // fetched it and nothing ever did. `handleSpend` reads `control.tenant`
+      // only, so the same figures server-render at no tenant-database cost.
+      //
+      // The dollar figures come from `spend()` and never from a literal:
+      // `test/ai/price-drift.test.ts` refuses a numeric literal on a line whose
+      // raw text matches its price context.
+      const money =
+        page.spend === null
+          ? `<p class="note">There is no spend record for this brain yet. That is not the same as having
+spent nothing; it means nothing has been counted here.</p>`
+          : `<p>Since ${moment(new Date(page.spend.windowStartedAt))} this brain has spent
+<strong>${spend(page.spend.spentMicroUsd)}</strong> on model calls.</p>
+${
+              page.spend.capMicroUsd === null
+                ? `<p class="note">No cap is set on this brain, so nothing here stops on spend alone.</p>`
+                : `<p class="note">Your cap for this window is ${spend(
+                    page.spend.capMicroUsd,
+                  )}. When spending reaches it the paid steps stop until the window rolls over. Nothing is
+lost while they are stopped; what arrives still arrives, and waits.</p>`
+            }
+<p class="note">This is what this brain's own model calls cost. It is not your bill and it is not what
+you are charged — the two are reconciled where you pay.</p>`;
+
+      return shell(
+        'Settings — brainz',
+        `<h1>Settings</h1>
 <h2>Your own model key</h2>
 <p class="note">Inference runs on our keys by default. Bring your own and your calls are still metered for
 your own spend cap, but billed to you rather than to us.</p>
@@ -912,10 +1233,11 @@ your own spend cap, but billed to you rather than to us.</p>
   <button type="submit">Save key</button>
 </form>
 <h2>Spend</h2>
-<p class="note">Loaded from <code>/api/spend</code>.</p>
+${money}
 <h2>Export</h2>
 <p class="note">Scheduled self-export lands with the lifecycle unit; the button is not wired to a store yet
 and says so rather than pretending to save.</p>`,
+        page.kind,
       );
     }
 
@@ -943,6 +1265,7 @@ is still working is refused rather than obeyed, because two brains for one accou
 not agree to and a database nobody would ever look in.</p>
 <p class="note">Nothing you have already sent us is lost by waiting: your account, your password and
 your plan are all in place already. The brain is the only piece missing.</p>`,
+        page.kind,
       );
     }
 
@@ -966,6 +1289,7 @@ granted until you say so.</p>
 <p>Run this once:</p>
 <p><code>${escapeHtml(page.command)}</code></p>
 <p class="note">Then <code>/mcp</code> in a session to sign in.</p>`,
+        page.kind,
       );
     }
 
@@ -1002,6 +1326,7 @@ Do not paste it anywhere — not into a chat, not into a note, not to yourself.<
 the back button. If you need another, press Connect on the dashboard again — the one above stops
 working when a new one is made.</p>
 <p><a href="/dashboard">Back to your dashboard</a></p>`,
+        page.kind,
       );
     }
 
@@ -1026,6 +1351,7 @@ here deletes what was ingested; the export and erasure controls are the ones tha
   <button type="submit">Disconnect ${source}</button>
 </form>
 <p><a href="/dashboard">No, keep it connected</a></p>`,
+        page.kind,
       );
     }
 
@@ -1044,6 +1370,7 @@ here deletes what was ingested; the export and erasure controls are the ones tha
 <code>${escapeHtml(page.tokensRevoked)}</code>. We report what the vendor reports rather than
 claiming more than it told us.</p>
 <p><a href="/dashboard">Back to your dashboard</a></p>`,
+        page.kind,
       );
     }
 
@@ -1053,6 +1380,7 @@ claiming more than it told us.</p>
         `<h1>${escapeHtml(page.heading)}</h1>
 <p class="problem">${escapeHtml(page.message)}</p>
 <p><a href="/dashboard">Back to your dashboard</a></p>`,
+        page.kind,
       );
 
     case 'retraction_notice':
@@ -1061,6 +1389,7 @@ claiming more than it told us.</p>
         `<h1>${escapeHtml(page.heading)}</h1>
 <p>${escapeHtml(page.message)}</p>
 <p><a href="/retractions">Back to what you can undo</a></p>`,
+        page.kind,
       );
 
     case 'coverage':
@@ -1096,6 +1425,7 @@ ${
       'and a button that said otherwise would be the lie this page exists to avoid.</p>'
 }
 <p><a href="/dashboard">Back to your dashboard</a></p>`,
+        page.kind,
       );
   }
 }
@@ -1600,6 +1930,7 @@ by a model from your own documents.</p>`;
 waiting. An empty page would say "nothing is waiting on you", which is the opposite of what is
 true here.</p>
 ${back}`,
+      page.kind,
     );
   }
 
@@ -1611,6 +1942,7 @@ ${back}`,
 after a quiet spell — loading this page again in a few seconds is usually the whole remedy.</p>
 <p class="note">Nothing has been lost and nothing has been decided in the meantime.</p>
 ${back}`,
+      page.kind,
     );
   }
 
@@ -1625,6 +1957,7 @@ ${rule}
 anything it needs you for. Nothing is wrong.</p>
 <p class="note"><a href="${escapeHtml(PROCESSING_PATH)}">What your brain is working on &rarr;</a></p>
 ${back}`,
+      page.kind,
     );
   }
 
@@ -1638,6 +1971,7 @@ confident enough to record on its own, or two things it holds that disagree.</p>
 <p class="note"><a href="${escapeHtml(COVERAGE_PATH)}">What your brain knows &rarr;</a> &middot;
 <a href="${escapeHtml(PROCESSING_PATH)}">What it is working on &rarr;</a></p>
 ${back}`,
+      page.kind,
     );
   }
 
@@ -1676,6 +2010,7 @@ ${rule}
 ${proposals}
 ${conflicts}
 ${back}`,
+    page.kind,
   );
 }
 
@@ -1698,6 +2033,7 @@ a desk.</p>`;
 <p class="problem">This deployment cannot read your brain, so this page has nothing to measure.
 Six steps all reading "nothing waiting" would be indistinguishable from a brain that has finished everything, which is the opposite of the truth here.</p>
 ${back}`,
+      page.kind,
     );
   }
 
@@ -1711,6 +2047,7 @@ after a quiet spell — loading this page again in a few seconds is usually the 
 drawn still arrives. Your plan, your connected accounts and everything else on your dashboard are
 unaffected.</p>
 ${back}`,
+      page.kind,
     );
   }
 
@@ -1727,6 +2064,7 @@ ${rule}
 <p class="note"><a href="${escapeHtml(COVERAGE_PATH)}">What your brain knows &rarr;</a> &middot;
 <a href="/connect">Connect an account &rarr;</a></p>
 ${back}`,
+      page.kind,
     );
   }
 
@@ -1881,6 +2219,7 @@ ${arriving}
 ${making}
 ${last}
 ${back}`,
+    page.kind,
   );
 }
 
@@ -1899,6 +2238,7 @@ be safe to screenshot, to put on a meeting-room screen, and to leave open on a d
 of zeroes would be indistinguishable from a brain with nothing in it, and telling those two apart is
 the only reason this page exists.</p>
 ${back}`,
+      page.kind,
     );
   }
 
@@ -1912,6 +2252,7 @@ after a quiet spell — loading this page again in a few seconds is usually the 
 drawn still arrives. Your plan, your connected accounts and everything else on your dashboard are
 unaffected.</p>
 ${back}`,
+      page.kind,
     );
   }
 
@@ -2022,6 +2363,7 @@ ${
     }${freezeNote(view)}${behind}${derived}
 <p><a href="${escapeHtml(PROCESSING_PATH)}">What your brain is working on &rarr;</a></p>
 ${back}`,
+    page.kind,
   );
 }
 

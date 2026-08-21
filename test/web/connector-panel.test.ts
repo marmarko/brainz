@@ -80,7 +80,6 @@ function dashboard(status: ConnectorStatus): string {
     tenantId: 'alice',
     connectorsAvailable: true,
     connectors: [status],
-    providers: [],
   });
 }
 

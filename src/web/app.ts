@@ -937,6 +937,7 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
       if (view === 'coverage') return renderCoverage(session);
       if (view === 'processing') return renderProcessing(session);
       if (view === 'review') return renderReview(session);
+      if (view === 'settings') return renderSettings(session);
       return renderDashboard(session);
     }
     if (path === '/brain') return renderBrainSetup(session);
@@ -2286,7 +2287,6 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
           tenantId,
           connectorsAvailable,
           connectors,
-          providers: [...BYOK_PROVIDERS],
         }),
       );
     }
@@ -2470,6 +2470,51 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         intent: intent as (typeof verdicts)[number],
       });
       return afterForm(request, REVIEW_PATH, {}) ?? json(resolved, resolved.ok ? 200 : 409);
+    }
+
+    /**
+     * Account configuration: the key form, the spend window and the export note.
+     *
+     * **Reads `control.tenant` and nothing else**, so this page opens no tenant
+     * database — the same property `renderDashboard` has and for the same
+     * reason. That is what makes it safe to put in the rail beside pages that
+     * do open one.
+     *
+     * The spend figures are the ones `handleSpend` already returns as JSON to a
+     * fetch that could never happen: the policy carries no `script-src`, so the
+     * dashboard's "Loaded from /api/spend" note has never loaded anything. This
+     * renders them.
+     */
+    async function renderSettings(session: Session): Promise<Response> {
+      const tenantId = await tenantOf(session.accountId);
+      if (tenantId === null) return seeOther(BRAIN_SETUP_PATH);
+
+      const rows = await deps.controlSql<
+        {
+          spend_micro_usd: string;
+          spend_window_started_at: Date;
+          spend_cap_micro_usd: string | null;
+        }[]
+      >`
+        SELECT spend_micro_usd, spend_window_started_at, spend_cap_micro_usd
+        FROM control.tenant WHERE tenant_id = ${tenantId}`;
+      const row = rows[0];
+      // `null`, not zero — an absent row means nothing has been counted, which
+      // is a different sentence from "you have spent nothing".
+      const spend =
+        row === undefined
+          ? null
+          : {
+              windowStartedAt: row.spend_window_started_at.toISOString(),
+              spentMicroUsd: Number(row.spend_micro_usd),
+              capMicroUsd: row.spend_cap_micro_usd === null ? null : Number(row.spend_cap_micro_usd),
+            };
+
+      return html(
+        renderPage({ kind: 'settings', providers: [...BYOK_PROVIDERS], spend }),
+        200,
+        { 'cache-control': 'no-store' },
+      );
     }
 
     async function renderProcessing(session: Session): Promise<Response> {

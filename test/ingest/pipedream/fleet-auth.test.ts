@@ -172,7 +172,6 @@ function dashboardFor(overrides: Partial<ConnectorStatus>): string {
     tenantId: 't-1',
     connectorsAvailable: true,
     connectors: [status],
-    providers: [],
   });
 }
 
