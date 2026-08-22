@@ -80,6 +80,7 @@ import type { SQL } from 'bun';
 import { RECENCY_HALF_LIFE_DAYS, SOURCE_TYPE_PRIOR } from '../../core/search/boosts.ts';
 import type { SourceType } from '../../core/search/types.ts';
 import { corpusEvidence } from '../../core/write/entity-admission.ts';
+import { promoteCorrespondents } from './promote-correspondents.ts';
 import { extractFromStatement } from '../../core/write/extract.ts';
 import {
   countRefusals,
@@ -221,6 +222,18 @@ export async function collapseDuplicateFacts(
 // ---------------------------------------------------------------------------
 // 2. Link reconciliation.
 // ---------------------------------------------------------------------------
+
+/** Two signal histograms into one, so the phase reports a single number. */
+function mergeSignals(
+  left: Readonly<Record<string, number>>,
+  right: Readonly<Record<string, number>>,
+): Record<string, number> {
+  const merged: Record<string, number> = { ...left };
+  for (const [signal, count] of Object.entries(right)) {
+    merged[signal] = (merged[signal] ?? 0) + count;
+  }
+  return merged;
+}
 
 export interface ReconcileResult {
   readonly added: number;
@@ -389,6 +402,21 @@ export async function reconcileAllEdges(
 
   const { entities, refused } = await resolveOrCreateEntities(sql, endpoints, { evidence });
 
+  // **Promotion, here rather than in a phase of its own.** This is the one place
+  // in the cycle that already holds all three things it needs — a whole-corpus
+  // evidence door, a settled entity map, and a budget — and anything it creates
+  // joins the desired-set loop below unchanged, so `CYCLE_PHASES` and rung 20's
+  // CHECK are untouched.
+  //
+  // After the resolve rather than before it, deliberately: a name promotion
+  // would create may already exist by the time it is asked about, and finding
+  // it is the dictionary's whole job.
+  const promoted = await promoteCorrespondents(sql, {
+    taxonomyVersion: options.taxonomyVersion,
+    evidence,
+    budget,
+  });
+
   const desired = new Map<string, DesiredEdge>();
   for (const edge of projected) {
     const subject = entities.get(edge.subject);
@@ -498,7 +526,18 @@ export async function reconcileAllEdges(
     }
   }
 
-  return { added, removed, kept, ...countRefusals(refused), ...FINISHED };
+  const counted = countRefusals(refused);
+  return {
+    added,
+    removed,
+    kept,
+    // Promotion's refusals join the phase's own counters rather than a parallel
+    // set: an operator reading "names declined" wants one number, and a second
+    // one under a different name is a number nobody adds up.
+    refused: counted.refused + promoted.refused,
+    refusedBySignal: mergeSignals(counted.refusedBySignal, promoted.refusedBySignal),
+    ...FINISHED,
+  };
 }
 
 // ---------------------------------------------------------------------------

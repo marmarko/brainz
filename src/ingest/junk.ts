@@ -148,7 +148,12 @@ const TRANSACTIONAL_SUBJECT =
 const AUTO_SUBMITTED = /^auto-/i;
 
 /** Senders that are machine mailboxes. Not junk on their own — see the header. */
-const MACHINE_SENDER = /(^|[.\-_+])(no-?reply|do-?not-?reply|notifications?|mailer-daemon)([.\-_+]|@)/i;
+/**
+ * Exported because promotion vetoes on it too, and a second copy is how one
+ * rule becomes two that disagree. Its false positives are disclosed at the
+ * promotion call site rather than re-argued there.
+ */
+export const MACHINE_SENDER = /(^|[.\-_+])(no-?reply|do-?not-?reply|notifications?|mailer-daemon)([.\-_+]|@)/i;
 
 function readHeaders(
   headers: Readonly<Record<string, string>> | undefined,
