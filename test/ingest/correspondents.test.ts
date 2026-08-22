@@ -121,7 +121,9 @@ describe('observing what the providers said', () => {
       sightings: [
         {
           pageId: page,
-          correspondents: [{ address: 'alice@example.test', name: 'Alice Doe', role: 'from' }],
+          correspondents: [
+            { address: 'alice@example.test', name: 'Alice Doe', role: 'from' as const },
+          ],
         },
       ],
     };

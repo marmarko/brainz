@@ -1365,6 +1365,85 @@ describe('contacts', () => {
     expect(outcome.page.nextCursor?.value).toBe(NOW.toISOString());
   });
 
+  test('the book reaches the dictionary as statements, one row per address', async () => {
+    const transport = withToken(createScriptedTransport());
+    transport.on('/people/me/connections', {
+      status: 200,
+      body: {
+        connections: [
+          {
+            resourceName: 'people/c1',
+            names: [{ displayName: 'Alice Doe' }],
+            emailAddresses: [{ value: 'alice@example.test' }, { value: 'a.doe@work.test' }],
+          },
+          // No email: the dictionary is keyed by address, so this contributes
+          // nothing at all. Measured, that is 897 of 2,525 real contacts.
+          { resourceName: 'people/c2', names: [{ displayName: 'No Email Person' }] },
+          // No name: the address is still the useful half.
+          { resourceName: 'people/c3', emailAddresses: [{ value: 'bare@example.test' }] },
+        ],
+        nextSyncToken: 'sync-1',
+      },
+    });
+
+    const outcome = await createContactsSource(client(transport)).list({
+      ...CONNECTION, mode: 'backfill', cursor: null, since: null, maxItems: 100, now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    // A person with two addresses is two rows: collapsing them would invent an
+    // identity the provider did not state.
+    expect(outcome.page.correspondents?.map((who) => who.address)).toEqual([
+      'alice@example.test',
+      'a.doe@work.test',
+      'bare@example.test',
+    ]);
+    expect(outcome.page.correspondents?.map((who) => who.name)).toEqual([
+      'Alice Doe',
+      'Alice Doe',
+      null,
+    ]);
+    // Every one is a STATEMENT. The role has no `book` value in
+    // `correspondent_sighting`, which is what makes the book unable to create
+    // anybody.
+    for (const who of outcome.page.correspondents ?? []) expect(who.role).toBe('book');
+    // And still no pages.
+    expect(outcome.page.items).toEqual([]);
+  });
+
+  test('a book too long to finish says so, and STILL banks its cursor', async () => {
+    // The wedge this guards: a retryable failure sets `incomplete`, the cursor
+    // is saved only when `incomplete` is undefined, and a withheld synthetic
+    // cursor sends the lane back through the first-import gate every single day
+    // — the exact failure `syntheticCursor` exists to prevent, reintroduced by
+    // its own safeguard.
+    const transport = withToken(createScriptedTransport());
+    for (let page = 0; page < 7; page += 1) {
+      transport.on('/people/me/connections', {
+        status: 200,
+        body: {
+          connections: [{ resourceName: `people/c${page}`, emailAddresses: [{ value: `p${page}@x.test` }] }],
+          nextPageToken: `p${page + 1}`,
+        },
+      });
+    }
+
+    const outcome = await createContactsSource(client(transport)).list({
+      ...CONNECTION, mode: 'backfill', cursor: null, since: null, maxItems: 100, now: NOW,
+    });
+
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.page.failures).toHaveLength(1);
+    // NOT retryable: asking again returns the same six pages, and a retryable
+    // row here would withhold the cursor below.
+    expect(outcome.page.failures[0]?.retryable).toBe(false);
+    expect(outcome.page.nextCursor?.kind).toBe('delta');
+    // What it did read is still handed over rather than discarded.
+    expect(outcome.page.correspondents).toHaveLength(6);
+  });
+
   test('a failed listing is a failed listing, not a broken contact', async () => {
     // `itemFailureFor` is deliberately not imported: it classifies the failure
     // of ONE ITEM inside a listing that succeeded. Mapping a failed listing
@@ -1380,5 +1459,31 @@ describe('contacts', () => {
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
     expect(outcome.reason).toBe('rate_limited');
+  });
+});
+
+/**
+ * A guard on the source text rather than on behaviour, because the mistake it
+ * prevents is invisible at runtime.
+ */
+describe('the contacts adapter cannot classify a listing failure as an item failure', () => {
+  test('it does not import itemFailureFor', async () => {
+    const source = await Bun.file(
+      `${import.meta.dir}/../../../../src/ingest/pipedream/sources/contacts.ts`,
+    ).text();
+    // `itemFailureFor` classifies the failure of ONE ITEM inside a listing that
+    // succeeded. A listing that failed is not that, and mapping it through the
+    // per-item vocabulary is how a rate limit becomes "this contact is broken"
+    // and the cursor walks past a page nobody ever read. The other three
+    // adapters import it correctly; this one has no items, so any use of it
+    // here would be that mistake.
+    //
+    // Asserted on the IMPORT rather than the word, because the module's own
+    // comment says why it is absent — and a guard that forbade explaining
+    // itself would be a guard nobody could document.
+    const imports = [...source.matchAll(/import\s*\{([^}]*)\}\s*from/g)]
+      .map((match) => match[1] ?? '')
+      .join(',');
+    expect(imports).not.toContain('itemFailureFor');
   });
 });

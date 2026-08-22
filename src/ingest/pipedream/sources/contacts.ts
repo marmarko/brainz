@@ -48,6 +48,7 @@
  * cursor it returns is **synthetic** — see {@link syntheticCursor}.
  */
 
+import type { Correspondent } from '../../correspondents.ts';
 import type { ProviderApi } from '../client.ts';
 import {
   asArray,
@@ -56,6 +57,7 @@ import {
   type ProviderListOutcome,
   type ProviderListRequest,
   type ProviderSource,
+  type PulledFailure,
 } from './types.ts';
 
 const APP = 'google_contacts' as const;
@@ -94,11 +96,12 @@ export function createContactsSource(api: ProviderApi): ProviderSource {
     async list(request: ProviderListRequest): Promise<ProviderListOutcome> {
       let pageToken: string | null = null;
       let walked = 0;
+      // **Accumulated now that there is a reader.** At the ceiling of
+      // MAX_PAGES x PAGE_SIZE this is six thousand `{address, name, role}`
+      // structs — a low six figures of bytes, a fraction of one page body — and
+      // the bodies themselves are still dropped per page rather than held.
+      const stated: Correspondent[] = [];
 
-      // The walk exists to prove the connection works and to report health;
-      // what it *reads* is handed to the dictionary in a later commit. Nothing
-      // is accumulated here on purpose — holding 2,525 contacts in memory to
-      // then discard them would be a cost with no reader.
       for (; walked < MAX_PAGES; walked += 1) {
         const listed = await api.request({
           app: APP,
@@ -121,22 +124,47 @@ export function createContactsSource(api: ProviderApi): ProviderSource {
         if (!listed.ok) return { ok: false, reason: listed.reason };
 
         const body = asRecord(listed.value);
+        for (const person of contactsIn(body)) stated.push(...correspondentsOf(person));
         pageToken = asString(body?.nextPageToken ?? null);
         if (pageToken === null) break;
       }
+
+      // **A truncated walk is surfaced, not absorbed.** A book needing more than
+      // MAX_PAGES is never finished, every day, forever, because a tokenless
+      // walk banks no resume cursor. That is a signal.
+      //
+      // **`retryable: false`, and getting this wrong wedges the lane.** A
+      // retryable failure sets `incomplete`, and the cursor is saved only when
+      // `incomplete` is undefined — so a retryable row here would withhold the
+      // synthetic cursor, `pullModeFor` would read null as `backfill`, and the
+      // lane would re-enter the first-import gate every single day: the exact
+      // failure `syntheticCursor` exists to prevent, reintroduced by its own
+      // safeguard. It is also the honest verdict, since asking again returns
+      // the same six pages. `ceilingFailureFor` is deliberately not reused —
+      // its `retryable: true` is right for an ITEM ceiling, where holding the
+      // cursor re-offers the item, and there is no cursor to hold here.
+      const failures: PulledFailure[] =
+        walked === MAX_PAGES && pageToken !== null
+          ? [{ externalRef: null, reason: 'cancelled', retryable: false }]
+          : [];
 
       return {
         ok: true,
         page: {
           items: [],
           tombstones: [],
-          failures: [],
+          failures,
           // Nothing was left outside a window, because this lane has no window:
           // it walks the whole book every time. Null is the honest answer and
           // not a shrug — `totalPeople` is available and deliberately unused,
           // since reporting "importing 0 of 2,525" would describe an import
           // that is not being attempted.
           outsideWindow: null,
+          // Statements, not sightings: the book carries no page, so these can
+          // never insert a `correspondent_sighting` and can never satisfy an
+          // evidence test. The dictionary supplies a NAME for somebody the
+          // corpus already justified, and nothing else.
+          correspondents: stated,
           nextCursor: syntheticCursor(request.now),
         },
       };
@@ -163,7 +191,26 @@ function syntheticCursor(now: Date): { kind: 'delta'; value: string; issuedAt: s
   return { kind: 'delta', value: now.toISOString(), issuedAt: now.toISOString() };
 }
 
-/** Contacts a page of the book states, for the dictionary commit that follows. */
+/**
+ * One contact's addresses, as the dictionary keys them.
+ *
+ * A person with six emails is six rows: the dictionary is keyed by address, and
+ * collapsing them would be inventing an identity the provider did not state.
+ * A contact with **no** email produces nothing at all — measured, that is 897 of
+ * 2,525, and a nameless key is not something this table can hold.
+ */
+function correspondentsOf(person: Record<string, unknown>): Correspondent[] {
+  const name = asString(asRecord(asArray(person.names)[0])?.displayName ?? null);
+  const found: Correspondent[] = [];
+  for (const entry of asArray(person.emailAddresses)) {
+    const address = asString(asRecord(entry)?.value ?? null);
+    if (address === null) continue;
+    found.push({ address, name, role: 'book' });
+  }
+  return found;
+}
+
+/** Contacts a page of the book states. */
 export function contactsIn(body: unknown): ReadonlyArray<Record<string, unknown>> {
   return asArray(asRecord(body)?.connections)
     .map((entry) => asRecord(entry))
