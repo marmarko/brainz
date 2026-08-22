@@ -77,7 +77,7 @@
 
 import type { SQL } from 'bun';
 
-import { isErasedSubject } from '../core/lifecycle/subject-erasure.ts';
+import { erasedSubjects } from '../core/lifecycle/subject-erasure.ts';
 import type { JunkInput } from './junk.ts';
 
 /**
@@ -219,10 +219,10 @@ export async function partitionErasedSubjects<T extends { readonly item: Erasabl
   const distinct = new Set<string>();
   for (const identifiers of perEntry) for (const identifier of identifiers) distinct.add(identifier);
 
-  const erased = new Set<string>();
-  for (const identifier of distinct) {
-    if (await isErasedSubject(sql, identifier)) erased.add(identifier);
-  }
+  // One statement for the whole listing, not one per correspondent. This runs
+  // on every mail poll, and the sequential form paid a round trip per person
+  // named anywhere in the listing against a database a network hop away.
+  const erased = await erasedSubjects(sql, [...distinct]);
 
   const kept: T[] = [];
   const suppressed: T[] = [];

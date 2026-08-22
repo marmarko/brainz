@@ -16,6 +16,7 @@
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test';
 
 import {
+  erasedSubjects,
   eraseSubject,
   isErasedSubject,
   previewSubjectErasure,
@@ -989,3 +990,60 @@ describe('the residue the purge is supposed to take, taken', () => {
 function quoted(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
+
+/**
+ * The probe, batched.
+ *
+ * `partitionErasedSubjects` asked once per distinct correspondent in a listing,
+ * sequentially, on a lane that polls every five minutes against a database a
+ * network hop away. The shape was invisible in tests because a fixture listing
+ * names three people.
+ */
+describe('erasedSubjects answers for a whole listing at once', () => {
+  test('it returns exactly the erased identifiers, in one statement', async () => {
+    await eraseSubject({ sql }, { identifier: 'alice@example.test', erasedBy: 'app' });
+
+    let statements = 0;
+    const counting = new Proxy(sql, {
+      get(target, property, receiver) {
+        if (property === 'unsafe') {
+          return (...args: unknown[]) => {
+            statements += 1;
+            return (target as unknown as { unsafe: (...a: unknown[]) => unknown }).unsafe(...args);
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    }) as unknown as SQL;
+
+    const asked = ['alice@example.test', 'bob@example.test', 'carol@example.test'];
+    const erased = await erasedSubjects(counting, asked);
+
+    expect([...erased]).toEqual(['alice@example.test']);
+    // One, not three. This is the whole point of the function.
+    expect(statements).toBe(1);
+  }, SETUP_TIMEOUT_MS);
+
+  test('an empty ask costs nothing at all', async () => {
+    let statements = 0;
+    const counting = new Proxy(sql, {
+      get(target, property, receiver) {
+        if (property === 'unsafe') {
+          return (...args: unknown[]) => {
+            statements += 1;
+            return (target as unknown as { unsafe: (...a: unknown[]) => unknown }).unsafe(...args);
+          };
+        }
+        return Reflect.get(target, property, receiver);
+      },
+    }) as unknown as SQL;
+    expect([...(await erasedSubjects(counting, []))]).toEqual([]);
+    expect(statements).toBe(0);
+  }, SETUP_TIMEOUT_MS);
+
+  test('isErasedSubject still answers for one, through the same door', async () => {
+    await eraseSubject({ sql }, { identifier: 'dave@example.test', erasedBy: 'app' });
+    expect(await isErasedSubject(sql, 'dave@example.test')).toBe(true);
+    expect(await isErasedSubject(sql, 'erin@example.test')).toBe(false);
+  }, SETUP_TIMEOUT_MS);
+});

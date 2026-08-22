@@ -553,11 +553,62 @@ export async function eraseSubject(
  * tempted to store the plaintext to compare against.
  */
 export async function isErasedSubject(sql: SQL, identifier: string): Promise<boolean> {
-  const rows = (await sql`
-    SELECT 1 AS present FROM erased_subject WHERE subject_digest = ${subjectDigest(identifier)}
-  `) as Array<{ present: number }>;
-  return rows.length === 1;
+  const erased = await erasedSubjects(sql, [identifier]);
+  return erased.has(identifier);
 }
+
+/**
+ * Which of these identifiers name somebody this brain was told to forget.
+ *
+ * **Batched because the caller is a mail poll**, not because a round trip is
+ * expensive in the abstract. `partitionErasedSubjects` asked this question once
+ * per *distinct correspondent in the listing*, sequentially, on a lane that runs
+ * every five minutes — so a busy listing paid one round trip per person named
+ * anywhere in it, every time, on a fleet whose database is a network hop away
+ * rather than on localhost. The shape was invisible in tests because a fixture
+ * listing names three people.
+ *
+ * **The hashing stays inside.** No caller learns that the tombstone stores a
+ * digest rather than an address, which is the property the table exists for:
+ * keeping `alice@example.test` in the table whose whole purpose is that this
+ * brain no longer holds anything about her would be the failure wearing the
+ * fix's clothes. Callers pass identifiers; they get identifiers back.
+ */
+export async function erasedSubjects(
+  sql: SQL,
+  identifiers: readonly string[],
+): Promise<ReadonlySet<string>> {
+  const found = new Set<string>();
+  const distinct = [...new Set(identifiers)].filter((identifier) => identifier.length > 0);
+  if (distinct.length === 0) return found;
+
+  // Keyed back by digest, because that is all the answer carries.
+  const byDigest = new Map<string, string>();
+  for (const identifier of distinct) byDigest.set(subjectDigest(identifier), identifier);
+
+  const digests = [...byDigest.keys()];
+  for (let at = 0; at < digests.length; at += ERASURE_PROBE_BATCH) {
+    const slice = digests.slice(at, at + ERASURE_PROBE_BATCH);
+    const rows = (await sql.unsafe(
+      `SELECT subject_digest FROM erased_subject WHERE subject_digest = ANY($1::text[])`,
+      [textArrayLiteral(slice)],
+    )) as Array<{ subject_digest: string }>;
+    for (const row of rows) {
+      const identifier = byDigest.get(row.subject_digest);
+      if (identifier !== undefined) found.add(identifier);
+    }
+  }
+  return found;
+}
+
+/**
+ * Digests per probe.
+ *
+ * Bounded rather than unbounded so one pathological listing cannot bind an
+ * array of arbitrary size; 500 is far above any real listing's distinct
+ * correspondent count, so the ordinary case is exactly one statement.
+ */
+const ERASURE_PROBE_BATCH = 500;
 
 async function matchingPages(
   sql: SQL,
