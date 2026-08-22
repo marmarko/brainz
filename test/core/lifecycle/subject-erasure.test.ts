@@ -55,6 +55,7 @@ async function seed(): Promise<void> {
     DELETE FROM review_queue; DELETE FROM attachment;
     DELETE FROM fact_source; DELETE FROM entity_edge; UPDATE fact SET superseded_by = NULL;
     DELETE FROM commitment; DELETE FROM entity_card;
+    DELETE FROM correspondent_sighting; DELETE FROM correspondent;
     DELETE FROM fact; DELETE FROM entity_alias; DELETE FROM entity_slug; DELETE FROM entity;
     DELETE FROM chunk; DELETE FROM page;
 
@@ -1045,5 +1046,79 @@ describe('erasedSubjects answers for a whole listing at once', () => {
     await eraseSubject({ sql }, { identifier: 'dave@example.test', erasedBy: 'app' });
     expect(await isErasedSubject(sql, 'dave@example.test')).toBe(true);
     expect(await isErasedSubject(sql, 'erin@example.test')).toBe(false);
+  }, SETUP_TIMEOUT_MS);
+});
+
+/**
+ * The dictionary is reachable by both halves of an erasure.
+ *
+ * `correspondent` and `correspondent_sighting` carry no `deleted_at`, which
+ * keeps a plaintext address from sitting soft-deleted for the life of the
+ * brain — and costs them enrolment in every automatic lifecycle census. These
+ * tests are the only thing holding this arm in place.
+ */
+describe('erasing a person reaches the correspondent dictionary', () => {
+  test('by address, and the sightings cascade with it', async () => {
+    // The beforeEach already seeds three pages; any live one will do.
+    const pages = (await sql.unsafe(
+      `SELECT page_id::text AS id FROM page WHERE external_ref = 'gmail:a1'`,
+    )) as Array<{ id: string }>;
+    const page = pages[0]?.id ?? '';
+    await sql.unsafe(
+      `INSERT INTO correspondent (address_key, origin_context, display_name, name_key, name_source)
+       VALUES ('alice@example.test', 'personal', 'Alice Doe', 'alice doe', 'headers')
+       RETURNING correspondent_id`,
+    );
+    const rows = (await sql.unsafe(
+      `SELECT correspondent_id::text AS id FROM correspondent WHERE address_key = 'alice@example.test'`,
+    )) as Array<{ id: string }>;
+    await sql.unsafe(
+      `INSERT INTO correspondent_sighting (correspondent_id, page_id, role)
+       VALUES ($1::bigint, $2::bigint, 'from')`,
+      [rows[0]?.id ?? '', page],
+    );
+
+    await eraseSubject({ sql }, { identifier: 'alice@example.test', erasedBy: 'app' });
+
+    const left = (await sql.unsafe(
+      `SELECT count(*)::int AS n FROM correspondent WHERE address_key = 'alice@example.test'`,
+    )) as Array<{ n: number }>;
+    expect(left[0]?.n).toBe(0);
+    // Hard-deleted, not tombstoned: there is no deleted_at to check, and the
+    // sighting goes with it through ON DELETE CASCADE.
+    const sightings = (await sql.unsafe(
+      `SELECT count(*)::int AS n FROM correspondent_sighting`,
+    )) as Array<{ n: number }>;
+    expect(sightings[0]?.n).toBe(0);
+  }, SETUP_TIMEOUT_MS);
+
+  test('by name, because a bare To: header stores no name to ask about', async () => {
+    // Ask by address only and a row that names them under a different address
+    // survives; ask by name only and every address spelling survives. Both arms
+    // are needed and this is the one that is easy to leave out.
+    await sql.unsafe(
+      `INSERT INTO correspondent (address_key, origin_context, display_name, name_key, name_source)
+       VALUES ('bob.other@example.test', 'personal', 'Bob Roberts', 'bob roberts', 'book')`,
+    );
+
+    await eraseSubject({ sql }, { identifier: 'Bob Roberts', erasedBy: 'app' });
+
+    const left = (await sql.unsafe(
+      `SELECT count(*)::int AS n FROM correspondent WHERE name_key = 'bob roberts'`,
+    )) as Array<{ n: number }>;
+    expect(left[0]?.n).toBe(0);
+  }, SETUP_TIMEOUT_MS);
+
+  test('it leaves other people alone', async () => {
+    await sql.unsafe(
+      `INSERT INTO correspondent (address_key, origin_context, display_name, name_key, name_source)
+       VALUES ('carol@example.test', 'personal', 'Carol Chen', 'carol chen', 'headers'),
+              ('dave@example.test', 'personal', 'Dave Dunn', 'dave dunn', 'headers')`,
+    );
+    await eraseSubject({ sql }, { identifier: 'carol@example.test', erasedBy: 'app' });
+    const left = (await sql.unsafe(
+      `SELECT address_key FROM correspondent ORDER BY address_key`,
+    )) as Array<{ address_key: string }>;
+    expect(left.map((row) => row.address_key)).toEqual(['dave@example.test']);
   }, SETUP_TIMEOUT_MS);
 });

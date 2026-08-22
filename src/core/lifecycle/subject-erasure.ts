@@ -435,6 +435,25 @@ export async function eraseSubject(
                 WHERE review_id = ANY(${textArrayLiteral(proposalIds)}::text[]::bigint[])`;
     }
 
+    // **The dictionary, by address AND by name, and both are needed.**
+    //
+    // A data subject asks to be forgotten by an identifier that may be either.
+    // Ask by address and a row naming them under a bare `To:` header survives;
+    // ask only by name and every alias-shaped spelling of the address survives.
+    //
+    // Hard-deleted, not tombstoned, for the reason this module already gives
+    // about its own tombstone table: a plaintext address sitting soft-deleted
+    // for the life of the brain, in a table where presence IS the record, is
+    // the failure wearing the fix's clothes. `correspondent_sighting` cascades.
+    //
+    // The name arm compares `name_key`, which `observeCorrespondents` wrote
+    // with the write path's normalizer, against the same function's output —
+    // never `lower()`, which would miss `O’Brien` against `o'brien` on a
+    // data-subject-rights path.
+    await tx`DELETE FROM correspondent
+              WHERE address_key = ${normalize(request.identifier)}
+                 OR (name_key IS NOT NULL AND name_key = ${normalize(request.identifier)})`;
+
     if (inside.entityIds.length > 0) {
       const ids = textArrayLiteral(inside.entityIds);
       await tx`UPDATE entity_card SET deleted_at = ${at}::timestamptz

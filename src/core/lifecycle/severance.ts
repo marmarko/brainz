@@ -133,6 +133,29 @@ export interface TombstonedCounts {
   readonly entities: number;
   readonly entityCards: number;
   readonly commitments: number;
+  /**
+   * **Hard-deleted, and this contradicts a guarantee one function down.**
+   *
+   * `archiveExactOriginAliases` says severance stays no more final than
+   * `forget`, which is what ruled out a hard delete there. The departure is
+   * deliberate and rests on what the two tables hold: an alias is derived
+   * knowledge the brain *built* and cannot rebuild, while a correspondent row
+   * is a mirror of what the provider currently holds — reconnect the account
+   * and the next walk restores it exactly.
+   *
+   * A 72-hour plaintext archive of a few thousand third-party addresses, in a
+   * table with no `deleted_at` where presence IS the record, bought for a copy
+   * the provider will hand back on request, is the failure wearing the fix's
+   * clothes.
+   *
+   * Without this arm the failure is worse than untidy. A pageless contacts lane
+   * means its origin never appears in `survivingOrigins`, which reads
+   * `SELECT DISTINCT origin_context FROM page` — so severing it computed an
+   * all-zero removal, took nothing, and answered `alreadySevered: true`. The
+   * owner disconnects their address book, is told there was nothing there, and
+   * every address stays.
+   */
+  readonly correspondents: number;
 }
 
 export interface ArchivedCounts {
@@ -170,6 +193,32 @@ export async function severOrigin(sql: SQL, request: SeveranceRequest): Promise<
 
     const tombstoned = await tombstoneExactOrigin(tx, request.origin, at);
     const archived = await archiveExactOriginAliases(tx, request.origin, at);
+
+    // **The severance undoes its own tombstone's effect on the dictionary.**
+    //
+    // The call above has just tombstoned every entity whose origins were
+    // exactly this one. A correspondent row in a SURVIVING origin that pointed
+    // at one of them now points at a tombstone — and promotion reads a dead
+    // binding as a user retraction, so severing the work mailbox would
+    // permanently disable promotion for a person the personal calendar
+    // attests. Both columns are cleared, which the promotion CHECK permits: the
+    // honest state is "observed, never decided".
+    //
+    // `deleted_at = $2` is load-bearing and is why this is not
+    // `deleted_at IS NOT NULL`. Without it a severance also clears bindings
+    // pointing at entities the owner forgot months ago, which resurrects
+    // exactly what `forget` retracted.
+    //
+    // Not on the receipt: it is an UPDATE rather than a removal, and the
+    // receipt's counts are compared field-for-field against the preview.
+    await tx.unsafe(
+      `UPDATE correspondent c SET entity_id = NULL, promoted_at = NULL
+         FROM entity e
+        WHERE e.entity_id = c.entity_id
+          AND e.deleted_at = $2::timestamptz
+          AND e.origin_contexts <@ ARRAY[$1]::text[]`,
+      [request.origin, at],
+    );
 
     const rows = (await tx`
       INSERT INTO severance (origin_context, severed_at, removed, recomputed, surviving_origins)
@@ -246,6 +295,10 @@ async function tombstoneExactOrigin(
     const rows = (await tx.unsafe(statement, [origin, at])) as Array<unknown>;
     return rows.length;
   };
+  // Its own helper because a DELETE that never references `$2` would fail the
+  // bind the shared one makes.
+  const take = async (statement: string): Promise<number> =>
+    ((await tx.unsafe(statement, [origin])) as Array<unknown>).length;
 
   return {
     pages: await count(
@@ -282,6 +335,12 @@ async function tombstoneExactOrigin(
     commitments: await count(
       `UPDATE commitment SET deleted_at = $2::timestamptz
         WHERE origin_contexts <@ ARRAY[$1]::text[] AND deleted_at IS NULL RETURNING commitment_id`,
+    ),
+    // `(address_key, origin_context)` makes the predicate exact: a row belongs
+    // entirely to one origin or not at all, so there is no `<@` subtlety and no
+    // mixed-row hazard. `correspondent_sighting` cascades.
+    correspondents: await take(
+      `DELETE FROM correspondent WHERE origin_context = $1 RETURNING correspondent_id`,
     ),
   };
 }
@@ -430,6 +489,11 @@ export async function recomputeWorklist(
       // no phase of consolidation re-derives one. A worklist that counted them
       // would be asking a cycle for work that has no producer.
       aliases: 0,
+      // Zero for a different reason from aliases, and worth separating: a
+      // correspondent row's origin is a SCALAR, so it belongs entirely to the
+      // severed origin or not at all. There is no such thing as one left with a
+      // hole in its evidence, so there is nothing here for a recompute to do.
+      correspondents: 0,
       facts: Number(row.facts ?? 0),
       entities: Number(row.entities ?? 0),
       entityCards: Number(row.entity_cards ?? 0),
@@ -489,6 +553,7 @@ function emptyCounts(): RemovalCounts {
     chunks: 0,
     attachments: 0,
     aliases: 0,
+    correspondents: 0,
     facts: 0,
     entities: 0,
     entityCards: 0,

@@ -76,6 +76,22 @@ export interface RemovalCounts {
    * pays.
    */
   readonly aliases: number;
+  /**
+   * Dictionary rows severance hard-deletes.
+   *
+   * **Always 0 in the `recomputed` column, and that is a statement rather than
+   * a placeholder.** `correspondent.origin_context` is a scalar, so a row
+   * belongs entirely to the severed origin or not at all — there is nothing to
+   * narrow and nothing left holding a hole. The `mixed` arm of this query
+   * therefore has no correspondent term at all, which is why the comparison
+   * test sees a constant zero on that side.
+   *
+   * It is counted here because the executor **takes** them, and the preview and
+   * the executor are compared field-for-field: an uncounted take makes the
+   * receipt understate what the owner consented to, and the append-only
+   * `severance.removed` audit is written from this object.
+   */
+  readonly correspondents: number;
 }
 
 export interface SeverancePreview {
@@ -177,7 +193,13 @@ async function counts(sql: SQL, origin: string, mode: 'exact' | 'mixed'): Promis
       (SELECT count(*)::int FROM entity_alias a
          JOIN entity e ON e.entity_id = a.entity_id
         WHERE ${ingested}
-          AND coalesce(a.origin_contexts, e.origin_contexts) <@ ARRAY[${origin}]::text[]) AS aliases
+          AND coalesce(a.origin_contexts, e.origin_contexts) <@ ARRAY[${origin}]::text[]) AS aliases,
+      -- Scalar origin, so exactness is the predicate rather than a subtlety,
+      -- and the mixed arm is structurally zero: there is no such thing as a
+      -- correspondent row partly belonging to this origin.
+      (SELECT CASE WHEN ${ingested}
+                THEN (SELECT count(*)::int FROM correspondent WHERE origin_context = ${origin})
+                ELSE 0 END) AS correspondents
   `) as Array<Record<string, number>>;
 
   const row = rows[0] ?? {};
@@ -191,6 +213,7 @@ async function counts(sql: SQL, origin: string, mode: 'exact' | 'mixed'): Promis
     commitments: Number(row.commitments ?? 0),
     edges: Number(row.edges ?? 0),
     aliases: Number(row.aliases ?? 0),
+    correspondents: Number(row.correspondents ?? 0),
   };
 }
 

@@ -427,3 +427,117 @@ async function census(f: McpFixture): Promise<Record<string, number>> {
   `) as Array<Record<string, number>>;
   return rows[0] ?? {};
 }
+
+/**
+ * The dictionary, on a severance.
+ *
+ * Without this arm the failure is worse than untidy. A pageless contacts lane
+ * means its origin never appears in `survivingOrigins`, which reads
+ * `SELECT DISTINCT origin_context FROM page` — so severing it computed an
+ * all-zero removal, took nothing, and answered `alreadySevered: true`. The owner
+ * disconnects their address book, is told there was nothing there, and every
+ * address stays in the database permanently.
+ */
+describe('severing an origin takes its correspondents', () => {
+  test(
+    'the rows go, the receipt counts them, and another origin is untouched',
+    async () => {
+      await fixture.sql.unsafe(
+        `INSERT INTO correspondent (address_key, origin_context, display_name, name_key, name_source)
+         VALUES ('gone@example.test', $1, 'Gone Person', 'gone person', 'headers'),
+                ('kept@example.test', $2, 'Kept Person', 'kept person', 'book')`,
+        [WORK, PERSONAL],
+      );
+
+      const outcome = await severOrigin(fixture.sql, {
+        origin: WORK,
+        confirm: WORK,
+        now: new Date(fixture.now()),
+      });
+      expect(outcome.ok).toBe(true);
+      if (!outcome.ok) return;
+      // Counted, because the preview and the executor are compared field for
+      // field: an uncounted take makes the receipt understate what was consented to.
+      expect(outcome.receipt.removed.correspondents).toBe(1);
+
+      const left = (await fixture.sql.unsafe(
+        `SELECT address_key FROM correspondent ORDER BY address_key`,
+      )) as Array<{ address_key: string }>;
+      expect(left.map((row) => row.address_key)).toEqual(['kept@example.test']);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a surviving row bound to a newly-severed entity is unlatched, not left dead',
+    async () => {
+      // The tombstone has just retired every entity whose origins were exactly
+      // the severed one. A correspondent in a SURVIVING origin pointing at one
+      // would read as a user retraction and be permanently un-promotable — for a
+      // person another credential still attests.
+      const entity = (await fixture.sql.unsafe(
+        `INSERT INTO entity (canonical_name, entity_type, origin_contexts)
+         VALUES ('Severed Person', 'person', ARRAY[$1]::text[])
+         RETURNING entity_id::text AS id`,
+        [WORK],
+      )) as Array<{ id: string }>;
+      await fixture.sql.unsafe(
+        `INSERT INTO correspondent (address_key, origin_context, display_name, name_key,
+                                    name_source, entity_id, promoted_at)
+         VALUES ('bound@example.test', $1, 'Severed Person', 'severed person',
+                 'headers', $2::bigint, now())`,
+        [PERSONAL, entity[0]?.id ?? ''],
+      );
+
+      await severOrigin(fixture.sql, {
+        origin: WORK,
+        confirm: WORK,
+        now: new Date(fixture.now()),
+      });
+
+      const row = (await fixture.sql.unsafe(
+        `SELECT entity_id, promoted_at FROM correspondent WHERE address_key = 'bound@example.test'`,
+      )) as Array<{ entity_id: string | null; promoted_at: Date | null }>;
+      // Both cleared, which the promotion CHECK permits: the honest state is
+      // "observed, never decided".
+      expect(row[0]?.entity_id).toBeNull();
+      expect(row[0]?.promoted_at).toBeNull();
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    'a binding the owner forgot months ago is NOT resurrected',
+    async () => {
+      // `deleted_at = $2` rather than `IS NOT NULL` is what makes this true.
+      // Without it a severance clears bindings pointing at entities a `forget`
+      // retracted, resurrecting exactly what the owner retracted.
+      const entity = (await fixture.sql.unsafe(
+        `INSERT INTO entity (canonical_name, entity_type, origin_contexts, deleted_at)
+         VALUES ('Forgotten Person', 'person', ARRAY[$1]::text[], now() - interval '30 days')
+         RETURNING entity_id::text AS id`,
+        [PERSONAL],
+      )) as Array<{ id: string }>;
+      await fixture.sql.unsafe(
+        `INSERT INTO correspondent (address_key, origin_context, display_name, name_key,
+                                    name_source, entity_id, promoted_at)
+         VALUES ('forgotten@example.test', $1, 'Forgotten Person',
+                 'forgotten person', 'headers', $2::bigint, now() - interval '30 days')`,
+        [PERSONAL, entity[0]?.id ?? ''],
+      );
+
+      await severOrigin(fixture.sql, {
+        origin: WORK,
+        confirm: WORK,
+        now: new Date(fixture.now()),
+      });
+
+      const row = (await fixture.sql.unsafe(
+        `SELECT entity_id FROM correspondent WHERE address_key = 'forgotten@example.test'`,
+      )) as Array<{ entity_id: string | null }>;
+      // Still bound to the tombstone, which promotion reads as "retracted".
+      expect(row[0]?.entity_id).not.toBeNull();
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
