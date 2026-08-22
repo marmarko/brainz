@@ -19,6 +19,7 @@
 import { normalizeAccountKey, type ConnectorSource, type CursorKind, type PullMode } from '../../cursor.ts';
 import type { SourceType } from '../../../core/write/write-path.ts';
 import type { IngestFailureCode } from '../../log.ts';
+import type { Correspondent } from '../../correspondents.ts';
 import type { JunkInput } from '../../junk.ts';
 import type { PullFailureReason } from '../client.ts';
 
@@ -95,6 +96,14 @@ export interface PulledItem {
   readonly occurredAt: Date | null;
   /** What the junk gate reads. Absent for sources that carry no headers. */
   readonly junk?: JunkInput;
+  /**
+   * Who this item is between, as the provider stated it. Absent for Drive.
+   *
+   * Structured rather than prose, deliberately: Calendar already flattens its
+   * `attendees[].email` into body text for a regex to re-parse downstream, and
+   * that round trip is where a name becomes a guess.
+   */
+  readonly correspondents?: readonly Correspondent[];
 }
 
 export type TombstoneReason = 'deleted' | 'trashed' | 'cancelled' | 'removed';
@@ -228,6 +237,14 @@ export interface PullPage {
    * number ("importing 1,204 of 40,000"). Null when the provider does not say.
    */
   readonly outsideWindow: number | null;
+  /**
+   * Correspondents a listing states that carry NO page — the address book.
+   *
+   * Absent for every source whose items ARE the content. A statement rather
+   * than a sighting, which is exactly why it cannot create anybody:
+   * `correspondent_sighting` has no row to take without a page.
+   */
+  readonly correspondents?: readonly Correspondent[];
   /**
    * **Which account this listing came from**, when the provider says cheaply.
    * The runner adopts it on first sight and refuses a listing that reports a

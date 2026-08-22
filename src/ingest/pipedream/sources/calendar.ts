@@ -21,6 +21,7 @@
  * a bounded window, never to re-list the whole calendar.
  */
 
+import type { Correspondent } from '../../correspondents.ts';
 import type { ProviderApi } from '../client.ts';
 import {
   asArray,
@@ -100,6 +101,36 @@ const CALENDAR_ID = 'primary';
  * the attendee list is the half a naive mapping drops, and it is the half that
  * answers "when did I last meet them".
  */
+/**
+ * The people an event states, structured, from the fields the API already gives.
+ *
+ * **`eventBody` is deliberately left alone.** It flattens these same addresses
+ * into `Attendees:` and `Organizer:` prose lines, which is the round trip this
+ * function exists to stop needing — but that prose is part of the page's
+ * content, so changing it changes `contentDigest`, which re-chunks and
+ * re-embeds the whole calendar corpus once. That is a cost with its own
+ * argument and its own commit. Both callers read the same fields through this
+ * helper so the parse is not written twice in the meantime.
+ */
+function eventCorrespondents(event: Record<string, unknown>): Correspondent[] {
+  const found: Correspondent[] = [];
+  for (const entry of asArray(event.attendees)) {
+    const email = asString(asRecord(entry)?.email ?? null);
+    const name = asString(asRecord(entry)?.displayName ?? null);
+    if (email !== null) found.push({ address: email, name, role: 'attendee' });
+  }
+  const organizer = asRecord(event.organizer);
+  const organizerEmail = organizer === null ? null : asString(organizer.email);
+  if (organizerEmail !== null) {
+    found.push({
+      address: organizerEmail,
+      name: organizer === null ? null : asString(organizer.displayName),
+      role: 'organizer',
+    });
+  }
+  return found;
+}
+
 function eventBody(event: Record<string, unknown>): string {
   const lines: string[] = [];
   const summary = asString(event.summary);
@@ -256,6 +287,7 @@ export function createCalendarSource(
           title: asString(event.summary),
           body: text,
           occurredAt: startsAtInstant,
+          correspondents: eventCorrespondents(event),
         });
       }
 

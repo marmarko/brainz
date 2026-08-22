@@ -79,6 +79,11 @@ import type { SQL } from 'bun';
 
 import { erasedSubjects } from '../core/lifecycle/subject-erasure.ts';
 import type { JunkInput } from './junk.ts';
+// **One regex pair, one file, three feeds.** These used to live here and are now
+// the correspondent module's, because that module needs the same parse to build
+// a structured correspondent and a second copy is how the two come to disagree
+// about what one address is. `identifiersIn` keeps its signature and its tests.
+import { correspondentsIn, MIN_NAME_CHARACTERS } from './correspondents.ts';
 
 /**
  * The headers that say who a message is *between*.
@@ -109,22 +114,6 @@ const CORRESPONDENT_HEADERS = [
  * validator — a string that is not really an address costs one primary-key
  * lookup that misses.
  */
-const ADDRESS = /[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g;
-
-/**
- * `Alice Example <alice@example.test>` and `"Example, Alice" <alice@…>`.
- *
- * The display name is only taken when it is *attached to an address*, which is
- * what keeps this from degenerating into "hash every phrase in the body". A name
- * that stands alone in prose has no address to anchor it and is the bound the
- * header states.
- */
-const NAMED_ADDRESS =
-  /(?:"([^"\r\n]{1,200})"|([^<>,;:"\r\n]{1,200}?))\s*<\s*([A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)\s*>/g;
-
-/** Shorter than this is not a name anybody was erased under. */
-const MIN_NAME_CHARACTERS = 2;
-
 /** What this module needs of an item. Structural, so both runners' shapes fit. */
 export interface ErasableItem {
   readonly title?: string | null;
@@ -173,11 +162,14 @@ export function identifiersIn(item: ErasableItem): string[] {
   surfaces.push(item.body);
 
   for (const surface of surfaces) {
-    for (const match of surface.matchAll(NAMED_ADDRESS)) {
-      const name = (match[1] ?? match[2] ?? '').trim();
-      if (name.length >= MIN_NAME_CHARACTERS && !name.includes('@')) addIdentifier(found, name);
+    // Flattened back to the two kinds this function has always produced: a name
+    // when one is attached to an address, and the address itself.
+    for (const who of correspondentsIn(surface, 'from')) {
+      if (who.name !== null && who.name.length >= MIN_NAME_CHARACTERS) {
+        addIdentifier(found, who.name);
+      }
     }
-    for (const match of surface.matchAll(ADDRESS)) addIdentifier(found, match[0]);
+    for (const who of correspondentsIn(surface, 'from')) addIdentifier(found, who.address);
   }
 
   return [...found];

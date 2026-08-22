@@ -121,6 +121,10 @@ import {
   type ImportWindow,
 } from '../first-import.ts';
 import { partitionErasedSubjects } from '../erased-subjects.ts';
+import {
+  observeCorrespondents,
+  type CorrespondentSighting,
+} from '../correspondents.ts';
 import { gateJunk } from '../junk.ts';
 import { countRunItem, finishRun, openRun, recordItem, type IngestFailureCode } from '../log.ts';
 import type { TenantRuntime } from '../import/run.ts';
@@ -979,6 +983,15 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
      * written. What it does do is hold the cursor — see step 10.
      */
     let incomplete: PullStopReason | undefined;
+    /**
+     * Correspondents this listing stated, flushed once after the loop.
+     *
+     * Accumulated rather than written per item so the whole listing costs a
+     * bounded number of statements — and written AFTER the loop rather than
+     * inside it so a dictionary write can never sit inside a write transaction
+     * or lengthen one.
+     */
+    const pendingSightings: CorrespondentSighting[] = [];
     /** Set with {@link incomplete}, and only by the setter that wins. */
     let stopStatus: number | null | undefined;
 
@@ -1054,6 +1067,22 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
           failureCode: writeCodeFor(receipt.reason),
         });
         continue;
+      }
+
+      // **Above the `unchanged` branch, and that placement is the whole point.**
+      //
+      // This is the only line in the loop that sees every successful receipt.
+      // The loop tail is not equivalent: both the failure branch above and the
+      // `unchanged` branch below skip it, and `unchanged` is a poller's
+      // commonest outcome by a wide margin — a hook at the tail would record
+      // correspondents only for mail that had just changed, which for a
+      // steady-state mailbox is almost none of it.
+      //
+      // `DocumentReceipt.pageId` is non-optional and IS returned on `unchanged`,
+      // and that branch returns before `commitWrite` is reached, so nothing here
+      // is inside a write transaction.
+      if (verdict.visibility === null && item.correspondents !== undefined) {
+        pendingSightings.push({ pageId: receipt.pageId, correspondents: item.correspondents });
       }
 
       if (receipt.status === 'unchanged') {
@@ -1135,6 +1164,31 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
             issuedAt: request.now.toISOString(),
           }
         : null;
+    // **After the items, before the receipt, and outside every transaction.**
+    //
+    // A failure here must not lose a pull that already wrote its pages: the
+    // dictionary is a mirror the next poll rebuilds, and the pages are not. So
+    // it is awaited (an erasure consult that cannot read its table must fail
+    // rather than be skipped) but its failure is contained to this step.
+    if (pendingSightings.length > 0 || (listed.correspondents ?? []).length > 0) {
+      try {
+        await observeCorrespondents(tenant.sql, {
+          originContext,
+          at: request.now,
+          sightings: pendingSightings,
+          ...(listed.correspondents === undefined
+            ? {}
+            : { stated: listed.correspondents }),
+        });
+      } catch {
+        // Deliberately swallowed and deliberately NOT counted as a pull
+        // failure. The alternative is a poll that discards written pages
+        // because a dictionary upsert lost a race, which trades the durable
+        // half for the rebuildable one.
+        incomplete ??= 'provider_error';
+      }
+    }
+
     const cursorAdvanced = await saveState(nextCursor);
 
     const stopReason = halted ?? incomplete;

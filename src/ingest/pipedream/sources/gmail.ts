@@ -47,6 +47,7 @@
 
 import { normalizeAccountKey } from '../../cursor.ts';
 import type { JunkInput } from '../../junk.ts';
+import { correspondentsIn } from '../../correspondents.ts';
 import type { ProviderApi } from '../client.ts';
 import {
   RESUME_DELIMITER,
@@ -209,6 +210,16 @@ function toItem(message: Record<string, unknown>, accountKey: string | null): Pu
     body,
     occurredAt: asDate(message.internalDate),
     junk,
+    // **Already fetched, and until now dropped on the floor.** `format: 'full'`
+    // returns every header, and this function has built the map three lines up
+    // to hand `from` to the junk gate. Keeping the other two costs nothing at
+    // the provider and is the difference between a brain that knows who its
+    // owner corresponds with and one that infers people from prose.
+    correspondents: [
+      ...correspondentsIn(headers.from ?? '', 'from'),
+      ...correspondentsIn(headers.to ?? '', 'to'),
+      ...correspondentsIn(headers.cc ?? '', 'cc'),
+    ],
   };
 }
 
