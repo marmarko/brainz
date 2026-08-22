@@ -361,6 +361,25 @@ export function buildExtractionPrompt(input: {
   };
 }
 
+/**
+ * Evidence characters per entity in the enrich prompt.
+ *
+ * The twin of {@link SALIENCE_PAGE_CHARS}, and it exists for a measured reason
+ * rather than symmetry. The evidence join has no `LIMIT`: it gathers **every**
+ * live statement that names an entity, and a common first name can match
+ * hundreds. On the brain this was written against, a recurring meeting series
+ * had expanded to 875 live pages, so an entity called `Eric` drew several
+ * hundred near-identical sentences into one paid prompt — several times its
+ * whole token allowance, and, worse than expensive, the *wrong* evidence: the
+ * card it produced summarised a meeting series as though it described a person.
+ *
+ * Truncating rather than sampling is deliberate. The join is
+ * `ORDER BY f.fact_id`, so the prefix is the oldest evidence, which is the half
+ * that says who somebody is; a random sample would make a card that changes
+ * every cycle for no reason the owner could see.
+ */
+export const ENRICH_EVIDENCE_CHARS = 1_500;
+
 export function buildEnrichPrompt(input: {
   readonly entities: readonly {
     readonly name: string;
@@ -371,11 +390,14 @@ export function buildEnrichPrompt(input: {
   readonly nonce?: string;
 }): Prompt {
   const nonce = input.nonce ?? mintDelimiter();
-  const parts = input.entities.map(
-    (entity) =>
-      `entity: ${entity.name}\ntype: ${entity.type}\n` +
-      wrap(entity.evidence.join('\n'), entity.origins, nonce),
-  );
+  const parts = input.entities.map((entity) => {
+    const joined = entity.evidence.join('\n');
+    const body =
+      joined.length > ENRICH_EVIDENCE_CHARS
+        ? `${joined.slice(0, ENRICH_EVIDENCE_CHARS)}\n[evidence continues]`
+        : joined;
+    return `entity: ${entity.name}\ntype: ${entity.type}\n` + wrap(body, entity.origins, nonce);
+  });
 
   return {
     nonce,

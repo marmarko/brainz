@@ -585,9 +585,29 @@ export async function runExtractPhase(deps: ModelPhaseDeps): Promise<PhaseOutcom
 // enrich.
 // ---------------------------------------------------------------------------
 
+/**
+ * Entities per enrich prompt.
+ *
+ * **Not a fix for today's brain, and the difference matters.** `DEFAULT_LIMIT`'s
+ * 200 is a ceiling on a SELECT over a few dozen live entities, and the
+ * unevidenced are already dropped before the prompt is built, so the batch does
+ * not fill. This is the precondition for anything that adds evidenced entities
+ * on a cadence.
+ *
+ * Both failure branches past the route's output ceiling are silent, in
+ * different ways. A truncated answer is **billed** — the gateway settles the
+ * spend before it returns the failure — and stamps nothing, so the identical
+ * rows come back every cycle forever. An answer the model closes early stamps
+ * the whole batch considered with most cards never written. `SALIENCE_REFINE_BATCH`
+ * is the shipped precedent and was arrived at the same way.
+ */
+const ENRICH_BATCH = 25;
+
 export async function runEnrichPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome> {
   const phase: ModelPhase = 'enrich';
-  const limit = deps.limit ?? DEFAULT_LIMIT;
+  // The `Math.min` shape, so no caller can widen the batch past what the route
+  // can answer in one reply.
+  const limit = Math.min(deps.limit ?? ENRICH_BATCH, ENRICH_BATCH);
   const version = (deps.consideration ?? CONSIDERATION_VERSION).enrich;
 
   const candidates = (await deps.sql`
