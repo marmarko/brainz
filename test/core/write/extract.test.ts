@@ -193,16 +193,17 @@ describe('sentence splitting keeps the text it splits', () => {
  * actually answerable: **when the extractor does fire on a gold statement, does
  * it agree with the key?**
  *
- * **Four rows disagree, from two unrelated causes**, and finding the second is
- * the argument for the test existing at all.
+ * **Three rows disagree, and every one of them is the KEY being wrong rather
+ * than the extractor** — which was not true when this test was written, and the
+ * difference is the argument for it existing.
  *
- * Two are the extractor being wrong: `ROLE` is `[a-z][a-z ]{2,40}?`, which
- * matches the word `part`, so `role_copula` intercepts every copula spelling of
- * `part_of` before `relation_verb` ever sees it — and re-asserts it as
- * `works_at`, whose subject slot is typed `person`. That is why a production
- * brain holds `Android` and `Google Play` as *people*.
+ * The fourth row was `f-saltmarsh-part-of-verdant`, and it was the extractor:
+ * `role_copula` admitted `of`, so it intercepted "X is part of Y" and asserted
+ * employment before `relation_verb` ever saw it. Narrowing that rule to `at`
+ * handed the sentence back and this row went green on its own.
  *
- * Two are the **key** being wrong: `f-tessellate-invested-*` are labelled
+ * The three that remain are labelled `model_only`, meaning the free tier is
+ * expected to miss them, and the free tier reads them fine: `f-tessellate-invested-*` are labelled
  * `model_only`, meaning the free tier is expected to miss them, and the free
  * tier reads them fine — `invested in` joined `RELATION_VERBS` after the key was
  * written. The eval has been crediting the model with recall the deterministic
@@ -217,8 +218,16 @@ describe('sentence splitting keeps the text it splits', () => {
  */
 describe('the gold key agrees with the extractor where the extractor fires', () => {
   const KNOWN_WRONG = new Set([
-    // `role_copula` shadows `part_of` — see the header.
-    'f-saltmarsh-part-of-verdant',
+    // `f-saltmarsh-part-of-verdant` used to be here: `role_copula` admitted
+    // `of`, so it intercepted "X is part of Y" and re-asserted it as `works_at`
+    // before `relation_verb` ever saw it. Narrowing that rule to `at` handed
+    // the sentence back, this row started agreeing with its label, and the
+    // `test.failing` went red — which is precisely the tripwire it was for.
+    //
+    // This one still disagrees, and now for a different reason: it is labelled
+    // `model_only`, meaning the free tier is expected to miss it, and
+    // `relation_verb` reads it fine. That is the key being wrong rather than
+    // the extractor, and correcting it is a change to a scored baseline.
     'f-windbreak-part-of-northwind',
     // A stale label, in the opposite direction: `invested in` joined
     // `RELATION_VERBS` after the key was written, so two facts the key reserves
@@ -256,7 +265,7 @@ describe('names, and where in a sentence they sat', () => {
     // The class is unbalanced quotes, not possessives: `NAME` starts `[A-Z]`, so
     // an opening quote is never captured while the closing one is. Three rows in
     // a production brain are spelled this way and nothing renames an entity.
-    expect(extractFromStatement("'AI Systems' is a partner of Anthem.")?.subject).toBe(
+    expect(extractFromStatement("'AI Systems' is a partner at Anthem.")?.subject).toBe(
       'AI Systems',
     );
   });

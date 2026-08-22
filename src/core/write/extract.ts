@@ -227,10 +227,44 @@ interface Rule {
 const RULES: readonly Rule[] = [
   {
     // "X is the head of platform at Y", "X is a partner at Y"
+    //
+    // **The preposition is `at`, and it is the whole rule.** This pattern used
+    // to admit `of` and `for` as well, and measured against a production brain
+    // that made it the single largest source of wrong knowledge in the system:
+    // of 58 sentences it matched, **one** was a job title. The other 57 were
+    // `set for` (17 — every recurring calendar entry), `trademark of` and
+    // `service mark of` (13 — the legal footer of any commercial mail),
+    // `confirmed for` and `scheduled for` (10 — bookings), `part of` and
+    // `division of` (4), and assorted prose like `too busy`, `going to the
+    // camp` and `increasing the price`. Every one of them was asserted as
+    // employment, which is what typed `Android`, `App Store`, `Google Play`,
+    // `FICO`, `Discover` and `Glassdoor` as **people** — because `works_at`
+    // declares its subject a person and nothing ever looks at the word.
+    //
+    // `ROLE` is `[a-z][a-z ]{2,40}?`, which is very nearly any lowercase run,
+    // so the preposition was carrying the whole burden of deciding what this
+    // sentence is about — and `of` and `for` are the prepositions of
+    // composition, attribution and scheduling rather than of employment. Both
+    // spellings this rule was written for take `at`, which is why narrowing it
+    // costs nothing the rule was ever for: "the head of platform **at** Y"
+    // still matches, with `head of platform` captured as the role.
+    //
+    // Measured cost of the narrowing on that corpus: 58 matches become 4, and
+    // the one true positive — "Jack Cheng is a senior editor at Every" — is
+    // among the four. Three false positives remain (`is meeting at`, `is going
+    // to the camp at`, `is hosted at`) and are left standing rather than
+    // chased, because a rule that fired on 58 and now fires on 4 has had its
+    // failure mode changed in kind, and the next narrowing should be argued
+    // from a fresh measurement rather than from this list.
+    //
+    // Handing `part of` back is the other half: with `of` gone, `relation_verb`
+    // finally sees "X is part of Y" and asserts `part_of`, whose slots are
+    // **organization to organization**. This rule was intercepting it purely by
+    // being first.
     family: 'role_copula_sentence',
     match(sentence) {
       const pattern = new RegExp(
-        String.raw`(${NAME})\s+is\s+(?:the|a|an)?\s*(${ROLE})\s+(?:of|at|for)\s+(${NAME})`,
+        String.raw`(${NAME})\s+is\s+(?:the|a|an)?\s*(${ROLE})\s+at\s+(${NAME})`,
         'u',
       );
       const found = pattern.exec(sentence);
