@@ -115,6 +115,7 @@ import {
   gateFirstImport,
   selectWindow,
   type GateDecision,
+  type GateRefusal,
   type ImportCandidate,
   type ImportEstimate,
   type ImportTarget,
@@ -222,6 +223,17 @@ export type PullStopReason =
   | 'embed_key_unavailable'
   /** The embedder answered, and what it answered with was a refusal. */
   | 'embed_transport_failed';
+
+/**
+ * Which ingest-log code a GATE refusal is.
+ *
+ * Three callers now: the two `finishRun`s that record a refusal in the ingest
+ * log, and the connector-health row. They used to be two copies of one ternary
+ * and a health row that carried neither — see {@link healthAttemptFor}.
+ */
+function refusalCodeFor(reason: GateRefusal): IngestFailureCode {
+  return reason === 'cap_exhausted' ? 'budget_exhausted' : 'cancelled';
+}
 
 /** Which ingest-log code a stop is, so a stopped run says *why* it stopped. */
 function stopCodeFor(reason: PullStopReason): IngestFailureCode {
@@ -843,7 +855,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
       if (!clamp.ok) {
         await finishRun(tenant.sql, run.ingestId, {
           outcome: 'failed',
-          failureCode: clamp.reason === 'cap_exhausted' ? 'budget_exhausted' : 'cancelled',
+          failureCode: refusalCodeFor(clamp.reason),
         });
         await saveState(null);
         return {
@@ -906,7 +918,7 @@ export async function runPull(request: PullRequest): Promise<PullResult> {
       if (decision.proceed === 'refused') {
         await finishRun(tenant.sql, run.ingestId, {
           outcome: 'failed',
-          failureCode: decision.reason === 'cap_exhausted' ? 'budget_exhausted' : 'cancelled',
+          failureCode: refusalCodeFor(decision.reason),
         });
         await saveState(null);
         return {
@@ -1462,13 +1474,31 @@ export function attemptFor(
   // A completed run has nothing to explain, and the control plane's CHECK
   // refuses a row that claims otherwise. Derived here rather than trusted,
   // because a code left on a recovered connector is a red line nobody can clear.
-  const failed = result.outcome !== 'completed' && result.stopReason !== undefined;
+  //
+  // **A gate REFUSAL carries `decision.reason`, not `stopReason`**, and that gap
+  // is why the dashboard could only say "refused". Observed in production: a
+  // tenant sat at `run_outcome = 'refused'` with `ingest_failure_code = NULL`
+  // for two days while every pull was being turned away for
+  // `cap_exhausted` — and `pages.ts` had a written sentence for exactly that
+  // code, waiting for a value that never arrived. The connectors page said a
+  // check had happened; it could not say the brain was out of budget.
+  const refusedFor =
+    result.outcome === 'refused' && result.decision?.proceed === 'refused'
+      ? result.decision.reason
+      : undefined;
+  const failed =
+    result.outcome !== 'completed' &&
+    (result.stopReason !== undefined || refusedFor !== undefined);
   return {
     tenantId: lease.tenantId,
     source,
     at,
     runOutcome: result.outcome,
-    ingestFailureCode: failed ? stopCodeFor(result.stopReason as PullStopReason) : null,
+    ingestFailureCode: failed
+      ? refusedFor !== undefined
+        ? refusalCodeFor(refusedFor)
+        : stopCodeFor(result.stopReason as PullStopReason)
+      : null,
     // Only on a failed attempt, for `ingestFailureCode`'s reason: a status left
     // on a recovered connector is a second red line nobody can clear.
     ingestFailureStatus: failed ? (result.stopStatus ?? null) : null,

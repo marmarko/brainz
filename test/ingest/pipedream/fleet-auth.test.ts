@@ -353,3 +353,56 @@ describe('the operator hears it, the user does not', () => {
     }
   });
 });
+
+/**
+ * A gate refusal reaches the dashboard.
+ *
+ * **Observed in production before this was fixed**: a tenant sat at
+ * `run_outcome = 'refused'` with `ingest_failure_code = NULL` for two days
+ * while every pull was turned away for `cap_exhausted`. The connectors page
+ * already had a written sentence for that code — *"This brain's spending cap
+ * stopped the import before it finished"* — waiting for a value that never
+ * arrived, because a refusal carries `decision.reason` and the health row only
+ * consulted `stopReason`. The page could say a check had happened; it could not
+ * say the brain was out of budget.
+ */
+describe('a refusal says why, not just that it happened', () => {
+  const refusedPull = (reason: 'cap_exhausted' | 'quarantined'): PullResult =>
+    ({
+      outcome: 'refused',
+      mode: 'delta',
+      runId: 'r-1',
+      decision: { proceed: 'refused', reason, headroom: null },
+      estimate: null,
+      counts: {
+        written: 0, unchanged: 0, quarantined: 0, warned: 0, failed: 0,
+        tombstoned: 0, suppressed: 0,
+      },
+      widen: { excludedItems: 0, windowDays: null, outsideWindow: null },
+      attemptedItems: 0,
+      cursorAdvanced: false,
+      cursorInvalidated: false,
+    }) as unknown as PullResult;
+
+  test('an exhausted cap is recorded as budget_exhausted', () => {
+    const attempt = attemptFor({ tenantId: 't-1' }, 'gmail', NOW, refusedPull('cap_exhausted'));
+    expect(attempt.runOutcome).toBe('refused');
+    expect(attempt.ingestFailureCode).toBe('budget_exhausted');
+  });
+
+  test('any other refusal is cancelled, which is what the ingest log records too', () => {
+    const attempt = attemptFor({ tenantId: 't-1' }, 'gmail', NOW, refusedPull('quarantined'));
+    expect(attempt.ingestFailureCode).toBe('cancelled');
+  });
+
+  test('a completed run still carries no code, because there is nothing to explain', () => {
+    const completed = {
+      ...refusedPull('cap_exhausted'),
+      outcome: 'completed',
+      decision: null,
+    } as unknown as PullResult;
+    const attempt = attemptFor({ tenantId: 't-1' }, 'gmail', NOW, completed);
+    // A code left on a recovered connector is a red line nobody can clear.
+    expect(attempt.ingestFailureCode).toBeNull();
+  });
+});
