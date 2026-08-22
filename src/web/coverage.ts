@@ -216,6 +216,19 @@ export const EDGE_KINDS = [
   'part_of',
   'has_part',
   'related_to',
+  // Rung 27's half: the relationships only the owner can state. Nothing infers
+  // these — no extractor rule, no model phase — so a brain will show zero of
+  // them until somebody says one, and that is the honest reading rather than a
+  // gap. `belongs_to` is deliberately distinct from `part_of`: a subsidiary is a
+  // component of its parent, and a company belongs to whoever owns it.
+  'spouse_of',
+  'sibling_of',
+  'colleague_of',
+  'friend_of',
+  'parent_of',
+  'child_of',
+  'belongs_to',
+  'owns',
 ] as const;
 
 export type EdgeKind = (typeof EDGE_KINDS)[number];
