@@ -675,6 +675,7 @@ export function reviewPort(withTenant: TenantWork): ReviewPort {
             reviewId: request.reviewId,
             intent: request.intent,
             seenCardId: request.seenCardId,
+            seenPair: request.seenPair,
             now: new Date(),
           });
         } catch (error) {

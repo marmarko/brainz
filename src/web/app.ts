@@ -357,6 +357,8 @@ export interface ReviewPort {
     readonly intent: 'apply' | 'dismiss';
     /** The live card the LISTING showed, or null when it showed none. */
     readonly seenCardId: string | null;
+    /** Both entity ids the listing showed for a merge, comma-separated. */
+    readonly seenPair: string | null;
   }): Promise<
     | { readonly ok: true; readonly outcome: 'applied'; readonly hadPrior: boolean }
     | { readonly ok: true; readonly outcome: 'dismissed' }
@@ -376,7 +378,15 @@ export interface ReviewPort {
           // that one means the row is closed either way, and reporting a close
           // that never committed leaves the owner looking at a queue which
           // disagrees with itself.
-          | 'raced';
+          | 'raced'
+          // Merge-only. The two rows are no longer the two the listing showed —
+          // a widen minted new ids, or a rule merge absorbed one — so applying
+          // would merge a pair the owner never saw.
+          | 'pair_changed'
+          // Merge-only, and the one refusal the owner can act on: both rows
+          // carry a summary they approved. Two decisions, and this will not
+          // pick between them.
+          | 'two_of_yours';
       }
   >;
 
@@ -2491,11 +2501,16 @@ export function createWebApp(deps: WebAppDeps): (request: Request) => Promise<Re
         return json({ ok: false, code: 'invalid_params' }, 400);
       }
       const seen = stringOf(fields, 'seen_card_id');
+      // Shape-checked the same way `seen_card_id` is: a value that is not two
+      // ids is not a claim about which rows were shown, and is dropped rather
+      // than half-trusted.
+      const seenPair = stringOf(fields, 'seen_pair');
       const decided = await deps.review.decide({
         tenantId,
         reviewId,
         intent,
         seenCardId: /^[0-9]{1,18}$/.test(seen) ? seen : null,
+        seenPair: /^[0-9]{1,18},[0-9]{1,18}$/.test(seenPair) ? seenPair : null,
       });
       return afterForm(request, REVIEW_PATH, {}) ?? json(decided, decided.ok ? 200 : 409);
     }

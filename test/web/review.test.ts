@@ -157,9 +157,28 @@ describe('a proposal is refused for the first reason that applies', () => {
     expect(
       refusalFor({ severed: false, kind: 'commitment', truncated: false, targetLive: false }),
     ).toBe('needs_corroboration');
+    // `entity_merge` is NOT in that group, and the difference is the point: a
+    // fact and a commitment carry `chunk:` refs, so `targetLive` is meaningless
+    // for them and the kind has to answer first. A merge carries a parseable
+    // entity ref, so a dead target is a real and specific thing to say.
     expect(
       refusalFor({ severed: false, kind: 'entity_merge', truncated: false, targetLive: false }),
+    ).toBe('target_gone');
+    // The kinds nothing writes keep the old sentence.
+    expect(
+      refusalFor({ severed: false, kind: 'contradiction', truncated: false, targetLive: true }),
     ).toBe('no_apply_path');
+  });
+
+  test('a live, readable merge is offered — the button that used to be a sentence', () => {
+    expect(
+      refusalFor({ severed: false, kind: 'entity_merge', truncated: false, targetLive: true }),
+    ).toBeNull();
+    // And severance still outranks it: the two names live inside prose the
+    // listing withholds for a severed row.
+    expect(
+      refusalFor({ severed: true, kind: 'entity_merge', truncated: false, targetLive: true }),
+    ).toBe('origin_severed');
   });
 
   test('an entity_card with a live target and readable text is offered', () => {
@@ -282,6 +301,7 @@ describe('applying a proposal writes the owner’s verdict without destroying th
       reviewId: id,
       intent: 'apply',
       seenCardId: prior,
+      seenPair: null,
       now: NOW,
     });
     expect(outcome).toEqual({ ok: true, action: 'applied', hadPrior: true });
@@ -315,6 +335,7 @@ describe('applying a proposal writes the owner’s verdict without destroying th
       reviewId: id,
       intent: 'apply',
       seenCardId: null,
+      seenPair: null,
       now: NOW,
     });
     expect(outcome).toEqual({ ok: true, action: 'applied', hadPrior: false });
@@ -329,6 +350,7 @@ describe('applying a proposal writes the owner’s verdict without destroying th
       reviewId: id,
       intent: 'apply',
       seenCardId: '999999',
+      seenPair: null,
       now: NOW,
     });
     expect(outcome).toEqual({ ok: false, reason: 'card_changed' });
@@ -345,11 +367,13 @@ describe('applying a proposal writes the owner’s verdict without destroying th
   test('a second press finds the row closed rather than applying twice', async () => {
     const entity = await insertEntity();
     const id = await enqueue({ targetRef: `entity:${entity}` });
-    await decideProposal(sql, { reviewId: id, intent: 'apply', seenCardId: null, now: NOW });
+    await decideProposal(sql, { reviewId: id, intent: 'apply', seenCardId: null,
+      seenPair: null, now: NOW });
     const again = await decideProposal(sql, {
       reviewId: id,
       intent: 'apply',
       seenCardId: null,
+      seenPair: null,
       now: NOW,
     });
     expect(again).toEqual({ ok: false, reason: 'already_closed' });
@@ -364,6 +388,7 @@ describe('applying a proposal writes the owner’s verdict without destroying th
       reviewId: id,
       intent: 'apply',
       seenCardId: null,
+      seenPair: null,
       now: NOW,
     });
     expect(outcome).toEqual({ ok: false, reason: 'target_gone' });
@@ -385,6 +410,7 @@ describe('applying a proposal writes the owner’s verdict without destroying th
       reviewId: id,
       intent: 'apply',
       seenCardId: null,
+      seenPair: null,
       now: NOW,
     });
     expect(outcome).toEqual({ ok: false, reason: 'needs_an_embedding' });
@@ -401,6 +427,7 @@ describe('applying a proposal writes the owner’s verdict without destroying th
       reviewId: id,
       intent: 'dismiss',
       seenCardId: null,
+      seenPair: null,
       now: NOW,
     });
     expect(outcome).toEqual({ ok: true, action: 'dismissed', hadPrior: false });
@@ -412,6 +439,141 @@ describe('applying a proposal writes the owner’s verdict without destroying th
 // ---------------------------------------------------------------------------
 // Undo. The order of the two card statements is the design.
 // ---------------------------------------------------------------------------
+
+describe('applying a merge through the queue', () => {
+  const pairProposal = (left: string, right: string): string =>
+    `These look like the same thing under two names: ${left} \u2194 ${right}. Merging them is not something your brain will do on its own.`;
+
+  test('it makes the two into one, and closes as the owner', async () => {
+    const keeper = await insertEntity('Google Inc');
+    const loser = await insertEntity('Google LLC');
+    const id = await enqueue({
+      kind: 'entity_merge',
+      targetRef: `entity:${keeper}`,
+      proposal: pairProposal('Google Inc', 'Google LLC'),
+    });
+
+    const outcome = await decideProposal(sql, {
+      reviewId: id,
+      intent: 'apply',
+      seenCardId: null,
+      seenPair: [keeper, loser].join(','),
+      now: NOW,
+    });
+    expect(outcome).toEqual({ ok: true, action: 'applied', hadPrior: false });
+
+    const live = (await sql.unsafe(
+      `SELECT canonical_name FROM entity WHERE deleted_at IS NULL ORDER BY canonical_name`,
+    )) as Array<{ canonical_name: string }>;
+    expect(live.map((row) => row.canonical_name)).toEqual(['Google Inc']);
+
+    const closed = (await sql.unsafe(
+      `SELECT state, closed_by FROM review_queue WHERE review_id = $1::bigint`,
+      [id],
+    )) as Array<{ state: string; closed_by: string }>;
+    // R12a: a person judged this, out of band. That attestation is the product.
+    expect(closed[0]).toEqual({ state: 'applied', closed_by: 'user_out_of_band' });
+  });
+
+  test('a pair that moved since the listing refuses rather than merging strangers', async () => {
+    const keeper = await insertEntity('Google Inc');
+    const loser = await insertEntity('Google LLC');
+    const id = await enqueue({
+      kind: 'entity_merge',
+      targetRef: `entity:${keeper}`,
+      proposal: pairProposal('Google Inc', 'Google LLC'),
+    });
+
+    // The merge's `card_changed`: between the listing and the press, a widen
+    // minted a new id for one of the rows.
+    const outcome = await decideProposal(sql, {
+      reviewId: id,
+      intent: 'apply',
+      seenCardId: null,
+      seenPair: [keeper, '999999'].join(','),
+      now: NOW,
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.reason).toBe('pair_changed');
+
+    // Nothing merged, and the row is still OPEN — the answer may differ next
+    // time the owner looks.
+    const live = (await sql.unsafe(
+      `SELECT count(*)::int AS n FROM entity WHERE deleted_at IS NULL`,
+    )) as Array<{ n: number }>;
+    expect(live[0]?.n).toBe(2);
+    const state = (await sql.unsafe(
+      `SELECT state FROM review_queue WHERE review_id = $1::bigint`,
+      [id],
+    )) as Array<{ state: string }>;
+    expect(state[0]?.state).toBe('open');
+    void loser;
+  });
+
+  test('two approved summaries refuse, and say which refusal it was', async () => {
+    const keeper = await insertEntity('Google Inc');
+    const loser = await insertEntity('Google LLC');
+    for (const entity of [keeper, loser]) {
+      await sql.unsafe(
+        `INSERT INTO entity_card (entity_id, summary, trust_level, derivation, confidence,
+                                  origin_contexts)
+         VALUES ($1::bigint, 'The owner approved this.', 'user_stated', 'model_derived', 1, $2::text[])`,
+        [entity, textArrayLiteral([WORK])],
+      );
+    }
+    const id = await enqueue({
+      kind: 'entity_merge',
+      targetRef: `entity:${keeper}`,
+      proposal: pairProposal('Google Inc', 'Google LLC'),
+    });
+
+    const outcome = await decideProposal(sql, {
+      reviewId: id,
+      intent: 'apply',
+      seenCardId: null,
+      seenPair: [keeper, loser].join(','),
+      now: NOW,
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.reason).toBe('two_of_yours');
+    // Open, because this one the owner CAN act on: retire one summary first.
+    const state = (await sql.unsafe(
+      `SELECT state FROM review_queue WHERE review_id = $1::bigint`,
+      [id],
+    )) as Array<{ state: string }>;
+    expect(state[0]?.state).toBe('open');
+  });
+
+  test('a pair that no longer resolves closes the row rather than asking forever', async () => {
+    const keeper = await insertEntity('Google Inc');
+    const id = await enqueue({
+      kind: 'entity_merge',
+      targetRef: `entity:${keeper}`,
+      proposal: pairProposal('Google Inc', 'Nothing Here'),
+    });
+
+    const outcome = await decideProposal(sql, {
+      reviewId: id,
+      intent: 'apply',
+      seenCardId: null,
+      seenPair: null,
+      now: NOW,
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.reason).toBe('target_gone');
+    // Closed as `internal`: the owner pressed Apply, so it must not stay open —
+    // but nothing about the SENTENCE was judged, and `user_out_of_band` has to
+    // keep meaning that a person judged it.
+    const state = (await sql.unsafe(
+      `SELECT state, closed_by FROM review_queue WHERE review_id = $1::bigint`,
+      [id],
+    )) as Array<{ state: string; closed_by: string }>;
+    expect(state[0]).toEqual({ state: 'dismissed', closed_by: 'internal' });
+  });
+});
 
 describe('the refusals the server derives rather than trusts', () => {
   test('a severed proposal cannot be applied, even though the listing withheld its prose', async () => {
@@ -434,6 +596,7 @@ describe('the refusals the server derives rather than trusts', () => {
       reviewId,
       intent: 'apply',
       seenCardId: null,
+      seenPair: null,
       now: NOW,
     });
     expect(outcome.ok).toBe(false);
@@ -475,7 +638,8 @@ describe('undo puts the card back and reopens the decision', () => {
     const entity = await insertEntity();
     const prior = await insertCard(entity, 'The old summary.');
     const id = await enqueue({ targetRef: `entity:${entity}`, proposal: 'The new summary.' });
-    await decideProposal(sql, { reviewId: id, intent: 'apply', seenCardId: prior, now: NOW });
+    await decideProposal(sql, { reviewId: id, intent: 'apply', seenCardId: prior,
+      seenPair: null, now: NOW });
 
     const outcome = await undoProposal(sql, { reviewId: id });
     expect(outcome).toEqual({ ok: true, restored: true });
@@ -500,7 +664,8 @@ describe('undo puts the card back and reopens the decision', () => {
   test('an apply with no prior card undoes to no card, and says so', async () => {
     const entity = await insertEntity();
     const id = await enqueue({ targetRef: `entity:${entity}` });
-    await decideProposal(sql, { reviewId: id, intent: 'apply', seenCardId: null, now: NOW });
+    await decideProposal(sql, { reviewId: id, intent: 'apply', seenCardId: null,
+      seenPair: null, now: NOW });
 
     expect(await undoProposal(sql, { reviewId: id })).toEqual({ ok: true, restored: false });
     const live = (await sql.unsafe(
@@ -512,14 +677,16 @@ describe('undo puts the card back and reopens the decision', () => {
   test('undoing twice refuses rather than deleting a later apply’s card', async () => {
     const entity = await insertEntity();
     const id = await enqueue({ targetRef: `entity:${entity}` });
-    await decideProposal(sql, { reviewId: id, intent: 'apply', seenCardId: null, now: NOW });
+    await decideProposal(sql, { reviewId: id, intent: 'apply', seenCardId: null,
+      seenPair: null, now: NOW });
     await undoProposal(sql, { reviewId: id });
     expect(await undoProposal(sql, { reviewId: id })).toEqual({ ok: false, reason: 'nothing_to_undo' });
   });
 
   test('a dismissed row cannot be undone through this door', async () => {
     const id = await enqueue({ targetRef: 'entity:1' });
-    await decideProposal(sql, { reviewId: id, intent: 'dismiss', seenCardId: null, now: NOW });
+    await decideProposal(sql, { reviewId: id, intent: 'dismiss', seenCardId: null,
+      seenPair: null, now: NOW });
     expect(await undoProposal(sql, { reviewId: id })).toEqual({ ok: false, reason: 'nothing_to_undo' });
   });
 });

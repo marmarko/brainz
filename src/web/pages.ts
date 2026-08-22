@@ -1884,6 +1884,7 @@ ${quoted(row.proposal, row.truncated)}`;
   <form method="post" action="/api/review">
     <input type="hidden" name="review_id" value="${escapeHtml(row.reviewId)}">
     <input type="hidden" name="seen_card_id" value="${escapeHtml(row.currentCardId ?? '')}">
+    <input type="hidden" name="seen_pair" value="${escapeHtml(row.seenPair ?? '')}">
     <input type="hidden" name="intent" value="apply">
     <button type="submit">Use this</button>
   </form>

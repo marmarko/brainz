@@ -122,7 +122,9 @@
 
 import type { SQL } from 'bun';
 
+import { mergeEntities, planMerge } from '../core/write/merge.ts';
 import { textArrayLiteral } from '../core/write/pg-values.ts';
+import { mergeProposalPair } from '../worker/consolidate/deterministic.ts';
 import type { ReviewKind } from '../worker/consolidate/materialize.ts';
 
 /** One screenful of decisions, plus the row that answers "is there more". */
@@ -169,6 +171,14 @@ export interface Proposal {
   readonly createdAt: string;
   /** Null means Apply is offered. Non-null renders as a sentence, never a dead button. */
   readonly refusal: ProposalRefusal | null;
+  /**
+   * For a merge: the two entity ids this listing resolved, comma-separated.
+   *
+   * The merge's equivalent of {@link Proposal.currentCardId} — the pin that says
+   * *these are the two rows you were shown*. Null for every other kind, and for
+   * a merge whose pair no longer resolves to exactly two live rows.
+   */
+  readonly seenPair: string | null;
 }
 
 export type SideState = 'live' | 'superseded' | 'withdrawn';
@@ -225,6 +235,14 @@ export function refusalFor(row: {
   if (row.severed) return 'origin_severed';
   if (row.kind === 'fact') return 'needs_an_embedding';
   if (row.kind === 'commitment') return 'needs_corroboration';
+  // Before the `entity_card` test, and after the kinds carrying `chunk:` refs.
+  // An `entity_merge` row DOES carry a parseable entity ref, so it must go
+  // through `targetLive` — but its prose is the pair key rather than a summary
+  // to read, so truncation means something different and is applied first.
+  if (row.kind === 'entity_merge') {
+    if (row.truncated) return 'too_long_to_read';
+    return row.targetLive ? null : 'target_gone';
+  }
   if (row.kind !== 'entity_card') return 'no_apply_path';
   if (row.truncated) return 'too_long_to_read';
   if (!row.targetLive) return 'target_gone';
@@ -302,6 +320,45 @@ export async function readReview(sql: SQL): Promise<ReviewView> {
   }>;
 
   const proposalsOverflowed = proposalRows.length > REVIEW_CEILING;
+
+  // **The pin a merge needs, resolved once for the whole listing.**
+  //
+  // A card's pin is the id it displayed; a merge's is *these are the two rows
+  // you were shown*, and the pair lives in the proposal's PROSE as names rather
+  // than in a column — a consequence of proposals being keyed on names, which
+  // is what stops a widen re-asking every question the owner already dismissed.
+  //
+  // One statement for every merge row on the page, not one per row: this is a
+  // page render, and the listing is already bounded by `REVIEW_CEILING`.
+  const pairNames = new Map<string, readonly [string, string]>();
+  for (const row of proposalRows.slice(0, REVIEW_CEILING)) {
+    if (row.kind !== 'entity_merge' || row.proposal === null) continue;
+    const pair = mergeProposalPair(row.proposal);
+    if (pair !== null) pairNames.set(row.review_id, pair);
+  }
+  const idByName = new Map<string, string[]>();
+  if (pairNames.size > 0) {
+    const wanted = [...new Set([...pairNames.values()].flat())];
+    const rows = (await sql.unsafe(
+      `SELECT entity_id::text AS entity_id, lower(canonical_name) AS key
+         FROM entity WHERE deleted_at IS NULL AND lower(canonical_name) = ANY($1::text[])`,
+      [textArrayLiteral(wanted.map((name) => name.toLowerCase()))],
+    )) as Array<{ entity_id: string; key: string }>;
+    for (const row of rows) {
+      idByName.set(row.key, [...(idByName.get(row.key) ?? []), row.entity_id]);
+    }
+  }
+  const seenPairOf = (reviewId: string): string | null => {
+    const pair = pairNames.get(reviewId);
+    if (pair === undefined) return null;
+    const ids = pair.map((name) => idByName.get(name.toLowerCase()) ?? []);
+    // Exactly one live row per name, or there is no honest pin to give: zero
+    // means the pair is gone, and more than one is a question this screen
+    // cannot answer because it cannot know which row was meant.
+    if (ids.some((hits) => hits.length !== 1)) return null;
+    return ids.map((hits) => hits[0]).join(',');
+  };
+
   const proposals: Proposal[] = proposalRows.slice(0, REVIEW_CEILING).map((row) => ({
     reviewId: row.review_id,
     kind: row.kind,
@@ -322,6 +379,7 @@ export async function readReview(sql: SQL): Promise<ReviewView> {
       truncated: row.truncated,
       targetLive: row.target_live,
     }),
+    seenPair: seenPairOf(row.review_id),
   }));
 
   // Lands on `contradiction_open (detected_at DESC) WHERE status='open'`, the
@@ -405,9 +463,87 @@ export async function readReview(sql: SQL): Promise<ReviewView> {
   };
 }
 
+/**
+ * Apply one merge proposal, inside the caller's transaction.
+ *
+ * **The pair is re-resolved from the proposal's own prose**, using the function
+ * that wrote it, rather than from `target_ref` — which names only one of the
+ * two. That is a consequence of the proposal being keyed on NAMES: an id-keyed
+ * one would re-enqueue every dismissal under a new keeper after any widen.
+ *
+ * **`pair_changed` is the merge's `card_changed`.** Between the listing and the
+ * press, a widen can mint new ids for either row, or a rule merge can absorb
+ * one. Applying then would merge two rows the owner never saw. The listing
+ * emits both ids it displayed and this refuses on any mismatch.
+ */
+async function applyMerge(
+  tx: SQL,
+  input: { readonly proposal: string; readonly seenPair: string | null },
+): Promise<
+  | { readonly ok: true; readonly entityId: string }
+  | { readonly ok: false; readonly reason: 'target_gone' | 'pair_changed' | 'two_of_yours' }
+> {
+  const pair = mergeProposalPair(input.proposal);
+  if (pair === null) return { ok: false, reason: 'target_gone' } as const;
+
+  // Resolved by canonical name against the live set, never through
+  // `findEntitiesByName`: that hops aliases first and collapses with
+  // `DISTINCT ON` over a vocabulary the schema itself calls "deliberately not
+  // unique across entities", so it could answer with a different entity than
+  // the one the proposal named.
+  const resolved: string[] = [];
+  for (const name of pair) {
+    const rows = (await tx.unsafe(
+      `SELECT entity_id::text AS entity_id FROM entity
+        WHERE deleted_at IS NULL AND lower(canonical_name) = lower($1)
+        ORDER BY entity_id
+          FOR UPDATE`,
+      [name],
+    )) as Array<{ entity_id: string }>;
+    // Zero is a pair that no longer exists; more than one is a question this
+    // screen cannot answer, because it cannot know which was meant.
+    if (rows.length !== 1) return { ok: false, reason: 'target_gone' } as const;
+    resolved.push(rows[0]?.entity_id ?? '');
+  }
+
+  if (input.seenPair !== null) {
+    const seen = input.seenPair.split(',').sort();
+    if (JSON.stringify(seen) !== JSON.stringify([...resolved].sort())) {
+      return { ok: false, reason: 'pair_changed' } as const;
+    }
+  }
+
+  const [primary, other] = resolved;
+  if (primary === undefined || other === undefined) {
+    return { ok: false, reason: 'target_gone' } as const;
+  }
+  const planned = await planMerge(tx, { primary, members: [other] });
+  if (!planned.ok) {
+    // `two_of_yours` is the only refusal the owner can act on; the rest mean
+    // the rows moved, which is `target_gone` from this surface.
+    return {
+      ok: false,
+      reason: planned.reason === 'two_of_yours' ? 'two_of_yours' : 'target_gone',
+    } as const;
+  }
+  const merged = await mergeEntities(tx, planned.plan, new Date());
+  return { ok: true, entityId: merged.entityId } as const;
+}
+
 export type ProposalOutcome =
   | { readonly ok: true; readonly action: 'applied' | 'dismissed'; readonly hadPrior: boolean }
-  | { readonly ok: false; readonly reason: 'already_closed' | 'target_gone' | 'card_changed' | ProposalRefusal };
+  | {
+      readonly ok: false;
+      readonly reason:
+        | 'already_closed'
+        | 'target_gone'
+        | 'card_changed'
+        /** The two rows are not the two the listing showed. */
+        | 'pair_changed'
+        /** Two summaries the owner approved are two decisions; it will not pick. */
+        | 'two_of_yours'
+        | ProposalRefusal;
+    };
 
 /**
  * Close one proposal, and for `entity_card` write the card it proposes.
@@ -421,6 +557,15 @@ export async function decideProposal(
     readonly reviewId: string;
     readonly intent: 'apply' | 'dismiss';
     readonly seenCardId: string | null;
+    /**
+     * The two entity ids the listing showed for a merge, comma-separated.
+     *
+     * The card path re-checks the card id it displayed; a merge needs the
+     * equivalent for *these are still the two rows you looked at*. It cannot be
+     * derived from the row, because the pair lives in the proposal PROSE as
+     * names — see `mergeProposalPair`.
+     */
+    readonly seenPair: string | null;
     readonly now: Date;
   },
 ): Promise<ProposalOutcome> {
@@ -486,6 +631,26 @@ export async function decideProposal(
       // person judged this", because that attestation is this screen's product.
       await close('dismissed', 'internal');
       return { ok: false, reason: 'target_gone' } as const;
+    }
+
+    if (row.kind === 'entity_merge') {
+      const applied = await applyMerge(tx, {
+        proposal: row.proposal,
+        seenPair: input.seenPair,
+      });
+      if (!applied.ok) {
+        // `target_gone` closes the row: a pair that no longer resolves is a
+        // question about rows that are not there, and leaving it open would ask
+        // it forever. Everything else leaves the row OPEN, because the answer
+        // may differ next time the owner looks.
+        if (applied.reason === 'target_gone') {
+          await close('dismissed', 'internal');
+          return { ok: false, reason: 'target_gone' } as const;
+        }
+        return { ok: false, reason: applied.reason } as const;
+      }
+      await close('applied', 'user_out_of_band');
+      return { ok: true, action: 'applied', hadPrior: false } as const;
     }
 
     const entityRows = (await tx.unsafe(

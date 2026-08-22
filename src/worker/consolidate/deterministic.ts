@@ -789,7 +789,7 @@ function designatorStrippedCore(name: string): string {
 }
 
 /** The two names, sorted, which is the identity a proposal is deduplicated on. */
-function mergeProposalKey(left: string, right: string): string {
+export function mergeProposalKey(left: string, right: string): string {
   return [left, right].sort((a, b) => normalize(a).localeCompare(normalize(b))).join(' \u2194 ');
 }
 
@@ -804,8 +804,28 @@ function mergeProposalText(key: string): string {
   return `These look like the same thing under two names: ${key}. Merging them is not something your brain will do on its own \u2014 the two rows have different names, so no rule will ever collapse them.`;
 }
 
+/**
+ * The two names back out of a stored proposal sentence.
+ *
+ * Exported because the review surface has to act on this proposal and the pair
+ * lives in the PROSE rather than in a column — which is deliberate, and the
+ * reason is one rung up: an id-keyed proposal would re-enqueue everything the
+ * owner had already dismissed, under a new keeper, after any widen. So the
+ * apply path re-derives the pair the same way, from the same text, using the
+ * same function that wrote it.
+ */
+export function mergeProposalPair(proposal: string): readonly [string, string] | null {
+  const key = proposalKeyOf(proposal);
+  const halves = key.split(' \u2194 ');
+  if (halves.length !== 2) return null;
+  const [left, right] = halves;
+  if (left === undefined || right === undefined) return null;
+  if (left.trim().length === 0 || right.trim().length === 0) return null;
+  return [left.trim(), right.trim()];
+}
+
 /** The pair key back out of a stored proposal sentence. */
-function proposalKeyOf(proposal: string): string {
+export function proposalKeyOf(proposal: string): string {
   const match = /two names: (.+?)\. Merging/u.exec(proposal);
   return match?.[1] ?? proposal;
 }
