@@ -428,7 +428,17 @@ export async function decideProposal(
     const claimed = (await tx.unsafe(
       `SELECT kind, target_ref, proposal, confidence, run_id::text AS run_id, origin_contexts,
               length(proposal) AS n,
-              nullif(substring(target_ref from '^entity:([0-9]{1,18})$'), '')::bigint AS entity_id
+              nullif(substring(target_ref from '^entity:([0-9]{1,18})$'), '')::bigint AS entity_id,
+              -- Read here rather than trusted from the listing, and never
+              -- hardcoded: the listing withholds a severed row's prose, so
+              -- applying one would act on text the owner was deliberately not
+              -- shown. The instant is the test, not membership -- see the
+              -- listing's own note.
+              EXISTS (
+                SELECT 1 FROM severance s
+                 WHERE s.origin_context = ANY (review_queue.origin_contexts)
+                   AND s.severed_at >= review_queue.created_at
+              ) AS severed
          FROM review_queue
         WHERE review_id = $1::bigint AND state = 'open'
           FOR UPDATE`,
@@ -441,6 +451,7 @@ export async function decideProposal(
       origin_contexts: string[];
       n: number;
       entity_id: string | null;
+      severed: boolean;
     }>;
     const row = claimed[0];
     if (row === undefined) return { ok: false, reason: 'already_closed' } as const;
@@ -462,7 +473,7 @@ export async function decideProposal(
     }
 
     const refusal = refusalFor({
-      severed: false,
+      severed: row.severed,
       kind: row.kind,
       truncated: row.n > REVIEWABLE_CHARACTERS,
       targetLive: row.entity_id !== null,
@@ -566,6 +577,14 @@ export async function undoProposal(
               nullif(substring(target_ref from '^entity:([0-9]{1,18})$'), '')::bigint AS entity_id
          FROM review_queue
         WHERE review_id = $1::bigint AND state = 'applied' AND closed_by = 'user_out_of_band'
+          -- A server gate, not a copy change. This function knows exactly one
+          -- reversal: delete a user_stated card and un-retire the one beneath
+          -- it. Any other appliable kind closes into the same claim, and aimed
+          -- at one of those this would restore nothing while reopening the row
+          -- for a second apply. The two extra predicates on the DELETE below
+          -- make that unreachable today; this makes it unreachable by
+          -- construction.
+          AND kind = 'entity_card'
           FOR UPDATE`,
       [input.reviewId],
     )) as Array<{ closed_at: Date | string | null; entity_id: string | null }>;

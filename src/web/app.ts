@@ -370,7 +370,13 @@ export interface ReviewPort {
           | 'needs_corroboration'
           | 'origin_severed'
           | 'too_long_to_read'
-          | 'card_changed';
+          | 'card_changed'
+          // The transaction rolled back on a late race, so the row is still
+          // OPEN. Deliberately not folded into the `target_gone` OUTCOME above:
+          // that one means the row is closed either way, and reporting a close
+          // that never committed leaves the owner looking at a queue which
+          // disagrees with itself.
+          | 'raced';
       }
   >;
 

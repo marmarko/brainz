@@ -413,6 +413,63 @@ describe('applying a proposal writes the owner’s verdict without destroying th
 // Undo. The order of the two card statements is the design.
 // ---------------------------------------------------------------------------
 
+describe('the refusals the server derives rather than trusts', () => {
+  test('a severed proposal cannot be applied, even though the listing withheld its prose', async () => {
+    // `decideProposal` hardcoded `severed: false`, so the one row whose text the
+    // listing deliberately does not print was the one row an apply would act on
+    // sight-unseen.
+    const entity = await insertEntity('Verdant Systems');
+    const reviewId = await enqueue({
+      kind: 'entity_card',
+      targetRef: `entity:${entity}`,
+      proposal: 'A summary the owner was never shown.',
+    });
+    await sql.unsafe(
+      `INSERT INTO severance (origin_context, severed_at, removed, recomputed, surviving_origins)
+       VALUES ($1, now(), '{}'::jsonb, '{}'::jsonb, ARRAY[]::text[])`,
+      [WORK],
+    );
+
+    const outcome = await decideProposal(sql, {
+      reviewId,
+      intent: 'apply',
+      seenCardId: null,
+      now: NOW,
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.reason).toBe('origin_severed');
+    // And nothing was written.
+    const cards = (await sql.unsafe(
+      `SELECT count(*)::int AS n FROM entity_card WHERE entity_id = $1::bigint`,
+      [entity],
+    )) as Array<{ n: number }>;
+    expect(cards[0]?.n).toBe(0);
+  });
+
+  test('undo refuses a kind it does not know how to reverse', async () => {
+    // The claim query had no `kind` predicate, and every appliable kind closes
+    // into the same `applied` / `user_out_of_band` state it matches on. This
+    // function knows exactly one reversal.
+    const entity = await insertEntity('Google Inc');
+    const reviewId = await enqueue({
+      kind: 'entity_merge',
+      targetRef: `entity:${entity}`,
+      proposal: 'These look like the same thing under two names: A <-> B.',
+    });
+    await sql.unsafe(
+      `UPDATE review_queue SET state = 'applied', closed_by = 'user_out_of_band', closed_at = now()
+        WHERE review_id = $1::bigint`,
+      [reviewId],
+    );
+
+    const outcome = await undoProposal(sql, { reviewId });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.reason).toBe('nothing_to_undo');
+  });
+});
+
 describe('undo puts the card back and reopens the decision', () => {
   test('it deletes the approved card, restores the retired one, and reopens the row', async () => {
     const entity = await insertEntity();

@@ -90,7 +90,13 @@ import { createTenantStorage } from '../control/storage.ts';
 import { createPipedreamConnectorVendor } from './connectors.ts';
 import { readCoverage } from './coverage.ts';
 import { readProcessing } from './processing.ts';
-import { decideConflict, decideProposal, readReview, undoProposal } from './review.ts';
+import {
+  ReviewRollback,
+  decideConflict,
+  decideProposal,
+  readReview,
+  undoProposal,
+} from './review.ts';
 import { listEntities, lookupEntity } from './entity.ts';
 import {
   openConnectorClient,
@@ -653,12 +659,36 @@ export function reviewPort(withTenant: TenantWork): ReviewPort {
 
     decide: (request) =>
       withTenant(request.tenantId, async (sql) => {
-        const outcome = await decideProposal(sql, {
-          reviewId: request.reviewId,
-          intent: request.intent,
-          seenCardId: request.seenCardId,
-          now: new Date(),
-        });
+        // **`ReviewRollback` is thrown inside the transaction and was caught
+        // nowhere in `src/`.** The late race its docstring promises as a typed
+        // reason therefore escaped the port as an uncaught throw — a 500 on the
+        // one surface whose job is explaining what happened.
+        //
+        // It is mapped to a FAILURE and never to the `target_gone` outcome
+        // below, and the distinction is the whole point: that branch means the
+        // row is closed either way, and a rollback means the row is still
+        // OPEN. Reporting a close that never committed would leave the owner
+        // looking at a queue that disagrees with itself.
+        let outcome: Awaited<ReturnType<typeof decideProposal>>;
+        try {
+          outcome = await decideProposal(sql, {
+            reviewId: request.reviewId,
+            intent: request.intent,
+            seenCardId: request.seenCardId,
+            now: new Date(),
+          });
+        } catch (error) {
+          if (error instanceof ReviewRollback) {
+            // `card_changed` keeps its own name because the page has a sentence
+            // for it. `target_gone` does not: as an outcome it means the row is
+            // closed, and here the transaction rolled back and the row is open.
+            return {
+              ok: false,
+              reason: error.reason === 'card_changed' ? 'card_changed' : 'raced',
+            } as const;
+          }
+          throw error;
+        }
         if (outcome.ok) {
           return outcome.action === 'applied'
             ? ({ ok: true, outcome: 'applied', hadPrior: outcome.hadPrior } as const)
