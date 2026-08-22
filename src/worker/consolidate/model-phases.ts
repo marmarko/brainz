@@ -729,7 +729,7 @@ export async function runEnrichPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome
       continue;
     }
 
-    await writeEntityCard(deps.sql, {
+    const written = await writeEntityCard(deps.sql, {
       entityId: entity.entity_id,
       summary,
       confidence: score,
@@ -737,7 +737,12 @@ export async function runEnrichPhase(deps: ModelPhaseDeps): Promise<PhaseOutcome
       runId: deps.runId,
       evidenceOrigins: entity.origin_contexts,
     });
-    applied += 1;
+    // `null` means the entity already carries a card the OWNER approved, and
+    // this phase declined to overwrite it. Not applied, and not logged as a
+    // refusal either: nothing went wrong and nothing needs looking at. The
+    // whole-batch `markConsidered` below still stamps it, so a declined entity
+    // is not re-offered every cycle for the life of the brain.
+    if (written !== null) applied += 1;
   }
 
   // The whole batch, card or no card. An entity the model declined to write

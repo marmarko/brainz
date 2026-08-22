@@ -494,7 +494,7 @@ export async function writeEntityCard(
     readonly runId: string;
     readonly evidenceOrigins: readonly string[];
   },
-): Promise<string> {
+): Promise<string | null> {
   const entity = (await sql`
     SELECT origin_contexts FROM entity WHERE entity_id = ${input.entityId}::bigint
   `) as Array<{ origin_contexts: string[] }>;
@@ -511,12 +511,30 @@ export async function writeEntityCard(
                   confidence = EXCLUDED.confidence,
                   model_id = EXCLUDED.model_id,
                   run_id = EXCLUDED.run_id
+      -- **The owner's decision outranks the next cycle's sentence.**
+      --
+      -- DO UPDATE sets four columns and deliberately never set trust_level,
+      -- derivation or created_at -- so without this predicate an approved card
+      -- kept its user_stated label while its BYTES were replaced by the
+      -- model's. That is the model's words published under the owner's name,
+      -- and it is worse than a silent overwrite: undoProposal keys on the
+      -- card's created_at, which survived too, so the Undo offered for that
+      -- approval would have deleted the model's text believing it was the
+      -- owner's.
+      --
+      -- It has to be drawn here because it cannot be drawn upstream:
+      -- runEnrichPhase selects candidates on enrich_considered_version alone
+      -- and carries no trust predicate, so by the time a summary reaches this
+      -- function the phase has already decided the entity is fair game.
+      WHERE entity_card.trust_level <> 'user_stated'
     RETURNING card_id::text AS card_id
   `) as Array<{ card_id: string }>;
 
-  const cardId = rows[0]?.card_id;
-  if (cardId === undefined) throw new Error(`could not write an entity card for ${input.entityId}`);
-  return cardId;
+  // **Zero rows is a legal outcome now, not a failure.** The conflict target
+  // matched an existing card and the predicate above declined to touch it, so
+  // there is no id to return and nothing went wrong. The old unconditional
+  // throw would have turned the owner owning their own card into a phase error.
+  return rows[0]?.card_id ?? null;
 }
 
 export async function writeCommitment(

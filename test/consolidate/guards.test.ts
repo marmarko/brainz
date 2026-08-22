@@ -300,6 +300,132 @@ describe('3 — the confidence gate', () => {
   );
 
   test(
+    'a card the owner approved is not overwritten by the next cycle, under their name',
+    async () => {
+      const { sql } = tenant;
+      const page = await seedPage(sql, {
+        origin: 'personal:mail',
+        sourceType: 'email',
+        title: 'intro',
+        body: 'Ronan Whitfield joined Verdant Systems.',
+      });
+      await seedFact(sql, {
+        statement: 'Ronan Whitfield joined Verdant Systems.',
+        origins: ['personal:mail'],
+        pageId: page.pageId,
+        chunkIds: page.chunkIds,
+        confidence: 0.8,
+      });
+      const entity = await sql`
+        INSERT INTO entity (canonical_name, entity_type, origin_contexts)
+        VALUES (${'Verdant Systems'}, ${'organization'}, ARRAY['personal:mail'])
+        RETURNING entity_id::text AS id` as Array<{ id: string }>;
+      const entityId = entity[0]?.id ?? '';
+
+      // The shape the review queue's apply path writes: the owner read a
+      // proposal and approved it, so the card is theirs.
+      await sql`
+        INSERT INTO entity_card (entity_id, summary, trust_level, derivation, confidence,
+                                 origin_contexts)
+        VALUES (${entityId}::bigint, ${'The owner wrote this.'}, ${'user_stated'},
+                ${'model_derived'}, 1, ARRAY['personal:mail'])`;
+      const before = (await sql`
+        SELECT summary, created_at FROM entity_card WHERE entity_id = ${entityId}::bigint
+      `) as Array<{ summary: string; created_at: Date }>;
+
+      const { gateway } = createGateway({
+        chat: {
+          enrich: () =>
+            JSON.stringify({
+              cards: [
+                { entity: 'Verdant Systems', summary: 'The model wrote this.', confidence: 0.95 },
+              ],
+            }),
+        },
+      });
+      const run = await openRun(sql, {
+        trigger: 'time_ceiling', tier: 'paid', now: new Date(), estimateMicroUsd: 0,
+      });
+      const outcome = await runEnrichPhase({
+        sql, gateway, tenantId: TENANT, caller: CALLER,
+        runId: run.run.runId, now: new Date(), budget: uncappedBudget('enrich'),
+      });
+
+      const after = (await sql`
+        SELECT summary, trust_level, created_at FROM entity_card
+         WHERE entity_id = ${entityId}::bigint
+      `) as Array<{ summary: string; trust_level: string; created_at: Date }>;
+
+      // The bytes are the owner's, not the model's.
+      expect(after[0]?.summary).toBe('The owner wrote this.');
+      expect(after[0]?.trust_level).toBe('user_stated');
+      // And `created_at` is untouched — `undoProposal` keys on it, so an
+      // overwrite that moved it would hand the owner an Undo that deleted
+      // somebody else's text.
+      expect(after[0]?.created_at).toEqual(before[0]?.created_at as Date);
+      // The phase did not count it as applied...
+      expect(outcome.applied).toBe(0);
+      // ...and still marked it considered, so it is not re-offered every cycle
+      // for the life of the brain.
+      const considered = (await sql`
+        SELECT enrich_considered_version AS v FROM entity WHERE entity_id = ${entityId}::bigint
+      `) as Array<{ v: number | null }>;
+      expect(considered[0]?.v).not.toBeNull();
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
+    'a model-written card IS replaced, so the guard is a trust rule and not a freeze',
+    async () => {
+      const { sql } = tenant;
+      const page = await seedPage(sql, {
+        origin: 'personal:mail', sourceType: 'email', title: 'intro',
+        body: 'Ronan Whitfield joined Verdant Systems.',
+      });
+      await seedFact(sql, {
+        statement: 'Ronan Whitfield joined Verdant Systems.',
+        origins: ['personal:mail'], pageId: page.pageId, chunkIds: page.chunkIds, confidence: 0.8,
+      });
+      const entity = await sql`
+        INSERT INTO entity (canonical_name, entity_type, origin_contexts)
+        VALUES (${'Verdant Systems'}, ${'organization'}, ARRAY['personal:mail'])
+        RETURNING entity_id::text AS id` as Array<{ id: string }>;
+      const entityId = entity[0]?.id ?? '';
+      await sql`
+        INSERT INTO entity_card (entity_id, summary, trust_level, derivation, confidence,
+                                 origin_contexts)
+        VALUES (${entityId}::bigint, ${'An older model sentence.'}, ${'model_inferred'},
+                ${'model_derived'}, 0.9, ARRAY['personal:mail'])`;
+
+      const { gateway } = createGateway({
+        chat: {
+          enrich: () =>
+            JSON.stringify({
+              cards: [
+                { entity: 'Verdant Systems', summary: 'A newer model sentence.', confidence: 0.95 },
+              ],
+            }),
+        },
+      });
+      const run = await openRun(sql, {
+        trigger: 'time_ceiling', tier: 'paid', now: new Date(), estimateMicroUsd: 0,
+      });
+      const outcome = await runEnrichPhase({
+        sql, gateway, tenantId: TENANT, caller: CALLER,
+        runId: run.run.runId, now: new Date(), budget: uncappedBudget('enrich'),
+      });
+
+      const after = (await sql`
+        SELECT summary FROM entity_card WHERE entity_id = ${entityId}::bigint
+      `) as Array<{ summary: string }>;
+      expect(after[0]?.summary).toBe('A newer model sentence.');
+      expect(outcome.applied).toBe(1);
+    },
+    SETUP_TIMEOUT_MS,
+  );
+
+  test(
     'an entity the corpus says nothing about is never sent to the model',
     async () => {
       const { sql } = tenant;
