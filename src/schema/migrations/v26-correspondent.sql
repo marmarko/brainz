@@ -68,7 +68,10 @@ CREATE TABLE correspondent (
   -- row, so a nulled binding reads as never-bound and live sightings would
   -- re-promote the person 96 hours after the owner retracted them. And a widen
   -- must still rebind, which `widenEntityOrigins` does by explicit UPDATE,
-  -- exactly as it already does for `entity_slug` and `entity_alias`.
+  -- exactly as it already does for `entity_slug` and `entity_alias`. (That
+  -- sentence was written here before the code did it, and was false for two
+  -- commits — see the re-point at step 6b of that function, and the test that
+  -- now holds it there.)
   --
   -- So a binding pointing at a tombstoned or absent entity is READ as a user
   -- retraction. The precedent for the soft reference is `review_queue.target_ref`.

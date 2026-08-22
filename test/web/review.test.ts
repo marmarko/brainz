@@ -511,6 +511,38 @@ describe('applying a merge through the queue', () => {
     void loser;
   });
 
+  test('a merge with no pin refuses, because that is the ambiguous case not the lenient one', async () => {
+    // The listing emits a null pin exactly when a name resolves to zero or more
+    // than one live row. Skipping the comparison then reads as lenient and is
+    // the opposite: the one case with no pin is the one case where the page
+    // could not say which two rows it had shown — and a merge cannot be undone.
+    const keeper = await insertEntity('Google Inc');
+    const loser = await insertEntity('Google LLC');
+    const id = await enqueue({
+      kind: 'entity_merge',
+      targetRef: `entity:${keeper}`,
+      proposal: pairProposal('Google Inc', 'Google LLC'),
+    });
+
+    const outcome = await decideProposal(sql, {
+      reviewId: id,
+      intent: 'apply',
+      seenCardId: null,
+      seenPair: null,
+      now: NOW,
+    });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.reason).toBe('pair_changed');
+
+    // Nothing merged, and the row is still open for a reload that can pin it.
+    const live = (await sql.unsafe(
+      `SELECT count(*)::int AS n FROM entity WHERE deleted_at IS NULL`,
+    )) as Array<{ n: number }>;
+    expect(live[0]?.n).toBe(2);
+    void loser;
+  });
+
   test('two approved summaries refuse, and say which refusal it was', async () => {
     const keeper = await insertEntity('Google Inc');
     const loser = await insertEntity('Google LLC');

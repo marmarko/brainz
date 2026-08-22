@@ -506,11 +506,20 @@ async function applyMerge(
     resolved.push(rows[0]?.entity_id ?? '');
   }
 
-  if (input.seenPair !== null) {
-    const seen = input.seenPair.split(',').sort();
-    if (JSON.stringify(seen) !== JSON.stringify([...resolved].sort())) {
-      return { ok: false, reason: 'pair_changed' } as const;
-    }
+  // **An absent pin refuses, and the reason is the shape of when it is absent.**
+  //
+  // The first version skipped the comparison when `seenPair` was null, which
+  // reads as lenient and is the opposite: the listing emits null exactly when a
+  // name resolves to zero or more than one live row — the KNOWN-AMBIGUOUS case
+  // — so the one situation with no pin was the one situation where the page
+  // could not say which two rows it had shown. It applied anyway.
+  //
+  // A merge cannot be undone, so the missing claim is refused rather than
+  // assumed. Reload and the listing either offers a pin or refuses the row.
+  if (input.seenPair === null) return { ok: false, reason: 'pair_changed' } as const;
+  const seen = input.seenPair.split(',').sort();
+  if (JSON.stringify(seen) !== JSON.stringify([...resolved].sort())) {
+    return { ok: false, reason: 'pair_changed' } as const;
   }
 
   const [primary, other] = resolved;

@@ -481,7 +481,33 @@ async function widenEntityOrigins(
     now: new Date(),
   });
 
-  // 6b. And any proposal still waiting on the owner. `review_queue.target_ref`
+  // 6b. **The dictionary binding, which rung 26's own comment claimed happened
+  // here and which did not.** That sentence was false against this file from the
+  // day it shipped, and the consequence is not cosmetic: promotion reads a
+  // binding pointing at a tombstoned entity as a USER RETRACTION — deliberately,
+  // because `forgetRecord` writes no suppression row and the latched binding is
+  // the record. So a widen silently and permanently un-promoted a person, with
+  // no counter and no trace: a latched row never re-enters the candidate scan,
+  // which is `WHERE promoted_at IS NULL`.
+  await db.unsafe(
+    `UPDATE correspondent c SET entity_id = m.new_id
+       FROM unnest($1::bigint[], $2::bigint[]) AS m(old_id, new_id)
+      WHERE c.entity_id = m.old_id`,
+    [numericArrayLiteral([...newIdOf.keys()]), numericArrayLiteral([...newIdOf.values()])],
+  );
+
+  // 6c. And the entity the owner said was them. Same shape, same reason: the
+  // pointer carries no foreign key, so a widen would leave it aimed at a
+  // tombstone, which reads as "never stated" — silently un-saying a thing the
+  // owner said.
+  await db.unsafe(
+    `UPDATE tenant_setting t SET self_entity_id = m.new_id
+       FROM unnest($1::bigint[], $2::bigint[]) AS m(old_id, new_id)
+      WHERE t.self_entity_id = m.old_id`,
+    [numericArrayLiteral([...newIdOf.keys()]), numericArrayLiteral([...newIdOf.values()])],
+  );
+
+  // 6d. And any proposal still waiting on the owner. `review_queue.target_ref`
   // is parsed rather than joined (deliberately -- it names rows in several
   // tables), so nothing re-pointed it: a widen quietly turned an open
   // `entity_card` proposal into one whose target no longer resolves, leaving

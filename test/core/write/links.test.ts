@@ -788,6 +788,54 @@ describe('widening an entity does not lose what was attached to it', () => {
     expect(rows[0]?.v).toBe(1);
   }, TEST_TIMEOUT_MS);
 
+  test('a dictionary binding follows the entity, or the person is silently un-promoted', async () => {
+    await reset();
+    const seeded = await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Kettle Works', type: 'organization', origins: ['personal'], taxonomyVersion: 1 },
+    ]);
+    const before = seeded.get('kettle works')?.entityId ?? '';
+    await tenant.sql`
+      INSERT INTO correspondent (address_key, origin_context, display_name, name_key, name_source,
+                                 entity_id, promoted_at)
+      VALUES (${'ada@example.test'}, ${'personal'}, ${'Ada Lovelace'}, ${'ada lovelace'},
+              ${'headers'}, ${before}::bigint, now())`;
+
+    const after = await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Kettle Works', type: 'organization', origins: ['work'], taxonomyVersion: 1 },
+    ]);
+    const successor = after.get('kettle works')?.entityId ?? '';
+
+    const rows = (await tenant.sql`
+      SELECT entity_id::text AS entity_id FROM correspondent WHERE address_key = ${'ada@example.test'}
+    `) as Array<{ entity_id: string }>;
+    // Promotion reads a binding pointing at a tombstone as a USER RETRACTION —
+    // deliberately, because `forgetRecord` writes no suppression row. So an
+    // un-re-pointed binding permanently un-promotes a person, with no counter
+    // and no trace: a latched row never re-enters the candidate scan.
+    expect(rows[0]?.entity_id).toBe(successor);
+    expect(rows[0]?.entity_id).not.toBe(before);
+  }, TEST_TIMEOUT_MS);
+
+  test('the entity the owner said was them follows too', async () => {
+    await reset();
+    const seeded = await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Marcus Fell', type: 'person', origins: ['personal'], taxonomyVersion: 1 },
+    ]);
+    const before = seeded.get('marcus fell')?.entityId ?? '';
+    await tenant.sql`UPDATE tenant_setting SET self_entity_id = ${before}::bigint`;
+
+    const after = await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Marcus Fell', type: 'person', origins: ['work'], taxonomyVersion: 1 },
+    ]);
+
+    const rows = (await tenant.sql`
+      SELECT self_entity_id::text AS self_entity_id FROM tenant_setting
+    `) as Array<{ self_entity_id: string | null }>;
+    // The pointer carries no foreign key, so a stale one reads as "never
+    // stated" — silently un-saying a thing the owner said.
+    expect(rows[0]?.self_entity_id).toBe(after.get('marcus fell')?.entityId ?? '');
+  }, TEST_TIMEOUT_MS);
+
   test('an open proposal follows the entity rather than being orphaned', async () => {
     await reset();
     const seeded = await resolveOrCreateEntities(tenant.sql, [

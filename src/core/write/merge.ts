@@ -537,7 +537,21 @@ export async function mergeEntities(
     originsOf: new Map([[survivor, plan.origins]]),
   });
 
-  // 8. Any proposal still waiting on a member now names the survivor.
+  // 8. The dictionary bindings and the owner's self-pointer, for the reason
+  // `widenEntityOrigins` re-points them: neither carries a foreign key, and a
+  // pointer left aimed at a tombstoned member reads as a user retraction in one
+  // case and as "never stated" in the other. A merge would silently un-promote
+  // a person, or un-say which entity the owner is.
+  await db.unsafe(
+    `UPDATE correspondent SET entity_id = $2::bigint WHERE entity_id = ANY($1::bigint[])`,
+    [members, survivor],
+  );
+  await db.unsafe(
+    `UPDATE tenant_setting SET self_entity_id = $2::bigint WHERE self_entity_id = ANY($1::bigint[])`,
+    [members, survivor],
+  );
+
+  // 9. Any proposal still waiting on a member now names the survivor.
   await db.unsafe(
     `UPDATE review_queue SET target_ref = 'entity:' || $2::text
       WHERE state = 'open' AND target_ref = ANY($1::text[])`,
@@ -547,7 +561,7 @@ export async function mergeEntities(
     ],
   );
 
-  // 9. The departing rows leave. `AND deleted_at IS NULL` because neither
+  // 10. The departing rows leave. `AND deleted_at IS NULL` because neither
   // existing tombstone path carries it, and both would silently overwrite a
   // concurrent cascade's instant.
   const departing = plan.members.filter((member) => member !== survivor);
