@@ -122,6 +122,14 @@ export interface CorrespondentObservation {
   readonly suppressed: number;
   /** Names nulled as encoded-word or address-shaped. The address still lands. */
   readonly refusedNames: number;
+  /**
+   * Keys that are not addresses at all, dropped whole.
+   *
+   * A real address book holds a phone number in an email field. Counted rather
+   * than silent, because the number going up is how an operator learns the
+   * provider is offering something this table cannot hold.
+   */
+  readonly refusedAddresses: number;
   /** Items whose addressed roles were dropped by the recipient cap. */
   readonly droppedByRecipientCap: number;
 }
@@ -146,6 +154,24 @@ const UPSERT_BATCH = 500;
 
 /** A display name that is machine noise rather than a person. */
 const ENCODED_WORD = /=\?[^?]+\?[BbQq]\?[^?]*\?=/;
+
+/**
+ * `correspondent_key_is_an_address`, restated so a bad key is refused BEFORE
+ * the write rather than at the last statement of a batch.
+ *
+ * **One malformed entry used to kill the whole book.** A real address book
+ * holds things that are not addresses: measured on the founder's, a phone
+ * number typed into an email field and a 46-character string with no `@` at
+ * all. The insert is batched, so both raised, the whole 2,131-row upsert rolled
+ * back, and the contacts lane reported `provider_error` on every poll —
+ * permanently, because the provider will keep offering the same two rows.
+ *
+ * Stated twice, here and in the DDL, which is a real hazard: a widening in one
+ * and not the other is either a refused write or a row this filter admits and
+ * the database rejects. It is worth it because the alternative is a batch whose
+ * failure mode is all-or-nothing on data the provider legitimately holds.
+ */
+const ADDRESS_KEY = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
 interface Folded {
   address: string;
@@ -187,6 +213,7 @@ export async function observeCorrespondents(
 ): Promise<CorrespondentObservation> {
   const folded = new Map<string, Folded>();
   let refusedNames = 0;
+  let refusedAddresses = 0;
   let droppedByRecipientCap = 0;
 
   const ADDRESSED: ReadonlySet<CorrespondentRole> = new Set(['to', 'cc', 'attendee']);
@@ -194,6 +221,12 @@ export async function observeCorrespondents(
   const fold = (who: Correspondent, source: 'headers' | 'book', pageId?: string): void => {
     const key = addressKey(who.address);
     if (key.length === 0) return;
+    // Refused here rather than by the CHECK, because the write is batched and a
+    // constraint violation takes every other row in the batch with it.
+    if (!ADDRESS_KEY.test(key)) {
+      refusedAddresses += 1;
+      return;
+    }
     let name = who.name;
     // An encoded-word or address-shaped display name is machine noise, not a
     // person. The ADDRESS is still recorded — it is the useful half — and only
@@ -244,6 +277,7 @@ export async function observeCorrespondents(
       sightings: 0,
       suppressed: 0,
       refusedNames,
+      refusedAddresses,
       droppedByRecipientCap,
     };
   }
@@ -261,7 +295,15 @@ export async function observeCorrespondents(
     }
   }
   if (folded.size === 0) {
-    return { addresses: 0, named: 0, sightings: 0, suppressed, refusedNames, droppedByRecipientCap };
+    return {
+      addresses: 0,
+      named: 0,
+      sightings: 0,
+      suppressed,
+      refusedNames,
+      refusedAddresses,
+      droppedByRecipientCap,
+    };
   }
 
   const rows = [...folded];
@@ -334,6 +376,7 @@ export async function observeCorrespondents(
     sightings,
     suppressed,
     refusedNames,
+    refusedAddresses,
     droppedByRecipientCap,
   };
 }

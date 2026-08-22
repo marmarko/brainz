@@ -217,6 +217,33 @@ describe('observing what the providers said', () => {
     for (const row of stored) expect(row.display_name).toBeNull();
   }, SETUP_TIMEOUT_MS);
 
+  test('a phone number in an email field does not take the whole book with it', async () => {
+    // Measured on a real 2,131-address book: one phone number typed into an
+    // email field and one 46-character string with no `@`. The insert is
+    // batched, so both violated `correspondent_key_is_an_address`, the whole
+    // upsert rolled back, and the contacts lane reported `provider_error` on
+    // every poll — permanently, because the provider keeps offering them.
+    const outcome = await observeCorrespondents(sql, {
+      originContext: 'pipedream:contacts',
+      at: NOW,
+      stated: [
+        { address: 'real@example.test', name: 'Real Person', role: 'book' },
+        { address: '917-543-6669', name: 'Phone Number', role: 'book' },
+        { address: 'vkcwnu1hrkhisfzhzvvjd1lubenlbhbyvldkafixwjvxbeu', name: 'Garbage', role: 'book' },
+        { address: 'also.real@example.test', name: 'Also Real', role: 'book' },
+      ],
+    });
+
+    expect(outcome.refusedAddresses).toBe(2);
+    // The two good rows land. All-or-nothing on data the provider legitimately
+    // holds is the failure this refusal exists to stop.
+    expect(outcome.addresses).toBe(2);
+    expect((await rows()).map((row) => row.address_key)).toEqual([
+      'also.real@example.test',
+      'real@example.test',
+    ]);
+  }, SETUP_TIMEOUT_MS);
+
   test('a mass mailing states no correspondents at all, rather than an arbitrary 25', async () => {
     const page = await seedPage('m-1');
     const many = Array.from({ length: 40 }, (_, at) => ({
