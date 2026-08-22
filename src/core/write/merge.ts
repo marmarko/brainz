@@ -387,3 +387,176 @@ export async function recastEdges(
   }
   return { rewritten: rows.length, dropped };
 }
+
+/**
+ * Make the members one entity, inside the caller's transaction.
+ *
+ * **Irreversible, and the design says so out loud rather than hedging.** Three
+ * of the steps below are one-way at the database level: the absorbed rows'
+ * aliases are hard-DELETEd (the unique key is total, so they cannot coexist),
+ * their canonical slugs are overwritten to redirects, and their edges are
+ * retired in a table `restoreForgotten` deliberately refuses to walk. There is
+ * no undo, so the protection is a preview read beforehand — see
+ * `src/ops/merge.ts`.
+ *
+ * Statement order is not arbitrary:
+ *
+ *  1. `FOR UPDATE` every member before any write, so a concurrent widen cannot
+ *     tombstone one out from under the merge.
+ *  2. The surviving row: unchanged on the in-place arm, minted on the successor
+ *     arm carrying every column.
+ *  3. Cards, then slugs, then aliases — aliases last of the three because their
+ *     delete-then-insert is the step with no undo, and everything that could
+ *     still refuse has refused by then.
+ *  4. Edges through {@link recastEdges}, which is where BZ002 is satisfied.
+ *  5. The departing rows leave, with `AND deleted_at IS NULL` so a concurrent
+ *     cascade's instant is never silently overwritten — neither existing
+ *     tombstone path carries that predicate.
+ */
+export async function mergeEntities(
+  db: SQL,
+  plan: MergePlan,
+  now: Date,
+): Promise<{ readonly entityId: string; readonly tombstoned: readonly string[] }> {
+  const members = numericArrayLiteral([...plan.members]);
+
+  // 1. Lock every member first. A rowcount short of the plan means something
+  // moved between planning and applying, and continuing would merge a subset.
+  const locked = (await db.unsafe(
+    `SELECT entity_id::text AS entity_id, canonical_name, entity_type, taxonomy_version,
+            origin_contexts
+       FROM entity
+      WHERE entity_id = ANY($1::bigint[]) AND deleted_at IS NULL
+      ORDER BY entity_id
+        FOR UPDATE`,
+    [members],
+  )) as MemberRow[];
+  if (locked.length !== plan.members.length) {
+    throw new Error('a member of this merge is gone; re-run the preview');
+  }
+
+  const primary = locked.find((row) => row.entity_id === plan.primary);
+  if (primary === undefined) throw new Error('the primary of this merge is gone');
+
+  // 2. The surviving row.
+  let survivor = plan.primary;
+  if (plan.arm === 'successor') {
+    // `origin_contexts` is immutable by trigger (BZ001), and its hint names the
+    // only remedy: a row whose origin would change is a different row.
+    const born = (await db.unsafe(
+      `INSERT INTO entity (canonical_name, entity_type, taxonomy_version, origin_contexts,
+                           subject_context, subject_confidence, enrich_considered_version)
+       SELECT $2, $3, e.taxonomy_version, $4::text[], e.subject_context, e.subject_confidence,
+              e.enrich_considered_version
+         FROM entity e WHERE e.entity_id = $1::bigint
+       RETURNING entity_id::text AS entity_id`,
+      [plan.primary, primary.canonical_name, plan.entityType, textArrayLiteral([...plan.origins])],
+    )) as Array<{ entity_id: string }>;
+    survivor = born[0]?.entity_id ?? '';
+    if (survivor === '') throw new Error('the successor was not created');
+  } else if (plan.entityType !== primary.entity_type) {
+    // A retype riding along on an in-place merge. Legal: `entity_type` has no
+    // trigger, and the caller has already been through the same collision
+    // pre-flight `src/ops/retype.ts` runs.
+    await db.unsafe(
+      `UPDATE entity SET entity_type = $2, enrich_considered_version = NULL
+        WHERE entity_id = $1::bigint`,
+      [survivor, plan.entityType],
+    );
+  }
+
+  // 3. The card follows, carrying the union.
+  await recastCards(db, {
+    moves: new Map(plan.members.map((member) => [member, survivor] as const)),
+    originsOf: new Map([[survivor, plan.origins]]),
+    now,
+  });
+
+  // 4. Slugs. The survivor's canonical slug stays canonical; every other
+  // member's becomes a redirect, so an address somebody already holds keeps
+  // resolving rather than 404ing.
+  await db.unsafe(
+    `UPDATE entity_slug SET entity_id = $2::bigint, kind = 'redirect'
+      WHERE entity_id = ANY($1::bigint[]) AND entity_id <> $2::bigint`,
+    [members, survivor],
+  );
+
+  // 5. Aliases. `entity_alias`'s unique key is (entity_id, alias) and is TOTAL
+  // -- there is no partial-on-live form -- so a spelling two members both know
+  // cannot be inserted twice. Read, resolve in memory, delete, re-insert.
+  const aliases = (await db.unsafe(
+    `SELECT alias, alias_source, confidence, origin_contexts
+       FROM entity_alias WHERE entity_id = ANY($1::bigint[]) ORDER BY alias`,
+    [members],
+  )) as Array<{
+    alias: string;
+    alias_source: string;
+    confidence: number | null;
+    origin_contexts: string[];
+  }>;
+  const resolved = new Map<string, (typeof aliases)[number]>();
+  for (const row of aliases) {
+    const seen = resolved.get(row.alias);
+    if (seen === undefined) {
+      resolved.set(row.alias, { ...row });
+      continue;
+    }
+    // A spelling both members knew keeps the wider provenance and the higher
+    // score. Narrowing either would make a merge lose recall.
+    seen.origin_contexts = [...new Set([...seen.origin_contexts, ...row.origin_contexts])].sort();
+    seen.confidence = Math.max(seen.confidence ?? 0, row.confidence ?? 0) || null;
+  }
+  await db.unsafe(`DELETE FROM entity_alias WHERE entity_id = ANY($1::bigint[])`, [members]);
+  const rows = [...resolved.values()];
+  if (rows.length > 0) {
+    await db.unsafe(
+      `INSERT INTO entity_alias (entity_id, alias, alias_source, confidence, origin_contexts)
+       SELECT $1::bigint, u.alias, u.alias_source, nullif(u.confidence, '')::real, u.origins::text[]
+         FROM unnest($2::text[], $3::text[], $4::text[], $5::text[])
+              AS u(alias, alias_source, confidence, origins)`,
+      [
+        survivor,
+        textArrayLiteral(rows.map((row) => row.alias)),
+        textArrayLiteral(rows.map((row) => row.alias_source)),
+        textArrayLiteral(rows.map((row) => (row.confidence == null ? '' : String(row.confidence)))),
+        textArrayLiteral(rows.map((row) => textArrayLiteral(row.origin_contexts))),
+      ],
+    );
+  }
+
+  // 6. Severance history follows the survivor, or a severed spelling would be
+  // stranded on a tombstone and stop suppressing what it was written to suppress.
+  await db.unsafe(
+    `UPDATE severed_alias SET entity_id = $2::bigint WHERE entity_id = ANY($1::bigint[])`,
+    [members, survivor],
+  );
+
+  // 7. Edges, where the origin union is actually satisfied.
+  await recastEdges(db, {
+    moves: new Map(plan.members.map((member) => [member, survivor] as const)),
+    originsOf: new Map([[survivor, plan.origins]]),
+  });
+
+  // 8. Any proposal still waiting on a member now names the survivor.
+  await db.unsafe(
+    `UPDATE review_queue SET target_ref = 'entity:' || $2::text
+      WHERE state = 'open' AND target_ref = ANY($1::text[])`,
+    [
+      textArrayLiteral(plan.members.filter((m) => m !== survivor).map((m) => `entity:${m}`)),
+      survivor,
+    ],
+  );
+
+  // 9. The departing rows leave. `AND deleted_at IS NULL` because neither
+  // existing tombstone path carries it, and both would silently overwrite a
+  // concurrent cascade's instant.
+  const departing = plan.members.filter((member) => member !== survivor);
+  if (departing.length > 0) {
+    await db.unsafe(
+      `UPDATE entity SET deleted_at = $2::timestamptz
+        WHERE entity_id = ANY($1::bigint[]) AND deleted_at IS NULL`,
+      [numericArrayLiteral(departing), now.toISOString()],
+    );
+  }
+  return { entityId: survivor, tombstoned: departing };
+}
