@@ -35,6 +35,7 @@
 import type { SQL } from 'bun';
 
 import { admitEntityName, corpusEvidence, type NameEvidence } from './entity-admission.ts';
+import { recastCards } from './merge.ts';
 import { extractFromStatement, type ExtractedFact, type Predicate } from './extract.ts';
 import { normalize, slugify } from './normalize.ts';
 import { numericArrayLiteral, textArrayLiteral } from './pg-values.ts';
@@ -319,11 +320,17 @@ async function widenEntityOrigins(
               nextval(pg_get_serial_sequence('entity', 'entity_id')) AS new_id
          FROM unnest($1::bigint[], $2::text[]) AS u(old_id, origins)
      ), born AS (
+       -- Every column the predecessor had. enrich_considered_version is the one
+       -- that used to be dropped: a successor born with it NULL is offered to
+       -- the enrichment model again on the next cycle, so every widen was
+       -- quietly re-buying a summary the brain had already paid for.
        INSERT INTO entity (entity_id, canonical_name, entity_type, taxonomy_version,
-                           origin_contexts, subject_context, subject_confidence)
+                           origin_contexts, subject_context, subject_confidence,
+                           enrich_considered_version)
        OVERRIDING SYSTEM VALUE
        SELECT s.new_id, e.canonical_name, e.entity_type, e.taxonomy_version,
-              s.origins, e.subject_context, e.subject_confidence
+              s.origins, e.subject_context, e.subject_confidence,
+              e.enrich_considered_version
          FROM src s JOIN entity e ON e.entity_id = s.old_id
        RETURNING entity_id, canonical_name, origin_contexts
      )
@@ -368,7 +375,7 @@ async function widenEntityOrigins(
   const edges = (await db.unsafe(
     `SELECT edge_id::text AS edge_id, subject_entity_id::text AS subject_entity_id,
             edge_type, object_entity_id::text AS object_entity_id,
-            origin_contexts, confidence
+            origin_contexts, confidence, subject_context, subject_confidence, derivation
        FROM entity_edge
       WHERE deleted_at IS NULL
         AND (subject_entity_id = ANY($1::bigint[]) OR object_entity_id = ANY($1::bigint[]))`,
@@ -380,6 +387,9 @@ async function widenEntityOrigins(
     object_entity_id: string;
     origin_contexts: string[];
     confidence: number | null;
+    subject_context: string | null;
+    subject_confidence: number | null;
+    derivation: string;
   }>;
 
   if (edges.length > 0) {
@@ -405,26 +415,86 @@ async function widenEntityOrigins(
         // element; the empty string `numericArrayLiteral` would otherwise
         // produce is not a `float8` and would fail the whole statement.
         confidence: edge.confidence === null ? 'NULL' : String(edge.confidence),
+        subjectContext: edge.subject_context,
+        subjectConfidence:
+          edge.subject_confidence === null ? 'NULL' : String(edge.subject_confidence),
+        // **The column whose absence was armed rather than theoretical.** An
+        // edge re-born without it takes the table DEFAULT, 'rule_derived' --
+        // and reconcileAllEdges' removal predicate is exactly that value, in a
+        // table restoreForgotten deliberately refuses to walk. So the first
+        // connector- or model-derived edge to meet a widen was deleted on the
+        // next cycle and was not restorable.
+        derivation: edge.derivation,
       };
     });
 
     for (const chunk of batched(replacements)) {
       await db.unsafe(
         `INSERT INTO entity_edge (subject_entity_id, edge_type, object_entity_id,
-                                  origin_contexts, confidence)
-         SELECT u.subject, u.edge_type, u.object, u.origins::text[], u.confidence
-           FROM unnest($1::bigint[], $2::text[], $3::bigint[], $4::text[], $5::float8[])
-                AS u(subject, edge_type, object, origins, confidence)`,
+                                  origin_contexts, confidence, subject_context,
+                                  subject_confidence, derivation)
+         SELECT u.subject, u.edge_type, u.object, u.origins::text[], u.confidence,
+                nullif(u.subject_context, ''), u.subject_confidence, u.derivation
+           FROM unnest($1::bigint[], $2::text[], $3::bigint[], $4::text[], $5::float8[],
+                       $6::text[], $7::float8[], $8::text[])
+                AS u(subject, edge_type, object, origins, confidence, subject_context,
+                     subject_confidence, derivation)`,
         [
           numericArrayLiteral(chunk.map((row) => row.subject)),
           textArrayLiteral(chunk.map((row) => row.edgeType)),
           numericArrayLiteral(chunk.map((row) => row.object)),
           textArrayLiteral(chunk.map((row) => row.origins)),
           numericArrayLiteral(chunk.map((row) => row.confidence)),
+          textArrayLiteral(chunk.map((row) => row.subjectContext ?? '')),
+          numericArrayLiteral(chunk.map((row) => row.subjectConfidence)),
+          textArrayLiteral(chunk.map((row) => row.derivation)),
         ],
       );
     }
   }
+
+  // 6a. **And the card follows, which it never did.**
+  //
+  // `entity_card` did not appear in this function at all, so a summary stayed
+  // live on a row this function was about to tombstone — where every read's
+  // `deleted_at IS NULL` join made it unreachable, and where the table's
+  // `ON DELETE CASCADE` could never rescue it either, because the predecessor
+  // is UPDATEd rather than DELETEd. Measured on a production brain before this
+  // landed: 29 of 84 live cards orphaned, three of them `user_stated` — the
+  // owner's own approved summaries, silently unreachable.
+  //
+  // It cannot be re-pointed in place. The successor's origins are by
+  // construction a strict superset of the card's, and `entity_card`'s origins
+  // are immutable by trigger — so `assert_entity_card_origin_union` would raise
+  // BZ002 at commit. Retire and re-seat with the union, exactly as the edges
+  // above do, and for exactly the same reason.
+  // One call over the whole set, not one per entity: the widen's whole point is
+  // a fixed statement count however large the set, and
+  // `test/core/write/links.test.ts` asserts exactly that.
+  await recastCards(db, {
+    moves: newIdOf,
+    originsOf: new Map(
+      [...newIdOf].map(([oldId, newId]) => [newId, widenedBy.get(oldId) ?? []] as const),
+    ),
+    // The same instant the tombstone below uses: a card retired a moment before
+    // its entity is not a different event.
+    now: new Date(),
+  });
+
+  // 6b. And any proposal still waiting on the owner. `review_queue.target_ref`
+  // is parsed rather than joined (deliberately -- it names rows in several
+  // tables), so nothing re-pointed it: a widen quietly turned an open
+  // `entity_card` proposal into one whose target no longer resolves, leaving
+  // Discard as its only verb.
+  await db.unsafe(
+    `UPDATE review_queue SET target_ref = 'entity:' || m.new_id
+       FROM unnest($1::bigint[], $2::bigint[]) AS m(old_id, new_id)
+      WHERE state = 'open' AND target_ref = 'entity:' || m.old_id`,
+    [
+      numericArrayLiteral([...newIdOf.keys()]),
+      numericArrayLiteral([...newIdOf.values()]),
+    ],
+  );
 
   // 7. The predecessors leave.
   await db.unsafe(`UPDATE entity SET deleted_at = now() WHERE entity_id = ANY($1::bigint[])`, [

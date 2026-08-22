@@ -679,6 +679,139 @@ describe('editing a page removes the edges it no longer states', () => {
  * removal safety follows from that placement and nothing else, so it is pinned
  * directly rather than inferred from a phase's output.
  */
+/**
+ * What a widen carries with it, and what it used to drop.
+ *
+ * Every one of these is a column or a row that existed before the widen and was
+ * silently absent afterwards. None of them errored; all of them were discovered
+ * by reading the INSERT beside the table it writes to.
+ */
+describe('widening an entity does not lose what was attached to it', () => {
+  test('the summary follows the entity instead of staying on the row it replaced', async () => {
+    await reset();
+    const seeded = await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Kettle Works', type: 'organization', origins: ['personal'], taxonomyVersion: 1 },
+    ]);
+    const before = seeded.get('kettle works');
+    expect(before).toBeDefined();
+
+    // The shape the review queue's apply path writes: the owner approved it.
+    await tenant.sql`
+      INSERT INTO entity_card (entity_id, summary, trust_level, derivation, confidence,
+                               origin_contexts)
+      VALUES (${before?.entityId ?? ''}::bigint, ${'The owner approved this.'}, ${'user_stated'},
+              ${'model_derived'}, 1, ARRAY['personal'])`;
+
+    // A second credential meets a corpus the brain already knows, which is the
+    // ordinary way a widen happens.
+    const after = await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Kettle Works', type: 'organization', origins: ['work'], taxonomyVersion: 1 },
+    ]);
+    const successor = after.get('kettle works');
+    expect(successor?.entityId).not.toBe(before?.entityId);
+
+    const cards = (await tenant.sql`
+      SELECT c.entity_id::text AS entity_id, c.summary, c.trust_level, c.origin_contexts,
+             e.deleted_at IS NULL AS entity_live
+        FROM entity_card c JOIN entity e ON e.entity_id = c.entity_id
+       WHERE c.deleted_at IS NULL
+    `) as Array<{
+      entity_id: string;
+      summary: string;
+      trust_level: string;
+      origin_contexts: string[];
+      entity_live: boolean;
+    }>;
+
+    // Exactly one live card, on the successor, reachable.
+    expect(cards).toHaveLength(1);
+    expect(cards[0]?.entity_id).toBe(successor?.entityId);
+    expect(cards[0]?.entity_live).toBe(true);
+    expect(cards[0]?.summary).toBe('The owner approved this.');
+    expect(cards[0]?.trust_level).toBe('user_stated');
+    // Carrying the union, which is what `assert_entity_card_origin_union`
+    // demands and why it cannot be re-pointed in place.
+    expect([...(cards[0]?.origin_contexts ?? [])].sort()).toEqual(['personal', 'work']);
+  }, TEST_TIMEOUT_MS);
+
+  test('an edge keeps its derivation, so the next cycle does not delete it', async () => {
+    await reset();
+    // `reconcileAllEdges` removes only what it could itself have produced —
+    // `derivation = 'rule_derived'`. An edge re-born at the column DEFAULT
+    // becomes exactly that, and `entity_edge` is a table `restoreForgotten`
+    // refuses to walk, so the deletion is permanent.
+    const seeded = await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Marcus Fell', type: 'person', origins: ['personal'], taxonomyVersion: 1 },
+      { name: 'Kettle Works', type: 'organization', origins: ['personal'], taxonomyVersion: 1 },
+    ]);
+    const subject = seeded.get('marcus fell');
+    const object = seeded.get('kettle works');
+    await tenant.sql`
+      INSERT INTO entity_edge (subject_entity_id, edge_type, object_entity_id, origin_contexts,
+                               confidence, derivation)
+      VALUES (${subject?.entityId ?? ''}::bigint, ${'works_at'}, ${object?.entityId ?? ''}::bigint,
+              ARRAY['personal'], 0.8, ${'model_derived'})`;
+
+    await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Marcus Fell', type: 'person', origins: ['work'], taxonomyVersion: 1 },
+    ]);
+
+    const rows = (await tenant.sql`
+      SELECT derivation, confidence::float8 AS confidence, origin_contexts
+        FROM entity_edge WHERE deleted_at IS NULL
+    `) as Array<{ derivation: string; confidence: number; origin_contexts: string[] }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.derivation).toBe('model_derived');
+    expect(rows[0]?.confidence).toBeCloseTo(0.8);
+    expect([...(rows[0]?.origin_contexts ?? [])].sort()).toEqual(['personal', 'work']);
+  }, TEST_TIMEOUT_MS);
+
+  test('the successor keeps its place in the enrichment queue', async () => {
+    await reset();
+    const seeded = await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Kettle Works', type: 'organization', origins: ['personal'], taxonomyVersion: 1 },
+    ]);
+    await tenant.sql`
+      UPDATE entity SET enrich_considered_version = 1
+       WHERE entity_id = ${seeded.get('kettle works')?.entityId ?? ''}::bigint`;
+
+    await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Kettle Works', type: 'organization', origins: ['work'], taxonomyVersion: 1 },
+    ]);
+
+    // Born NULL, this entity is re-sent to the paid enrichment model on the next
+    // cycle — a summary the brain had already bought, bought again.
+    const rows = (await tenant.sql`
+      SELECT enrich_considered_version AS v FROM entity WHERE deleted_at IS NULL
+    `) as Array<{ v: number | null }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.v).toBe(1);
+  }, TEST_TIMEOUT_MS);
+
+  test('an open proposal follows the entity rather than being orphaned', async () => {
+    await reset();
+    const seeded = await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Kettle Works', type: 'organization', origins: ['personal'], taxonomyVersion: 1 },
+    ]);
+    const before = seeded.get('kettle works')?.entityId ?? '';
+    await tenant.sql`
+      INSERT INTO review_queue (kind, target_ref, proposal, confidence, origin_contexts)
+      VALUES (${'entity_card'}, ${`entity:${before}`}, ${'A summary to approve.'}, 0.6,
+              ARRAY['personal'])`;
+
+    const after = await resolveOrCreateEntities(tenant.sql, [
+      { name: 'Kettle Works', type: 'organization', origins: ['work'], taxonomyVersion: 1 },
+    ]);
+
+    const rows = (await tenant.sql`
+      SELECT target_ref FROM review_queue WHERE state = ${'open'}
+    `) as Array<{ target_ref: string }>;
+    // `target_ref` is parsed rather than joined, so nothing re-pointed it and
+    // the proposal's only remaining verb was Discard.
+    expect(rows[0]?.target_ref).toBe(`entity:${after.get('kettle works')?.entityId ?? ''}`);
+  }, TEST_TIMEOUT_MS);
+});
+
 describe('the admission fence gates creations and only creations', () => {
   test('a name that does not look like one is never created, and takes its edge with it', async () => {
     await reset();
