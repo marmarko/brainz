@@ -1087,6 +1087,38 @@ describe('the port that is actually wired', () => {
   );
 
   test(
+    'a card whose entity is gone is not counted, because no surface can return it',
+    async () => {
+      // Entities are tombstoned by UPDATE, never DELETEd, so `entity_card`'s
+      // `ON DELETE CASCADE` never fires — and nothing in `src/` re-points
+      // `entity_card.entity_id`, so a merge or an origin-widen leaves the card
+      // behind on the row it replaced. Every read joins a live entity, so the
+      // card is unreachable; counting it here made the page whose whole job is
+      // being honest about what the brain holds the one over-reporting it.
+      // Measured on a production brain: 84 live card rows, 29 orphaned.
+      const live = await insertEntity('acme-example', 'organization');
+      const gone = await insertEntity('predecessor', 'organization', true);
+      for (const entityId of [live, gone]) {
+        await brainSql.unsafe(
+          `INSERT INTO entity_card (entity_id, summary, trust_level, derivation, confidence,
+                                    origin_contexts)
+           VALUES ($1::bigint, 'a summary', 'model_inferred', 'model_derived', 0.9,
+                   ARRAY['${WORK}']::text[])`,
+          [entityId],
+        );
+      }
+
+      const view = await coveragePort(withTenant).read({ tenantId: TENANT });
+      // Two card rows exist and one of them is reachable.
+      expect(view.entitiesWithCard).toBe(1);
+      // ...and the entity count already ignored the tombstone, which is what
+      // made the two numbers contradict each other on the same page.
+      expect(view.entities).toBe(1);
+    },
+    120_000,
+  );
+
+  test(
     'a stopped cycle closes its run and must not become the backlog’s anchor',
     async () => {
       // **The receipt for the whole fixture rewrite, taken from the real

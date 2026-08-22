@@ -565,7 +565,18 @@ export async function readCoverage(sql: SQL, options: { readonly now: Date }): P
        (SELECT count(*) FROM fact
          WHERE deleted_at IS NULL AND quarantined_at IS NULL AND superseded_by IS NULL)::int AS facts,
        (SELECT count(*) FROM entity_edge WHERE deleted_at IS NULL)::int AS edges,
-       (SELECT count(*) FROM entity_card WHERE deleted_at IS NULL)::int AS entities_with_card`,
+       -- **Joined to a live entity, because a card can outlive one.** Entities
+       -- are tombstoned by \`UPDATE ... SET deleted_at\`, never DELETEd, so the
+       -- \`ON DELETE CASCADE\` on this table's foreign key never fires; and
+       -- nothing in \`src/\` ever re-points \`entity_card.entity_id\`, so a merge
+       -- or an origin-widen leaves the card behind on the row it replaced.
+       -- Counting those made this page report cards no surface can return:
+       -- measured on a production brain, 84 live card rows of which 29 pointed
+       -- at tombstoned entities. The page whose whole job is being honest about
+       -- what the brain holds was the one over-reporting it.
+       (SELECT count(*) FROM entity_card c
+          JOIN entity e ON e.entity_id = c.entity_id AND e.deleted_at IS NULL
+         WHERE c.deleted_at IS NULL)::int AS entities_with_card`,
     [],
   )) as Array<{
     last_completed_at: Date | string | null;
