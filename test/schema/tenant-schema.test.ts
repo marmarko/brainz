@@ -158,6 +158,17 @@ const EXPECTED_TABLES: ReadonlyMap<string, TableClass> = new Map([
   // mechanism, so it classifies with the other retraction bookkeeping.
   ['severed_alias', 'operational'],
 
+  // Rung 26's dictionary. `correspondent` is the first table in this schema to
+  // hold third-party personal data the user did not write — an address and the
+  // display name a provider attached to it, per origin — and it is classified
+  // `operational` rather than content because it asserts nothing ABOUT those
+  // people: no page text, no subject, no sentence, and evidence is a join
+  // rather than a stored counter. `correspondent_sighting` carries no origin of
+  // its own on purpose; a sighting's origin is its page's, and a second copy is
+  // a second thing to keep true.
+  ['correspondent', 'operational'],
+  ['correspondent_sighting', 'operational'],
+
   // Rung 18's discovery index. One row per `forget`, written in the same
   // transaction as the tombstones it describes, so the 72-hour window can be
   // listed and not merely keyed. It is classified with the other retraction
@@ -468,6 +479,16 @@ const ORIGIN_FIXTURES: ReadonlyMap<string, { readonly where: string; readonly ta
       'severed_alias',
       { where: `alias = 'fence archived alias'`, tamper: `origin_contexts = ARRAY['personal','work']` },
     ],
+    [
+      'correspondent',
+      {
+        where: `address_key = 'fence@example.test'`,
+        // Scalar rather than a union, because identity here is (address,
+        // origin): moving the origin would silently re-file one person's
+        // dictionary entry under a credential that never saw them.
+        tamper: `origin_context = 'work'`,
+      },
+    ],
     // Rung 18. The ledger row is what makes an instant *listable*, so an origin
     // that could be edited afterwards would let a retraction from one credential
     // be re-labelled as another's — on the one table a restore surface reads to
@@ -527,6 +548,8 @@ describe('R15 — the database refuses to let an origin move, on every table tha
              'fence archived alias', 'user', ARRAY['personal'], now(), now();
       INSERT INTO retraction (retracted_at, target_kind, origin_contexts, removed)
       VALUES (now(), 'doc', ARRAY['personal'], '{}'::jsonb);
+      INSERT INTO correspondent (address_key, origin_context, display_name, name_key, name_source)
+      VALUES ('fence@example.test', 'personal', 'Fence Fixture', 'fence fixture', 'headers');
     `);
   });
 
