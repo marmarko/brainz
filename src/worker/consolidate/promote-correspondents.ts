@@ -48,7 +48,7 @@ export interface PromotionResult {
 }
 
 /**
- * Address keys examined per pass.
+ * Entities CREATED per pass.
  *
  * The first-run clamp, in the shape `tombstone.ts` argues for — *a first run
  * that takes everything is a decision nobody got to make*. A module constant
@@ -56,7 +56,26 @@ export interface PromotionResult {
  * number as the enrich batch: one promotion pass can never hand the enrichment
  * phase more entities than one of its prompts can summarise.
  */
-const PROMOTION_BATCH = 25;
+const PROMOTION_CREATE_BATCH = 25;
+
+/**
+ * Address keys EXAMINED per pass, and it is deliberately not the same number.
+ *
+ * **This separation is a starvation fix, found in production.** The first
+ * version clamped the examination itself, and a refused group stays unpromoted
+ * on purpose — the unknown reads closed, so a later cycle can re-decide when a
+ * second page arrives. Those two rules together are a pass permanently stuck on
+ * whichever 25 keys sort first: measured on a real brain, 2,145 candidates of
+ * which 25 were re-examined every cycle forever and **2,120 were never examined
+ * at all**. A colleague whose address sorted after `aaron@…` could never be
+ * bound, which is most of the alphabet.
+ *
+ * Examining is cheap and set-based — two statements and one batched
+ * `findEntitiesByName`, whatever the count — so the clamp belongs on the
+ * expensive, irreversible half. The ceiling here is a bound on one pathological
+ * dictionary rather than a decision about pace.
+ */
+const PROMOTION_SCAN = 5_000;
 
 /**
  * Pages naming this address in an ADDRESSED slot — `to`, `cc`, `attendee`.
@@ -120,7 +139,7 @@ export async function promoteCorrespondents(
       GROUP BY c.address_key
       ORDER BY c.address_key
       LIMIT $1`,
-    [PROMOTION_BATCH],
+    [PROMOTION_SCAN],
   )) as Array<{ address_key: string }>;
   if (keyRows.length === 0) return nothing;
   const keys = keyRows.map((row) => row.address_key);
@@ -295,12 +314,20 @@ export async function promoteCorrespondents(
     // 7. Only then, independent evidence. A book-only group has no sightings and
     // therefore no origins, so it can never reach here — which is the whole
     // measurement made structural.
-    const creatable = unresolved.filter(
-      (candidate) =>
-        candidate.origins.length > 0 &&
-        (candidate.addressed >= MIN_ADDRESSED_PAGES ||
-          candidate.attesting >= MIN_ATTESTING_PAGES),
-    );
+    //
+    // The clamp is HERE rather than on the examination above: creating is the
+    // irreversible half, and clamping the examination instead starves every key
+    // that sorts late. Sorted by evidence so that if the cap ever binds, it
+    // binds on the best-attested candidates rather than on whoever sorts first.
+    const creatable = unresolved
+      .filter(
+        (candidate) =>
+          candidate.origins.length > 0 &&
+          (candidate.addressed >= MIN_ADDRESSED_PAGES ||
+            candidate.attesting >= MIN_ATTESTING_PAGES),
+      )
+      .sort((left, right) => right.addressed - left.addressed || right.attesting - left.attesting)
+      .slice(0, PROMOTION_CREATE_BATCH);
     for (const candidate of unresolved) {
       if (!creatable.includes(candidate)) {
         // Left alone: not latched, not retracted. The unknown reads closed, and

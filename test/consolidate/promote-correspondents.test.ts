@@ -277,3 +277,49 @@ describe('a retraction is permanent', () => {
     void who;
   }, SETUP_TIMEOUT_MS);
 });
+
+/**
+ * The starvation this pass was stuck in, found in production.
+ *
+ * A refused group stays unpromoted on purpose — the unknown reads closed, so a
+ * later cycle re-decides when a second page arrives. Clamping the EXAMINATION
+ * as well turns those two rules into a pass permanently stuck on whichever keys
+ * sort first: measured on a real brain, 2,145 candidates of which 25 were
+ * re-examined every cycle and 2,120 were never examined at all.
+ */
+describe('a key that sorts late is still examined', () => {
+  test('a promotable correspondent past the creation cap is not starved by earlier refusals', async () => {
+    // Thirty refusable rows that sort BEFORE the real one: named, but with no
+    // sighting at all, so they can never promote and never latch.
+    for (let at = 0; at < 30; at += 1) {
+      await seedCorrespondent({
+        address: `aaa${String(at).padStart(2, '0')}@example.test`,
+        name: `Book Person ${at}`,
+        origin: BOOK,
+        source: 'book',
+      });
+    }
+    // And one real correspondent whose address sorts last.
+    const real = await seedCorrespondent({ address: 'zoe@example.test', name: 'Zoe Zheng' });
+    await sight(real, await seedPage('m-1'), 'to');
+
+    const result = await promote();
+    // Examined despite thirty earlier candidates that will never resolve.
+    expect(result.created).toBe(1);
+    expect(await entities()).toEqual(['Zoe Zheng']);
+  }, SETUP_TIMEOUT_MS);
+
+  test('the cap bounds creation, not examination, and takes the best-attested first', async () => {
+    // One weakly-attested candidate sorting first, one strongly-attested last.
+    const weak = await seedCorrespondent({ address: 'aaa@example.test', name: 'Weak Evidence' });
+    await sight(weak, await seedPage('m-1'), 'to');
+    const strong = await seedCorrespondent({ address: 'zzz@example.test', name: 'Strong Evidence' });
+    for (const ref of ['m-2', 'm-3', 'm-4']) await sight(strong, await seedPage(ref), 'to');
+
+    const result = await promote();
+    // Both clear the floor, so both are created — the point is that the one
+    // sorting last was seen at all.
+    expect(result.created).toBe(2);
+    expect((await entities()).sort()).toEqual(['Strong Evidence', 'Weak Evidence']);
+  }, SETUP_TIMEOUT_MS);
+});
